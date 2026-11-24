@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Siphon — Drain Every EVM Chain into Solana USDC</title>
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230A0A0A'/%3E%3Cpath d='M7 9H25L18.5 16.5L22 23H10L13.5 16.5L7 9Z' fill='%23C6F4FF'/%3E%3C/svg%3E"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <!-- =============================================================== -->
+    <!-- MODE 1: PROTOCOL WEBSITE (Kamino 2.0 + Aave BUCK + 0.xyz)       -->
+    <!-- =============================================================== -->
+    <div class="site-shell" id="siteShell">
+      <header class="site-nav">
+        <div class="site-nav-inner">
+          <a href="#top" class="brand-mark">
+            <svg width="24" height="22" viewBox="0 0 26 24" fill="none" aria-hidden="true">
+              <path d="M2 2H24L15 11.5H22L10.5 22L13 13.5H5L2 2Z" fill="#0A0A0A" />
+            </svg>
+            <span>Siphon</span>
+          </a>
+
+          <nav class="site-links" aria-label="Primary navigation">
+            <a href="#how-it-works">How It Works</a>
+            <button type="button" class="link-btn" data-open-app="scanner">Live Scanner</button>
+            <button type="button" class="link-btn" data-open-app="burns">Burn Policy</button>
+            <button type="button" class="link-btn" data-open-app="contract">Contract</button>
+          </nav>
+
+          <div>
+            <button type="button" class="btn-pill-dark" id="navLaunchBtn">Launch Migrator</button>
+          </div>
+        </div>
+      </header>
+
+      <main id="top" class="site-rail">
+        <!-- HERO GRID -->
+        <section class="hero-grid">
+          <div class="hero-copy-col">
+            <h1 class="hero-h1">
+              Drain every<br />
+              EVM chain into<br />
+              Solana USDC.
+            </h1>
+            <p class="hero-sub">
+              Withdraw DeFi positions, batch-swap ERC-20 dust, burn dead tokens, and bridge native USDC to Solana via Circle CCTP.
+            </p>
+
+            <!-- Hero Inline EVM Wallet Scanner Pill (matches design comp) -->
+            <form class="hero-scan-pill" id="heroScanForm">
+              <input
+                type="text"
+                id="heroWalletInput"
+                class="hero-scan-input mono"
+                placeholder="0x… paste any EVM wallet"
+                aria-label="EVM wallet address to scan"
+              />
+              <button type="submit" class="btn-pill-dark btn-scan" id="heroScanBtn">Scan Wallet</button>
+            </form>
+
+            <div class="preset-row">
+              <span class="preset-label">Try live:</span>
+              <button type="button" class="preset-chip" data-preset="veteran_defi">Multi-Chain DeFi Veteran</button>
+              <button type="button" class="preset-chip" data-preset="vitalik_live">vitalik.eth (Live RPC)</button>
+              <button type="button" class="preset-chip" data-preset="airdrop_farmer">Zero-Gas L2 Rescue</button>
+            </div>
+          </div>
+
+          <div class="hero-visual-col">
+            <canvas
+              id="siphonHeroCanvas"
+              class="hero-3d-canvas"
+              aria-label="3D porcelain, brushed titanium, and frosted ice-cyan Solana funnel sculpture"
+            ></canvas>
+            <div class="hero-stage-bar mono">
+              <span class="stage-dot-line">
+                <span class="dot-sm allow"></span>
+                <span>Multicall3 RPC live across 6 Circle CCTP chains</span>
+              </span>
+              <span class="stage-domain">DOMAIN 5 → SOLANA</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- EXPOSED 4-COLUMN HAIRLINE SPEC STRIP -->
+        <section class="spec-strip" aria-label="Protocol specifications">
+          <div class="spec-cell">
+            <span class="ice-marker" aria-hidden="true"></span>
+            <div class="spec-title"><strong>6</strong> EVM Chains</div>
+          </div>
+          <div class="spec-cell">
+            <span class="ice-marker" aria-hidden="true"></span>
+            <div class="spec-title"><strong>Circle</strong> CCTP 1:1</div>
+          </div>
+          <div class="spec-cell">
+            <span class="ice-marker" aria-hidden="true"></span>
+            <div class="spec-title"><strong>Aave</strong> · Comp · Lido</div>
+          </div>
+          <div class="spec-cell">
+            <span class="ice-marker" aria-hidden="true"></span>
+            <div class="spec-title"><strong>Safe</strong> Zero-Liq Burn</div>
+          </div>
+        </section>
+
+        <!-- 3-STAGE PIPELINE ARCHITECTURE -->
+        <section class="pillars-grid" id="how-it-works">
+          <article class="pillar-card">
+            <div class="pillar-index mono">01 / WITHDRAW &amp; SWEEP</div>
+            <h3>Smart-Contract DeFi Exits</h3>
+            <p>
+              Detects idle principal trapped in Aave v3, Compound v3, Lido, and ERC-4626 vaults via <code class="code-inline">Multicall3</code>, then redeems and consolidates everything into USDC inside one batched router call.
+            </p>
+            <button type="button" class="pillar-link" data-open-app="scanner">Scan DeFi positions →</button>
+          </article>
+
+          <article class="pillar-card">
+            <div class="pillar-index mono">02 / SELL OR BURN</div>
+            <h3>Net-Value Dust &amp; Isolated Burn</h3>
+            <p>
+              Quotes every ERC-20 against live gas costs: liquid tokens batch-swap into USDC; zero-liquidity rugged tokens burn cleanly to <code class="code-inline">0x…dEaD</code> inside <code class="code-inline">try/catch</code> so honeypots never revert your sweep.
+            </p>
+            <button type="button" class="pillar-link" data-open-app="burns">Inspect Burn Policy →</button>
+          </article>
+
+          <article class="pillar-card">
+            <div class="pillar-index mono">03 / BRIDGE 1:1</div>
+            <h3>Native Circle CCTP to Solana</h3>
+            <p>
+              Converts your Solana Ed25519 address into exact <code class="code-inline">bytes32</code> calldata and calls <code class="code-inline">depositForBurn</code> (Domain 5) so native Solana USDC lands with zero wrapped-asset risk.
+            </p>
+            <button type="button" class="pillar-link" data-open-app="contract">Read SiphonRouter.sol →</button>
+          </article>
+        </section>
+
+        <footer class="site-footer">
+          <div class="footer-left">
+            <strong>Siphon Protocol</strong>
+            <span class="mono">Ethereum · Base · Arbitrum · Optimism · Polygon · Avalanche → Solana (Domain 5)</span>
+          </div>
+          <div class="footer-right">
+            <button type="button" class="link-btn" data-open-app="scanner">Launch Migrator</button>
+            <button type="button" class="link-btn" data-open-app="contract">SiphonRouter.sol</button>
+          </div>
+        </footer>
+      </main>
+    </div>
+
+    <!-- =============================================================== -->
+    <!-- MODE 2: INTERACTIVE MIGRATOR CONSOLE (Kamino / Aave Daylight)   -->
+    <!-- =============================================================== -->
+    <div class="app-shell hidden" id="appShell">
+      <header class="app-topbar">
+        <div class="app-topbar-inner">
+          <div class="app-brand-group">
+            <button type="button" class="brand-mark brand-btn" id="backToSiteBtn" title="Back to Siphon homepage">
+              <svg width="22" height="20" viewBox="0 0 26 24" fill="none" aria-hidden="true">
+                <path d="M2 2H24L15 11.5H22L10.5 22L13 13.5H5L2 2Z" fill="#0A0A0A" />
+              </svg>
+              <span>Siphon</span>
+            </button>
+            <span class="mode-badge mono" id="scanModeBadge">Multi-Chain Preset</span>
+          </div>
+
+          <nav class="app-tabs" role="tablist" aria-label="Migrator views">
+            <button type="button" class="app-tab active" data-view="scanner" role="tab">Scanner &amp; Plan</button>
+            <button type="button" class="app-tab" data-view="pipeline" role="tab">
+              Execution &amp; CCTP
+              <span class="tab-count" id="tabLegCount">0</span>
+            </button>
+            <button type="button" class="app-tab" data-view="burns" role="tab">
+              Burn Receipts
+              <span class="tab-count muted" id="tabBurnCount">0</span>
+            </button>
+            <button type="button" class="app-tab" data-view="contract" role="tab">SiphonRouter.sol</button>
+          </nav>
+
+          <div class="app-top-right">
+            <span class="cluster-pill">
+              <span class="dot-sm allow"></span>
+              <span>6 EVM → Solana</span>
+            </span>
+            <button type="button" class="btn-pill-dark btn-sm" id="topSimulateBtn">Execute Dry-Run</button>
+          </div>
+        </div>
+      </header>
+
+      <main class="app-container">
+        <!-- UNIFIED WALLET & DESTINATION CONTROL BAR -->
+        <div class="card control-bar">
+          <form class="control-source" id="appScanForm">
+            <label class="ctrl-label mono">SOURCE EVM WALLET (LIVE RPC OR PRESET)</label>
+            <div class="ctrl-input-row">
+              <input type="text" id="appEvmInput" class="field-input mono" placeholder="0x… EVM address" />
+              <button type="submit" class="btn-outline-dark" id="appScanBtn">Scan Live</button>
+            </div>
+            <div class="ctrl-presets">
+              <button type="button" class="text-action" data-preset="veteran_defi">Veteran DeFi</button>
+              <span class="sep-dot">·</span>
+              <button type="button" class="text-action" data-preset="vitalik_live">vitalik.eth (Live)</button>
+              <span class="sep-dot">·</span>
+              <button type="button" class="text-action" data-preset="airdrop_farmer">Zero-Gas L2</button>
+            </div>
+          </form>
+
+          <div class="control-arrow" aria-hidden="true">→</div>
+
+          <div class="control-dest">
+            <label class="ctrl-label mono">SOLANA DESTINATION (CIRCLE CCTP DOMAIN 5)</label>
+            <div class="ctrl-input-row">
+              <input
+                type="text"
+                id="solanaDestInput"
+                class="field-input mono"
+                value="AK9CKqppArTVRrmd4rQKzvjcmNUHnx5LBFx1HXoYaz2n"
+                placeholder="Solana base58 address"
+              />
+              <div class="seg-output" role="group" aria-label="Solana output asset">
+                <button type="button" class="seg-opt active" data-out-asset="USDC">USDC</button>
+                <button type="button" class="seg-opt" data-out-asset="SOL">SOL</button>
+              </div>
+            </div>
+            <div class="ctrl-toggles">
+              <label class="inline-check">
+                <input type="checkbox" id="permit2Toggle" checked />
+                <span>Permit2 Batching &amp; Gas Sponsorship</span>
+              </label>
+              <label class="inline-check">
+                <input type="checkbox" id="burnToggle" checked />
+                <span>Burn Zero-Liquidity Tokens</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4-COLUMN RECONCILED KPI STRIP -->
+        <div class="kpi-strip">
+          <div class="kpi-cell highlight-cell">
+            <strong class="kpi-val" id="kpiNetUsdc">$0.00</strong>
+            <span class="kpi-label" id="kpiNetLabel">Net Solana USDC</span>
+            <span class="kpi-sub mono" id="kpiNetSub">0.00 SOL eq · 0.35% fee</span>
+          </div>
+          <div class="kpi-cell">
+            <strong class="kpi-val" id="kpiDefiUsd">$0.00</strong>
+            <span class="kpi-label">DeFi Smart Contracts</span>
+            <span class="kpi-sub mono" id="kpiDefiSub">0 positions to withdraw</span>
+          </div>
+          <div class="kpi-cell">
+            <strong class="kpi-val" id="kpiDustUsd">$0.00</strong>
+            <span class="kpi-label">Liquid Dust &amp; Native</span>
+            <span class="kpi-sub mono" id="kpiDustSub">0 assets across 0 chains</span>
+          </div>
+          <div class="kpi-cell">
+            <strong class="kpi-val" id="kpiBurnCount">0</strong>
+            <span class="kpi-label">Zero-Liq Burns</span>
+            <span class="kpi-sub mono" id="kpiBurnSub">0 honeypots skipped · $0.00 gas saved</span>
+          </div>
+        </div>
+
+        <!-- ======================================================= -->
+        <!-- VIEW 1: SCANNER & MIGRATION PLAN                        -->
+        <!-- ======================================================= -->
+        <section class="view-pane active" id="view-scanner">
+          <!-- Swiss-Infographic Multi-Chain Convergence SVG -->
+          <div class="card flow-card">
+            <div class="card-head">
+              <h2>Multi-Chain Convergence Flow</h2>
+              <span class="mono muted-xs" id="flowSummaryMeta">6 EVM chains → Circle CCTP Domain 5 → Solana</span>
+            </div>
+            <div class="flow-svg-host" id="convergenceSvgHost"></div>
+          </div>
+
+          <!-- Per-Chain Status Strip -->
+          <div class="chain-cards-grid" id="chainCardsGrid"></div>
+
+          <!-- Asset & Smart-Contract Position Ledger -->
+          <div class="card table-card">
+            <div class="card-head">
+              <div class="filter-tabs" role="group" aria-label="Filter assets by bucket">
+                <button type="button" class="filter-pill active" data-filter="all">All Assets</button>
+                <button type="button" class="filter-pill" data-filter="defi">DeFi Contracts</button>
+                <button type="button" class="filter-pill" data-filter="liquid">Liquid Dust</button>
+                <button type="button" class="filter-pill" data-filter="burn">Zero-Liq Burns</button>
+                <button type="button" class="filter-pill" data-filter="skipped">Skipped / Honeypots</button>
+              </div>
+              <div class="btn-row">
+                <button type="button" class="text-action" id="selectProfitableBtn">Select profitable</button>
+                <span class="sep-dot">·</span>
+                <button type="button" class="text-action muted" id="clearSelectionBtn">Clear</button>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="ledger-table">
+                <thead>
+                  <tr>
+                    <th style="width: 38px;"></th>
+                    <th>Asset / Contract</th>
+                    <th>Chain</th>
+                    <th>Balance</th>
+                    <th>Gross Value</th>
+                    <th>Gas</th>
+                    <th>Action</th>
+                    <th style="text-align: right;">Net Output</th>
+                  </tr>
+                </thead>
+                <tbody id="assetTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- ======================================================= -->
+        <!-- VIEW 2: EXECUTION PIPELINE & CCTP CALLDATA              -->
+        <!-- ======================================================= -->
+        <section class="view-pane" id="view-pipeline">
+          <div class="view-header">
+            <div>
+              <h1>Execution Pipeline &amp; Circle CCTP Calldata</h1>
+              <p>Exact per-chain routing steps, Solana <code class="code-inline">bytes32</code> mintRecipient, and live dry-run simulation.</p>
+            </div>
+            <button type="button" class="btn-pill-dark btn-sm" id="runSimulationBtn">Run Dry-Run Simulation</button>
+          </div>
+
+          <div class="card pad-card recipient-card">
+            <div class="kv-clean">
+              <div class="kv-r">
+                <span>Solana Destination (Ed25519 Base58)</span>
+                <span class="mono" id="planSolAddr">—</span>
+              </div>
+              <div class="kv-r">
+                <span>Circle CCTP <code class="code-inline">mintRecipient</code> (bytes32)</span>
+                <span class="mono" id="planSolBytes32">—</span>
+              </div>
+              <div class="kv-r">
+                <span>Estimated Settlement Window</span>
+                <span class="mono" id="planTiming">—</span>
+              </div>
+            </div>
+          </div>
+
+          <div id="simulationBanner" class="sim-success-banner hidden"></div>
+          <div class="legs-grid" id="cctpLegsGrid"></div>
+        </section>
+
+        <!-- ======================================================= -->
+        <!-- VIEW 3: ZERO-LIQUIDITY BURN RECEIPTS                    -->
+        <!-- ======================================================= -->
+        <section class="view-pane" id="view-burns">
+          <div class="view-header">
+            <div>
+              <h1>Zero-Liquidity Burn Policy &amp; Hygiene Receipts</h1>
+              <p>Dead tokens with $0 DEX liquidity burn cleanly to <code class="code-inline">0x0000…dEaD</code> inside <code class="code-inline">try/catch</code>. Reverting honeypots are automatically skipped.</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn-outline-sm" id="downloadBurnCsvBtn">Export CSV Receipt</button>
+              <button type="button" class="btn-pill-dark btn-sm" id="copyBurnJsonBtn">Copy JSON Manifest</button>
+            </div>
+          </div>
+
+          <div class="card table-card">
+            <div class="card-head">
+              <h2>Burn &amp; Honeypot Isolation Manifest</h2>
+              <span class="mono muted-xs" id="burnManifestCount">0 tokens</span>
+            </div>
+            <div class="table-scroll">
+              <table class="ledger-table">
+                <thead>
+                  <tr>
+                    <th>Token</th>
+                    <th>Chain</th>
+                    <th>Balance</th>
+                    <th>Status</th>
+                    <th>Burn Sink / Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="burnTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- ======================================================= -->
+        <!-- VIEW 4: SIPHONROUTER.SOL CONTRACT                       -->
+        <!-- ======================================================= -->
+        <section class="view-pane" id="view-contract">
+          <div class="view-header">
+            <div>
+              <h1>SiphonRouter.sol &amp; CCTP Registry</h1>
+              <p>Auditable Solidity 0.8.24 batch router handling DeFi withdrawals, aggregator swaps, isolated zero-liquidity burns, and Circle CCTP bridging.</p>
+            </div>
+            <button type="button" class="btn-outline-sm" id="copyContractBtn">Copy Solidity Source</button>
+          </div>
+
+          <div class="card code-card">
+            <div class="code-meta-bar mono">
+              <span>contracts/SiphonRouter.sol</span>
+              <span id="contractStats">Solidity 0.8.24 · Domain 5 → Solana</span>
+            </div>
+            <pre class="code-viewer mono" id="contractCodeHost">Loading…</pre>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast-host" id="toastRegion" aria-live="polite"></div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

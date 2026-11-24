@@ -1,0 +1,22 @@
+{
+  "name": "siphon-migrator",
+  "version": "0.1.0",
+  "description": "Multi-chain EVM dust, DeFi position & zero-liquidity token migrator into native Solana USDC via Circle CCTP",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server/index.ts",
+    "start": "node dist/src/server/index.js",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.0",
+    "three": "^0.174.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
