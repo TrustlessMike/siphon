@@ -186,11 +186,9 @@
           </nav>
 
           <div class="app-top-right">
-            <span class="cluster-pill">
-              <span class="dot-sm allow"></span>
-              <span>6 EVM → Solana</span>
-            </span>
-            <button type="button" class="btn-pill-dark btn-sm" id="topSimulateBtn">Execute Dry-Run</button>
+            <button type="button" class="btn-outline-sm" id="connectEvmBtn">Connect EVM</button>
+            <button type="button" class="btn-outline-sm" id="connectSolBtn">Connect Solana</button>
+            <button type="button" class="btn-pill-dark btn-sm" id="topExecuteLiveBtn">Execute Live</button>
           </div>
         </div>
       </header>
@@ -233,12 +231,13 @@
             <div class="ctrl-toggles">
               <label class="inline-check">
                 <input type="checkbox" id="permit2Toggle" checked />
-                <span>Permit2 Batching &amp; Gas Sponsorship</span>
+                <span>Batch Gas Savings</span>
               </label>
               <label class="inline-check">
                 <input type="checkbox" id="burnToggle" checked />
-                <span>Burn Zero-Liquidity Tokens</span>
+                <span>Include Zero-Liq Burns</span>
               </label>
+              <span class="mono sol-live-bal" id="solanaLiveBalanceBadge">Solana balance: checking…</span>
             </div>
           </div>
         </div>
@@ -311,6 +310,7 @@
                     <th>Gas</th>
                     <th>Action</th>
                     <th style="text-align: right;">Net Output</th>
+                    <th style="text-align: right; width: 120px;">Execute</th>
                   </tr>
                 </thead>
                 <tbody id="assetTableBody"></tbody>
@@ -320,35 +320,68 @@
         </section>
 
         <!-- ======================================================= -->
-        <!-- VIEW 2: EXECUTION PIPELINE & CCTP CALLDATA              -->
+        <!-- VIEW 2: LIVE EXECUTION QUEUE & BRIDGE ROUTES            -->
         <!-- ======================================================= -->
         <section class="view-pane" id="view-pipeline">
           <div class="view-header">
             <div>
-              <h1>Execution Pipeline &amp; Circle CCTP Calldata</h1>
-              <p>Exact per-chain routing steps, Solana <code class="code-inline">bytes32</code> mintRecipient, and live dry-run simulation.</p>
+              <h1>Live Execution Queue &amp; Real Mainnet Routes</h1>
+              <p>Fetches live executable calldata from <strong>Relay</strong>, <strong>LI.FI</strong>, <strong>Aave v3</strong>, <strong>Compound v3</strong>, and <strong>Circle CCTP</strong>, signs via your connected wallet, and tracks Solana landing.</p>
             </div>
-            <button type="button" class="btn-pill-dark btn-sm" id="runSimulationBtn">Run Dry-Run Simulation</button>
+            <div class="btn-row">
+              <select id="bridgePrefSelect" class="field-select-sm mono" aria-label="Bridge route preference">
+                <option value="auto" selected>Auto (Relay → LI.FI → CCTP)</option>
+                <option value="relay">Relay (~2s auto-fill)</option>
+                <option value="lifi">LI.FI Aggregator</option>
+                <option value="cctp">Direct Circle CCTP (USDC)</option>
+              </select>
+              <button type="button" class="btn-pill-dark btn-sm" id="runLiveQueueBtn">Execute Selected Live</button>
+            </div>
           </div>
 
           <div class="card pad-card recipient-card">
             <div class="kv-clean">
               <div class="kv-r">
+                <span>Connected EVM Signer</span>
+                <span class="mono" id="execConnectedEvm">Not connected (read-only quote mode)</span>
+              </div>
+              <div class="kv-r">
                 <span>Solana Destination (Ed25519 Base58)</span>
                 <span class="mono" id="planSolAddr">—</span>
+              </div>
+              <div class="kv-r">
+                <span>Live Solana Mainnet Balance</span>
+                <span class="mono" id="execSolanaBalance">—</span>
               </div>
               <div class="kv-r">
                 <span>Circle CCTP <code class="code-inline">mintRecipient</code> (bytes32)</span>
                 <span class="mono" id="planSolBytes32">—</span>
               </div>
-              <div class="kv-r">
-                <span>Estimated Settlement Window</span>
-                <span class="mono" id="planTiming">—</span>
-              </div>
             </div>
           </div>
 
-          <div id="simulationBanner" class="sim-success-banner hidden"></div>
+          <!-- Real Onchain Execution Log -->
+          <div id="liveExecLogCard" class="card table-card hidden" style="margin-bottom: 18px;">
+            <div class="card-head">
+              <h2>Live Mainnet Transaction Log</h2>
+              <span class="mono muted-xs" id="liveExecStatusMeta">Ready</span>
+            </div>
+            <div class="table-scroll">
+              <table class="ledger-table">
+                <thead>
+                  <tr>
+                    <th>Asset / Step</th>
+                    <th>Provider</th>
+                    <th>Quote Output</th>
+                    <th>Status</th>
+                    <th>Onchain Explorer Links</th>
+                  </tr>
+                </thead>
+                <tbody id="liveExecLogBody"></tbody>
+              </table>
+            </div>
+          </div>
+
           <div class="legs-grid" id="cctpLegsGrid"></div>
         </section>
 

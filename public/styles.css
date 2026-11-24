@@ -159,6 +159,59 @@ select {
   color: #ffffff;
 }
 
+.btn-outline-sm.connected {
+  background: var(--allow-bg);
+  border-color: #34d399;
+  color: #065f46;
+  font-weight: 600;
+}
+
+.btn-row-exec {
+  background: var(--bg-surface);
+  color: var(--ink-0);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-row-exec:hover {
+  border-color: var(--ink-0);
+  background: var(--ice-soft);
+}
+
+.btn-row-exec:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.sol-live-bal {
+  font-size: 11.5px;
+  color: #065f46;
+  background: var(--allow-bg);
+  border: 1px solid #a7f3d0;
+  border-radius: 999px;
+  padding: 2px 9px;
+}
+
+.field-select-sm {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 7px 11px;
+  font-size: 12px;
+  color: var(--ink-0);
+}
+
+.explorer-link {
+  color: #0284c7;
+  text-decoration: underline;
+  font-weight: 500;
+}
+
 .btn-outline-dark {
   display: inline-flex;
   align-items: center;
@@ -552,12 +605,13 @@ select {
 }
 
 .mode-badge {
-  font-size: 11.5px;
-  padding: 3px 10px;
+  font-size: 11px;
+  padding: 3px 9px;
   border-radius: 999px;
   background: var(--bg-well);
   border: 1px solid var(--border);
   color: var(--ink-2);
+  white-space: nowrap;
 }
 
 .mode-badge.is-live {
@@ -577,13 +631,14 @@ select {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   background: transparent;
   border: none;
-  padding: 0 15px;
-  font-size: 14px;
+  padding: 0 11px;
+  font-size: 13.5px;
   font-weight: 500;
   color: var(--ink-2);
+  white-space: nowrap;
   cursor: pointer;
 }
 

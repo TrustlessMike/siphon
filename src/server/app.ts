@@ -4,9 +4,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { buildMigrationPlan, solanaAddressToBytes32 } from '../bridge/cctp.js';
+import { checkLiveExecutionStatus, prepareRealExecution } from '../execution/tx-builder.js';
 import { CHAIN_LIST, DEAD_BURN_ADDRESS, PROTOCOL_FEE_BPS, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { scanLiveWallet, scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
-import type { ScanReport } from '../scanner/types.js';
+import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
+import type { EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -181,6 +183,68 @@ export function createSiphonServer() {
         });
 
         return sendJson(res, 200, plan);
+      }
+
+      if (method === 'GET' && pathname === '/api/solana/balance') {
+        const address = url.searchParams.get('address')?.trim();
+        if (!address) return sendJson(res, 400, { error: 'address query parameter is required' });
+        try {
+          const balances = await fetchSolanaWalletBalances(address);
+          return sendJson(res, 200, balances);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Invalid Solana address',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/tx/prepare') {
+        const body = await readJsonBody<{
+          asset?: ScannedAsset;
+          userAddress?: string;
+          solanaDestination?: string;
+          outputAsset?: 'USDC' | 'SOL';
+          bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+        }>(req);
+
+        if (!body.asset || !body.userAddress || !body.solanaDestination) {
+          return sendJson(res, 400, {
+            error: 'asset, userAddress, and solanaDestination are required',
+          });
+        }
+
+        try {
+          const prepared = await prepareRealExecution({
+            asset: body.asset,
+            userAddress: body.userAddress,
+            solanaDestination: body.solanaDestination,
+            outputAsset: body.outputAsset ?? 'USDC',
+            bridgePreference: body.bridgePreference ?? 'auto',
+          });
+          return sendJson(res, 200, prepared);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Could not prepare real transaction',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/tx/status') {
+        const body = await readJsonBody<{
+          chain?: EvmChainId;
+          txHash?: string;
+          requestId?: string;
+          provider?: string;
+        }>(req);
+
+        if (!body.chain) return sendJson(res, 400, { error: 'chain is required' });
+        const status = await checkLiveExecutionStatus({
+          chain: body.chain,
+          txHash: body.txHash,
+          requestId: body.requestId,
+          provider: body.provider,
+        });
+        return sendJson(res, 200, status);
       }
 
       if (method === 'POST' && pathname === '/api/simulate') {

@@ -7,6 +7,7 @@ import {
   TOKEN_REGISTRY,
 } from './chains.js';
 import { fetchLiveUsdPrices } from './prices.js';
+import { discoverEthereumTokens, simulateBurnTransferOnchain } from './discovery.js';
 import { formatUnits, isValidEvmAddress, scanSingleEvmChain } from './rpc.js';
 import type {
   AssetAction,
@@ -355,8 +356,9 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     ...TOKEN_REGISTRY.map((t) => t.llamaKey).filter((k): k is string => Boolean(k)),
   ];
 
-  const [prices, ...chainOutputs] = await Promise.all([
+  const [prices, discoveredEth, ...chainOutputs] = await Promise.all([
     fetchLiveUsdPrices(llamaKeys),
+    discoverEthereumTokens(cleanAddr, 24),
     ...CHAIN_LIST.map((c) =>
       scanSingleEvmChain(
         c,
@@ -419,9 +421,11 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     }
 
     const chainTokens = TOKEN_REGISTRY.filter((t) => t.chain === c.id);
+    const seenAddrs = new Set<string>();
     for (const tok of chainTokens) {
       const rawBal = out.tokenBalances.get(tok.address.toLowerCase());
       if (!rawBal || rawBal === 0n) continue;
+      seenAddrs.add(tok.address.toLowerCase());
       const priceUsd = (tok.llamaKey ? prices.get(tok.llamaKey) : undefined) ?? 0;
       rawAssets.push({
         chain: c.id,
@@ -437,6 +441,58 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
         priceUsd,
         liquidityUsd: priceUsd > 0 ? 5_000_000 : 0,
       });
+    }
+
+    // Merge real discovered arbitrary Ethereum ERC-20s (including long-tail dust & zero-liquidity dead tokens)
+    if (c.id === 'ethereum' && discoveredEth.length > 0) {
+      const extraDead: typeof discoveredEth = [];
+      for (const dt of discoveredEth) {
+        if (seenAddrs.has(dt.address.toLowerCase())) continue;
+        seenAddrs.add(dt.address.toLowerCase());
+        if (dt.ethplorerPriceUsd > 0) {
+          rawAssets.push({
+            chain: 'ethereum',
+            address: dt.address,
+            symbol: dt.symbol,
+            name: dt.name,
+            decimals: dt.decimals,
+            kind: 'erc20',
+            rawBalance: dt.rawBalance,
+            priceUsd: dt.ethplorerPriceUsd,
+            liquidityUsd: 250_000,
+          });
+        } else if (extraDead.length < 6) {
+          extraDead.push(dt);
+        }
+      }
+
+      // Live onchain eth_call honeypot verification on discovered zero-liquidity dead tokens!
+      if (extraDead.length > 0) {
+        const simChecks = await Promise.all(
+          extraDead.map((dt) =>
+            simulateBurnTransferOnchain({
+              chain: 'ethereum',
+              walletAddress: cleanAddr,
+              tokenAddress: dt.address,
+              rawAmount: dt.rawBalance,
+            })
+          )
+        );
+        extraDead.forEach((dt, idx) => {
+          rawAssets.push({
+            chain: 'ethereum',
+            address: dt.address,
+            symbol: dt.symbol,
+            name: dt.name,
+            decimals: dt.decimals,
+            kind: 'dead_token',
+            rawBalance: dt.rawBalance,
+            priceUsd: 0,
+            liquidityUsd: 0,
+            honeypot: !simChecks[idx].safeToBurn,
+          });
+        });
+      }
     }
   }
 

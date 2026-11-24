@@ -132,6 +132,41 @@ test('Siphon HTTP API serves health, chains, scan, plan, simulate, contract, and
     const threeRes = await fetch(`${base}/vendor/three.module.js`);
     assert.equal(threeRes.status, 200);
     await threeRes.text();
+
+    // Real executable Aave v3 withdrawal calldata preparation
+    const aaveAsset = scan.assets.find((a: { protocol?: string }) => a.protocol === 'Aave v3');
+    assert.ok(aaveAsset);
+    const aavePrep = await fetch(`${base}/api/tx/prepare`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        asset: aaveAsset,
+        userAddress: scan.walletAddress,
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+      }),
+    }).then((r) => r.json());
+    assert.equal(aavePrep.provider, 'aave_v3');
+    assert.ok(aavePrep.transactions[0].data.startsWith('0x69328dec'));
+
+    // Real direct Circle CCTP USDC calldata preparation
+    const opUsdc = scan.assets.find(
+      (a: { chain: string; symbol: string }) => a.chain === 'optimism' && a.symbol === 'USDC'
+    );
+    assert.ok(opUsdc);
+    const cctpPrep = await fetch(`${base}/api/tx/prepare`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        asset: opUsdc,
+        userAddress: scan.walletAddress,
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+        bridgePreference: 'cctp',
+      }),
+    }).then((r) => r.json());
+    assert.equal(cctpPrep.provider, 'circle_cctp');
+    assert.ok(
+      cctpPrep.transactions.some((tx: { data: string }) => tx.data.startsWith('0x6fd3504e'))
+    );
   } finally {
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
