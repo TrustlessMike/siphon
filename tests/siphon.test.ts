@@ -167,6 +167,55 @@ test('Siphon HTTP API serves health, chains, scan, plan, simulate, contract, and
     assert.ok(
       cctpPrep.transactions.some((tx: { data: string }) => tx.data.startsWith('0x6fd3504e'))
     );
+
+    // EIP-5792 1-click-per-chain batch preparation: bundles DeFi withdraw + CCTP + burn + dedupes approvals
+    const polygonAssets = scan.assets.filter(
+      (a: { chain: string }) => a.chain === 'polygon'
+    );
+    const polyBatch = await fetch(`${base}/api/tx/prepare-chain-batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chain: 'polygon',
+        assets: polygonAssets,
+        userAddress: scan.walletAddress,
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+        bridgePreference: 'cctp',
+        bundleDefiCctp: true,
+      }),
+    }).then((r) => r.json());
+    assert.equal(polyBatch.chain, 'polygon');
+    assert.equal(polyBatch.savings.walletPopupsEip5792, 1);
+    assert.equal(polyBatch.calls.length, 3); // Aave withdraw + USDC approve + CCTP depositForBurn in 1 click!
+    assert.equal(polyBatch.savings.popupsSaved, 2);
+    assert.ok(polyBatch.calls[0].data.startsWith('0x69328dec')); // Aave withdraw
+    assert.ok(polyBatch.calls[1].data.startsWith('0x095ea7b3')); // USDC approve
+    assert.ok(polyBatch.calls[2].data.startsWith('0x6fd3504e')); // Circle CCTP depositForBurn
+    assert.equal(polyBatch.skippedAssets.length, 1); // Polygon honeypot safely skipped
+
+    // Approval deduplication test: 2 CCTP USDC ops on Optimism merge their USDC->TokenMessenger approvals into 1!
+    const opBatch = await fetch(`${base}/api/tx/prepare-chain-batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chain: 'optimism',
+        assets: [opUsdc, { ...opUsdc, id: 'op_usdc_dup_2' }],
+        userAddress: scan.walletAddress,
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+        bridgePreference: 'cctp',
+      }),
+    }).then((r) => r.json());
+    assert.equal(opBatch.savings.dedupedApprovals, 1);
+    assert.equal(
+      opBatch.calls.filter((c: { data: string }) => c.data.startsWith('0x095ea7b3')).length,
+      1
+    );
+    assert.equal(
+      opBatch.calls.filter((c: { data: string }) => c.data.startsWith('0x6fd3504e')).length,
+      2
+    );
+    assert.equal(opBatch.savings.walletPopupsEip5792, 1);
+    assert.ok(opBatch.savings.eip2612Count >= 2);
   } finally {
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));

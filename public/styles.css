@@ -1043,6 +1043,78 @@ select {
   color: var(--ink-3);
 }
 
+.micro-pill {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 5px;
+  vertical-align: middle;
+  border: 1px solid var(--border);
+  background: var(--bg-well);
+  color: var(--ink-2);
+}
+
+.micro-pill.permit2 {
+  background: var(--allow-bg);
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+
+.micro-pill.eip2612 {
+  background: var(--ice-soft);
+  border-color: var(--ice-border);
+  color: #0369a1;
+}
+
+.batch-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--ice);
+  color: var(--ink-0);
+  margin-right: 6px;
+}
+
+.batch-pill.armed {
+  background: var(--allow-bg);
+  border: 1px solid #34d399;
+  color: #065f46;
+}
+
+.batch-pill.fallback {
+  background: var(--hold-bg);
+  border: 1px solid #fcd34d;
+  color: #92400e;
+}
+
+.leg-batch-footer {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.leg-batch-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+
 /* Execution Pipeline View */
 .view-header {
   display: flex;
@@ -1265,5 +1337,39 @@ select {
     white-space: nowrap;
     padding: 0 11px;
     font-size: 13px;
+  }
+  .app-top-right {
+    flex-wrap: wrap;
+    gap: 6px;
+    min-width: 0;
+  }
+  .app-top-right > button {
+    padding-left: 10px;
+    padding-right: 10px;
+    white-space: nowrap;
+  }
+  .view-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .view-header > * {
+    min-width: 0;
+  }
+  .btn-row {
+    flex-wrap: wrap;
+  }
+  .btn-row > .field-select-sm {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+  .kv-r {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+  .kv-r > * {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
   }
 }

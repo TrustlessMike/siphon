@@ -79,6 +79,8 @@ export interface ScannedAsset {
   actionReason: string;
   selectedByDefault: boolean;
   honeypotSafe: boolean;
+  eip2612Supported?: boolean;
+  permit2Approved?: boolean;
   calldataPreview?: string;
 }
 

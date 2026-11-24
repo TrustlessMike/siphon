@@ -5,7 +5,12 @@ import {
   connectSolanaWallet,
   getConnectedEvmAddress,
   getConnectedSolanaAddress,
+  getConnectedWalletName,
+  getWalletBatchCapabilities,
+  isChainBatchSupported,
+  sendEip5792Batch,
   sendRealEvmTransaction,
+  waitForEip5792Batch,
 } from './wallets.js';
 
 let currentScan = null;
@@ -93,18 +98,55 @@ async function refreshSolanaBalance() {
     const summary = `${solanaBalances.usdcBalance.toLocaleString(undefined, { minimumFractionDigits: 2 })} USDC · ${solanaBalances.solBalance.toFixed(4)} SOL (slot ${solanaBalances.slot.toLocaleString()})`;
     if (badge) badge.textContent = `Live Solana: ${solanaBalances.usdcBalance.toFixed(2)} USDC · ${solanaBalances.solBalance.toFixed(3)} SOL`;
     if (execEl) execEl.textContent = summary;
-  } catch {
-    if (badge) badge.textContent = 'Invalid Solana address';
-    if (execEl) execEl.textContent = 'Invalid Solana address';
+  } catch (err) {
+    const isInvalid = String(err?.message || '').toLowerCase().includes('invalid');
+    const msg = isInvalid ? 'Invalid Solana address' : 'Solana RPC busy · valid Ed25519 destination';
+    if (badge) badge.textContent = msg;
+    if (execEl) execEl.textContent = msg;
   }
+}
+
+function estimateChainCallCounts() {
+  if (!currentScan) return { totalCalls: 0, totalChains: 0, popupsSaved: 0, perChain: new Map() };
+  const perChain = new Map();
+  const chosen = currentScan.assets.filter(
+    (a) => selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
+  );
+  for (const a of chosen) {
+    const entry = perChain.get(a.chain) || { assets: [], estCalls: 0, permit2Count: 0, eip2612Count: 0 };
+    entry.assets.push(a);
+    // Estimate raw individual txs: DeFi USDC withdraw + approve + CCTP = 3, Swap/Bridge = 2 (approve + swap) or 1 (native), Burn = 1
+    if (a.action === 'WITHDRAW_AND_BRIDGE' && a.underlyingSymbol === 'USDC') entry.estCalls += 3;
+    else if (a.action === 'BURN_ZERO_LIQUIDITY' || a.address === 'native') entry.estCalls += 1;
+    else entry.estCalls += 2;
+    if (a.permit2Approved) entry.permit2Count += 1;
+    if (a.eip2612Supported) entry.eip2612Count += 1;
+    perChain.set(a.chain, entry);
+  }
+  const totalChains = perChain.size;
+  let totalCalls = 0;
+  for (const v of perChain.values()) totalCalls += v.estCalls;
+  return {
+    totalCalls,
+    totalChains,
+    popupsSaved: Math.max(0, totalCalls - totalChains),
+    perChain,
+  };
 }
 
 function updateWalletButtons() {
   const evmAddr = getConnectedEvmAddress();
   const solAddr = getConnectedSolanaAddress();
+  const walletName = getConnectedWalletName();
+  const caps = getWalletBatchCapabilities();
+  const stats = estimateChainCallCounts();
+
   const evmBtn = document.getElementById('connectEvmBtn');
   const solBtn = document.getElementById('connectSolBtn');
   const execEvm = document.getElementById('execConnectedEvm');
+  const execBatch = document.getElementById('execBatchMode');
+  const topBtn = document.getElementById('topExecuteLiveBtn');
+  const queueBtn = document.getElementById('runLiveQueueBtn');
 
   if (evmBtn) {
     evmBtn.textContent = evmAddr ? `EVM: ${shortAddr(evmAddr)}` : 'Connect EVM';
@@ -116,12 +158,41 @@ function updateWalletButtons() {
   }
   if (execEvm) {
     execEvm.textContent = evmAddr
-      ? `${evmAddr} (Live Signing Armed)`
-      : 'Not connected — Connect EVM wallet to sign real transactions';
+      ? `${evmAddr} (${walletName || 'EVM'} · Live Signing Armed)`
+      : 'Not connected — Connect EVM wallet to sign real batches';
+  }
+  if (execBatch) {
+    const reduction =
+      stats.totalChains > 0
+        ? ` · ${stats.totalCalls} calls → ${stats.totalChains} click(s) (${stats.popupsSaved} popups saved)`
+        : '';
+    if (evmAddr && caps.probed && caps.anySupported) {
+      execBatch.innerHTML = `<span class="batch-pill armed">EIP-5792 Armed</span> ${escapeHtml(caps.modeLabel)}${escapeHtml(reduction)}`;
+    } else if (evmAddr && caps.probed && !caps.anySupported) {
+      execBatch.innerHTML = `<span class="batch-pill fallback">Sequential Fallback</span> ${escapeHtml(caps.modeLabel)}`;
+    } else {
+      execBatch.innerHTML = `<span class="batch-pill">EIP-5792 Ready</span> 1 Click / Chain via wallet_sendCalls${escapeHtml(reduction)}`;
+    }
+  }
+  if (topBtn) {
+    topBtn.textContent =
+      stats.totalChains > 0
+        ? `Batch (${stats.totalChains} ${stats.totalChains === 1 ? 'Click' : 'Clicks'})`
+        : 'Batch Execute';
+  }
+  if (queueBtn) {
+    queueBtn.textContent =
+      stats.totalChains > 0
+        ? `Execute ${stats.totalChains} Chain${stats.totalChains === 1 ? '' : 's'} (${stats.totalChains} Click${stats.totalChains === 1 ? '' : 's'})`
+        : 'Execute All Chains (1 Click / Chain)';
   }
 }
 
+// Latest scan wins: a slower earlier scan must never overwrite a newer one.
+let scanSeq = 0;
+
 async function runScan({ address = null, presetId = null, autoOpen = false } = {}) {
+  const seq = ++scanSeq;
   heroScene?.setActive(true);
   const scanBtn = document.getElementById('appScanBtn');
   if (scanBtn) {
@@ -130,10 +201,12 @@ async function runScan({ address = null, presetId = null, autoOpen = false } = {
   }
   try {
     const payload = presetId ? { presetId } : address ? { address } : { presetId: 'vitalik_live' };
-    currentScan = await api('/api/scan', {
+    const scan = await api('/api/scan', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
+    if (seq !== scanSeq) return;
+    currentScan = scan;
 
     selectedAssetIds = new Set(
       currentScan.assets.filter((a) => a.selectedByDefault).map((a) => a.id)
@@ -154,8 +227,9 @@ async function runScan({ address = null, presetId = null, autoOpen = false } = {
     await Promise.all([recomputePlan(), refreshSolanaBalance()]);
     if (autoOpen) openApp('scanner');
   } catch (err) {
-    showToast(err.message);
+    if (seq === scanSeq) showToast(err.message);
   } finally {
+    if (seq !== scanSeq) return;
     heroScene?.setActive(false);
     if (scanBtn) {
       scanBtn.disabled = false;
@@ -313,7 +387,9 @@ function renderAssetTable() {
             <input type="checkbox" class="asset-chk" data-asset-id="${escapeHtml(a.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''} />
           </td>
           <td>
-            <div class="asset-title">${escapeHtml(a.symbol)}${a.protocol ? ` <span class="muted-xs">· ${escapeHtml(a.protocol)}</span>` : ''}</div>
+            <div class="asset-title">
+              ${escapeHtml(a.symbol)}${a.protocol ? ` <span class="muted-xs">· ${escapeHtml(a.protocol)}</span>` : ''}${a.permit2Approved ? `<span class="micro-pill permit2" title="Already approved on Uniswap Permit2 (no approval tx needed)">Permit2</span>` : a.eip2612Supported ? `<span class="micro-pill eip2612" title="Supports EIP-2612 gasless signature permit">EIP-2612</span>` : ''}
+            </div>
             <div class="asset-sub">${escapeHtml(a.name)}</div>
           </td>
           <td class="mono">${escapeHtml(a.chainName)}</td>
@@ -510,39 +586,213 @@ async function executeSingleAssetLive(asset) {
   }
 }
 
+/**
+ * Executes an ENTIRE EVM chain in ONE wallet confirmation popup using EIP-5792 `wallet_sendCalls`
+ * (bundles DeFi exits + deduped approvals + Relay/LI.FI/CCTP bridges + eth_call-verified burns).
+ * Automatically falls back to sequential `eth_sendTransaction` if the connected wallet lacks EIP-5792.
+ */
+async function executeChainBatchLive(chain) {
+  if (!currentScan) return;
+  switchView('pipeline');
+
+  const chainAssets = currentScan.assets.filter(
+    (a) => a.chain === chain && selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
+  );
+  if (!chainAssets.length) {
+    showToast(`No selected executable assets on ${chain}.`);
+    return;
+  }
+
+  const solDest = document.getElementById('solanaDestInput').value.trim();
+  const bridgePreference = document.getElementById('bridgePrefSelect')?.value || 'auto';
+  const connectedEvm = getConnectedEvmAddress();
+  const userAddress = connectedEvm || currentScan.walletAddress;
+  const chainName = chainAssets[0]?.chainName || chain;
+
+  const entry = {
+    title: `${chainName} Atomic Chain Batch (${chainAssets.length} asset${chainAssets.length === 1 ? '' : 's'})`,
+    chain,
+    chainName,
+    explorerUrl: '',
+    provider: 'eip5792_batch',
+    estimatedOutput: 'Preparing batched calldata…',
+    detail: `Bundling ${chainAssets.map((a) => a.symbol).join(', ')}`,
+    status: 'Preparing Batch',
+    toneClass: 'tag-skip',
+    evmTxHash: null,
+    solanaTxHash: null,
+    requestId: null,
+  };
+  liveExecutionLog.unshift(entry);
+  renderLiveExecutionLog();
+
+  try {
+    const batch = await api('/api/tx/prepare-chain-batch', {
+      method: 'POST',
+      body: JSON.stringify({
+        chain,
+        assets: chainAssets,
+        userAddress,
+        solanaDestination: solDest,
+        outputAsset,
+        bridgePreference,
+        bundleDefiCctp: true,
+      }),
+    });
+
+    entry.explorerUrl = batch.explorerUrl;
+    const trackerSummary = batch.bridgeTrackers
+      .map((t) => `${t.assetSymbol}→${t.estimatedOutput}`)
+      .slice(0, 2)
+      .join(' + ');
+    entry.estimatedOutput =
+      trackerSummary || `${batch.calls.length} call(s) batched (~${batch.estimatedSeconds}s)`;
+    entry.detail = `${batch.savings.totalCalls} call(s) → 1 EIP-5792 click (${batch.savings.popupsSaved} popup${batch.savings.popupsSaved === 1 ? '' : 's'} saved${batch.savings.dedupedApprovals ? ` · ${batch.savings.dedupedApprovals} deduped` : ''})`;
+
+    if (!batch.calls.length) {
+      entry.status = 'No Executable Route';
+      entry.detail = batch.skippedAssets.map((s) => `${s.assetSymbol}: ${s.reason}`).join(' | ') || 'No calls built';
+      entry.toneClass = 'tag-skip';
+      renderLiveExecutionLog();
+      return;
+    }
+
+    if (!connectedEvm) {
+      entry.status = `Batch Ready (${batch.calls.length} → 1 Click · Connect EVM)`;
+      entry.toneClass = 'tag-sell';
+      renderLiveExecutionLog();
+      showToast(
+        `${batch.chainName} EIP-5792 batch ready: ${batch.calls.length} calls in 1 click (${batch.savings.popupsSaved} popups saved). Connect EVM wallet to sign.`
+      );
+      return;
+    }
+
+    if (connectedEvm.toLowerCase() !== currentScan.walletAddress.toLowerCase()) {
+      entry.status = 'Switch to Connected Wallet Scan';
+      entry.toneClass = 'tag-burn';
+      renderLiveExecutionLog();
+      showToast('Connected EVM wallet differs from scanned address. Scanning your connected wallet now.');
+      await runScan({ address: connectedEvm, autoOpen: true });
+      return;
+    }
+
+    const chainCap = isChainBatchSupported(batch.chainId);
+    let submittedHashes = [];
+    let usedEip5792 = false;
+
+    // Try EIP-5792 wallet_sendCalls first (1 popup for the entire chain!)
+    if (chainCap.supported || batch.calls.length > 1) {
+      try {
+        entry.status = `Sign 1 Click (${batch.calls.length} Batched Calls)`;
+        entry.toneClass = 'tag-sell';
+        renderLiveExecutionLog();
+
+        const { batchId } = await sendEip5792Batch({
+          chainId: batch.chainId,
+          calls: batch.calls,
+        });
+        usedEip5792 = true;
+        entry.status = `EIP-5792 Submitted (${shortAddr(batchId)})`;
+        renderLiveExecutionLog();
+
+        const settled = await waitForEip5792Batch(batchId, (upd) => {
+          if (upd.txHashes?.length) entry.evmTxHash = upd.txHashes[0];
+          entry.status = `Batch Status: ${upd.status}`;
+          renderLiveExecutionLog();
+        });
+
+        submittedHashes = settled.txHashes || [];
+        if (submittedHashes[0]) entry.evmTxHash = submittedHashes[0];
+
+        if (settled.failed) {
+          entry.status = 'Batch Failed Onchain';
+          entry.toneClass = 'tag-burn';
+          renderLiveExecutionLog();
+          return;
+        }
+
+        entry.status = batch.bridgeTrackers.length
+          ? 'Batch Confirmed · Tracking Solana'
+          : 'Batch Confirmed Onchain';
+        entry.toneClass = 'tag-defi';
+        renderLiveExecutionLog();
+      } catch (err) {
+        if (err?.code === 4001) throw err; // User rejected
+        if (!err?.unsupportedEip5792) throw err;
+        // Transparent fallback for legacy wallets without EIP-5792
+        showToast(`${batch.chainName}: wallet lacks EIP-5792 — switching to sequential signing.`);
+      }
+    }
+
+    if (!usedEip5792) {
+      entry.provider = 'sequential_fallback';
+      for (let i = 0; i < batch.calls.length; i++) {
+        const call = batch.calls[i];
+        entry.status = `Sign ${i + 1}/${batch.calls.length}: ${call.stepId}`;
+        entry.toneClass = 'tag-sell';
+        renderLiveExecutionLog();
+
+        const txHash = await sendRealEvmTransaction({
+          chainId: batch.chainId,
+          to: call.to,
+          data: call.data,
+          value: call.value,
+          gas: call.gas,
+        });
+        submittedHashes.push(txHash);
+        entry.evmTxHash = txHash;
+        entry.status = `Submitted ${i + 1}/${batch.calls.length} (${shortAddr(txHash)})`;
+        renderLiveExecutionLog();
+      }
+    }
+
+    // Track Relay / bridge landing on Solana for every bridged asset in the chain batch
+    const relayTracker = batch.bridgeTrackers.find((t) => t.provider === 'relay' && t.requestId);
+    if (relayTracker) {
+      entry.provider = 'relay';
+      entry.requestId = relayTracker.requestId;
+      pollLiveStatus(entry);
+    } else if (entry.evmTxHash) {
+      pollLiveStatus(entry);
+    }
+
+    showToast(
+      usedEip5792
+        ? `${batch.chainName} EIP-5792 batch confirmed in 1 click!`
+        : `${batch.chainName} sequential execution submitted.`
+    );
+    refreshSolanaBalance();
+  } catch (err) {
+    entry.status = 'Failed / Cancelled';
+    entry.detail = err.message;
+    entry.toneClass = 'tag-burn';
+    renderLiveExecutionLog();
+    showToast(err.message);
+  }
+}
+
 async function executeSelectedLiveQueue() {
   if (!currentScan) return;
-  const chosen = currentScan.assets.filter(
-    (a) => selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
-  );
-  if (!chosen.length) {
+  const stats = estimateChainCallCounts();
+  const activeChains = Array.from(stats.perChain.keys());
+  if (!activeChains.length) {
     showToast('Select at least one asset to execute.');
     return;
   }
 
-  // Execute DeFi withdrawals first, then liquid swaps/bridges, then burns
-  const order = {
-    WITHDRAW_AND_BRIDGE: 1,
-    SELL_AND_BRIDGE: 2,
-    BRIDGE_DIRECT_USDC: 3,
-    BURN_ZERO_LIQUIDITY: 4,
-    SKIP_GAS_NEGATIVE: 5,
-    SKIP_HONEYPOT: 6,
-  };
-  chosen.sort((a, b) => (order[a.action] ?? 9) - (order[b.action] ?? 9));
-
   const connectedEvm = getConnectedEvmAddress();
   if (!connectedEvm) {
-    // If no wallet connected yet, fetch live quotes for top 3 items so user sees real live routes immediately
-    showToast('No EVM wallet connected — fetching live quotes for preview. Connect EVM to sign.');
-    for (const asset of chosen.slice(0, 3)) {
-      await executeSingleAssetLive(asset);
+    showToast(
+      `No EVM wallet connected — preparing live EIP-5792 chain batches (${stats.totalCalls} calls → ${activeChains.length} clicks).`
+    );
+    for (const chain of activeChains.slice(0, 3)) {
+      await executeChainBatchLive(chain);
     }
     return;
   }
 
-  for (const asset of chosen) {
-    await executeSingleAssetLive(asset);
+  for (const chain of activeChains) {
+    await executeChainBatchLive(chain);
   }
 }
 
@@ -556,8 +806,16 @@ function renderPipelineView() {
     return;
   }
 
+  const stats = estimateChainCallCounts();
+
   grid.innerHTML = currentPlan.legs
     .map((leg) => {
+      const chainStats = stats.perChain.get(leg.chain);
+      const estCalls = chainStats?.estCalls ?? Math.max(1, leg.defiExits + leg.swaps + leg.burns);
+      const saved = Math.max(0, estCalls - 1);
+      const chainCfg = currentScan.chains.find((c) => c.chain === leg.chain);
+      const cap = chainCfg ? isChainBatchSupported(chainCfg.chainId) : { supported: false };
+
       return `
         <div class="card leg-card">
           <div class="leg-head">
@@ -585,10 +843,28 @@ function renderPipelineView() {
             <div style="color:var(--ink-0); font-weight:600; margin-bottom:3px;">Direct CCTP depositForBurn (${shortAddr(leg.tokenMessenger)})</div>
             ${escapeHtml(leg.cctpCalldata.slice(0, 88))}…
           </div>
+
+          <div class="leg-batch-footer">
+            <div class="leg-batch-meta mono">
+              <span class="batch-pill ${cap.supported ? 'armed' : ''}">${estCalls} call${estCalls === 1 ? '' : 's'} → 1 click</span>
+              ${saved > 0 ? `<span>${saved} popup${saved === 1 ? '' : 's'} saved</span>` : `<span>atomic</span>`}
+              ${chainStats?.permit2Count ? `<span class="micro-pill permit2">${chainStats.permit2Count} Permit2</span>` : ''}
+              ${chainStats?.eip2612Count ? `<span class="micro-pill eip2612">${chainStats.eip2612Count} EIP-2612</span>` : ''}
+            </div>
+            <button type="button" class="btn-pill-dark btn-sm" data-exec-chain-batch="${escapeHtml(leg.chain)}">
+              Execute ${escapeHtml(leg.chainName)} (1 Click)
+            </button>
+          </div>
         </div>
       `;
     })
     .join('');
+
+  grid.querySelectorAll('[data-exec-chain-batch]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      executeChainBatchLive(btn.dataset.execChainBatch);
+    });
+  });
 }
 
 function renderBurnView() {
@@ -643,12 +919,15 @@ function wireEvents() {
 
   document.getElementById('connectEvmBtn').addEventListener('click', async () => {
     try {
-      const { address, walletName } = await connectEvmWallet((next) => {
+      const { address, walletName, capabilities } = await connectEvmWallet((next) => {
         updateWalletButtons();
         if (next) runScan({ address: next, autoOpen: true });
       });
       updateWalletButtons();
-      showToast(`Connected ${walletName}: ${shortAddr(address)} — scanning live across 6 chains!`);
+      const batchNote = capabilities?.anySupported
+        ? 'EIP-5792 1-Click Batch armed!'
+        : 'Sequential signing ready.';
+      showToast(`Connected ${walletName} (${shortAddr(address)}) · ${batchNote}`);
       await runScan({ address, autoOpen: true });
     } catch (err) {
       showToast(err.message);

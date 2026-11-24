@@ -2,6 +2,7 @@ import { encodeCctpDepositForBurn, solanaAddressToBytes32 } from '../bridge/cctp
 import { DEAD_BURN_ADDRESS, EVM_CHAINS, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import {
   checkErc20Allowance,
+  isEip2612Token,
   simulateBurnTransferOnchain,
   SOLANA_USDC_MINT,
 } from '../scanner/discovery.js';
@@ -11,6 +12,65 @@ const RELAY_SOLANA_CHAIN_ID = 792703809;
 const LIFI_SOLANA_CHAIN_ID = 1151111081099710;
 const SOLANA_NATIVE_MINT = '11111111111111111111111111111111';
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+/** Set when a quote provider was rate-limited or unreachable, as opposed to answering "no route". */
+interface QuoteState {
+  throttled: boolean;
+}
+
+/** Max simultaneous live quote lookups per chain batch (public quote APIs rate-limit bursts). */
+const QUOTE_CONCURRENCY = 4;
+
+/**
+ * Fetch with a per-attempt timeout and one backoff retry on 429 / 5xx / timeout,
+ * so a rate-limited quote is not misreported as "no route".
+ */
+async function fetchQuote(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  state?: QuoteState
+): Promise<Response | null> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...init, signal: controller.signal });
+      if (res.status !== 429 && res.status < 500) return res;
+      if (state) state.throttled = true;
+    } catch {
+      // timeout or network error: retry once
+      if (state) state.throttled = true;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 900));
+  }
+  return null;
+}
+
+async function settleWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>
+): Promise<PromiseSettledResult<R>[]> {
+  const results = new Array<PromiseSettledResult<R>>(items.length);
+  let next = 0;
+  const run = async (): Promise<void> => {
+    while (next < items.length) {
+      const idx = next;
+      next += 1;
+      try {
+        results[idx] = { status: 'fulfilled', value: await worker(items[idx]) };
+      } catch (reason) {
+        results[idx] = { status: 'rejected', reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return results;
+}
+const MAX_UINT256 = (1n << 256n) - 1n;
 
 export interface ExecutableEvmTx {
   stepId: string;
@@ -41,6 +101,55 @@ export interface PreparedExecution {
   estimatedFeeUsd?: number;
   requestId?: string;
   transactions: ExecutableEvmTx[];
+  notes: string[];
+}
+
+export interface PreparedBatchCall {
+  stepId: string;
+  assetId: string;
+  assetSymbol: string;
+  action: ScannedAsset['action'];
+  provider: PreparedExecution['provider'];
+  label: string;
+  description: string;
+  to: string;
+  data: string;
+  value: string;
+  gas?: string;
+}
+
+export interface PreparedChainBatch {
+  chain: EvmChainId;
+  chainId: number;
+  chainName: string;
+  explorerUrl: string;
+  userAddress: string;
+  solanaDestination: string;
+  outputAsset: 'USDC' | 'SOL';
+  calls: PreparedBatchCall[];
+  bridgeTrackers: Array<{
+    assetId: string;
+    assetSymbol: string;
+    provider: PreparedExecution['provider'];
+    requestId?: string;
+    estimatedOutput: string;
+    estimatedSeconds: number;
+  }>;
+  skippedAssets: Array<{
+    assetId: string;
+    assetSymbol: string;
+    reason: string;
+  }>;
+  savings: {
+    totalCalls: number;
+    walletPopupsEip5792: number;
+    walletPopupsLegacy: number;
+    popupsSaved: number;
+    dedupedApprovals: number;
+    permit2ReadyCount: number;
+    eip2612Count: number;
+  };
+  estimatedSeconds: number;
   notes: string[];
 }
 
@@ -192,16 +301,15 @@ async function tryRelayBridgeQuote(params: {
   userAddress: string;
   solanaDestination: string;
   outputAsset: 'USDC' | 'SOL';
+  quoteState?: QuoteState;
 }): Promise<PreparedExecution | null> {
-  const { asset, userAddress, solanaDestination, outputAsset } = params;
+  const { asset, userAddress, solanaDestination, outputAsset, quoteState } = params;
   const cfg = EVM_CHAINS[asset.chain];
   const originCurrency = asset.address === 'native' ? ZERO_ADDRESS : asset.address;
   const destinationCurrency = outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 7000);
-    const res = await fetch('https://api.relay.link/quote', {
+    const res = await fetchQuote('https://api.relay.link/quote', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -214,10 +322,8 @@ async function tryRelayBridgeQuote(params: {
         amount: asset.rawBalance,
         tradeType: 'EXACT_INPUT',
       }),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    if (!res.ok) return null;
+    }, 7000, quoteState);
+    if (!res || !res.ok) return null;
 
     const json = (await res.json()) as {
       requestId?: string;
@@ -309,8 +415,9 @@ async function tryLifiBridgeQuote(params: {
   userAddress: string;
   solanaDestination: string;
   outputAsset: 'USDC' | 'SOL';
+  quoteState?: QuoteState;
 }): Promise<PreparedExecution | null> {
-  const { asset, userAddress, solanaDestination, outputAsset } = params;
+  const { asset, userAddress, solanaDestination, outputAsset, quoteState } = params;
   const cfg = EVM_CHAINS[asset.chain];
   const fromToken = asset.address === 'native' ? ZERO_ADDRESS : asset.address;
   const toToken = outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
@@ -325,11 +432,14 @@ async function tryLifiBridgeQuote(params: {
     url.searchParams.set('fromAddress', userAddress);
     url.searchParams.set('toAddress', solanaDestination);
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 7500);
-    const res = await fetch(url.toString(), { signal: controller.signal });
-    clearTimeout(timer);
-    if (!res.ok) return null;
+    const res = await fetchQuote(
+      url.toString(),
+      // Keyless LI.FI is tightly rate-limited; set LIFI_API_KEY for production volume.
+      process.env.LIFI_API_KEY ? { headers: { 'x-lifi-api-key': process.env.LIFI_API_KEY } } : {},
+      7500,
+      quoteState
+    );
+    if (!res || !res.ok) return null;
 
     const json = (await res.json()) as {
       id?: string;
@@ -503,21 +613,28 @@ async function buildBridgeExecution(
   const cfg = EVM_CHAINS[asset.chain];
   const isNativeUsdc =
     asset.address.toLowerCase() === cfg.usdcAddress.toLowerCase();
+  const quoteState: QuoteState = { throttled: false };
 
   if (bridgePreference === 'cctp' && isNativeUsdc) {
     return buildDirectCctpUsdcExecution({ asset, userAddress, solanaDestination });
   }
 
   if (bridgePreference !== 'lifi') {
-    const relay = await tryRelayBridgeQuote({ asset, userAddress, solanaDestination, outputAsset });
+    const relay = await tryRelayBridgeQuote({ asset, userAddress, solanaDestination, outputAsset, quoteState });
     if (relay) return relay;
   }
 
-  const lifi = await tryLifiBridgeQuote({ asset, userAddress, solanaDestination, outputAsset });
+  const lifi = await tryLifiBridgeQuote({ asset, userAddress, solanaDestination, outputAsset, quoteState });
   if (lifi) return lifi;
 
   if (isNativeUsdc) {
     return buildDirectCctpUsdcExecution({ asset, userAddress, solanaDestination });
+  }
+
+  if (quoteState.throttled) {
+    throw new Error(
+      `Quote providers were rate-limited or unreachable for ${asset.symbol} on ${cfg.name}. Not a routing verdict; retry in about a minute.`
+    );
   }
 
   throw new Error(
@@ -605,6 +722,281 @@ export async function prepareRealExecution(params: {
   }
 
   return buildBridgeExecution(asset, userAddress, solanaDestination, outputAsset, bridgePreference);
+}
+
+function decodeApproveCalldata(data: string): { spender: string; amount: bigint } | null {
+  const clean = data.toLowerCase();
+  if (!clean.startsWith('0x095ea7b3') || clean.length < 138) return null;
+  const spender = '0x' + clean.slice(34, 74);
+  try {
+    const amount = BigInt('0x' + clean.slice(74, 138));
+    return { spender, amount };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Prepares ONE unified EIP-5792 (`wallet_sendCalls`) atomic batch for an ENTIRE EVM chain:
+ *   1. Orders calls: DeFi withdrawals (optionally bundled with atomic Circle CCTP USDC bridge!)
+ *      -> Liquid swaps/bridges -> eth_call-verified zero-liquidity burns.
+ *   2. Deduplicates any duplicate ERC-20 `approve(spender, amount)` calls targeting the same
+ *      (token, spender) pair by summing their allowances into a single leading approval.
+ *   3. Returns exact `calls[]` ready for 1-click-per-chain signing via `wallet_sendCalls`,
+ *      plus legacy fallback metadata and Permit2 / EIP-2612 capability counts.
+ */
+export async function prepareChainBatchExecution(params: {
+  chain: EvmChainId;
+  assets: ScannedAsset[];
+  userAddress: string;
+  solanaDestination: string;
+  outputAsset?: 'USDC' | 'SOL';
+  bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+  bundleDefiCctp?: boolean;
+}): Promise<PreparedChainBatch> {
+  const {
+    chain,
+    assets,
+    userAddress,
+    solanaDestination,
+    outputAsset = 'USDC',
+    bridgePreference = 'auto',
+    bundleDefiCctp = true,
+  } = params;
+
+  const cfg = EVM_CHAINS[chain];
+  if (!cfg) throw new Error(`Unsupported chain: ${chain}`);
+
+  const mintRecipientBytes32 = solanaAddressToBytes32(solanaDestination);
+  const chainAssets = assets.filter((a) => a.chain === chain);
+
+  const actionOrder: Record<ScannedAsset['action'], number> = {
+    WITHDRAW_AND_BRIDGE: 1,
+    SELL_AND_BRIDGE: 2,
+    BRIDGE_DIRECT_USDC: 3,
+    BURN_ZERO_LIQUIDITY: 4,
+    SKIP_GAS_NEGATIVE: 5,
+    SKIP_HONEYPOT: 6,
+  };
+
+  const ordered = [...chainAssets].sort(
+    (a, b) => (actionOrder[a.action] ?? 9) - (actionOrder[b.action] ?? 9)
+  );
+
+  const skippedAssets: PreparedChainBatch['skippedAssets'] = [];
+  const executableAssets: ScannedAsset[] = [];
+
+  for (const asset of ordered) {
+    if (asset.action === 'SKIP_HONEYPOT') {
+      skippedAssets.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        reason: 'Reverting honeypot — safely skipped from chain batch.',
+      });
+      continue;
+    }
+    executableAssets.push(asset);
+  }
+
+  const results = await settleWithConcurrency(executableAssets, QUOTE_CONCURRENCY, (asset) =>
+    prepareRealExecution({
+      asset,
+      userAddress,
+      solanaDestination,
+      outputAsset,
+      bridgePreference,
+    })
+  );
+
+  const rawCalls: PreparedBatchCall[] = [];
+  const bridgeTrackers: PreparedChainBatch['bridgeTrackers'] = [];
+  const notes: string[] = [];
+  let maxSeconds = 10;
+
+  results.forEach((res, idx) => {
+    const asset = executableAssets[idx];
+    if (res.status === 'rejected') {
+      skippedAssets.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        reason: res.reason instanceof Error ? res.reason.message : 'Route unavailable',
+      });
+      return;
+    }
+
+    const prep = res.value;
+    maxSeconds = Math.max(maxSeconds, prep.estimatedSeconds);
+
+    for (const tx of prep.transactions) {
+      rawCalls.push({
+        stepId: tx.stepId,
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        action: asset.action,
+        provider: prep.provider,
+        label: tx.label,
+        description: tx.description,
+        to: tx.to,
+        data: tx.data,
+        value: tx.value || '0x0',
+        gas: tx.gas,
+      });
+    }
+
+    // Atomic DeFi USDC Withdraw + Circle CCTP depositForBurn in the SAME 1-click batch!
+    const isDefiUsdcWithdraw =
+      bundleDefiCctp &&
+      outputAsset === 'USDC' &&
+      (prep.provider === 'aave_v3' || prep.provider === 'compound_v3') &&
+      asset.underlyingSymbol === 'USDC';
+
+    if (isDefiUsdcWithdraw) {
+      const rawAmount = BigInt(asset.rawBalance);
+      rawCalls.push({
+        stepId: 'approve_cctp_after_defi',
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        action: asset.action,
+        provider: 'circle_cctp',
+        label: `Approve withdrawn ${asset.uiBalance.toFixed(2)} USDC for Circle CCTP`,
+        description: `Batched immediately after ${asset.protocol} withdrawal in the same atomic call bundle`,
+        to: cfg.usdcAddress,
+        data: encodeErc20Approve(cfg.cctpTokenMessenger, rawAmount),
+        value: '0x0',
+      });
+      rawCalls.push({
+        stepId: 'cctp_deposit_for_burn_after_defi',
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        action: asset.action,
+        provider: 'circle_cctp',
+        label: `Bridge withdrawn ${asset.uiBalance.toFixed(2)} USDC → Solana (Circle CCTP)`,
+        description: `Native 1:1 Circle CCTP burn (Domain ${cfg.cctpDomain} → Domain 5 Solana) in the same click`,
+        to: cfg.cctpTokenMessenger,
+        data: encodeCctpDepositForBurn({
+          rawUsdcAmount: rawAmount,
+          destinationDomain: SOLANA_CCTP_DOMAIN,
+          solanaMintRecipientBytes32: mintRecipientBytes32,
+          usdcAddress: cfg.usdcAddress,
+        }),
+        value: '0x0',
+      });
+      maxSeconds = Math.max(maxSeconds, cfg.cctpAttestationSec);
+      bridgeTrackers.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        provider: 'circle_cctp',
+        estimatedOutput: `${asset.uiBalance.toFixed(2)} USDC (Atomic DeFi Exit + CCTP)`,
+        estimatedSeconds: cfg.cctpAttestationSec,
+      });
+      notes.push(
+        `Bundled ${asset.protocol} ${asset.symbol} withdrawal + Circle CCTP bridge atomically in 1 click.`
+      );
+    } else if (prep.provider === 'relay' || prep.provider === 'lifi' || prep.provider === 'circle_cctp') {
+      bridgeTrackers.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        provider: prep.provider,
+        requestId: prep.requestId,
+        estimatedOutput: prep.estimatedOutput,
+        estimatedSeconds: prep.estimatedSeconds,
+      });
+    }
+  });
+
+  // Deduplicate identical ERC-20 approve(spender, amount) calls by summing required amounts
+  const mergedApprovals = new Map<
+    string,
+    { firstIdx: number; call: PreparedBatchCall; amount: bigint; spender: string; count: number }
+  >();
+  const skipIndices = new Set<number>();
+  let dedupedApprovals = 0;
+
+  rawCalls.forEach((call, idx) => {
+    const decoded = decodeApproveCalldata(call.data);
+    if (!decoded) return;
+    const key = `${call.to.toLowerCase()}:${decoded.spender.toLowerCase()}`;
+    const existing = mergedApprovals.get(key);
+    if (!existing) {
+      mergedApprovals.set(key, {
+        firstIdx: idx,
+        call,
+        amount: decoded.amount,
+        spender: decoded.spender,
+        count: 1,
+      });
+    } else {
+      const summed = existing.amount + decoded.amount;
+      existing.amount = summed > MAX_UINT256 ? MAX_UINT256 : summed;
+      existing.count += 1;
+      skipIndices.add(idx);
+      dedupedApprovals += 1;
+    }
+  });
+
+  const finalCalls: PreparedBatchCall[] = [];
+  rawCalls.forEach((call, idx) => {
+    if (skipIndices.has(idx)) return;
+    const decoded = decodeApproveCalldata(call.data);
+    if (decoded) {
+      const key = `${call.to.toLowerCase()}:${decoded.spender.toLowerCase()}`;
+      const merged = mergedApprovals.get(key);
+      if (merged && merged.firstIdx === idx && merged.count > 1) {
+        finalCalls.push({
+          ...call,
+          label: `Combined Approve (${merged.count} batched ops)`,
+          description: `Deduplicated ${merged.count} ERC-20 approvals to ${merged.spender} into 1 call`,
+          data: encodeErc20Approve(merged.spender, merged.amount),
+        });
+        return;
+      }
+    }
+    finalCalls.push(call);
+  });
+
+  const permit2ReadyCount = executableAssets.filter((a) => Boolean(a.permit2Approved)).length;
+  const eip2612Count = executableAssets.filter(
+    (a) =>
+      a.eip2612Supported ?? (a.kind !== 'dead_token' && isEip2612Token(a.chain, a.address, a.symbol))
+  ).length;
+
+  const totalCalls = finalCalls.length;
+  const walletPopupsEip5792 = totalCalls > 0 ? 1 : 0;
+  const walletPopupsLegacy = totalCalls;
+  const popupsSaved = Math.max(0, walletPopupsLegacy - walletPopupsEip5792);
+
+  if (dedupedApprovals > 0) {
+    notes.push(`Deduplicated ${dedupedApprovals} redundant ERC-20 approval(s) inside this chain batch.`);
+  }
+  if (totalCalls > 1) {
+    notes.push(
+      `EIP-5792 wallet_sendCalls bundles all ${totalCalls} calls on ${cfg.name} into 1 single wallet confirmation (${popupsSaved} popups eliminated).`
+    );
+  }
+
+  return {
+    chain,
+    chainId: cfg.chainId,
+    chainName: cfg.name,
+    explorerUrl: cfg.explorerUrl,
+    userAddress,
+    solanaDestination,
+    outputAsset,
+    calls: finalCalls,
+    bridgeTrackers,
+    skippedAssets,
+    savings: {
+      totalCalls,
+      walletPopupsEip5792,
+      walletPopupsLegacy,
+      popupsSaved,
+      dedupedApprovals,
+      permit2ReadyCount,
+      eip2612Count,
+    },
+    estimatedSeconds: maxSeconds,
+    notes,
+  };
 }
 
 /**

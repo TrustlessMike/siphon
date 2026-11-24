@@ -4,7 +4,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { buildMigrationPlan, solanaAddressToBytes32 } from '../bridge/cctp.js';
-import { checkLiveExecutionStatus, prepareRealExecution } from '../execution/tx-builder.js';
+import {
+  checkLiveExecutionStatus,
+  prepareChainBatchExecution,
+  prepareRealExecution,
+} from '../execution/tx-builder.js';
 import { CHAIN_LIST, DEAD_BURN_ADDRESS, PROTOCOL_FEE_BPS, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { scanLiveWallet, scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
@@ -12,7 +16,17 @@ import type { EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const ROOT_DIR = path.resolve(__dirname, '../..');
+// Works from both src/server (tsx) and dist/src/server (node): walk up to the package root.
+function findPackageRoot(start: string): string {
+  let dir = start;
+  while (!fs.existsSync(path.join(dir, 'package.json'))) {
+    const parent = path.dirname(dir);
+    if (parent === dir) return path.resolve(start, '../..');
+    dir = parent;
+  }
+  return dir;
+}
+const ROOT_DIR = findPackageRoot(__dirname);
 const PUBLIC_DIR = path.resolve(ROOT_DIR, 'public');
 const CONTRACTS_DIR = path.resolve(ROOT_DIR, 'contracts');
 const THREE_BUILD_DIR = path.resolve(ROOT_DIR, 'node_modules/three/build');
@@ -225,6 +239,41 @@ export function createSiphonServer() {
         } catch (err) {
           return sendJson(res, 400, {
             error: err instanceof Error ? err.message : 'Could not prepare real transaction',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/tx/prepare-chain-batch') {
+        const body = await readJsonBody<{
+          chain?: EvmChainId;
+          assets?: ScannedAsset[];
+          userAddress?: string;
+          solanaDestination?: string;
+          outputAsset?: 'USDC' | 'SOL';
+          bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+          bundleDefiCctp?: boolean;
+        }>(req);
+
+        if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
+          return sendJson(res, 400, {
+            error: 'chain, assets[], userAddress, and solanaDestination are required',
+          });
+        }
+
+        try {
+          const batch = await prepareChainBatchExecution({
+            chain: body.chain,
+            assets: body.assets,
+            userAddress: body.userAddress,
+            solanaDestination: body.solanaDestination,
+            outputAsset: body.outputAsset ?? 'USDC',
+            bridgePreference: body.bridgePreference ?? 'auto',
+            bundleDefiCctp: body.bundleDefiCctp ?? true,
+          });
+          return sendJson(res, 200, batch);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Could not prepare EIP-5792 chain batch',
           });
         }
       }

@@ -175,7 +175,7 @@
           <nav class="app-tabs" role="tablist" aria-label="Migrator views">
             <button type="button" class="app-tab active" data-view="scanner" role="tab">Scanner &amp; Plan</button>
             <button type="button" class="app-tab" data-view="pipeline" role="tab">
-              Execution &amp; CCTP
+              Batch Execution
               <span class="tab-count" id="tabLegCount">0</span>
             </button>
             <button type="button" class="app-tab" data-view="burns" role="tab">
@@ -188,7 +188,7 @@
           <div class="app-top-right">
             <button type="button" class="btn-outline-sm" id="connectEvmBtn">Connect EVM</button>
             <button type="button" class="btn-outline-sm" id="connectSolBtn">Connect Solana</button>
-            <button type="button" class="btn-pill-dark btn-sm" id="topExecuteLiveBtn">Execute Live</button>
+            <button type="button" class="btn-pill-dark btn-sm" id="topExecuteLiveBtn">Batch Execute</button>
           </div>
         </div>
       </header>
@@ -325,8 +325,8 @@
         <section class="view-pane" id="view-pipeline">
           <div class="view-header">
             <div>
-              <h1>Live Execution Queue &amp; Real Mainnet Routes</h1>
-              <p>Fetches live executable calldata from <strong>Relay</strong>, <strong>LI.FI</strong>, <strong>Aave v3</strong>, <strong>Compound v3</strong>, and <strong>Circle CCTP</strong>, signs via your connected wallet, and tracks Solana landing.</p>
+              <h1>1-Click-Per-Chain Atomic Batch Execution</h1>
+              <p>Bundles DeFi withdrawals, approvals, <strong>Relay / LI.FI / Circle CCTP</strong> bridges, and safe burns into <strong>1 EIP-5792 wallet confirmation per chain</strong> (<code class="code-inline">wallet_sendCalls</code>) with automatic legacy fallback.</p>
             </div>
             <div class="btn-row">
               <select id="bridgePrefSelect" class="field-select-sm mono" aria-label="Bridge route preference">
@@ -335,7 +335,7 @@
                 <option value="lifi">LI.FI Aggregator</option>
                 <option value="cctp">Direct Circle CCTP (USDC)</option>
               </select>
-              <button type="button" class="btn-pill-dark btn-sm" id="runLiveQueueBtn">Execute Selected Live</button>
+              <button type="button" class="btn-pill-dark btn-sm" id="runLiveQueueBtn">Execute All Chains (1 Click / Chain)</button>
             </div>
           </div>
 
@@ -343,7 +343,11 @@
             <div class="kv-clean">
               <div class="kv-r">
                 <span>Connected EVM Signer</span>
-                <span class="mono" id="execConnectedEvm">Not connected (read-only quote mode)</span>
+                <span class="mono" id="execConnectedEvm">Not connected (read-only live batch preview)</span>
+              </div>
+              <div class="kv-r">
+                <span>EIP-5792 Atomic Batch Engine</span>
+                <span class="mono" id="execBatchMode"><span class="batch-pill">EIP-5792 Ready</span> 1 Click / Chain (MetaMask · Rabby · Coinbase · Phantom)</span>
               </div>
               <div class="kv-r">
                 <span>Solana Destination (Ed25519 Base58)</span>

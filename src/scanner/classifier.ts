@@ -7,7 +7,12 @@ import {
   TOKEN_REGISTRY,
 } from './chains.js';
 import { fetchLiveUsdPrices } from './prices.js';
-import { discoverEthereumTokens, simulateBurnTransferOnchain } from './discovery.js';
+import {
+  detectPermit2Allowances,
+  discoverEthereumTokens,
+  isEip2612Token,
+  simulateBurnTransferOnchain,
+} from './discovery.js';
 import { formatUnits, isValidEvmAddress, scanSingleEvmChain } from './rpc.js';
 import type {
   AssetAction,
@@ -84,6 +89,7 @@ interface RawAssetSeed {
   priceUsd: number;
   liquidityUsd: number;
   honeypot?: boolean;
+  permit2Approved?: boolean;
 }
 
 function classifyAndBuildReport(params: {
@@ -223,6 +229,9 @@ function classifyAndBuildReport(params: {
       actionReason,
       selectedByDefault,
       honeypotSafe,
+      eip2612Supported:
+        item.kind !== 'dead_token' && isEip2612Token(item.chain, item.address, item.symbol),
+      permit2Approved: Boolean(item.permit2Approved),
       calldataPreview,
     };
   });
@@ -493,6 +502,32 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
           });
         });
       }
+    }
+  }
+
+  // Check real onchain Permit2 allowances per chain in a single parallel Multicall3 pass
+  const erc20ByChain = new Map<EvmChainId, string[]>();
+  for (const a of rawAssets) {
+    if (a.address !== 'native' && a.kind !== 'dead_token') {
+      const list = erc20ByChain.get(a.chain) ?? [];
+      list.push(a.address);
+      erc20ByChain.set(a.chain, list);
+    }
+  }
+  const permit2Checks = await Promise.all(
+    Array.from(erc20ByChain.entries()).map(async ([chain, tokenAddresses]) => {
+      const approved = await detectPermit2Allowances({
+        chain,
+        owner: cleanAddr,
+        tokenAddresses,
+      });
+      return [chain, approved] as const;
+    })
+  );
+  const permit2Map = new Map(permit2Checks);
+  for (const a of rawAssets) {
+    if (a.address !== 'native') {
+      a.permit2Approved = permit2Map.get(a.chain)?.has(a.address.toLowerCase()) ?? false;
     }
   }
 
@@ -883,6 +918,14 @@ export async function scanPresetWallet(presetId: string): Promise<ScanReport> {
           liquidityUsd: 0,
         },
       ];
+
+  // Preset demo wallets mark standard Uniswap/Router tokens as already Permit2-approved
+  const presetPermit2Symbols = new Set(['USDC', 'UNI', 'AERO', 'ARB', 'OP']);
+  for (const a of rawAssets) {
+    if (a.kind === 'erc20' && presetPermit2Symbols.has(a.symbol)) {
+      a.permit2Approved = true;
+    }
+  }
 
   return classifyAndBuildReport({
     mode: 'preset',
