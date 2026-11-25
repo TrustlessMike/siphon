@@ -7,7 +7,8 @@ import {
   extractCctpMessageFromLogs,
   solanaAddressToBytes32,
 } from '../src/bridge/cctp.js';
-import { prepareRealExecution } from '../src/execution/tx-builder.js';
+import { prepareChainBatchExecution, prepareRealExecution } from '../src/execution/tx-builder.js';
+import { getProtocolFeeConfig, resolveProtocolFeeBps } from '../src/scanner/chains.js';
 import { scanPresetWallet } from '../src/scanner/classifier.js';
 import { decodeAaveAccountData } from '../src/scanner/discovery.js';
 import {
@@ -345,4 +346,88 @@ test('Circle CCTP MessageSent log ABI extractor produces valid message bytes and
   assert.ok(extracted);
   assert.equal(extracted.messageBytesHex, '0x' + payload.toString('hex'));
   assert.match(extracted.messageHash, /^0x[0-9a-f]{64}$/);
+});
+
+test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain transfers, and exposes SiphonFeeVault.sol', async () => {
+  // Clamping: below 5% -> 500 bps, above 10% -> 1000 bps, default -> 700 bps (7%)
+  assert.equal(resolveProtocolFeeBps(undefined), 700);
+  assert.equal(resolveProtocolFeeBps(100), 500);
+  assert.equal(resolveProtocolFeeBps(750), 750);
+  assert.equal(resolveProtocolFeeBps(2500), 1000);
+
+  const treasury = '0x1111111111111111111111111111111111111111';
+  const cfg10 = getProtocolFeeConfig({ feeBps: 1000, feeRecipientEvm: treasury });
+  assert.equal(cfg10.feeBps, 1000);
+  assert.equal(cfg10.feePercent, 10);
+  assert.equal(cfg10.feeRecipientEvm, treasury);
+  assert.equal(cfg10.treasuryConfigured, true);
+
+  // Plan uses requested 8% (800 bps) fee and reconciles net USDC cleanly
+  const report = await scanPresetWallet('veteran_defi');
+  const plan8 = buildMigrationPlan({
+    scan: report,
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+    protocolFeeBps: 800,
+    feeRecipientEvm: treasury,
+  });
+  assert.equal(plan8.protocolFeeBps, 800);
+  assert.equal(plan8.protocolFeePercent, 8);
+  assert.equal(plan8.feeRecipientEvm, treasury);
+  assert.ok(plan8.totals.protocolFeeUsd > 100);
+  assert.ok(
+    Math.abs(plan8.totals.protocolFeeUsd - (plan8.totals.grossUsd * 800) / 10_000) < 5,
+    `Expected ~8% fee on $${plan8.totals.grossUsd}, got $${plan8.totals.protocolFeeUsd}`
+  );
+  assert.ok(plan8.legs.every((l) => l.steps.some((s) => s.step.includes('Protocol Fee (8%)'))));
+
+  // Direct Circle CCTP preparation with 10% fee splits exact 10% ERC-20 transfer to treasury + bridges 90%
+  const opUsdc = report.assets.find((a) => a.chain === 'optimism' && a.symbol === 'USDC');
+  assert.ok(opUsdc);
+  const cctp10 = await prepareRealExecution({
+    asset: opUsdc,
+    userAddress: report.walletAddress,
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+    bridgePreference: 'cctp',
+    protocolFeeBps: 1000,
+    feeRecipientEvm: treasury,
+  });
+  assert.equal(cctp10.feeBreakdown?.collectionMethod, 'onchain_split');
+  assert.equal(cctp10.feeBreakdown?.feeBps, 1000);
+  const feeTx = cctp10.transactions.find((t) => t.stepId === 'protocol_fee_transfer');
+  assert.ok(feeTx, 'Expected onchain protocol_fee_transfer tx');
+  assert.ok(feeTx.data.startsWith('0xa9059cbb'));
+  assert.ok(feeTx.data.toLowerCase().includes(treasury.slice(2).toLowerCase()));
+
+  // Atomic EIP-5792 DeFi USDC withdraw + 7% protocol fee + CCTP batch on Polygon
+  const polyAssets = report.assets.filter((a) => a.chain === 'polygon');
+  const polyBatch = await prepareChainBatchExecution({
+    chain: 'polygon',
+    assets: polyAssets,
+    userAddress: report.walletAddress,
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+    bridgePreference: 'cctp',
+    bundleDefiCctp: true,
+    protocolFeeBps: 700,
+    feeRecipientEvm: treasury,
+  });
+  assert.equal(polyBatch.feeBreakdown.feeBps, 700);
+  assert.equal(polyBatch.feeBreakdown.collectionMethod, 'onchain_split');
+  assert.ok(polyBatch.calls.some((c) => c.stepId === 'protocol_fee_transfer_after_defi'));
+  assert.equal(polyBatch.calls.length, 4); // Aave withdraw + 7% fee transfer + approve + CCTP burn
+
+  // HTTP /api/contract serves both SiphonRouter.sol (500-1000 bps) & SiphonFeeVault.sol
+  const { server } = createSiphonServer();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = server.address();
+  assert.ok(addr && typeof addr !== 'string');
+  try {
+    const c = await fetch(`http://127.0.0.1:${addr.port}/api/contract`).then((r) => r.json());
+    assert.ok(c.source.includes('MIN_FEE_BPS = 500'));
+    assert.ok(c.source.includes('MAX_FEE_BPS = 1000'));
+    assert.ok(c.feeVaultSource.includes('contract SiphonFeeVault'));
+    assert.equal(c.contracts.length, 2);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

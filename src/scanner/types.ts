@@ -181,6 +181,10 @@ export interface MigrationPlan {
   outputAsset: 'USDC' | 'SOL';
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
   activeBridgeLabel?: string;
+  protocolFeeBps: number;
+  protocolFeePercent: number;
+  feeRecipientEvm: string | null;
+  feeDestinationType: 'contract' | 'wallet';
   legs: CctpBridgeLeg[];
   totals: {
     selectedAssets: number;

@@ -3,7 +3,65 @@ import type { ChainConfig, EvmChainId, TokenDescriptor } from './types.js';
 export const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 export const DEAD_BURN_ADDRESS = '0x000000000000000000000000000000000000dEaD';
 export const SOLANA_CCTP_DOMAIN = 5;
-export const PROTOCOL_FEE_BPS = 35; // 0.35%
+
+export const MIN_PROTOCOL_FEE_BPS = 500; // 5.0%
+export const MAX_PROTOCOL_FEE_BPS = 1000; // 10.0%
+export const DEFAULT_PROTOCOL_FEE_BPS = 700; // 7.0%
+
+export function resolveProtocolFeeBps(raw?: number | string | null): number {
+  if (raw === undefined || raw === null || raw === '') return DEFAULT_PROTOCOL_FEE_BPS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return DEFAULT_PROTOCOL_FEE_BPS;
+  const rounded = Math.round(parsed);
+  return Math.min(MAX_PROTOCOL_FEE_BPS, Math.max(MIN_PROTOCOL_FEE_BPS, rounded));
+}
+
+export function isValidFeeRecipientEvm(addr?: string | null): addr is string {
+  if (!addr) return false;
+  const clean = addr.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(clean)) return false;
+  const lower = clean.toLowerCase();
+  return (
+    lower !== '0x0000000000000000000000000000000000000000' &&
+    lower !== DEAD_BURN_ADDRESS.toLowerCase()
+  );
+}
+
+export const PROTOCOL_FEE_BPS = resolveProtocolFeeBps(process.env.SIPHON_FEE_BPS);
+
+export interface ProtocolFeeConfig {
+  feeBps: number;
+  feePercent: number;
+  minFeeBps: number;
+  maxFeeBps: number;
+  feeRecipientEvm: string | null;
+  feeRecipientSol: string | null;
+  feeDestinationType: 'contract' | 'wallet';
+  treasuryConfigured: boolean;
+}
+
+export function getProtocolFeeConfig(overrides?: {
+  feeBps?: number | string | null;
+  feeRecipientEvm?: string | null;
+}): ProtocolFeeConfig {
+  const feeBps = resolveProtocolFeeBps(overrides?.feeBps ?? process.env.SIPHON_FEE_BPS);
+  const candidateEvm = overrides?.feeRecipientEvm ?? process.env.SIPHON_FEE_RECIPIENT_EVM ?? null;
+  const feeRecipientEvm = isValidFeeRecipientEvm(candidateEvm) ? candidateEvm.trim() : null;
+  const feeRecipientSol = process.env.SIPHON_FEE_RECIPIENT_SOL?.trim() || null;
+  const rawType = (process.env.SIPHON_FEE_DESTINATION_TYPE ?? 'contract').toLowerCase();
+  const feeDestinationType: 'contract' | 'wallet' = rawType === 'wallet' ? 'wallet' : 'contract';
+
+  return {
+    feeBps,
+    feePercent: Number((feeBps / 100).toFixed(2)),
+    minFeeBps: MIN_PROTOCOL_FEE_BPS,
+    maxFeeBps: MAX_PROTOCOL_FEE_BPS,
+    feeRecipientEvm,
+    feeRecipientSol,
+    feeDestinationType,
+    treasuryConfigured: Boolean(feeRecipientEvm),
+  };
+}
 
 function buildRpcUrls(envUrl: string | undefined, fallbacks: string[]): string[] {
   return Array.from(new Set([envUrl?.trim(), ...fallbacks].filter((u): u is string => Boolean(u))));

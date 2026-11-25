@@ -13,7 +13,13 @@ import {
   prepareChainBatchExecution,
   prepareRealExecution,
 } from '../execution/tx-builder.js';
-import { CHAIN_LIST, DEAD_BURN_ADDRESS, PROTOCOL_FEE_BPS, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
+import {
+  CHAIN_LIST,
+  DEAD_BURN_ADDRESS,
+  getProtocolFeeConfig,
+  PROTOCOL_FEE_BPS,
+  SOLANA_CCTP_DOMAIN,
+} from '../scanner/chains.js';
 import { scanLiveWallet, scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
 import { fetchSolanaWalletBalances, getL2IndexerProvider } from '../scanner/discovery.js';
 import type { EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
@@ -145,12 +151,14 @@ export function createSiphonServer() {
 
     try {
       if (method === 'GET' && pathname === '/api/health') {
+        const protocolFee = getProtocolFeeConfig();
         return sendJson(res, 200, {
           status: 'ok',
           service: 'siphon-migrator',
           chains: CHAIN_LIST.length,
           solanaCctpDomain: SOLANA_CCTP_DOMAIN,
-          protocolFeeBps: PROTOCOL_FEE_BPS,
+          protocolFeeBps: protocolFee.feeBps,
+          protocolFee,
           l2IndexerProvider: getL2IndexerProvider(),
         });
       }
@@ -160,6 +168,7 @@ export function createSiphonServer() {
           coinbaseSmartWalletEnabled: fs.existsSync(path.join(DIST_VENDOR_DIR, 'wallet-sdks.js')),
           walletConnectProjectId: process.env.WALLETCONNECT_PROJECT_ID?.trim() || null,
           l2IndexerProvider: getL2IndexerProvider(),
+          protocolFee: getProtocolFeeConfig(),
         });
       }
 
@@ -168,6 +177,7 @@ export function createSiphonServer() {
           solanaCctpDomain: SOLANA_CCTP_DOMAIN,
           burnSink: DEAD_BURN_ADDRESS,
           protocolFeeBps: PROTOCOL_FEE_BPS,
+          protocolFee: getProtocolFeeConfig(),
           chains: CHAIN_LIST,
           presets: WALLET_PRESETS,
         });
@@ -175,14 +185,23 @@ export function createSiphonServer() {
 
       if (method === 'GET' && pathname === '/api/contract') {
         const routerPath = path.join(CONTRACTS_DIR, 'SiphonRouter.sol');
+        const feeVaultPath = path.join(CONTRACTS_DIR, 'SiphonFeeVault.sol');
         const source = fs.existsSync(routerPath) ? fs.readFileSync(routerPath, 'utf8') : '';
+        const feeVaultSource = fs.existsSync(feeVaultPath) ? fs.readFileSync(feeVaultPath, 'utf8') : '';
+        const protocolFee = getProtocolFeeConfig();
         return sendJson(res, 200, {
           name: 'SiphonRouter.sol',
           solidityVersion: '0.8.24',
-          protocolFeeBps: PROTOCOL_FEE_BPS,
+          protocolFeeBps: protocolFee.feeBps,
+          protocolFee,
           burnSink: DEAD_BURN_ADDRESS,
           solanaCctpDomain: SOLANA_CCTP_DOMAIN,
           source,
+          feeVaultSource,
+          contracts: [
+            { id: 'router', filename: 'contracts/SiphonRouter.sol', title: 'SiphonRouter.sol', source },
+            { id: 'vault', filename: 'contracts/SiphonFeeVault.sol', title: 'SiphonFeeVault.sol', source: feeVaultSource },
+          ],
           chains: CHAIN_LIST.map((c) => ({
             chain: c.name,
             chainId: c.chainId,
@@ -236,6 +255,8 @@ export function createSiphonServer() {
           includeBurns?: boolean;
           outputAsset?: 'USDC' | 'SOL';
           bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+          protocolFeeBps?: number;
+          feeRecipientEvm?: string | null;
         }>(req);
 
         const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
@@ -262,6 +283,8 @@ export function createSiphonServer() {
           includeBurns: body.includeBurns ?? true,
           outputAsset: body.outputAsset ?? 'USDC',
           bridgePreference: body.bridgePreference ?? 'auto',
+          protocolFeeBps: body.protocolFeeBps,
+          feeRecipientEvm: body.feeRecipientEvm,
         });
 
         return sendJson(res, 200, plan);
@@ -293,6 +316,8 @@ export function createSiphonServer() {
           solanaDestination?: string;
           outputAsset?: 'USDC' | 'SOL';
           bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+          protocolFeeBps?: number;
+          feeRecipientEvm?: string | null;
         }>(req);
 
         if (!body.asset || !body.userAddress || !body.solanaDestination) {
@@ -308,6 +333,8 @@ export function createSiphonServer() {
             solanaDestination: body.solanaDestination,
             outputAsset: body.outputAsset ?? 'USDC',
             bridgePreference: body.bridgePreference ?? 'auto',
+            protocolFeeBps: body.protocolFeeBps,
+            feeRecipientEvm: body.feeRecipientEvm,
           });
           return sendJson(res, 200, prepared);
         } catch (err) {
@@ -326,6 +353,8 @@ export function createSiphonServer() {
           outputAsset?: 'USDC' | 'SOL';
           bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
           bundleDefiCctp?: boolean;
+          protocolFeeBps?: number;
+          feeRecipientEvm?: string | null;
         }>(req);
 
         if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
@@ -343,6 +372,8 @@ export function createSiphonServer() {
             outputAsset: body.outputAsset ?? 'USDC',
             bridgePreference: body.bridgePreference ?? 'auto',
             bundleDefiCctp: body.bundleDefiCctp ?? true,
+            protocolFeeBps: body.protocolFeeBps,
+            feeRecipientEvm: body.feeRecipientEvm,
           });
           return sendJson(res, 200, batch);
         } catch (err) {

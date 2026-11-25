@@ -86,13 +86,77 @@ let cachedBatchCapabilities = {
 let walletSdkConfig = {
   coinbaseSmartWalletEnabled: true,
   walletConnectProjectId: null,
+  protocolFee: {
+    feeBps: 700,
+    feePercent: 7,
+    minFeeBps: 500,
+    maxFeeBps: 1000,
+    feeRecipientEvm: null,
+    feeDestinationType: 'contract',
+    treasuryConfigured: false,
+  },
 };
 let cachedSdkModule = null;
+let sdkPreloadPromise = null;
+let cachedCoinbaseProvider = null;
+let activeEvmListeners = null;
+
+const WC_STORAGE_KEY = 'siphon_wc_project_id';
+
+export function getSavedWalletConnectProjectId() {
+  try {
+    return window.localStorage?.getItem(WC_STORAGE_KEY)?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export function setSavedWalletConnectProjectId(projectId) {
+  try {
+    const clean = String(projectId || '').trim();
+    if (clean) window.localStorage?.setItem(WC_STORAGE_KEY, clean);
+    else window.localStorage?.removeItem(WC_STORAGE_KEY);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function getEffectiveWalletConnectProjectId() {
+  return walletSdkConfig.walletConnectProjectId || getSavedWalletConnectProjectId();
+}
 
 async function loadWalletSdkBundle() {
   if (cachedSdkModule) return cachedSdkModule;
-  cachedSdkModule = await import('/vendor/wallet-sdks.js');
-  return cachedSdkModule;
+  if (!sdkPreloadPromise) {
+    sdkPreloadPromise = import('/vendor/wallet-sdks.js')
+      .then((mod) => {
+        cachedSdkModule = mod;
+        if (!cachedCoinbaseProvider && typeof mod.createCoinbaseWalletSDK === 'function') {
+          try {
+            const sdk = mod.createCoinbaseWalletSDK({
+              appName: 'Siphon',
+              appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
+              appChainIds: SUPPORTED_CHAIN_IDS,
+              preference: { options: 'all' },
+            });
+            cachedCoinbaseProvider = sdk.getProvider();
+          } catch {
+            // instantiate on demand
+          }
+        }
+        return mod;
+      })
+      .catch((err) => {
+        sdkPreloadPromise = null;
+        throw err;
+      });
+  }
+  return sdkPreloadPromise;
+}
+
+export function preloadWalletSdks() {
+  if (typeof window === 'undefined') return;
+  loadWalletSdkBundle().catch(() => {});
 }
 
 export async function loadWalletConnectorConfig() {
@@ -183,7 +247,46 @@ export function getConnectedSolanaWalletName() {
   return connectedSolanaWalletName;
 }
 
+function detachEvmListeners() {
+  if (!activeEvmListeners) return;
+  const { provider, onAccounts, onChain, onDisconnect } = activeEvmListeners;
+  try {
+    provider.removeListener?.('accountsChanged', onAccounts);
+    provider.removeListener?.('chainChanged', onChain);
+    if (onDisconnect) provider.removeListener?.('disconnect', onDisconnect);
+  } catch {
+    // ignore provider cleanup errors
+  }
+  activeEvmListeners = null;
+}
+
+function attachEvmListeners(provider, callbacks = {}) {
+  detachEvmListeners();
+  const onAccounts = async (nextAccounts) => {
+    connectedEvmAddress = nextAccounts?.[0] ?? null;
+    await detectWalletBatchCapabilities(connectedEvmAddress);
+    callbacks.onAccountsChanged?.(connectedEvmAddress);
+  };
+  const onChain = async () => {
+    if (connectedEvmAddress) {
+      await detectWalletBatchCapabilities(connectedEvmAddress);
+      callbacks.onChainChanged?.();
+    }
+  };
+  const onDisconnect = callbacks.onDisconnect
+    ? () => {
+        disconnectEvmWallet();
+        callbacks.onDisconnect?.();
+      }
+    : null;
+  provider.on?.('accountsChanged', onAccounts);
+  provider.on?.('chainChanged', onChain);
+  if (onDisconnect) provider.on?.('disconnect', onDisconnect);
+  activeEvmListeners = { provider, onAccounts, onChain, onDisconnect };
+}
+
 export function disconnectEvmWallet() {
+  detachEvmListeners();
   activeEvmProvider = null;
   connectedEvmAddress = null;
   connectedWalletName = null;
@@ -320,17 +423,35 @@ function inferInjectedEvmName(prov) {
   return 'Browser EVM Wallet';
 }
 
+function canonicalWalletFamily(name, rdns = '') {
+  const s = `${name || ''} ${rdns || ''}`.toLowerCase();
+  if (s.includes('rabby')) return 'rabby';
+  if (s.includes('metamask')) return 'metamask';
+  if (s.includes('phantom')) return 'phantom';
+  if (s.includes('coinbase')) return 'coinbase';
+  if (s.includes('okx') || s.includes('okex')) return 'okx';
+  if (s.includes('trust')) return 'trust';
+  if (s.includes('brave')) return 'brave';
+  if (s.includes('rainbow')) return 'rainbow';
+  if (s.includes('backpack')) return 'backpack';
+  if (s.includes('solflare')) return 'solflare';
+  if (s.includes('ledger')) return 'ledger';
+  return String(name || '').trim().toLowerCase();
+}
+
 export function listAvailableEvmWallets() {
   const list = [];
   const seenProviders = new Set();
-  const seenNames = new Set();
+  const seenFamilies = new Set();
 
   for (let idx = 0; idx < discoveredEvmProviders.length; idx++) {
     const d = discoveredEvmProviders[idx];
     if (!d?.provider || seenProviders.has(d.provider)) continue;
-    seenProviders.add(d.provider);
     const name = d.info?.name || 'EVM Wallet';
-    seenNames.add(name.toLowerCase());
+    const family = canonicalWalletFamily(name, d.info?.rdns);
+    if (seenFamilies.has(family)) continue;
+    seenProviders.add(d.provider);
+    seenFamilies.add(family);
     list.push({
       id: d.info?.uuid || d.info?.rdns || `eip6963-${idx}`,
       name,
@@ -349,15 +470,19 @@ export function listAvailableEvmWallets() {
       injectedCandidates.push({ prov: window.ethereum, fallbackName: null });
     }
     if (window.phantom?.ethereum) injectedCandidates.push({ prov: window.phantom.ethereum, fallbackName: 'Phantom EVM' });
+    if (window.coinbaseWalletExtension) {
+      injectedCandidates.push({ prov: window.coinbaseWalletExtension, fallbackName: 'Coinbase Wallet' });
+    }
     if (window.okxwallet) injectedCandidates.push({ prov: window.okxwallet, fallbackName: 'OKX Wallet' });
     if (window.trustwallet) injectedCandidates.push({ prov: window.trustwallet, fallbackName: 'Trust Wallet' });
 
     injectedCandidates.forEach(({ prov, fallbackName }, idx) => {
       if (!prov || typeof prov.request !== 'function' || seenProviders.has(prov)) return;
       const name = fallbackName || inferInjectedEvmName(prov);
-      if (seenNames.has(name.toLowerCase())) return;
+      const family = canonicalWalletFamily(name);
+      if (seenFamilies.has(family)) return;
       seenProviders.add(prov);
-      seenNames.add(name.toLowerCase());
+      seenFamilies.add(family);
       list.push({
         id: `injected-${idx}-${name.toLowerCase().replace(/\s+/g, '-')}`,
         name,
@@ -385,28 +510,17 @@ export async function connectEvmWallet(optionsOrCallback) {
   }
   const chosen =
     (opts.walletId ? wallets.find((w) => w.id === opts.walletId) : null) || wallets[0];
-  activeEvmProvider = chosen.provider;
-  const accounts = await activeEvmProvider.request({ method: 'eth_requestAccounts' });
+  const provider = chosen.provider;
+  const accounts = await provider.request({ method: 'eth_requestAccounts' });
   if (!accounts || !accounts[0]) {
     throw new Error('Wallet connection was cancelled.');
   }
+  activeEvmProvider = provider;
   connectedEvmAddress = accounts[0];
   connectedWalletName = chosen.name;
 
   const capabilities = await detectWalletBatchCapabilities(connectedEvmAddress);
-
-  activeEvmProvider.on?.('accountsChanged', async (nextAccounts) => {
-    connectedEvmAddress = nextAccounts?.[0] ?? null;
-    await detectWalletBatchCapabilities(connectedEvmAddress);
-    opts.onAccountsChanged?.(connectedEvmAddress);
-  });
-
-  activeEvmProvider.on?.('chainChanged', async () => {
-    if (connectedEvmAddress) {
-      await detectWalletBatchCapabilities(connectedEvmAddress);
-      opts.onChainChanged?.();
-    }
-  });
+  attachEvmListeners(provider, opts);
 
   return { address: connectedEvmAddress, walletName: chosen.name, capabilities };
 }
@@ -414,51 +528,48 @@ export async function connectEvmWallet(optionsOrCallback) {
 /**
  * Connects via Coinbase Smart Wallet (keys.coinbase.com passkey / popup) —
  * works in ANY browser with zero extension installed and native EIP-5792 batching.
+ * Uses pre-initialized provider when available so eth_requestAccounts fires synchronously
+ * inside the user click gesture (avoiding browser popup blockers).
  */
 export async function connectCoinbaseSmartWallet(callbacks = {}) {
-  const { createCoinbaseWalletSDK } = await loadWalletSdkBundle();
-  const sdk = createCoinbaseWalletSDK({
-    appName: 'Siphon',
-    appChainIds: SUPPORTED_CHAIN_IDS,
-    preference: { options: 'all' },
-  });
-  const provider = sdk.getProvider();
-  activeEvmProvider = provider;
+  let provider = cachedCoinbaseProvider;
+  if (!provider) {
+    const { createCoinbaseWalletSDK } = await loadWalletSdkBundle();
+    const sdk = createCoinbaseWalletSDK({
+      appName: 'Siphon',
+      appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
+      appChainIds: SUPPORTED_CHAIN_IDS,
+      preference: { options: 'all' },
+    });
+    provider = sdk.getProvider();
+    cachedCoinbaseProvider = provider;
+  }
   const accounts = await provider.request({ method: 'eth_requestAccounts' });
   if (!accounts || !accounts[0]) {
     throw new Error('Coinbase Wallet connection was cancelled.');
   }
+  activeEvmProvider = provider;
   connectedEvmAddress = accounts[0];
   connectedWalletName = 'Coinbase Wallet';
   const capabilities = await detectWalletBatchCapabilities(connectedEvmAddress);
-
-  provider.on?.('accountsChanged', async (nextAccounts) => {
-    connectedEvmAddress = nextAccounts?.[0] ?? null;
-    await detectWalletBatchCapabilities(connectedEvmAddress);
-    callbacks.onAccountsChanged?.(connectedEvmAddress);
-  });
-  provider.on?.('chainChanged', async () => {
-    if (connectedEvmAddress) {
-      await detectWalletBatchCapabilities(connectedEvmAddress);
-      callbacks.onChainChanged?.();
-    }
-  });
+  attachEvmListeners(provider, callbacks);
 
   return { address: connectedEvmAddress, walletName: 'Coinbase Wallet', capabilities };
 }
 
 /**
  * Connects mobile or hardware wallets via WalletConnect v2 QR modal
- * when WALLETCONNECT_PROJECT_ID is configured on the server.
+ * using server WALLETCONNECT_PROJECT_ID or a user-saved Reown Project ID.
  */
 export async function connectWalletConnect(callbacks = {}) {
   const cfg = walletSdkConfig.walletConnectProjectId
     ? walletSdkConfig
     : await loadWalletConnectorConfig();
-  const projectId = callbacks.projectId?.trim() || cfg.walletConnectProjectId;
+  const projectId =
+    callbacks.projectId?.trim() || cfg.walletConnectProjectId || getSavedWalletConnectProjectId();
   if (!projectId) {
     throw new Error(
-      'WalletConnect QR requires WALLETCONNECT_PROJECT_ID on the server (free at cloud.reown.com).'
+      'Enter a free Reown / WalletConnect Project ID (cloud.reown.com) to launch the mobile QR modal.'
     );
   }
   const { EthereumProvider } = await loadWalletSdkBundle();
@@ -471,27 +582,21 @@ export async function connectWalletConnect(callbacks = {}) {
       name: 'Siphon',
       description: 'Move fragmented EVM positions and tokens to Solana.',
       url: window.location.origin,
-      icons: [],
+      icons: [`${window.location.origin}/logos/siphon.svg`],
     },
   });
   await provider.connect();
-  activeEvmProvider = provider;
   const accounts = await provider.request({ method: 'eth_requestAccounts' });
   if (!accounts || !accounts[0]) {
     throw new Error('WalletConnect session cancelled.');
   }
+  activeEvmProvider = provider;
   connectedEvmAddress = accounts[0];
   connectedWalletName = 'WalletConnect';
   const capabilities = await detectWalletBatchCapabilities(connectedEvmAddress);
-
-  provider.on?.('accountsChanged', async (nextAccounts) => {
-    connectedEvmAddress = nextAccounts?.[0] ?? null;
-    await detectWalletBatchCapabilities(connectedEvmAddress);
-    callbacks.onAccountsChanged?.(connectedEvmAddress);
-  });
-  provider.on?.('disconnect', () => {
-    disconnectEvmWallet();
-    callbacks.onAccountsChanged?.(null);
+  attachEvmListeners(provider, {
+    ...callbacks,
+    onDisconnect: () => callbacks.onAccountsChanged?.(null),
   });
 
   return { address: connectedEvmAddress, walletName: 'WalletConnect', capabilities };
@@ -752,5 +857,23 @@ export async function connectSolanaWallet(options = {}) {
   if (!pubkey) throw new Error('Solana wallet connection cancelled.');
   connectedSolanaAddress = pubkey;
   connectedSolanaWalletName = chosen.name;
+
+  if (chosen.kind === 'legacy' && chosen.provider?.on) {
+    try {
+      chosen.provider.on('accountChanged', (nextPubkey) => {
+        const nextStr = nextPubkey?.toString?.() || null;
+        connectedSolanaAddress = nextStr;
+        options.onAccountChanged?.(nextStr);
+      });
+      chosen.provider.on('disconnect', () => {
+        connectedSolanaAddress = null;
+        connectedSolanaWalletName = null;
+        options.onAccountChanged?.(null);
+      });
+    } catch {
+      // ignore optional listener errors
+    }
+  }
+
   return { address: pubkey, walletName: chosen.name };
 }

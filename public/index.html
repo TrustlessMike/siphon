@@ -84,8 +84,15 @@
               aria-label="3D porcelain, brushed titanium, and frosted ice-cyan Solana funnel sculpture"
             ></canvas>
             <div class="hero-stage-bar mono">
-              <span>Ethereum · Base · Arbitrum · Optimism · Polygon · Avalanche</span>
-              <span class="stage-domain">→ SOLANA</span>
+              <div class="hero-chain-strip" aria-label="Supported EVM source chains">
+                <span class="hero-chain-chip"><img src="/logos/ethereum.svg" alt="" class="chain-logo-xs" />Ethereum</span>
+                <span class="hero-chain-chip"><img src="/logos/base.svg" alt="" class="chain-logo-xs" />Base</span>
+                <span class="hero-chain-chip"><img src="/logos/arbitrum.svg" alt="" class="chain-logo-xs" />Arbitrum</span>
+                <span class="hero-chain-chip"><img src="/logos/optimism.svg" alt="" class="chain-logo-xs" />Optimism</span>
+                <span class="hero-chain-chip"><img src="/logos/polygon.svg" alt="" class="chain-logo-xs" />Polygon</span>
+                <span class="hero-chain-chip"><img src="/logos/avalanche.svg" alt="" class="chain-logo-xs" />Avalanche</span>
+              </div>
+              <span class="stage-domain">→ <img src="/logos/solana.svg" alt="" class="chain-logo-xs" />SOLANA</span>
             </div>
           </div>
         </section>
@@ -165,8 +172,14 @@
           </nav>
 
           <div class="app-top-right">
-            <button type="button" class="btn-outline-sm" id="connectEvmBtn">Connect EVM</button>
-            <button type="button" class="btn-outline-sm" id="connectSolBtn">Connect Solana</button>
+            <button type="button" class="btn-outline-sm btn-with-logo" id="connectEvmBtn">
+              <img src="/logos/ethereum.svg" alt="" class="btn-logo" />
+              <span>Connect EVM</span>
+            </button>
+            <button type="button" class="btn-outline-sm btn-with-logo" id="connectSolBtn">
+              <img src="/logos/solana.svg" alt="" class="btn-logo" />
+              <span>Connect Solana</span>
+            </button>
             <button type="button" class="btn-pill-dark btn-sm" id="topExecuteLiveBtn">Batch Execute</button>
           </div>
         </div>
@@ -201,8 +214,12 @@
                 placeholder="Solana base58 address"
               />
               <div class="seg-output" role="group" aria-label="Solana output asset">
-                <button type="button" class="seg-opt active" data-out-asset="USDC">USDC</button>
-                <button type="button" class="seg-opt" data-out-asset="SOL">SOL</button>
+                <button type="button" class="seg-opt active" data-out-asset="USDC">
+                  <img src="/logos/usdc.svg" alt="" class="chain-logo-xs" />USDC
+                </button>
+                <button type="button" class="seg-opt" data-out-asset="SOL">
+                  <img src="/logos/solana.svg" alt="" class="chain-logo-xs" />SOL
+                </button>
               </div>
             </div>
             <div class="ctrl-toggles">
@@ -328,7 +345,30 @@
               </div>
               <div class="kv-r">
                 <span>Active Bridge Provider</span>
-                <span class="mono" id="execActiveProvider">Auto (Relay → LI.FI → Circle CCTP)</span>
+                <span class="mono inline-logo-row" id="execActiveProvider">
+                  <img src="/logos/relay.svg" alt="" class="chain-logo-xs" />
+                  <img src="/logos/lifi.svg" alt="" class="chain-logo-xs" />
+                  <span>Auto (Relay → LI.FI → Circle CCTP)</span>
+                </span>
+              </div>
+              <div class="kv-r">
+                <span>Protocol Fee &amp; Treasury (5–10%)</span>
+                <div class="fee-config-row">
+                  <select id="protocolFeeSelect" class="field-select-xs mono" aria-label="Protocol fee percentage">
+                    <option value="500">5.0%</option>
+                    <option value="700" selected>7.0% (Default)</option>
+                    <option value="850">8.5%</option>
+                    <option value="1000">10.0%</option>
+                  </select>
+                  <input
+                    type="text"
+                    id="feeRecipientInput"
+                    class="field-input-xs mono"
+                    placeholder="0x… SiphonFeeVault or Treasury wallet"
+                    aria-label="Protocol fee recipient EVM address"
+                  />
+                  <span class="mono muted-xs" id="execFeeUsdSummary">$0.00</span>
+                </div>
               </div>
               <div class="kv-r">
                 <span>Solana Destination (Ed25519 Base58)</span>
@@ -413,16 +453,22 @@
         <section class="view-pane" id="view-contract">
           <div class="view-header">
             <div>
-              <h1>SiphonRouter.sol &amp; CCTP Registry</h1>
-              <p>Auditable Solidity 0.8.24 batch router handling DeFi withdrawals, aggregator swaps, isolated zero-liquidity burns, and Circle CCTP bridging.</p>
+              <h1>Smart Contracts &amp; Treasury Fee Vault</h1>
+              <p>Auditable Solidity 0.8.24 contracts handling DeFi withdrawals, DEX swaps, isolated zero-liquidity burns, 5–10% protocol fee routing, and Circle CCTP bridging.</p>
             </div>
-            <button type="button" class="btn-outline-sm" id="copyContractBtn">Copy Solidity Source</button>
+            <div class="btn-row">
+              <div class="seg-output" role="tablist" aria-label="Smart contract selector">
+                <button type="button" class="seg-opt contract-tab active" data-contract-id="router">SiphonRouter.sol</button>
+                <button type="button" class="seg-opt contract-tab" data-contract-id="vault">SiphonFeeVault.sol</button>
+              </div>
+              <button type="button" class="btn-outline-sm" id="copyContractBtn">Copy Solidity Source</button>
+            </div>
           </div>
 
           <div class="card code-card">
             <div class="code-meta-bar mono">
-              <span>contracts/SiphonRouter.sol</span>
-              <span id="contractStats">Solidity 0.8.24 · Domain 5 → Solana</span>
+              <span id="contractFileLabel">contracts/SiphonRouter.sol</span>
+              <span id="contractStats">Solidity 0.8.24 · 5–10% Fee · Domain 5 → Solana</span>
             </div>
             <pre class="code-viewer mono" id="contractCodeHost">Loading…</pre>
           </div>

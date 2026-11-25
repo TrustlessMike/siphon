@@ -1,5 +1,11 @@
 import { encodeCctpDepositForBurn, solanaAddressToBytes32 } from '../bridge/cctp.js';
-import { DEAD_BURN_ADDRESS, EVM_CHAINS, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
+import {
+  DEAD_BURN_ADDRESS,
+  EVM_CHAINS,
+  getProtocolFeeConfig,
+  type ProtocolFeeConfig,
+  SOLANA_CCTP_DOMAIN,
+} from '../scanner/chains.js';
 import {
   checkAaveV3AccountSafety,
   checkErc20Allowance,
@@ -89,6 +95,16 @@ export interface ExecutableEvmTx {
   gas?: string;
 }
 
+export interface FeeBreakdown {
+  feeBps: number;
+  feePercent: number;
+  feeRecipientEvm: string | null;
+  feeDestinationType: 'contract' | 'wallet';
+  treasuryConfigured: boolean;
+  collectionMethod: 'relay_app_fee' | 'onchain_split' | 'none';
+  estimatedFeeUsd: number;
+}
+
 export interface PreparedExecution {
   assetId: string;
   action: ScannedAsset['action'];
@@ -101,6 +117,7 @@ export interface PreparedExecution {
   estimatedSeconds: number;
   estimatedGasUsd?: number;
   estimatedFeeUsd?: number;
+  feeBreakdown?: FeeBreakdown;
   requestId?: string;
   transactions: ExecutableEvmTx[];
   notes: string[];
@@ -152,8 +169,64 @@ export interface PreparedChainBatch {
     permit2ReadyCount: number;
     eip2612Count: number;
   };
+  feeBreakdown: FeeBreakdown;
   estimatedSeconds: number;
   notes: string[];
+}
+
+function splitRawAmountForFee(
+  rawAmount: bigint,
+  feeConfig: ProtocolFeeConfig
+): { feeRaw: bigint; netRaw: bigint } {
+  if (!feeConfig.feeRecipientEvm || feeConfig.feeBps <= 0 || rawAmount <= 0n) {
+    return { feeRaw: 0n, netRaw: rawAmount };
+  }
+  const feeRaw = (rawAmount * BigInt(feeConfig.feeBps)) / 10_000n;
+  const netRaw = rawAmount - feeRaw;
+  return { feeRaw, netRaw };
+}
+
+function buildProtocolFeeTransferTx(params: {
+  asset: ScannedAsset;
+  userAddress: string;
+  feeRaw: bigint;
+  feeConfig: ProtocolFeeConfig;
+}): ExecutableEvmTx | null {
+  const { asset, userAddress, feeRaw, feeConfig } = params;
+  if (!feeConfig.feeRecipientEvm || feeRaw <= 0n) return null;
+  const cfg = EVM_CHAINS[asset.chain];
+  const recipient = feeConfig.feeRecipientEvm;
+  const destLabel = feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'SiphonFeeVault';
+
+  if (asset.address === 'native') {
+    return {
+      stepId: 'protocol_fee_transfer',
+      label: `Protocol Fee (${feeConfig.feePercent}% ${asset.symbol} → ${destLabel})`,
+      description: `Routes ${feeConfig.feePercent}% (${feeConfig.feeBps} bps) native ${asset.symbol} fee to ${recipient}`,
+      chain: asset.chain,
+      chainId: cfg.chainId,
+      chainName: cfg.name,
+      explorerUrl: cfg.explorerUrl,
+      from: userAddress,
+      to: recipient,
+      data: '0x',
+      value: toHexWei(feeRaw),
+    };
+  }
+
+  return {
+    stepId: 'protocol_fee_transfer',
+    label: `Protocol Fee (${feeConfig.feePercent}% ${asset.symbol} → ${destLabel})`,
+    description: `Transfers ${feeConfig.feePercent}% (${feeConfig.feeBps} bps) ${asset.symbol} fee to ${recipient}`,
+    chain: asset.chain,
+    chainId: cfg.chainId,
+    chainName: cfg.name,
+    explorerUrl: cfg.explorerUrl,
+    from: userAddress,
+    to: asset.address,
+    data: encodeErc20Transfer(recipient, feeRaw),
+    value: '0x0',
+  };
 }
 
 function toHexWei(val: string | number | bigint | undefined): string {
@@ -305,7 +378,7 @@ async function buildDefiWithdrawExecution(
   }
 
   // Lido stETH / wstETH are liquid ERC-20s that can swap & bridge directly to Solana via Relay/LI.FI!
-  return buildBridgeExecution(asset, userAddress, userAddress, 'USDC', 'auto');
+  return buildBridgeExecution(asset, userAddress, userAddress, 'USDC', 'auto', getProtocolFeeConfig());
 }
 
 /**
@@ -316,110 +389,168 @@ async function tryRelayBridgeQuote(params: {
   userAddress: string;
   solanaDestination: string;
   outputAsset: 'USDC' | 'SOL';
+  feeConfig: ProtocolFeeConfig;
   quoteState?: QuoteState;
 }): Promise<PreparedExecution | null> {
-  const { asset, userAddress, solanaDestination, outputAsset, quoteState } = params;
+  const { asset, userAddress, solanaDestination, outputAsset, feeConfig, quoteState } = params;
   const cfg = EVM_CHAINS[asset.chain];
   const originCurrency = asset.address === 'native' ? ZERO_ADDRESS : asset.address;
   const destinationCurrency = outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
+  const rawTotal = BigInt(asset.rawBalance);
+  const { feeRaw, netRaw } = splitRawAmountForFee(rawTotal, feeConfig);
+  const estFeeUsd = Number(((asset.grossUsd * feeConfig.feeBps) / 10_000).toFixed(2));
 
-  try {
-    const res = await fetchQuote('https://api.relay.link/quote', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+  // Prefer Relay's native appFees (single solver fill, zero extra tx).
+  // If Relay rejects appFees for a given route/bps, fall back cleanly to an explicit
+  // onchain fee transfer + Relay quote on the exact net amount inside the same EIP-5792 batch.
+  const attempts: Array<{ useAppFee: boolean; amount: bigint }> = feeConfig.feeRecipientEvm
+    ? [
+        { useAppFee: true, amount: rawTotal },
+        { useAppFee: false, amount: netRaw },
+      ]
+    : [{ useAppFee: false, amount: rawTotal }];
+
+  for (const attempt of attempts) {
+    if (attempt.amount <= 0n) continue;
+    try {
+      const bodyPayload: Record<string, unknown> = {
         user: userAddress,
         originChainId: cfg.chainId,
         destinationChainId: RELAY_SOLANA_CHAIN_ID,
         originCurrency,
         destinationCurrency,
         recipient: solanaDestination,
-        amount: asset.rawBalance,
+        amount: attempt.amount.toString(),
         tradeType: 'EXACT_INPUT',
-      }),
-    }, 7000, quoteState);
-    if (!res || !res.ok) return null;
-
-    const json = (await res.json()) as {
-      requestId?: string;
-      details?: {
-        timeEstimate?: number;
-        currencyOut?: { amountFormatted?: string; currency?: { symbol?: string } };
       };
-      fees?: {
-        gas?: { amountUsd?: string };
-        relayer?: { amountUsd?: string };
-      };
-      steps?: Array<{
-        id: string;
-        action?: string;
-        description?: string;
-        kind: string;
-        requestId?: string;
-        items?: Array<{
-          status?: string;
-          data?: {
-            from?: string;
-            to?: string;
-            data?: string;
-            value?: string;
-            gas?: string;
-            chainId?: number;
-          };
-        }>;
-      }>;
-    };
-
-    const txs: ExecutableEvmTx[] = [];
-    let reqId = json.requestId;
-    for (const step of json.steps ?? []) {
-      if (step.requestId) reqId = step.requestId;
-      if (step.kind !== 'transaction') continue;
-      for (const item of step.items ?? []) {
-        if (!item.data?.to || !item.data?.data) continue;
-        txs.push({
-          stepId: step.id,
-          label: step.action || `Execute ${step.id}`,
-          description: step.description || `${step.id} ${asset.symbol} on ${cfg.name}`,
-          chain: asset.chain,
-          chainId: item.data.chainId ?? cfg.chainId,
-          chainName: cfg.name,
-          explorerUrl: cfg.explorerUrl,
-          from: item.data.from ?? userAddress,
-          to: item.data.to,
-          data: item.data.data,
-          value: toHexWei(item.data.value),
-          gas: item.data.gas ? toHexWei(item.data.gas) : undefined,
-        });
+      if (attempt.useAppFee && feeConfig.feeRecipientEvm) {
+        bodyPayload.appFees = [
+          {
+            recipient: feeConfig.feeRecipientEvm,
+            fee: String(feeConfig.feeBps),
+          },
+        ];
       }
+
+      const res = await fetchQuote(
+        'https://api.relay.link/quote',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(bodyPayload),
+        },
+        7000,
+        quoteState
+      );
+      if (!res || !res.ok) continue;
+
+      const json = (await res.json()) as {
+        requestId?: string;
+        details?: {
+          timeEstimate?: number;
+          currencyOut?: { amountFormatted?: string; currency?: { symbol?: string } };
+        };
+        fees?: {
+          gas?: { amountUsd?: string };
+          relayer?: { amountUsd?: string };
+          app?: { amountUsd?: string };
+        };
+        steps?: Array<{
+          id: string;
+          action?: string;
+          description?: string;
+          kind: string;
+          requestId?: string;
+          items?: Array<{
+            status?: string;
+            data?: {
+              from?: string;
+              to?: string;
+              data?: string;
+              value?: string;
+              gas?: string;
+              chainId?: number;
+            };
+          }>;
+        }>;
+      };
+
+      const txs: ExecutableEvmTx[] = [];
+      let collectionMethod: FeeBreakdown['collectionMethod'] = 'none';
+      if (attempt.useAppFee && feeConfig.feeRecipientEvm) {
+        collectionMethod = 'relay_app_fee';
+      } else if (!attempt.useAppFee && feeConfig.feeRecipientEvm && feeRaw > 0n) {
+        const feeTx = buildProtocolFeeTransferTx({ asset, userAddress, feeRaw, feeConfig });
+        if (feeTx) {
+          txs.push(feeTx);
+          collectionMethod = 'onchain_split';
+        }
+      }
+
+      let reqId = json.requestId;
+      for (const step of json.steps ?? []) {
+        if (step.requestId) reqId = step.requestId;
+        if (step.kind !== 'transaction') continue;
+        for (const item of step.items ?? []) {
+          if (!item.data?.to || !item.data?.data) continue;
+          txs.push({
+            stepId: step.id,
+            label: step.action || `Execute ${step.id}`,
+            description: step.description || `${step.id} ${asset.symbol} on ${cfg.name}`,
+            chain: asset.chain,
+            chainId: item.data.chainId ?? cfg.chainId,
+            chainName: cfg.name,
+            explorerUrl: cfg.explorerUrl,
+            from: item.data.from ?? userAddress,
+            to: item.data.to,
+            data: item.data.data,
+            value: toHexWei(item.data.value),
+            gas: item.data.gas ? toHexWei(item.data.gas) : undefined,
+          });
+        }
+      }
+
+      if (!txs.length) continue;
+
+      const outFormatted = json.details?.currencyOut?.amountFormatted ?? '0';
+      const outSym = json.details?.currencyOut?.currency?.symbol ?? outputAsset;
+      const appFeeUsd = Number(json.fees?.app?.amountUsd ?? estFeeUsd);
+
+      return {
+        assetId: asset.id,
+        action: asset.action,
+        provider: 'relay',
+        chain: asset.chain,
+        chainId: cfg.chainId,
+        chainName: cfg.name,
+        explorerUrl: cfg.explorerUrl,
+        estimatedOutput: `${Number(outFormatted).toLocaleString(undefined, { maximumFractionDigits: 4 })} ${outSym}`,
+        estimatedSeconds: Math.max(2, Number(json.details?.timeEstimate ?? 10)),
+        estimatedGasUsd: Number(json.fees?.gas?.amountUsd ?? 0),
+        estimatedFeeUsd: Number(json.fees?.relayer?.amountUsd ?? 0) + (feeConfig.feeRecipientEvm ? appFeeUsd : 0),
+        feeBreakdown: {
+          feeBps: feeConfig.feeBps,
+          feePercent: feeConfig.feePercent,
+          feeRecipientEvm: feeConfig.feeRecipientEvm,
+          feeDestinationType: feeConfig.feeDestinationType,
+          treasuryConfigured: feeConfig.treasuryConfigured,
+          collectionMethod,
+          estimatedFeeUsd: feeConfig.feeRecipientEvm ? appFeeUsd : estFeeUsd,
+        },
+        requestId: reqId,
+        transactions: txs,
+        notes: [
+          `Live Relay cross-chain route: swaps & fills directly into ${solanaDestination.slice(0, 6)}…${solanaDestination.slice(-4)} on Solana with zero manual claim.`,
+          feeConfig.feeRecipientEvm
+            ? `Protocol fee ${feeConfig.feePercent}% routed via ${collectionMethod === 'relay_app_fee' ? 'Relay native appFee' : 'onchain EIP-5792 split'} to ${feeConfig.feeRecipientEvm}.`
+            : `Protocol fee ${feeConfig.feePercent}% modeled (set SIPHON_FEE_RECIPIENT_EVM or enter a treasury address to route onchain).`,
+        ],
+      };
+    } catch {
+      continue;
     }
-
-    if (!txs.length) return null;
-
-    const outFormatted = json.details?.currencyOut?.amountFormatted ?? '0';
-    const outSym = json.details?.currencyOut?.currency?.symbol ?? outputAsset;
-
-    return {
-      assetId: asset.id,
-      action: asset.action,
-      provider: 'relay',
-      chain: asset.chain,
-      chainId: cfg.chainId,
-      chainName: cfg.name,
-      explorerUrl: cfg.explorerUrl,
-      estimatedOutput: `${Number(outFormatted).toLocaleString(undefined, { maximumFractionDigits: 4 })} ${outSym}`,
-      estimatedSeconds: Math.max(2, Number(json.details?.timeEstimate ?? 10)),
-      estimatedGasUsd: Number(json.fees?.gas?.amountUsd ?? 0),
-      estimatedFeeUsd: Number(json.fees?.relayer?.amountUsd ?? 0),
-      requestId: reqId,
-      transactions: txs,
-      notes: [
-        `Live Relay cross-chain route: swaps & fills directly into ${solanaDestination.slice(0, 6)}…${solanaDestination.slice(-4)} on Solana with zero manual claim.`,
-      ],
-    };
-  } catch {
-    return null;
   }
+  return null;
 }
 
 /**
@@ -430,12 +561,18 @@ async function tryLifiBridgeQuote(params: {
   userAddress: string;
   solanaDestination: string;
   outputAsset: 'USDC' | 'SOL';
+  feeConfig: ProtocolFeeConfig;
   quoteState?: QuoteState;
 }): Promise<PreparedExecution | null> {
-  const { asset, userAddress, solanaDestination, outputAsset, quoteState } = params;
+  const { asset, userAddress, solanaDestination, outputAsset, feeConfig, quoteState } = params;
   const cfg = EVM_CHAINS[asset.chain];
   const fromToken = asset.address === 'native' ? ZERO_ADDRESS : asset.address;
   const toToken = outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
+  const rawTotal = BigInt(asset.rawBalance);
+  const { feeRaw, netRaw } = splitRawAmountForFee(rawTotal, feeConfig);
+  const bridgeRaw = feeConfig.feeRecipientEvm ? netRaw : rawTotal;
+  if (bridgeRaw <= 0n) return null;
+  const estFeeUsd = Number(((asset.grossUsd * feeConfig.feeBps) / 10_000).toFixed(2));
 
   try {
     const url = new URL('https://li.quest/v1/quote');
@@ -443,9 +580,10 @@ async function tryLifiBridgeQuote(params: {
     url.searchParams.set('toChain', String(LIFI_SOLANA_CHAIN_ID));
     url.searchParams.set('fromToken', fromToken);
     url.searchParams.set('toToken', toToken);
-    url.searchParams.set('fromAmount', asset.rawBalance);
+    url.searchParams.set('fromAmount', bridgeRaw.toString());
     url.searchParams.set('fromAddress', userAddress);
     url.searchParams.set('toAddress', solanaDestination);
+    url.searchParams.set('integrator', 'siphon');
 
     const res = await fetchQuote(
       url.toString(),
@@ -479,16 +617,24 @@ async function tryLifiBridgeQuote(params: {
     if (!txReq?.to || !txReq?.data) return null;
 
     const txs: ExecutableEvmTx[] = [];
+    let collectionMethod: FeeBreakdown['collectionMethod'] = 'none';
+    if (feeConfig.feeRecipientEvm && feeRaw > 0n) {
+      const feeTx = buildProtocolFeeTransferTx({ asset, userAddress, feeRaw, feeConfig });
+      if (feeTx) {
+        txs.push(feeTx);
+        collectionMethod = 'onchain_split';
+      }
+    }
+
     const approvalAddr = json.estimate?.approvalAddress;
     if (asset.address !== 'native' && approvalAddr) {
-      const rawAmount = BigInt(asset.rawBalance);
       const allowance = await checkErc20Allowance({
         chain: asset.chain,
         tokenAddress: asset.address,
         owner: userAddress,
         spender: approvalAddr,
       });
-      if (allowance < rawAmount) {
+      if (allowance < bridgeRaw) {
         txs.push({
           stepId: 'approve',
           label: `Approve ${asset.symbol} for ${json.toolDetails?.name ?? 'LI.FI'}`,
@@ -499,7 +645,7 @@ async function tryLifiBridgeQuote(params: {
           explorerUrl: cfg.explorerUrl,
           from: userAddress,
           to: asset.address,
-          data: encodeErc20Approve(approvalAddr, rawAmount),
+          data: encodeErc20Approve(approvalAddr, bridgeRaw),
           value: '0x0',
         });
       }
@@ -534,9 +680,24 @@ async function tryLifiBridgeQuote(params: {
       explorerUrl: cfg.explorerUrl,
       estimatedOutput: `${outUi.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${outputAsset}`,
       estimatedSeconds: Math.max(5, Number(json.estimate?.executionDuration ?? 30)),
+      estimatedFeeUsd: estFeeUsd,
+      feeBreakdown: {
+        feeBps: feeConfig.feeBps,
+        feePercent: feeConfig.feePercent,
+        feeRecipientEvm: feeConfig.feeRecipientEvm,
+        feeDestinationType: feeConfig.feeDestinationType,
+        treasuryConfigured: feeConfig.treasuryConfigured,
+        collectionMethod,
+        estimatedFeeUsd: estFeeUsd,
+      },
       requestId: json.id,
       transactions: txs,
-      notes: [`Live LI.FI quote via ${json.toolDetails?.name ?? 'multi-bridge router'}.`],
+      notes: [
+        `Live LI.FI quote via ${json.toolDetails?.name ?? 'multi-bridge router'}.`,
+        feeConfig.feeRecipientEvm
+          ? `Protocol fee ${feeConfig.feePercent}% routed atomically onchain to ${feeConfig.feeRecipientEvm}.`
+          : `Protocol fee ${feeConfig.feePercent}% modeled (set treasury address to collect onchain).`,
+      ],
     };
   } catch {
     return null;
@@ -550,12 +711,25 @@ async function buildDirectCctpUsdcExecution(params: {
   asset: ScannedAsset;
   userAddress: string;
   solanaDestination: string;
+  feeConfig: ProtocolFeeConfig;
 }): Promise<PreparedExecution> {
-  const { asset, userAddress, solanaDestination } = params;
+  const { asset, userAddress, solanaDestination, feeConfig } = params;
   const cfg = EVM_CHAINS[asset.chain];
-  const rawAmount = BigInt(asset.rawBalance);
+  const rawTotal = BigInt(asset.rawBalance);
+  const { feeRaw, netRaw } = splitRawAmountForFee(rawTotal, feeConfig);
+  const bridgeRaw = feeConfig.feeRecipientEvm ? netRaw : rawTotal;
   const mintRecipientBytes32 = solanaAddressToBytes32(solanaDestination);
   const txs: ExecutableEvmTx[] = [];
+  const estFeeUsd = Number(((asset.grossUsd * feeConfig.feeBps) / 10_000).toFixed(2));
+  let collectionMethod: FeeBreakdown['collectionMethod'] = 'none';
+
+  if (feeConfig.feeRecipientEvm && feeRaw > 0n) {
+    const feeTx = buildProtocolFeeTransferTx({ asset, userAddress, feeRaw, feeConfig });
+    if (feeTx) {
+      txs.push(feeTx);
+      collectionMethod = 'onchain_split';
+    }
+  }
 
   const allowance = await checkErc20Allowance({
     chain: asset.chain,
@@ -564,24 +738,25 @@ async function buildDirectCctpUsdcExecution(params: {
     spender: cfg.cctpTokenMessenger,
   });
 
-  if (allowance < rawAmount) {
+  const netUiUsdc = Number(bridgeRaw) / 1_000_000;
+  if (allowance < bridgeRaw) {
     txs.push({
       stepId: 'approve_cctp',
       label: `Approve USDC for Circle CCTP`,
-      description: `Grants Circle TokenMessenger (${cfg.cctpTokenMessenger}) exact spend for ${asset.uiBalance} USDC`,
+      description: `Grants Circle TokenMessenger (${cfg.cctpTokenMessenger}) exact spend for ${netUiUsdc.toFixed(2)} USDC`,
       chain: asset.chain,
       chainId: cfg.chainId,
       chainName: cfg.name,
       explorerUrl: cfg.explorerUrl,
       from: userAddress,
       to: cfg.usdcAddress,
-      data: encodeErc20Approve(cfg.cctpTokenMessenger, rawAmount),
+      data: encodeErc20Approve(cfg.cctpTokenMessenger, bridgeRaw),
       value: '0x0',
     });
   }
 
   const calldata = encodeCctpDepositForBurn({
-    rawUsdcAmount: rawAmount,
+    rawUsdcAmount: bridgeRaw,
     destinationDomain: SOLANA_CCTP_DOMAIN,
     solanaMintRecipientBytes32: mintRecipientBytes32,
     usdcAddress: cfg.usdcAddress,
@@ -589,7 +764,7 @@ async function buildDirectCctpUsdcExecution(params: {
 
   txs.push({
     stepId: 'cctp_deposit_for_burn',
-    label: `Circle CCTP depositForBurn (${asset.uiBalance.toFixed(2)} USDC → Solana)`,
+    label: `Circle CCTP depositForBurn (${netUiUsdc.toFixed(2)} USDC → Solana)`,
     description: `Native 1:1 burn on ${cfg.name} (Domain ${cfg.cctpDomain} → Domain 5 Solana)`,
     chain: asset.chain,
     chainId: cfg.chainId,
@@ -609,11 +784,24 @@ async function buildDirectCctpUsdcExecution(params: {
     chainId: cfg.chainId,
     chainName: cfg.name,
     explorerUrl: cfg.explorerUrl,
-    estimatedOutput: `${asset.uiBalance.toFixed(2)} USDC (1:1 Native CCTP)`,
+    estimatedOutput: `${netUiUsdc.toFixed(2)} USDC (1:1 Native CCTP)`,
     estimatedSeconds: cfg.cctpAttestationSec,
+    estimatedFeeUsd: estFeeUsd,
+    feeBreakdown: {
+      feeBps: feeConfig.feeBps,
+      feePercent: feeConfig.feePercent,
+      feeRecipientEvm: feeConfig.feeRecipientEvm,
+      feeDestinationType: feeConfig.feeDestinationType,
+      treasuryConfigured: feeConfig.treasuryConfigured,
+      collectionMethod,
+      estimatedFeeUsd: estFeeUsd,
+    },
     transactions: txs,
     notes: [
       `Direct Circle CCTP burn-and-mint targeting Solana bytes32 ${mintRecipientBytes32}.`,
+      feeConfig.feeRecipientEvm
+        ? `Protocol fee ${feeConfig.feePercent}% (${(Number(feeRaw) / 1_000_000).toFixed(2)} USDC) transferred atomically to ${feeConfig.feeRecipientEvm}.`
+        : `Protocol fee ${feeConfig.feePercent}% modeled (configure treasury address to split onchain).`,
     ],
   };
 }
@@ -623,7 +811,8 @@ async function buildBridgeExecution(
   userAddress: string,
   solanaDestination: string,
   outputAsset: 'USDC' | 'SOL',
-  bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp'
+  bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp',
+  feeConfig: ProtocolFeeConfig
 ): Promise<PreparedExecution> {
   const cfg = EVM_CHAINS[asset.chain];
   const isNativeUsdc =
@@ -631,19 +820,33 @@ async function buildBridgeExecution(
   const quoteState: QuoteState = { throttled: false };
 
   if (bridgePreference === 'cctp' && isNativeUsdc) {
-    return buildDirectCctpUsdcExecution({ asset, userAddress, solanaDestination });
+    return buildDirectCctpUsdcExecution({ asset, userAddress, solanaDestination, feeConfig });
   }
 
   if (bridgePreference !== 'lifi') {
-    const relay = await tryRelayBridgeQuote({ asset, userAddress, solanaDestination, outputAsset, quoteState });
+    const relay = await tryRelayBridgeQuote({
+      asset,
+      userAddress,
+      solanaDestination,
+      outputAsset,
+      feeConfig,
+      quoteState,
+    });
     if (relay) return relay;
   }
 
-  const lifi = await tryLifiBridgeQuote({ asset, userAddress, solanaDestination, outputAsset, quoteState });
+  const lifi = await tryLifiBridgeQuote({
+    asset,
+    userAddress,
+    solanaDestination,
+    outputAsset,
+    feeConfig,
+    quoteState,
+  });
   if (lifi) return lifi;
 
   if (isNativeUsdc) {
-    return buildDirectCctpUsdcExecution({ asset, userAddress, solanaDestination });
+    return buildDirectCctpUsdcExecution({ asset, userAddress, solanaDestination, feeConfig });
   }
 
   if (quoteState.throttled) {
@@ -669,6 +872,8 @@ export async function prepareRealExecution(params: {
   solanaDestination: string;
   outputAsset?: 'USDC' | 'SOL';
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+  protocolFeeBps?: number;
+  feeRecipientEvm?: string | null;
 }): Promise<PreparedExecution> {
   const {
     asset,
@@ -676,7 +881,10 @@ export async function prepareRealExecution(params: {
     solanaDestination,
     outputAsset = 'USDC',
     bridgePreference = 'auto',
+    protocolFeeBps,
+    feeRecipientEvm,
   } = params;
+  const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
 
   const cfg = EVM_CHAINS[asset.chain];
   if (!cfg) throw new Error(`Unsupported chain: ${asset.chain}`);
@@ -736,7 +944,14 @@ export async function prepareRealExecution(params: {
     return buildDefiWithdrawExecution(asset, userAddress);
   }
 
-  return buildBridgeExecution(asset, userAddress, solanaDestination, outputAsset, bridgePreference);
+  return buildBridgeExecution(
+    asset,
+    userAddress,
+    solanaDestination,
+    outputAsset,
+    bridgePreference,
+    feeConfig
+  );
 }
 
 function decodeApproveCalldata(data: string): { spender: string; amount: bigint } | null {
@@ -768,6 +983,8 @@ export async function prepareChainBatchExecution(params: {
   outputAsset?: 'USDC' | 'SOL';
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
   bundleDefiCctp?: boolean;
+  protocolFeeBps?: number;
+  feeRecipientEvm?: string | null;
 }): Promise<PreparedChainBatch> {
   const {
     chain,
@@ -777,7 +994,10 @@ export async function prepareChainBatchExecution(params: {
     outputAsset = 'USDC',
     bridgePreference = 'auto',
     bundleDefiCctp = true,
+    protocolFeeBps,
+    feeRecipientEvm,
   } = params;
+  const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
 
   const cfg = EVM_CHAINS[chain];
   if (!cfg) throw new Error(`Unsupported chain: ${chain}`);
@@ -820,6 +1040,8 @@ export async function prepareChainBatchExecution(params: {
       solanaDestination,
       outputAsset,
       bridgePreference,
+      protocolFeeBps: feeConfig.feeBps,
+      feeRecipientEvm: feeConfig.feeRecipientEvm,
     })
   );
 
@@ -866,17 +1088,35 @@ export async function prepareChainBatchExecution(params: {
       asset.underlyingSymbol === 'USDC';
 
     if (isDefiUsdcWithdraw) {
-      const rawAmount = BigInt(asset.rawBalance);
+      const rawTotal = BigInt(asset.rawBalance);
+      const { feeRaw, netRaw } = splitRawAmountForFee(rawTotal, feeConfig);
+      const bridgeRaw = feeConfig.feeRecipientEvm ? netRaw : rawTotal;
+      const netUi = Number(bridgeRaw) / 1_000_000;
+
+      if (feeConfig.feeRecipientEvm && feeRaw > 0n) {
+        rawCalls.push({
+          stepId: 'protocol_fee_transfer_after_defi',
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          action: asset.action,
+          provider: 'circle_cctp',
+          label: `Protocol Fee (${feeConfig.feePercent}% USDC → ${feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'SiphonFeeVault'})`,
+          description: `Routes ${(Number(feeRaw) / 1_000_000).toFixed(2)} USDC (${feeConfig.feeBps} bps) to ${feeConfig.feeRecipientEvm}`,
+          to: cfg.usdcAddress,
+          data: encodeErc20Transfer(feeConfig.feeRecipientEvm, feeRaw),
+          value: '0x0',
+        });
+      }
       rawCalls.push({
         stepId: 'approve_cctp_after_defi',
         assetId: asset.id,
         assetSymbol: asset.symbol,
         action: asset.action,
         provider: 'circle_cctp',
-        label: `Approve withdrawn ${asset.uiBalance.toFixed(2)} USDC for Circle CCTP`,
+        label: `Approve withdrawn ${netUi.toFixed(2)} USDC for Circle CCTP`,
         description: `Batched immediately after ${asset.protocol} withdrawal in the same atomic call bundle`,
         to: cfg.usdcAddress,
-        data: encodeErc20Approve(cfg.cctpTokenMessenger, rawAmount),
+        data: encodeErc20Approve(cfg.cctpTokenMessenger, bridgeRaw),
         value: '0x0',
       });
       rawCalls.push({
@@ -885,11 +1125,11 @@ export async function prepareChainBatchExecution(params: {
         assetSymbol: asset.symbol,
         action: asset.action,
         provider: 'circle_cctp',
-        label: `Bridge withdrawn ${asset.uiBalance.toFixed(2)} USDC → Solana (Circle CCTP)`,
+        label: `Bridge withdrawn ${netUi.toFixed(2)} USDC → Solana (Circle CCTP)`,
         description: `Native 1:1 Circle CCTP burn (Domain ${cfg.cctpDomain} → Domain 5 Solana) in the same click`,
         to: cfg.cctpTokenMessenger,
         data: encodeCctpDepositForBurn({
-          rawUsdcAmount: rawAmount,
+          rawUsdcAmount: bridgeRaw,
           destinationDomain: SOLANA_CCTP_DOMAIN,
           solanaMintRecipientBytes32: mintRecipientBytes32,
           usdcAddress: cfg.usdcAddress,
@@ -901,12 +1141,12 @@ export async function prepareChainBatchExecution(params: {
         assetId: asset.id,
         assetSymbol: asset.symbol,
         provider: 'circle_cctp',
-        estimatedOutput: `${asset.uiBalance.toFixed(2)} USDC (Atomic DeFi Exit + CCTP)`,
+        estimatedOutput: `${netUi.toFixed(2)} USDC (Atomic DeFi Exit + CCTP)`,
         estimatedSeconds: cfg.cctpAttestationSec,
         requiresSolanaClaim: true,
       });
       notes.push(
-        `Bundled ${asset.protocol} ${asset.symbol} withdrawal + Circle CCTP bridge atomically in 1 click (poll /api/cctp/attestation for Solana receiveMessage claim).`
+        `Bundled ${asset.protocol} ${asset.symbol} withdrawal + ${feeConfig.feePercent}% protocol fee + Circle CCTP bridge atomically in 1 click (poll /api/cctp/attestation for Solana receiveMessage claim).`
       );
     } else if (prep.provider === 'relay' || prep.provider === 'lifi' || prep.provider === 'circle_cctp') {
       bridgeTrackers.push({
@@ -991,6 +1231,20 @@ export async function prepareChainBatchExecution(params: {
     );
   }
 
+  const batchGrossUsd = executableAssets
+    .filter((a) => a.action !== 'BURN_ZERO_LIQUIDITY')
+    .reduce((sum, a) => sum + a.grossUsd, 0);
+  const estimatedBatchFeeUsd = Number(((batchGrossUsd * feeConfig.feeBps) / 10_000).toFixed(2));
+  const hasOnchainFeeCall = finalCalls.some((c) => c.stepId.startsWith('protocol_fee_transfer'));
+  const hasRelayAppFee = results.some(
+    (r) => r.status === 'fulfilled' && r.value.feeBreakdown?.collectionMethod === 'relay_app_fee'
+  );
+  const batchCollectionMethod: FeeBreakdown['collectionMethod'] = hasOnchainFeeCall
+    ? 'onchain_split'
+    : hasRelayAppFee
+    ? 'relay_app_fee'
+    : 'none';
+
   return {
     chain,
     chainId: cfg.chainId,
@@ -1010,6 +1264,15 @@ export async function prepareChainBatchExecution(params: {
       dedupedApprovals,
       permit2ReadyCount,
       eip2612Count,
+    },
+    feeBreakdown: {
+      feeBps: feeConfig.feeBps,
+      feePercent: feeConfig.feePercent,
+      feeRecipientEvm: feeConfig.feeRecipientEvm,
+      feeDestinationType: feeConfig.feeDestinationType,
+      treasuryConfigured: feeConfig.treasuryConfigured,
+      collectionMethod: batchCollectionMethod,
+      estimatedFeeUsd: estimatedBatchFeeUsd,
     },
     estimatedSeconds: maxSeconds,
     notes,

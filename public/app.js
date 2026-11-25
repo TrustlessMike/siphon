@@ -11,15 +11,18 @@ import {
   getConnectedSolanaAddress,
   getConnectedSolanaWalletName,
   getConnectedWalletName,
+  getEffectiveWalletConnectProjectId,
   getWalletBatchCapabilities,
   getWalletConnectorConfig,
   isChainBatchSupported,
   listAvailableEvmWallets,
   listAvailableSolanaWallets,
   loadWalletConnectorConfig,
+  preloadWalletSdks,
   refreshInstalledWallets,
   sendEip5792Batch,
   sendRealEvmTransaction,
+  setSavedWalletConnectProjectId,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
 } from './wallets.js';
@@ -31,8 +34,73 @@ let activeFilter = 'all';
 let outputAsset = 'USDC';
 let heroScene = null;
 let contractData = null;
+let activeContractId = 'router';
 let solanaBalances = null;
 const liveExecutionLog = [];
+
+const FEE_RECIPIENT_STORAGE_KEY = 'siphon_fee_recipient_evm';
+
+function getWalletLogoPath(name, rdns = '') {
+  const s = `${name || ''} ${rdns || ''}`.toLowerCase();
+  if (s.includes('metamask')) return '/logos/metamask.svg';
+  if (s.includes('rabby')) return '/logos/rabby.svg';
+  if (s.includes('phantom')) return '/logos/phantom.svg';
+  if (s.includes('coinbase')) return '/logos/coinbase.svg';
+  if (s.includes('walletconnect')) return '/logos/walletconnect.svg';
+  if (s.includes('okx') || s.includes('okex')) return '/logos/okx.svg';
+  if (s.includes('backpack')) return '/logos/backpack.svg';
+  if (s.includes('solflare')) return '/logos/solflare.svg';
+  if (s.includes('trust')) return '/logos/trust.svg';
+  if (s.includes('brave')) return '/logos/brave.svg';
+  if (s.includes('rainbow')) return '/logos/rainbow.svg';
+  if (s.includes('ledger')) return '/logos/ledger.svg';
+  return '/logos/ethereum.svg';
+}
+
+function getChainLogoPath(chain) {
+  const c = String(chain || '').toLowerCase();
+  if (['ethereum', 'base', 'arbitrum', 'optimism', 'polygon', 'avalanche', 'solana'].includes(c)) {
+    return `/logos/${c}.svg`;
+  }
+  return '/logos/ethereum.svg';
+}
+
+function getProtocolLogoPath(protocol) {
+  const p = String(protocol || '').toLowerCase();
+  if (p.includes('aave')) return '/logos/aave.svg';
+  if (p.includes('lido')) return '/logos/lido.svg';
+  if (p.includes('compound')) return '/logos/compound.svg';
+  return null;
+}
+
+function getBridgeProviderLogosHtml(pref) {
+  if (pref === 'cctp') {
+    return `<img src="/logos/circle.svg" alt="" class="chain-logo-xs" />`;
+  }
+  if (pref === 'lifi') {
+    return `<img src="/logos/lifi.svg" alt="" class="chain-logo-xs" />`;
+  }
+  if (pref === 'relay') {
+    return `<img src="/logos/relay.svg" alt="" class="chain-logo-xs" />`;
+  }
+  return `<img src="/logos/relay.svg" alt="" class="chain-logo-xs" /><img src="/logos/lifi.svg" alt="" class="chain-logo-xs" />`;
+}
+
+function getActiveProtocolFeeBps() {
+  const sel = document.getElementById('protocolFeeSelect');
+  const raw = Number(sel?.value || 700);
+  if (!Number.isFinite(raw)) return 700;
+  return Math.min(1000, Math.max(500, Math.round(raw)));
+}
+
+function getActiveFeeRecipientEvm() {
+  const input = document.getElementById('feeRecipientInput');
+  const val = input?.value?.trim();
+  if (val && /^0x[0-9a-fA-F]{40}$/.test(val)) return val;
+  const serverCfg = getWalletConnectorConfig()?.protocolFee?.feeRecipientEvm;
+  if (serverCfg && /^0x[0-9a-fA-F]{40}$/.test(serverCfg)) return serverCfg;
+  return null;
+}
 
 function escapeHtml(str) {
   return String(str ?? '')
@@ -164,22 +232,30 @@ function updateWalletButtons() {
 
   if (evmBtn) {
     const shortName = walletName ? walletName.split(' ')[0] : 'EVM';
-    evmBtn.textContent = evmAddr ? `${shortName}: ${shortAddr(evmAddr)}` : 'Connect EVM';
+    const logo = evmAddr ? getWalletLogoPath(walletName) : '/logos/ethereum.svg';
+    evmBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(evmAddr ? `${shortName}: ${shortAddr(evmAddr)}` : 'Connect EVM')}</span>`;
     evmBtn.classList.toggle('connected', Boolean(evmAddr));
   }
   if (solBtn) {
-    const solName = getConnectedSolanaWalletName()?.split(' ')[0] || 'SOL';
-    solBtn.textContent = solAddr ? `${solName}: ${shortAddr(solAddr)}` : 'Connect Solana';
+    const solFull = getConnectedSolanaWalletName();
+    const solName = solFull?.split(' ')[0] || 'SOL';
+    const logo = solAddr ? getWalletLogoPath(solFull || 'Phantom') : '/logos/solana.svg';
+    solBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(solAddr ? `${solName}: ${shortAddr(solAddr)}` : 'Connect Solana')}</span>`;
     solBtn.classList.toggle('connected', Boolean(solAddr));
   }
   if (siteBtn) {
     const shortName = walletName ? walletName.split(' ')[0] : null;
-    siteBtn.textContent = evmAddr
-      ? `${shortName ? `${shortName} · ` : ''}${shortAddr(evmAddr)}`
-      : solAddr
-      ? `SOL · ${shortAddr(solAddr)}`
-      : 'Connect Wallet';
+    if (evmAddr) {
+      const logo = getWalletLogoPath(walletName);
+      siteBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(`${shortName ? `${shortName} · ` : ''}${shortAddr(evmAddr)}`)}</span>`;
+    } else if (solAddr) {
+      const logo = getWalletLogoPath(getConnectedSolanaWalletName() || 'Phantom');
+      siteBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(`SOL · ${shortAddr(solAddr)}`)}</span>`;
+    } else {
+      siteBtn.textContent = 'Connect Wallet';
+    }
     siteBtn.classList.toggle('connected', Boolean(evmAddr || solAddr));
+    siteBtn.classList.toggle('btn-with-logo', Boolean(evmAddr || solAddr));
   }
   if (heroBtn) {
     heroBtn.textContent = evmAddr
@@ -290,6 +366,8 @@ async function recomputePlan() {
   const usePermit2Batch = document.getElementById('permit2Toggle').checked;
   const includeBurns = document.getElementById('burnToggle').checked;
   const bridgePreference = getActiveBridgePreference();
+  const protocolFeeBps = getActiveProtocolFeeBps();
+  const feeRecipientEvm = getActiveFeeRecipientEvm();
 
   try {
     currentPlan = await api('/api/plan', {
@@ -302,6 +380,8 @@ async function recomputePlan() {
         includeBurns,
         outputAsset,
         bridgePreference,
+        protocolFeeBps,
+        feeRecipientEvm,
       }),
     });
     renderAll();
@@ -330,10 +410,11 @@ function renderAll() {
       : `$${t.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
   document.getElementById('kpiNetLabel').textContent =
     outputAsset === 'SOL' ? 'Net Solana SOL' : 'Net Solana USDC';
+  const feePct = currentPlan.protocolFeePercent ?? (getActiveProtocolFeeBps() / 100);
   document.getElementById('kpiNetSub').textContent =
     outputAsset === 'SOL'
-      ? `$${t.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })} eq · ${shortProvider}`
-      : `${t.netSolanaSol.toFixed(2)} SOL eq · ${shortProvider}`;
+      ? `$${t.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })} eq · ${shortProvider} · ${feePct}% fee`
+      : `${t.netSolanaSol.toFixed(2)} SOL eq · ${shortProvider} · ${feePct}% fee`;
 
   const selectedAssets = currentScan.assets.filter((a) => selectedAssetIds.has(a.id));
   const defiUsd = selectedAssets
@@ -377,8 +458,11 @@ function renderChainCards() {
       return `
         <div class="chain-mini-card ${sponsored ? 'sponsored' : ''}">
           <div class="chain-mini-top">
-            <span>${escapeHtml(c.chainName)}</span>
-            <span class="mono muted-xs">${c.rpcStatus === 'live' ? `blk ${c.blockNumber.toLocaleString()}` : `D${c.cctpDomain}`}</span>
+            <span class="inline-logo-row">
+              <img src="${escapeHtml(getChainLogoPath(c.chain))}" alt="" class="chain-logo-sm" />
+              <span>${escapeHtml(c.chainName)}</span>
+            </span>
+            <span class="mono muted-xs">${c.rpcStatus === 'live' ? `Live` : `D${c.cctpDomain}`}</span>
           </div>
           <div class="chain-mini-val mono">$${val.toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
           <div class="chain-mini-sub mono">
@@ -444,12 +528,13 @@ function renderAssetTable() {
             <input type="checkbox" class="asset-chk" data-asset-id="${escapeHtml(a.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''} />
           </td>
           <td>
-            <div class="asset-title">
-              ${escapeHtml(a.symbol)}${a.protocol ? ` <span class="muted-xs">· ${escapeHtml(a.protocol)}</span>` : ''}${a.aaveDebtUsd > 0 ? `<span class="micro-pill" style="background:var(--block-bg);border-color:#fecaca;color:#991b1b;" title="${escapeHtml(a.actionReason)}">Debt Guard</span>` : a.permit2Approved ? `<span class="micro-pill permit2" title="Already approved on Uniswap Permit2 (no approval tx needed)">Permit2</span>` : a.eip2612Supported ? `<span class="micro-pill eip2612" title="Supports EIP-2612 gasless signature permit">EIP-2612</span>` : ''}
+            <div class="asset-title inline-logo-row">
+              ${a.protocol && getProtocolLogoPath(a.protocol) ? `<img src="${escapeHtml(getProtocolLogoPath(a.protocol))}" alt="" class="chain-logo-xs" />` : ''}
+              <span>${escapeHtml(a.symbol)}</span>${a.protocol ? ` <span class="muted-xs">· ${escapeHtml(a.protocol)}</span>` : ''}${a.aaveDebtUsd > 0 ? `<span class="micro-pill" style="background:var(--block-bg);border-color:#fecaca;color:#991b1b;" title="${escapeHtml(a.actionReason)}">Debt Guard</span>` : a.permit2Approved ? `<span class="micro-pill permit2" title="Already approved on Uniswap Permit2 (no approval tx needed)">Permit2</span>` : a.eip2612Supported ? `<span class="micro-pill eip2612" title="Supports EIP-2612 gasless signature permit">EIP-2612</span>` : ''}
             </div>
             <div class="asset-sub">${escapeHtml(a.name)}</div>
           </td>
-          <td class="mono">${escapeHtml(a.chainName)}</td>
+          <td class="mono"><span class="inline-logo-row"><img src="${escapeHtml(getChainLogoPath(a.chain))}" alt="" class="chain-logo-xs" /><span>${escapeHtml(a.chainName)}</span></span></td>
           <td class="mono">${a.uiBalance.toLocaleString(undefined, { maximumFractionDigits: 4 })}</td>
           <td class="mono">$${a.grossUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
           <td class="mono muted-xs">$${gas.toFixed(2)}</td>
@@ -621,6 +706,8 @@ async function executeSingleAssetLive(asset) {
         solanaDestination: solDest,
         outputAsset,
         bridgePreference,
+        protocolFeeBps: getActiveProtocolFeeBps(),
+        feeRecipientEvm: getActiveFeeRecipientEvm(),
       }),
     });
 
@@ -721,6 +808,8 @@ async function executeChainBatchLive(chain) {
         solanaDestination: solDest,
         outputAsset,
         bridgePreference,
+        protocolFeeBps: getActiveProtocolFeeBps(),
+        feeRecipientEvm: getActiveFeeRecipientEvm(),
         // Only bundle direct Circle CCTP after DeFi USDC exits when Solana signer is connected or CCTP was explicitly chosen;
         // otherwise withdraw cleanly to wallet so auto-delivered Relay/LI.FI can bridge with zero manual Solana claim.
         bundleDefiCctp: hasSolanaSigner || bridgePreference === 'cctp',
@@ -902,7 +991,17 @@ function renderPipelineView() {
   const pref = currentPlan.bridgePreference || getActiveBridgePreference();
   const activeProvEl = document.getElementById('execActiveProvider');
   if (activeProvEl) {
-    activeProvEl.textContent = currentPlan.activeBridgeLabel || 'Auto (Relay → LI.FI → Circle CCTP)';
+    activeProvEl.innerHTML = `${getBridgeProviderLogosHtml(pref)}<span>${escapeHtml(
+      currentPlan.activeBridgeLabel || 'Auto (Relay → LI.FI → Circle CCTP)'
+    )}</span>`;
+  }
+  const feeUsdEl = document.getElementById('execFeeUsdSummary');
+  if (feeUsdEl) {
+    const feeUsd = Number(currentPlan.totals.protocolFeeUsd || 0).toLocaleString(undefined, {
+      minimumFractionDigits: 2,
+    });
+    const destTag = currentPlan.feeRecipientEvm ? shortAddr(currentPlan.feeRecipientEvm) : 'Set treasury';
+    feeUsdEl.textContent = `$${feeUsd} → ${destTag}`;
   }
 
   const grid = document.getElementById('cctpLegsGrid');
@@ -933,21 +1032,33 @@ function renderPipelineView() {
         pref === 'cctp'
           ? `
           <div class="calldata-box mono">
-            <div style="color:var(--ink-0); font-weight:600; margin-bottom:3px;">Circle CCTP depositForBurn (${shortAddr(leg.tokenMessenger)})</div>
-            ${escapeHtml(leg.cctpCalldata.slice(0, 88))}…
+            <div class="calldata-title">
+              <img src="/logos/circle.svg" alt="" class="chain-logo-xs" />
+              <span>Circle CCTP depositForBurn (${shortAddr(leg.tokenMessenger)})</span>
+            </div>
+            <div>${escapeHtml(leg.cctpCalldata.slice(0, 88))}…</div>
           </div>`
           : `
           <div class="calldata-box mono">
-            <div style="color:var(--ink-0); font-weight:600; margin-bottom:3px;">Live ${pref === 'lifi' ? 'LI.FI /v1/quote' : 'Relay /quote'} Route (${leg.chainName} #${chainCfg?.chainId ?? ''} → Solana ${currentPlan.outputAsset})</div>
-            Exact calldata fetched fresh on click · Zero manual Solana claim · Exact ERC-20 approvals only
+            <div class="calldata-title">
+              ${getBridgeProviderLogosHtml(pref)}
+              <span>Live ${pref === 'lifi' ? 'LI.FI /v1/quote' : 'Relay /quote'} Route (${leg.chainName} #${chainCfg?.chainId ?? ''} → Solana ${currentPlan.outputAsset})</span>
+            </div>
+            <div>Exact calldata fetched fresh on click · Zero manual Solana claim · Exact ERC-20 approvals only</div>
           </div>`;
 
       return `
         <div class="card leg-card">
           <div class="leg-head">
             <div>
-              <strong>${escapeHtml(leg.chainName)} → Solana ${escapeHtml(currentPlan.outputAsset)}</strong>
-              <div class="mono muted-xs">Est. Gas $${leg.gasUsd.toFixed(2)} · ${escapeHtml(routeMeta)}</div>
+              <strong class="inline-logo-row">
+                <img src="${escapeHtml(getChainLogoPath(leg.chain))}" alt="" class="chain-logo-sm" />
+                <span>${escapeHtml(leg.chainName)}</span>
+                <span class="muted-xs">→</span>
+                <img src="/logos/solana.svg" alt="" class="chain-logo-sm" />
+                <span>Solana ${escapeHtml(currentPlan.outputAsset)}</span>
+              </strong>
+              <div class="mono muted-xs" style="margin-top:3px;">Est. Gas $${leg.gasUsd.toFixed(2)} · ${escapeHtml(routeMeta)}</div>
             </div>
             <strong class="mono" style="font-size:16px;">$${leg.bridgedUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })}</strong>
           </div>
@@ -1016,13 +1127,32 @@ function renderBurnView() {
     .join('');
 }
 
+function renderActiveContract() {
+  if (!contractData) return;
+  const list = Array.isArray(contractData.contracts) ? contractData.contracts : [];
+  const chosen =
+    list.find((c) => c.id === activeContractId) || {
+      id: 'router',
+      filename: 'contracts/SiphonRouter.sol',
+      source: contractData.source || '',
+    };
+  const src = chosen.source || '';
+  document.getElementById('contractCodeHost').textContent = src;
+  const fileEl = document.getElementById('contractFileLabel');
+  if (fileEl) fileEl.textContent = chosen.filename;
+  const lines = src.split('\n').length;
+  const feePct = ((contractData.protocolFeeBps ?? 700) / 100).toFixed(1);
+  document.getElementById('contractStats').textContent =
+    `Solidity ${contractData.solidityVersion} · ${lines} lines · ${feePct}% Fee (5–10%) · Domain ${contractData.solanaCctpDomain} → Solana`;
+  document.querySelectorAll('.contract-tab').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.contractId === activeContractId);
+  });
+}
+
 async function loadContract() {
   try {
     contractData = await api('/api/contract');
-    document.getElementById('contractCodeHost').textContent = contractData.source;
-    const lines = contractData.source.split('\n').length;
-    document.getElementById('contractStats').textContent =
-      `Solidity ${contractData.solidityVersion} · ${lines} lines · Domain ${contractData.solanaCctpDomain} → Solana`;
+    renderActiveContract();
   } catch (err) {
     document.getElementById('contractCodeHost').textContent = err.message;
   }
@@ -1082,12 +1212,19 @@ async function pollBatchBridgeTrackers(entry, chain, trackers) {
 }
 
 let activeWalletModalTab = 'evm';
+let walletModalError = null;
+let walletModalConnecting = null;
+let walletWcPromptOpen = false;
 
 function closeWalletModal() {
+  walletModalError = null;
+  walletModalConnecting = null;
+  walletWcPromptOpen = false;
   document.getElementById('walletModalBackdrop')?.classList.add('hidden');
 }
 
 async function handleEvmConnected({ address, walletName, capabilities }) {
+  closeWalletModal();
   updateWalletButtons();
   const batchNote = capabilities?.anySupported
     ? '1-Click EIP-5792 Batch armed'
@@ -1096,25 +1233,11 @@ async function handleEvmConnected({ address, walletName, capabilities }) {
   await runScan({ address, autoOpen: true });
 }
 
-function getWalletBrandBadge(name, iconUrl) {
-  if (iconUrl) {
-    return `<img src="${escapeHtml(iconUrl)}" alt="" class="wallet-option-icon" />`;
-  }
-  const n = String(name || '').toLowerCase();
-  let bg = '#0A0A0A';
-  let fg = '#FFFFFF';
-  let glyph = String(name || 'W').slice(0, 2).toUpperCase();
-  if (n.includes('metamask')) { bg = '#F6851B'; glyph = 'MM'; }
-  else if (n.includes('rabby')) { bg = '#7084FF'; glyph = 'RB'; }
-  else if (n.includes('phantom')) { bg = '#AB9FF2'; fg = '#1C1433'; glyph = 'PH'; }
-  else if (n.includes('coinbase')) { bg = '#0052FF'; glyph = 'CB'; }
-  else if (n.includes('walletconnect')) { bg = '#3B99FC'; glyph = 'WC'; }
-  else if (n.includes('backpack')) { bg = '#E33E3F'; glyph = 'BP'; }
-  else if (n.includes('solflare')) { bg = '#FC7227'; glyph = 'SF'; }
-  else if (n.includes('brave')) { bg = '#FB542B'; glyph = 'BR'; }
-  else if (n.includes('trust')) { bg = '#0500FF'; glyph = 'TW'; }
-  else if (n.includes('okx')) { bg = '#0A0A0A'; glyph = 'OK'; }
-  return `<span class="wallet-option-monogram" style="background:${bg};color:${fg};">${escapeHtml(glyph)}</span>`;
+function getWalletBrandBadge(name, iconUrl, rdns = '') {
+  const localLogo = getWalletLogoPath(name, rdns);
+  const src = iconUrl || localLogo;
+  const isDark = String(name || '').toLowerCase().includes('solflare');
+  return `<span class="wallet-logo-tile${isDark ? ' is-dark' : ''}"><img src="${escapeHtml(src)}" alt="" class="wallet-logo-img" onerror="this.onerror=null;this.src='${escapeHtml(localLogo)}';" /></span>`;
 }
 
 function renderWalletModalContent() {
@@ -1139,6 +1262,7 @@ function renderWalletModalContent() {
   const activeAddr = isEvm ? evmAddr : solAddr;
   const activeName = isEvm ? getConnectedWalletName() : getConnectedSolanaWalletName();
   const cfg = getWalletConnectorConfig();
+  const effectiveWcId = getEffectiveWalletConnectProjectId();
 
   titleEl.textContent = isEvm ? 'Connect EVM Wallet' : 'Connect Solana Wallet';
   subEl.textContent = isEvm
@@ -1147,21 +1271,26 @@ function renderWalletModalContent() {
 
   const rows = [];
 
+  if (walletModalError) {
+    rows.push(`<div class="wallet-modal-error">${escapeHtml(walletModalError)}</div>`);
+  }
+
   if (isEvm) {
     const detected = listAvailableEvmWallets();
     if (detected.length) {
       rows.push(`<div class="wallet-section-label">Installed in browser</div>`);
       for (const w of detected) {
+        const isBusy = walletModalConnecting === `evm:${w.id}`;
         rows.push(`
-          <button type="button" class="wallet-option-row" data-pick-evm="${escapeHtml(w.id)}">
+          <button type="button" class="wallet-option-row" data-pick-evm="${escapeHtml(w.id)}" ${walletModalConnecting ? 'disabled' : ''}>
             <div class="wallet-option-left">
-              ${getWalletBrandBadge(w.name, w.icon)}
+              ${getWalletBrandBadge(w.name, w.icon, w.rdns)}
               <div>
                 <div class="wallet-option-name">${escapeHtml(w.name)}</div>
                 <div class="wallet-option-meta mono">Detected · ${escapeHtml(w.standard)}</div>
               </div>
             </div>
-            <span class="mono wallet-option-action">${activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
+            <span class="mono wallet-option-action">${isBusy ? 'Connecting…' : activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
           </button>
         `);
       }
@@ -1169,44 +1298,60 @@ function renderWalletModalContent() {
 
     rows.push(`<div class="wallet-section-label">Universal &amp; Mobile</div>`);
     if (cfg.coinbaseSmartWalletEnabled) {
+      const isBusy = walletModalConnecting === 'coinbase';
       rows.push(`
-        <button type="button" class="wallet-option-row" data-pick-coinbase="true">
+        <button type="button" class="wallet-option-row" data-pick-coinbase="true" ${walletModalConnecting ? 'disabled' : ''}>
           <div class="wallet-option-left">
             ${getWalletBrandBadge('Coinbase Smart Wallet', null)}
             <div>
               <div class="wallet-option-name">Coinbase Smart Wallet</div>
-              <div class="wallet-option-meta mono">Passkey / Popup · No extension needed</div>
+              <div class="wallet-option-meta mono">Passkey / Popup · Native EIP-5792</div>
             </div>
           </div>
-          <span class="mono wallet-option-action">${activeName === 'Coinbase Wallet' && activeAddr ? 'Connected' : 'Connect →'}</span>
+          <span class="mono wallet-option-action">${isBusy ? 'Opening…' : activeName === 'Coinbase Wallet' && activeAddr ? 'Connected' : 'Connect →'}</span>
         </button>
       `);
     }
 
+    const wcBusy = walletModalConnecting === 'wc';
     rows.push(`
-      <button type="button" class="wallet-option-row" data-pick-wc="true">
+      <button type="button" class="wallet-option-row" data-pick-wc="true" ${walletModalConnecting ? 'disabled' : ''}>
         <div class="wallet-option-left">
           ${getWalletBrandBadge('WalletConnect', null)}
           <div>
             <div class="wallet-option-name">WalletConnect (Mobile QR)</div>
             <div class="wallet-option-meta mono">${
-              cfg.walletConnectProjectId
+              effectiveWcId
                 ? 'MetaMask · Rabby · Rainbow · Ledger'
-                : 'Mobile QR · Requires project ID'
+                : 'Scan QR · Paste free Reown Project ID'
             }</div>
           </div>
         </div>
-        <span class="mono wallet-option-action">QR →</span>
+        <span class="mono wallet-option-action">${wcBusy ? 'Opening QR…' : effectiveWcId ? 'QR →' : 'Set ID →'}</span>
       </button>
     `);
+
+    if (walletWcPromptOpen) {
+      rows.push(`
+        <form class="wallet-wc-inline-form" id="modalWcProjectForm">
+          <div class="muted-xs" style="margin-bottom:6px;">
+            Get a free Project ID at <a href="https://cloud.reown.com" target="_blank" rel="noreferrer" class="explorer-link">cloud.reown.com ↗</a> (saved locally in your browser).
+          </div>
+          <div class="wallet-manual-form">
+            <input type="text" id="modalWcProjectIdInput" class="field-input mono" value="${escapeHtml(effectiveWcId || '')}" placeholder="Paste 32-char Reown Project ID" aria-label="WalletConnect Project ID" />
+            <button type="submit" class="btn-pill-dark btn-sm">Launch QR</button>
+          </div>
+        </form>
+      `);
+    }
 
     if (!detected.length) {
       rows.push(`
         <div class="wallet-section-label">Browser extensions</div>
         <div class="wallet-install-strip">
-          <a class="wallet-install-chip" href="https://rabby.io" target="_blank" rel="noreferrer">Rabby ↗</a>
-          <a class="wallet-install-chip" href="https://metamask.io" target="_blank" rel="noreferrer">MetaMask ↗</a>
-          <a class="wallet-install-chip" href="https://phantom.app" target="_blank" rel="noreferrer">Phantom ↗</a>
+          <a class="wallet-install-chip" href="https://rabby.io" target="_blank" rel="noreferrer"><img src="/logos/rabby.svg" alt="" class="chain-logo-xs" />Rabby ↗</a>
+          <a class="wallet-install-chip" href="https://metamask.io" target="_blank" rel="noreferrer"><img src="/logos/metamask.svg" alt="" class="chain-logo-xs" />MetaMask ↗</a>
+          <a class="wallet-install-chip" href="https://phantom.app" target="_blank" rel="noreferrer"><img src="/logos/phantom.svg" alt="" class="chain-logo-xs" />Phantom ↗</a>
         </div>
       `);
     }
@@ -1215,8 +1360,9 @@ function renderWalletModalContent() {
     if (solWallets.length) {
       rows.push(`<div class="wallet-section-label">Installed in browser</div>`);
       for (const w of solWallets) {
+        const isBusy = walletModalConnecting === `sol:${w.id}`;
         rows.push(`
-          <button type="button" class="wallet-option-row" data-pick-sol="${escapeHtml(w.id)}">
+          <button type="button" class="wallet-option-row" data-pick-sol="${escapeHtml(w.id)}" ${walletModalConnecting ? 'disabled' : ''}>
             <div class="wallet-option-left">
               ${getWalletBrandBadge(w.name, w.icon)}
               <div>
@@ -1224,7 +1370,7 @@ function renderWalletModalContent() {
                 <div class="wallet-option-meta mono">Detected · ${escapeHtml(w.standard)}</div>
               </div>
             </div>
-            <span class="mono wallet-option-action">${activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
+            <span class="mono wallet-option-action">${isBusy ? 'Connecting…' : activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
           </button>
         `);
       }
@@ -1232,9 +1378,9 @@ function renderWalletModalContent() {
       rows.push(`
         <div class="wallet-section-label">Browser extensions</div>
         <div class="wallet-install-strip">
-          <a class="wallet-install-chip" href="https://phantom.app" target="_blank" rel="noreferrer">Phantom ↗</a>
-          <a class="wallet-install-chip" href="https://backpack.app" target="_blank" rel="noreferrer">Backpack ↗</a>
-          <a class="wallet-install-chip" href="https://solflare.com" target="_blank" rel="noreferrer">Solflare ↗</a>
+          <a class="wallet-install-chip" href="https://phantom.app" target="_blank" rel="noreferrer"><img src="/logos/phantom.svg" alt="" class="chain-logo-xs" />Phantom ↗</a>
+          <a class="wallet-install-chip" href="https://backpack.app" target="_blank" rel="noreferrer"><img src="/logos/backpack.svg" alt="" class="chain-logo-xs" />Backpack ↗</a>
+          <a class="wallet-install-chip" href="https://solflare.com" target="_blank" rel="noreferrer"><img src="/logos/solflare.svg" alt="" class="chain-logo-xs" />Solflare ↗</a>
         </div>
       `);
     }
@@ -1273,48 +1419,111 @@ function renderWalletModalContent() {
   listEl.querySelectorAll('[data-pick-evm]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const walletId = btn.dataset.pickEvm;
-      closeWalletModal();
+      walletModalError = null;
+      walletModalConnecting = `evm:${walletId}`;
+      renderWalletModalContent();
       try {
         const res = await connectEvmWallet({ walletId, ...evmCallbacks });
         await handleEvmConnected(res);
       } catch (err) {
-        showToast(err.message);
+        walletModalConnecting = null;
+        walletModalError = err?.message || 'Wallet connection cancelled.';
+        renderWalletModalContent();
+        showToast(walletModalError);
       }
     });
   });
 
   listEl.querySelector('[data-pick-coinbase]')?.addEventListener('click', async () => {
-    closeWalletModal();
+    // Call connectCoinbaseSmartWallet BEFORE re-rendering DOM so browser popup blockers keep the user click gesture!
+    const connectPromise = connectCoinbaseSmartWallet(evmCallbacks);
+    walletModalError = null;
+    walletModalConnecting = 'coinbase';
+    renderWalletModalContent();
     try {
-      const res = await connectCoinbaseSmartWallet(evmCallbacks);
+      const res = await connectPromise;
       await handleEvmConnected(res);
     } catch (err) {
-      showToast(err.message);
+      walletModalConnecting = null;
+      walletModalError = err?.message || 'Coinbase Smart Wallet connection cancelled.';
+      renderWalletModalContent();
+      showToast(walletModalError);
     }
   });
 
   listEl.querySelector('[data-pick-wc]')?.addEventListener('click', async () => {
-    closeWalletModal();
+    if (!getEffectiveWalletConnectProjectId()) {
+      walletModalError = null;
+      walletWcPromptOpen = !walletWcPromptOpen;
+      renderWalletModalContent();
+      document.getElementById('modalWcProjectIdInput')?.focus();
+      return;
+    }
+    walletModalError = null;
+    walletModalConnecting = 'wc';
+    renderWalletModalContent();
     try {
       const res = await connectWalletConnect(evmCallbacks);
       await handleEvmConnected(res);
     } catch (err) {
-      showToast(err.message);
+      walletModalConnecting = null;
+      walletModalError = err?.message || 'WalletConnect session cancelled.';
+      renderWalletModalContent();
+      showToast(walletModalError);
+    }
+  });
+
+  document.getElementById('modalWcProjectForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const projectId = document.getElementById('modalWcProjectIdInput')?.value.trim();
+    if (!projectId) {
+      walletModalError = 'Paste a valid Reown / WalletConnect Project ID from cloud.reown.com.';
+      renderWalletModalContent();
+      return;
+    }
+    setSavedWalletConnectProjectId(projectId);
+    walletModalError = null;
+    walletWcPromptOpen = false;
+    walletModalConnecting = 'wc';
+    renderWalletModalContent();
+    try {
+      const res = await connectWalletConnect({ ...evmCallbacks, projectId });
+      await handleEvmConnected(res);
+    } catch (err) {
+      walletModalConnecting = null;
+      walletModalError = err?.message || 'WalletConnect failed — verify your Project ID.';
+      walletWcPromptOpen = true;
+      renderWalletModalContent();
+      showToast(walletModalError);
     }
   });
 
   listEl.querySelectorAll('[data-pick-sol]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const walletId = btn.dataset.pickSol;
-      closeWalletModal();
+      walletModalError = null;
+      walletModalConnecting = `sol:${walletId}`;
+      renderWalletModalContent();
       try {
-        const { address, walletName } = await connectSolanaWallet({ walletId });
+        const { address, walletName } = await connectSolanaWallet({
+          walletId,
+          onAccountChanged: (nextAddr) => {
+            if (nextAddr) document.getElementById('solanaDestInput').value = nextAddr;
+            updateWalletButtons();
+            recomputePlan();
+            refreshSolanaBalance();
+          },
+        });
         document.getElementById('solanaDestInput').value = address;
+        closeWalletModal();
         updateWalletButtons();
         showToast(`Connected ${walletName}: ${shortAddr(address)}`);
         await Promise.all([recomputePlan(), refreshSolanaBalance()]);
       } catch (err) {
-        showToast(err.message);
+        walletModalConnecting = null;
+        walletModalError = err?.message || 'Solana wallet connection cancelled.';
+        renderWalletModalContent();
+        showToast(walletModalError);
       }
     });
   });
@@ -1340,6 +1549,10 @@ function renderWalletModalContent() {
 
 function openWalletModal(kind = 'evm') {
   refreshInstalledWallets();
+  preloadWalletSdks();
+  walletModalError = null;
+  walletModalConnecting = null;
+  walletWcPromptOpen = false;
   activeWalletModalTab = kind;
   renderWalletModalContent();
   document.getElementById('walletModalBackdrop')?.classList.remove('hidden');
@@ -1402,6 +1615,27 @@ function wireEvents() {
   document.getElementById('permit2Toggle').addEventListener('change', recomputePlan);
   document.getElementById('burnToggle').addEventListener('change', recomputePlan);
   document.getElementById('bridgePrefSelect')?.addEventListener('change', recomputePlan);
+  document.getElementById('protocolFeeSelect')?.addEventListener('change', recomputePlan);
+  document.getElementById('feeRecipientInput')?.addEventListener('change', (e) => {
+    const val = e.target.value.trim();
+    try {
+      if (val && /^0x[0-9a-fA-F]{40}$/.test(val)) {
+        window.localStorage?.setItem(FEE_RECIPIENT_STORAGE_KEY, val);
+      } else if (!val) {
+        window.localStorage?.removeItem(FEE_RECIPIENT_STORAGE_KEY);
+      }
+    } catch {
+      // ignore storage errors
+    }
+    recomputePlan();
+  });
+
+  document.querySelectorAll('.contract-tab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      activeContractId = btn.dataset.contractId || 'router';
+      renderActiveContract();
+    });
+  });
 
   subscribeWalletDiscovery(() => {
     const modal = document.getElementById('walletModalBackdrop');
@@ -1410,10 +1644,12 @@ function wireEvents() {
     }
   });
 
-  document.querySelectorAll('.seg-opt').forEach((btn) => {
+  document.querySelectorAll('.seg-opt[data-out-asset]').forEach((btn) => {
     btn.addEventListener('click', () => {
       outputAsset = btn.dataset.outAsset;
-      document.querySelectorAll('.seg-opt').forEach((b) => b.classList.toggle('active', b === btn));
+      document
+        .querySelectorAll('.seg-opt[data-out-asset]')
+        .forEach((b) => b.classList.toggle('active', b === btn));
       recomputePlan();
     });
   });
@@ -1462,14 +1698,36 @@ function wireEvents() {
   });
 
   document.getElementById('copyContractBtn').addEventListener('click', async () => {
-    const src = contractData?.source || '';
+    const list = Array.isArray(contractData?.contracts) ? contractData.contracts : [];
+    const chosen = list.find((c) => c.id === activeContractId);
+    const src = chosen?.source || contractData?.source || '';
+    const title = chosen?.title || 'SiphonRouter.sol';
     await navigator.clipboard?.writeText(src).catch(() => {});
-    showToast('Copied SiphonRouter.sol.');
+    showToast(`Copied ${title}.`);
   });
 }
 
 wireEvents();
-loadWalletConnectorConfig();
+loadWalletConnectorConfig().then((cfg) => {
+  const feeSel = document.getElementById('protocolFeeSelect');
+  const feeInput = document.getElementById('feeRecipientInput');
+  if (feeSel && cfg?.protocolFee?.feeBps) {
+    const bps = String(cfg.protocolFee.feeBps);
+    if (feeSel.querySelector(`option[value="${bps}"]`)) feeSel.value = bps;
+  }
+  if (feeInput) {
+    let saved = null;
+    try {
+      saved = window.localStorage?.getItem(FEE_RECIPIENT_STORAGE_KEY);
+    } catch {
+      saved = null;
+    }
+    const initial = cfg?.protocolFee?.feeRecipientEvm || saved || '';
+    if (initial && !feeInput.value) feeInput.value = initial;
+  }
+  // Eagerly warm wallet SDKs on idle so Coinbase Smart Wallet popup fires synchronously on click
+  setTimeout(() => preloadWalletSdks(), 600);
+});
 heroScene = mountSiphonFunnelScene(document.getElementById('siphonHeroCanvas'));
 // Default load: REAL live mainnet scan of vitalik.eth
 runScan({ presetId: 'vitalik_live', autoOpen: false });

@@ -4,7 +4,7 @@ import { PublicKey } from '@solana/web3.js';
 import {
   DEAD_BURN_ADDRESS,
   EVM_CHAINS,
-  PROTOCOL_FEE_BPS,
+  getProtocolFeeConfig,
   SOLANA_CCTP_DOMAIN,
 } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
@@ -212,6 +212,8 @@ export interface BuildPlanInput {
   includeBurns?: boolean;
   outputAsset?: 'USDC' | 'SOL';
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+  protocolFeeBps?: number;
+  feeRecipientEvm?: string | null;
 }
 
 function getBridgeProviderMeta(
@@ -264,6 +266,10 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
   const rawPref = input.bridgePreference ?? 'auto';
   const bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp' =
     outputAsset === 'SOL' && rawPref === 'cctp' ? 'auto' : rawPref;
+  const feeConfig = getProtocolFeeConfig({
+    feeBps: input.protocolFeeBps,
+    feeRecipientEvm: input.feeRecipientEvm,
+  });
 
   const solanaMintRecipientBytes32 = solanaAddressToBytes32(solanaDestination);
   const selectedSet = Array.isArray(selectedAssetIds)
@@ -331,7 +337,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     const activeGas = round4(
       chainAssets.reduce((s, a) => s + (usePermit2Batch ? a.batchedGasUsd : a.estimatedGasUsd), 0)
     );
-    const feeUsdc = round2((Math.max(0, grossUsdc - slippage) * PROTOCOL_FEE_BPS) / 10_000);
+    const feeUsdc = round2((Math.max(0, grossUsdc - slippage) * feeConfig.feeBps) / 10_000);
     const bridgedUsdc = round2(Math.max(0, grossUsdc - slippage - activeGas - feeUsdc));
     const rawUsdcAmount = BigInt(Math.round(bridgedUsdc * 1_000_000));
 
@@ -381,6 +387,16 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
         step: 'Isolated Safe Burn',
         detail: `Burn ${burnItems.length} zero-liquidity token(s) to 0x…dEaD (eth_call verified)`,
         target: DEAD_BURN_ADDRESS,
+      });
+    }
+    if (feeUsdc > 0) {
+      const destLabel = feeConfig.feeRecipientEvm
+        ? `${feeConfig.feeRecipientEvm.slice(0, 6)}…${feeConfig.feeRecipientEvm.slice(-4)} (${feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'SiphonFeeVault'})`
+        : 'SiphonFeeVault / Treasury (set recipient)';
+      steps.push({
+        step: `Protocol Fee (${feeConfig.feePercent}%)`,
+        detail: `Routes $${feeUsdc.toFixed(2)} (${feeConfig.feeBps} bps) atomically to ${destLabel}`,
+        target: feeConfig.feeRecipientEvm ?? 'SiphonFeeVault',
       });
     }
     if (bridgedUsdc > 0 && (bridgePreference === 'cctp' || directUsdcItems.length > 0 || swapItems.length === 0)) {
@@ -441,6 +457,10 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     outputAsset,
     bridgePreference,
     activeBridgeLabel: activeBridgeMeta.label,
+    protocolFeeBps: feeConfig.feeBps,
+    protocolFeePercent: feeConfig.feePercent,
+    feeRecipientEvm: feeConfig.feeRecipientEvm,
+    feeDestinationType: feeConfig.feeDestinationType,
     legs,
     totals: {
       selectedAssets: chosen.length,

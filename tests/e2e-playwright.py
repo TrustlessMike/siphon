@@ -157,7 +157,19 @@ def main():
             evmWallets = pgD.locator(".wallet-option-name").all_inner_texts()
             assert "MetaMask" in evmWallets and "Rabby Wallet" in evmWallets, evmWallets
             assert "Coinbase Smart Wallet" in evmWallets and "WalletConnect (Mobile QR)" in evmWallets, evmWallets
+            # Verify every official brand logo SVG in the wallet modal + hero bar loaded cleanly!
+            pgD.wait_for_timeout(150)
+            brokenWalletImgs = pgD.evaluate("""() => {
+              const imgs = Array.from(document.querySelectorAll('#walletModalBackdrop img, .hero-stage-bar img'));
+              return imgs.filter(i => !i.complete || i.naturalWidth === 0).map(i => i.src);
+            }""")
+            assert not brokenWalletImgs, f"Broken brand logo images: {brokenWalletImgs}"
             maybe_shot(pgD, "goal_desktop_wallet_modal_1440.png", full_page=False)
+
+            # Verify WalletConnect inline Project ID setup opens smoothly when clicked without env var
+            pgD.click("[data-pick-wc='true']")
+            pgD.wait_for_selector("#modalWcProjectForm", timeout=3000)
+            pgD.click("[data-pick-wc='true']")
 
             pgD.click("#walletTabSol")
             solWallets = pgD.locator(".wallet-option-name").all_inner_texts()
@@ -176,10 +188,20 @@ def main():
             pgD.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=15000)
             pgD.wait_for_timeout(400)
 
-            # Verify SVG & Batch Execution leg cards match selected bridge provider dynamically!
+            # Verify SVG & Batch Execution leg cards match selected bridge provider + 5-10% protocol fee dynamically!
             svgTextAuto = pgD.locator("#convergenceSvgHost").inner_text()
             assert "Relay / LI.FI" in svgTextAuto, svgTextAuto
+            assert "Fee (7%)" in svgTextAuto, svgTextAuto
             pgD.click(".app-tab[data-view='pipeline']")
+            pgD.select_option("#protocolFeeSelect", "1000")
+            pgD.fill("#feeRecipientInput", "0x1111111111111111111111111111111111111111")
+            pgD.locator("#feeRecipientInput").dispatch_event("change")
+            pgD.wait_for_function("() => (document.querySelector('#cctpLegsGrid')?.innerText || '').includes('Protocol Fee (10%)')", timeout=5000)
+            pgD.select_option("#protocolFeeSelect", "700")
+            pgD.fill("#feeRecipientInput", "")
+            pgD.locator("#feeRecipientInput").dispatch_event("change")
+            pgD.wait_for_function("() => (document.querySelector('#cctpLegsGrid')?.innerText || '').includes('Protocol Fee (7%)')", timeout=5000)
+
             pgD.select_option("#bridgePrefSelect", "lifi")
             pgD.wait_for_function("() => (document.querySelector('#execActiveProvider')?.innerText || '').includes('LI.FI')", timeout=5000)
             assert "LI.FI /v1/quote" in pgD.locator("#cctpLegsGrid").inner_text()
@@ -188,6 +210,14 @@ def main():
             assert "Circle CCTP depositForBurn" in pgD.locator("#cctpLegsGrid").inner_text()
             pgD.select_option("#bridgePrefSelect", "auto")
             pgD.wait_for_function("() => (document.querySelector('#execActiveProvider')?.innerText || '').includes('Auto')", timeout=5000)
+
+            # Verify Contract switcher toggles between SiphonRouter.sol and SiphonFeeVault.sol
+            pgD.click(".app-tab[data-view='contract']")
+            pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonRouter')", timeout=5000)
+            pgD.click(".contract-tab[data-contract-id='vault']")
+            pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonFeeVault')", timeout=5000)
+            pgD.click(".contract-tab[data-contract-id='router']")
+
             pgD.click(".app-tab[data-view='scanner']")
             pgD.wait_for_timeout(200)
 

@@ -10,8 +10,9 @@ pragma solidity ^0.8.24;
  *   2. Pulls user aTokens before Aave v3 withdrawals so the router withdraws the user's actual collateral
  *   3. Measures exact balance deltas per swap step so residual dust can never be swept across callers
  *   4. Isolates user-selected zero-liquidity token burns inside try/catch so honeypots never revert a sweep
- *   5. Bridges consolidated native USDC directly to the user's Solana Ed25519 bytes32 address via Circle CCTP
- *   6. Two-step ownership transfer and hard-capped protocol fee (<= 100 bps)
+ *   5. Routes a protocol fee (5% - 10%, default 7%) directly to a treasury wallet or SiphonFeeVault contract
+ *   6. Bridges consolidated net native USDC directly to the user's Solana Ed25519 bytes32 address via Circle CCTP
+ *   7. Two-step ownership transfer and hard-bounded protocol fee (500 - 1000 bps)
  */
 
 interface IERC20 {
@@ -88,8 +89,9 @@ contract SiphonRouter {
     /// @notice Circle CCTP destination domain ID for Solana Mainnet.
     uint32 public constant SOLANA_CCTP_DOMAIN = 5;
 
-    /// @notice Hard protocol fee cap (1.00% = 100 bps). Default deployment uses 35 bps (0.35%).
-    uint16 public constant MAX_FEE_BPS = 100;
+    /// @notice Protocol fee bounds: 5.00% (500 bps) minimum, 10.00% (1000 bps) maximum. Default: 700 bps (7.0%).
+    uint16 public constant MIN_FEE_BPS = 500;
+    uint16 public constant MAX_FEE_BPS = 1000;
 
     address public immutable usdc;
     ITokenMessengerCCTP public immutable cctpMessenger;
@@ -164,7 +166,7 @@ contract SiphonRouter {
     error SlippageExceeded(uint256 actualUsdc, uint256 minExpected);
     error ZeroUsdcOutput();
     error Unauthorized();
-    error FeeTooHigh();
+    error FeeOutOfBounds(uint16 feeBps);
     error Reentrancy();
 
     modifier nonReentrant() {
@@ -185,8 +187,10 @@ contract SiphonRouter {
         address _feeRecipient,
         uint16 _feeBps
     ) {
-        if (_usdc == address(0) || _cctpMessenger == address(0)) revert InvalidAddress();
-        if (_feeBps > MAX_FEE_BPS) revert FeeTooHigh();
+        if (_usdc == address(0) || _cctpMessenger == address(0) || _feeRecipient == address(0)) {
+            revert InvalidAddress();
+        }
+        if (_feeBps < MIN_FEE_BPS || _feeBps > MAX_FEE_BPS) revert FeeOutOfBounds(_feeBps);
         usdc = _usdc;
         cctpMessenger = ITokenMessengerCCTP(_cctpMessenger);
         owner = msg.sender;
@@ -203,7 +207,8 @@ contract SiphonRouter {
     }
 
     function setFeeParams(address _feeRecipient, uint16 _feeBps) external onlyOwner {
-        if (_feeBps > MAX_FEE_BPS) revert FeeTooHigh();
+        if (_feeRecipient == address(0)) revert InvalidAddress();
+        if (_feeBps < MIN_FEE_BPS || _feeBps > MAX_FEE_BPS) revert FeeOutOfBounds(_feeBps);
         feeRecipient = _feeRecipient;
         feeBps = _feeBps;
         emit FeeUpdated(_feeRecipient, _feeBps);
