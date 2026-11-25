@@ -16,6 +16,7 @@
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/styles.css?v=8" />
+    <link rel="stylesheet" href="/degen.css?v=1" />
   </head>
   <body>
     <!-- =============================================================== -->
@@ -167,6 +168,10 @@
             <button type="button" class="app-tab" data-view="activity" role="tab">
               Activity
               <span class="tab-count muted" id="tabBurnCount">0</span>
+            </button>
+            <button type="button" class="app-tab" data-view="degen" role="tab">
+              Degen
+              <span class="tab-count muted" id="tabDegenCount">JUP</span>
             </button>
             <button type="button" class="app-tab pro-only" data-view="agents" role="tab">
               Agents &amp; AI
@@ -787,6 +792,13 @@
             <pre class="code-viewer mono" id="contractCodeHost">Loading…</pre>
           </div>
         </section>
+
+        <!-- ======================================================= -->
+        <!-- VIEW 5: DEGEN — JUPITER PREDICTION MARKETS & GAMES      -->
+        <!-- ======================================================= -->
+        <section class="view-pane" id="view-degen" aria-label="Degen Jupiter Prediction Markets">
+          <div id="degenRoot" class="degen-root"></div>
+        </section>
       </main>
     </div>
 
@@ -825,5 +837,6 @@
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>
 
     <script type="module" src="/app.js?v=8"></script>
+    <script type="module" src="/degen.js?v=1"></script>
   </body>
 </html>

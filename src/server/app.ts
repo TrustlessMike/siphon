@@ -52,6 +52,8 @@ import { scanUnifiedWallets, type UnifiedWalletInput } from '../scanner/unify.js
 import { evaluatePortfolioRoi } from '../scanner/roi.js';
 import type { AnyChainId, ChainFamily, EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
 import { BoundedTtlCache } from './cache.js';
+import { JupiterMarketsClient } from '../degen/jupiter-markets.js';
+import { handleDegenRoutes } from './degen-routes.js';
 import { BackgroundJobStore, type JobLegStatus } from './jobs.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -98,6 +100,7 @@ export interface SiphonServerOptions {
   scanCacheTtlMs?: number;
   jobStoreMaxJobs?: number;
   jobStoreTtlMs?: number;
+  degenClient?: JupiterMarketsClient;
   nowMs?: () => number;
 }
 
@@ -520,6 +523,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
     nowMs: opts.nowMs,
   });
   const agentEngine = new SiphonAgentEngine({ nowMs: opts.nowMs });
+  const degenClient = opts.degenClient ?? new JupiterMarketsClient({ nowMs: opts.nowMs });
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -1773,6 +1777,21 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           plan,
           executions,
         });
+      }
+
+      if (
+        pathname.startsWith('/api/degen/') &&
+        (await handleDegenRoutes({
+          method,
+          pathname,
+          url,
+          req,
+          reply,
+          readJsonBody,
+          client: degenClient,
+        }))
+      ) {
+        return;
       }
 
       if ((method === 'GET' || method === 'HEAD') && serveStaticFile(res, pathname, method === 'HEAD')) {
