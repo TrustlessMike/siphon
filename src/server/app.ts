@@ -66,6 +66,7 @@ import { JupiterMarketsClient } from '../degen/jupiter-markets.js';
 import { handleDegenRoutes } from './degen-routes.js';
 import { BackgroundJobStore, type JobLegStatus } from './jobs.js';
 import { handlePreservationRoute } from './preservation-routes.js';
+import { handleSolanaRoutes } from './solana-routes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1957,6 +1958,10 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           liveGasFetcher: opts.liveGasFetcher,
         })
       ) {
+        return;
+      }
+
+      if (pathname.startsWith('/api/solana/') && (await handleSolanaRoutes({ method, pathname, url, req, reply, readJsonBody }))) {
         return;
       }
 
