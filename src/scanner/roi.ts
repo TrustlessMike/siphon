@@ -329,20 +329,46 @@ export function estimateSolanaAtaRentUsd(opts: { hasUsdcAta?: boolean; solPriceU
 }
 
 /**
- * Estimates realistic price impact scaled by verified DEX liquidity depth rather than a flat 0.15%.
+ * Estimates realistic constant-product AMM price impact scaled by verified DEX liquidity depth
+ * and 24h trading volume rather than an artificial 40% slippage ceiling.
+ *
+ * In a 50/50 constant-product pool (`x * y = k`), the counter-asset reserve is at most
+ * `0.5 * liquidityUsd`, so net sellable output (`grossUsd - slippageUsd`) can NEVER exceed
+ * `0.5 * liquidityUsd` — and is discounted further on `$0` / near-zero 24h-volume skewed pools.
  */
 export function estimateLiquidityScaledSlippageUsd(params: {
   grossUsd: number;
   liquidityUsd: number;
+  volume24hUsd?: number;
   isDirectUsdc?: boolean;
   isDead?: boolean;
 }): number {
-  if (params.isDead || params.isDirectUsdc || params.grossUsd <= 0) return 0;
-  const liq = Math.max(1000, params.liquidityUsd || 0);
-  // Base AMM fee (0.15%) + constant-product price impact scaled by trade/depth ratio (capped at 35%)
-  const depthImpact = Math.min(0.35, (params.grossUsd / liq) * 2.0);
-  const totalRate = Math.min(0.4, 0.0015 + depthImpact);
-  return r2(params.grossUsd * totalRate);
+  if (params.isDead || params.isDirectUsdc || !Number.isFinite(params.grossUsd) || params.grossUsd <= 0) {
+    return 0;
+  }
+  const grossUsd = params.grossUsd;
+  const liq = Number.isFinite(params.liquidityUsd) ? Math.max(0, params.liquidityUsd) : 0;
+  if (liq <= 0) {
+    return r2(grossUsd);
+  }
+
+  let usableReserveUsd = 0.5 * liq;
+  if (params.volume24hUsd !== undefined && Number.isFinite(params.volume24hUsd)) {
+    const vol = Math.max(0, params.volume24hUsd);
+    if (vol <= 0) {
+      // Stale / $0 24h-volume skewed pool: heavily discount realizable quote-side depth
+      usableReserveUsd = Math.min(usableReserveUsd, 0.1 * liq);
+    } else if (vol < liq * 0.05) {
+      const turnoverRatio = Math.min(1, vol / (liq * 0.05));
+      usableReserveUsd = Math.min(usableReserveUsd, liq * (0.15 + 0.35 * turnoverRatio));
+    }
+  }
+
+  // Base AMM fee (0.15%) + exact constant-product output: out = (R * dx_eff) / (R + dx_eff)
+  const effectiveIn = grossUsd * (1 - 0.0015);
+  const ammOutUsd = (usableReserveUsd * effectiveIn) / (usableReserveUsd + effectiveIn);
+  const cappedSellableOutUsd = Math.min(ammOutUsd, 0.5 * liq);
+  return r2(Math.max(0, grossUsd - cappedSellableOutUsd));
 }
 
 /**
