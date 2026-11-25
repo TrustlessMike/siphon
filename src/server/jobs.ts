@@ -111,10 +111,15 @@ export interface BackgroundJob {
 
 export interface BackgroundJobStoreOptions {
   maxJobs?: number;
+  ttlMs?: number;
+  nowMs?: () => number;
   pollIntervalMs?: number;
   statusChecker?: typeof checkLiveExecutionStatus;
   attestationFetcher?: typeof fetchCctpAttestationForTx;
 }
+
+const DEFAULT_MAX_JOBS = 30;
+const DEFAULT_JOB_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /**
  * Computes the polling window and maxAttempts for a leg so Ethereum CCTP legs cover
@@ -172,19 +177,35 @@ export function sanitizeLegPatch(patch: BackgroundJobLegPatch): BackgroundJobLeg
 }
 
 export class BackgroundJobStore {
-  private jobs = new Map<string, BackgroundJob>();
+  private jobs = new Map<string, { job: BackgroundJob; expiresAt: number }>();
   private pollTimers = new Map<string, NodeJS.Timeout>();
   private pollInFlight = new Set<string>();
-  private maxJobs: number;
-  private pollIntervalMs: number;
-  private statusChecker: typeof checkLiveExecutionStatus;
-  private attestationFetcher: typeof fetchCctpAttestationForTx;
+  private readonly maxJobs: number;
+  private readonly ttlMs: number;
+  private readonly nowMs: () => number;
+  private readonly pollIntervalMs: number;
+  private readonly statusChecker: typeof checkLiveExecutionStatus;
+  private readonly attestationFetcher: typeof fetchCctpAttestationForTx;
 
   constructor(opts: BackgroundJobStoreOptions = {}) {
-    this.maxJobs = Math.max(1, opts.maxJobs ?? 30);
+    this.maxJobs = Math.max(1, Math.floor(opts.maxJobs ?? DEFAULT_MAX_JOBS));
+    this.ttlMs = Math.max(1, Math.floor(opts.ttlMs ?? DEFAULT_JOB_TTL_MS));
+    this.nowMs = opts.nowMs ?? (() => Date.now());
     this.pollIntervalMs = Math.max(10, opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
     this.statusChecker = opts.statusChecker ?? checkLiveExecutionStatus;
     this.attestationFetcher = opts.attestationFetcher ?? fetchCctpAttestationForTx;
+  }
+
+  pruneExpired(now = this.nowMs()): number {
+    let removed = 0;
+    for (const [jobId, entry] of this.jobs.entries()) {
+      if (now >= entry.expiresAt) {
+        this.clearPollersForJob(jobId);
+        this.jobs.delete(jobId);
+        removed += 1;
+      }
+    }
+    return removed;
   }
 
   createJob(input: {
@@ -209,7 +230,9 @@ export class BackgroundJobStore {
       throw new Error('legs must be an array');
     }
 
-    const now = new Date().toISOString();
+    const nowMs = this.nowMs();
+    this.pruneExpired(nowMs);
+    const now = new Date(nowMs).toISOString();
     const jobId = `job_${crypto.randomBytes(5).toString('hex')}`;
     const seenLegIds = new Set<string>();
 
@@ -279,30 +302,50 @@ export class BackgroundJobStore {
       legs,
     };
 
-    this.jobs.set(jobId, job);
+    this.jobs.set(jobId, { job, expiresAt: nowMs + this.ttlMs });
     this.pruneInactiveJobs(jobId);
     return job;
   }
 
   private pruneInactiveJobs(protectedJobId?: string): void {
     if (this.jobs.size <= this.maxJobs) return;
-    // Evict oldest terminal (non-active) jobs first; NEVER evict active in-progress jobs
-    for (const [candidateId, candidate] of this.jobs.entries()) {
+    // Pass 1: Evict oldest terminal (non-active) jobs first so active in-progress jobs stay protected
+    for (const [candidateId, entry] of this.jobs.entries()) {
       if (candidateId === protectedJobId) continue;
-      if (candidate.status !== 'active') {
+      if (entry.job.status !== 'active') {
         this.clearPollersForJob(candidateId);
         this.jobs.delete(candidateId);
-        if (this.jobs.size <= this.maxJobs) break;
+        if (this.jobs.size <= this.maxJobs) return;
       }
+    }
+    // Pass 2: Hard LRU capacity cap to prevent unbounded memory growth under an all-active job flood
+    for (const candidateId of this.jobs.keys()) {
+      if (candidateId === protectedJobId) continue;
+      this.clearPollersForJob(candidateId);
+      this.jobs.delete(candidateId);
+      if (this.jobs.size <= this.maxJobs) break;
     }
   }
 
   listJobs(): BackgroundJob[] {
-    return Array.from(this.jobs.values()).reverse();
+    this.pruneExpired();
+    return Array.from(this.jobs.values())
+      .map((entry) => entry.job)
+      .reverse();
   }
 
   getJob(jobId: string): BackgroundJob | null {
-    return this.jobs.get(jobId) ?? null;
+    const entry = this.jobs.get(jobId);
+    if (!entry) return null;
+    if (this.nowMs() >= entry.expiresAt) {
+      this.clearPollersForJob(jobId);
+      this.jobs.delete(jobId);
+      return null;
+    }
+    // Refresh LRU order on read
+    this.jobs.delete(jobId);
+    this.jobs.set(jobId, entry);
+    return entry.job;
   }
 
   private findLeg(
@@ -353,14 +396,24 @@ export class BackgroundJobStore {
     patch: BackgroundJobLegPatch,
     opts?: { legId?: string; sourceWallet?: string; walletAddress?: string }
   ): BackgroundJob | null {
-    const job = this.jobs.get(jobId);
-    if (!job) return null;
+    const entry = this.jobs.get(jobId);
+    if (!entry) return null;
+    const nowMs = this.nowMs();
+    if (nowMs >= entry.expiresAt) {
+      this.clearPollersForJob(jobId);
+      this.jobs.delete(jobId);
+      return null;
+    }
+    const job = entry.job;
     const leg = this.findLeg(job, target, opts);
     if (!leg) return null;
 
     const cleanPatch = sanitizeLegPatch(patch);
-    Object.assign(leg, cleanPatch, { updatedAt: new Date().toISOString() });
+    Object.assign(leg, cleanPatch, { updatedAt: new Date(nowMs).toISOString() });
     this.recomputeJobSummary(job);
+    // Refresh LRU position and extend TTL on active update
+    this.jobs.delete(jobId);
+    this.jobs.set(jobId, { job, expiresAt: nowMs + this.ttlMs });
 
     const pollerKey = `${jobId}:${leg.legId}`;
 
@@ -419,7 +472,8 @@ export class BackgroundJobStore {
     const key = `${jobId}:${legId}`;
     if (this.pollTimers.has(key)) return;
 
-    const initialJob = this.jobs.get(jobId);
+    const initialEntry = this.jobs.get(jobId);
+    const initialJob = initialEntry && this.nowMs() < initialEntry.expiresAt ? initialEntry.job : undefined;
     const initialLeg = initialJob?.legs.find((l) => l.legId === legId);
     if (!initialJob || !initialLeg) return;
 
@@ -433,7 +487,8 @@ export class BackgroundJobStore {
 
       try {
         attempts += 1;
-        const job = this.jobs.get(jobId);
+        const entry = this.jobs.get(jobId);
+        const job = entry && this.nowMs() < entry.expiresAt ? entry.job : undefined;
         const leg = job?.legs.find((l) => l.legId === legId);
         if (!job || !leg) {
           this.clearPoller(key);

@@ -51,6 +51,7 @@ import { planDustConversion } from '../scanner/dust.js';
 import { scanUnifiedWallets, type UnifiedWalletInput } from '../scanner/unify.js';
 import { evaluatePortfolioRoi } from '../scanner/roi.js';
 import type { AnyChainId, ChainFamily, EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
+import { BoundedTtlCache } from './cache.js';
 import { BackgroundJobStore, type JobLegStatus } from './jobs.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -81,7 +82,122 @@ const MIME_TYPES: Record<string, string> = {
   '.png': 'image/png',
 };
 
-const MAX_JSON_BODY_BYTES = 1_048_576; // 1 MiB safety cap
+const MAX_JSON_BODY_BYTES = 1_048_576; // 1 MiB safety cap for scan/tx payloads
+const MAX_PRIVILEGED_JSON_BODY_BYTES = 65_536; // 64 KiB strict cap for agent/plugin/MCP/job endpoints
+const DEFAULT_SCAN_CACHE_MAX = 40;
+const DEFAULT_SCAN_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const MAX_JOB_LEGS = 50;
+
+export interface SiphonServerOptions {
+  allowedOrigins?: string[];
+  allowedHosts?: string[];
+  publicBaseUrl?: string;
+  requirePluginAuth?: boolean;
+  adminSessionToken?: string;
+  scanCacheMaxEntries?: number;
+  scanCacheTtlMs?: number;
+  jobStoreMaxJobs?: number;
+  jobStoreTtlMs?: number;
+  nowMs?: () => number;
+}
+
+const VALID_JOB_LEG_STATUSES = new Set<JobLegStatus>([
+  'queued',
+  'preparing',
+  'signing',
+  'confirming',
+  'relaying',
+  'attested',
+  'landed',
+  'failed',
+  'skipped',
+]);
+
+function isLoopbackHostname(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  return lower === '127.0.0.1' || lower === 'localhost' || lower === '[::1]' || lower === '::1';
+}
+
+function parseConfiguredAllowedHosts(explicit?: string[], extraOrigins?: Set<string>, publicBaseUrl?: string): Set<string> {
+  const set = new Set<string>(['127.0.0.1', 'localhost', '[::1]', '::1']);
+  const envHosts = process.env.SIPHON_ALLOWED_HOSTS
+    ? process.env.SIPHON_ALLOWED_HOSTS.split(',')
+    : [];
+  for (const h of [...(explicit ?? []), ...envHosts]) {
+    const clean = h.trim().toLowerCase().replace(/:\d+$/, '');
+    if (clean) set.add(clean);
+  }
+  if (extraOrigins) {
+    for (const orig of extraOrigins) {
+      try {
+        set.add(new URL(orig).hostname.toLowerCase());
+      } catch {
+        // ignore
+      }
+    }
+  }
+  if (publicBaseUrl) {
+    try {
+      set.add(new URL(publicBaseUrl).hostname.toLowerCase());
+    } catch {
+      // ignore
+    }
+  }
+  return set;
+}
+
+/**
+ * Validates HTTP `Host` header syntax (preventing `new URL()` crashes) and enforces
+ * a strict hostname allowlist to defeat localhost DNS-rebinding attacks (`HIGH-5` & `CRIT-3`).
+ */
+function validateHostHeader(
+  rawHost: string | undefined,
+  allowedHostnames: Set<string>
+): { ok: true; host: string; hostname: string } | { ok: false; status: 400 | 403; error: string } {
+  if (!rawHost || typeof rawHost !== 'string') {
+    return { ok: true, host: '127.0.0.1', hostname: '127.0.0.1' };
+  }
+  const trimmed = rawHost.trim();
+  if (!trimmed || /[\s/@\\]/.test(trimmed) || /[\u0000-\u001F\u007F]/.test(trimmed)) {
+    return { ok: false, status: 400, error: 'Malformed Host header.' };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(`http://${trimmed}`);
+  } catch {
+    return { ok: false, status: 400, error: 'Malformed Host header.' };
+  }
+  if (!parsed.hostname || parsed.username || parsed.password || parsed.pathname !== '/') {
+    return { ok: false, status: 400, error: 'Malformed Host header.' };
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (!isLoopbackHostname(hostname) && !allowedHostnames.has(hostname)) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'Disallowed Host header blocked by Siphon DNS-rebinding protection.',
+    };
+  }
+  return { ok: true, host: parsed.host, hostname };
+}
+
+/**
+ * Rejects client-supplied `feeRecipientEvm` overrides (`HIGH-7`).
+ * Protocol fee treasury must be configured exclusively on the server via `SIPHON_FEE_RECIPIENT_EVM`.
+ */
+function assertNoFeeRecipientOverride(supplied?: string | null): void {
+  if (supplied === undefined || supplied === null || supplied === '') return;
+  if (typeof supplied !== 'string') {
+    throw new HttpError(400, 'Invalid feeRecipientEvm value.');
+  }
+  const serverRecipient = process.env.SIPHON_FEE_RECIPIENT_EVM?.trim();
+  if (!serverRecipient || supplied.trim().toLowerCase() !== serverRecipient.toLowerCase()) {
+    throw new HttpError(
+      400,
+      'Client-supplied feeRecipientEvm override is forbidden; protocol fee treasury is server-configured only.'
+    );
+  }
+}
 
 class HttpError extends Error {
   status: number;
@@ -91,48 +207,215 @@ class HttpError extends Error {
   }
 }
 
-async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const ha = crypto.createHash('sha256').update(a).digest();
+  const hb = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+function normalizeOrigin(raw: string): string | null {
+  try {
+    const u = new URL(raw.trim());
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.origin;
+  } catch {
+    return null;
+  }
+}
+
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== 'http:') return false;
+    return u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
+function parseConfiguredAllowedOrigins(explicit?: string[]): Set<string> {
+  const rawList =
+    explicit ??
+    (process.env.SIPHON_ALLOWED_ORIGIN
+      ? process.env.SIPHON_ALLOWED_ORIGIN.split(',')
+      : []);
+  const set = new Set<string>();
+  for (const item of rawList) {
+    const norm = normalizeOrigin(item);
+    if (norm) set.add(norm);
+  }
+  return set;
+}
+
+function isRestrictedCorsRoute(pathname: string, method: string): boolean {
+  if (
+    pathname === '/mcp' ||
+    pathname.startsWith('/api/agents/') ||
+    pathname === '/api/agents' ||
+    pathname.startsWith('/api/plugin/') ||
+    pathname === '/api/plugin' ||
+    pathname.startsWith('/api/jobs/') ||
+    pathname === '/api/jobs'
+  ) {
+    return true;
+  }
+  return method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
+}
+
+function isAdminMutationRoute(pathname: string, method: string): boolean {
+  if (method === 'GET' && (pathname === '/api/plugin/setup' || pathname === '/api/jobs' || pathname.startsWith('/api/jobs/'))) {
+    return true;
+  }
+  if (method !== 'POST') return false;
+  return (
+    pathname === '/api/agents/mandates' ||
+    (pathname.startsWith('/api/agents/mandates/') && pathname.endsWith('/revoke')) ||
+    (pathname.startsWith('/api/agents/approvals/') && pathname.endsWith('/decide')) ||
+    pathname === '/api/plugin/tokens' ||
+    (pathname.startsWith('/api/plugin/tokens/') && pathname.endsWith('/revoke')) ||
+    pathname === '/api/jobs' ||
+    (pathname.startsWith('/api/jobs/') && pathname.endsWith('/leg'))
+  );
+}
+
+function isAgentReadRoute(pathname: string, method: string): boolean {
+  return (
+    method === 'GET' &&
+    (pathname === '/api/agents/mandates' || pathname === '/api/agents/approvals')
+  );
+}
+
+function isPrivilegedCrossOriginProtectedRoute(pathname: string, method = 'GET'): boolean {
+  if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+    return true;
+  }
+  return (
+    pathname === '/mcp' ||
+    pathname.startsWith('/api/agents/') ||
+    pathname.startsWith('/api/plugin/') ||
+    pathname === '/api/jobs' ||
+    pathname.startsWith('/api/jobs/')
+  );
+}
+
+async function readJsonBody<T>(req: IncomingMessage, maxBytes = MAX_JSON_BODY_BYTES): Promise<T> {
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+    const ct = String(req.headers['content-type'] ?? '').toLowerCase();
+    if (!ct.includes('application/json')) {
+      throw new HttpError(415, 'Content-Type must be application/json.');
+    }
+  }
+  const contentLengthHeader = req.headers['content-length'];
+  if (contentLengthHeader) {
+    const declared = Number(Array.isArray(contentLengthHeader) ? contentLengthHeader[0] : contentLengthHeader);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw new HttpError(413, `Request payload exceeds ${maxBytes} byte limit.`);
+    }
+  }
   const chunks: Buffer[] = [];
   let totalBytes = 0;
   for await (const chunk of req) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     totalBytes += buf.length;
-    if (totalBytes > MAX_JSON_BODY_BYTES) {
-      throw new HttpError(413, 'Request payload exceeds 1 MiB limit.');
+    if (totalBytes > maxBytes) {
+      throw new HttpError(413, `Request payload exceeds ${maxBytes} byte limit.`);
     }
     chunks.push(buf);
   }
   const raw = Buffer.concat(chunks).toString('utf8');
   if (!raw.trim()) return {} as T;
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as T;
+    parsed = JSON.parse(raw);
   } catch {
     throw new HttpError(400, 'Malformed JSON request body.');
   }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new HttpError(400, 'JSON request body must be a JSON object.');
+  }
+  return parsed as T;
 }
 
-function sendJson(res: ServerResponse, status: number, payload: unknown): void {
-  res.writeHead(status, {
+function buildCorsHeaders(params: {
+  originHeader?: string;
+  restricted: boolean;
+  isAllowedOrigin: (origin: string) => boolean;
+}): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Siphon-Admin-Session, Mcp-Session-Id, MCP-Protocol-Version',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  };
+  if (!params.restricted) {
+    headers['Access-Control-Allow-Origin'] = '*';
+    return headers;
+  }
+  headers.Vary = 'Origin';
+  if (params.originHeader) {
+    const norm = normalizeOrigin(params.originHeader);
+    if (norm && params.isAllowedOrigin(norm)) {
+      headers['Access-Control-Allow-Origin'] = norm;
+    }
+  }
+  return headers;
+}
+
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  payload: unknown,
+  corsHeaders: Record<string, string> = {}
+): void {
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  });
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    ...corsHeaders,
+  };
+  if (status === 413) {
+    headers.Connection = 'close';
+  }
+  res.writeHead(status, headers);
   res.end(JSON.stringify(payload));
 }
 
+function pipeStaticFileSafely(res: ServerResponse, filePath: string): void {
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', () => {
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Static asset read error.' }));
+    } else {
+      res.destroy();
+    }
+  });
+  res.on('close', () => {
+    stream.destroy();
+  });
+  stream.pipe(res);
+}
+
+const REAL_PUBLIC_DIR = fs.existsSync(PUBLIC_DIR) ? fs.realpathSync(PUBLIC_DIR) : PUBLIC_DIR;
+
 function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): boolean {
+  const baseSecurityHeaders: Record<string, string> = {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+  };
+
   if (reqPath === '/vendor/wallet-sdks.js') {
     const bundleFile = path.join(DIST_VENDOR_DIR, 'wallet-sdks.js');
     if (fs.existsSync(bundleFile)) {
       res.writeHead(200, {
+        ...baseSecurityHeaders,
         'Content-Type': 'application/javascript; charset=utf-8',
         'Cache-Control': 'public, max-age=3600',
-        'Access-Control-Allow-Origin': '*',
       });
       if (isHead) res.end();
-      else fs.createReadStream(bundleFile).pipe(res);
+      else pipeStaticFileSafely(res, bundleFile);
       return true;
     }
     return false;
@@ -143,29 +426,48 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
     const threeFile = path.join(THREE_BUILD_DIR, fileName);
     if (fs.existsSync(threeFile)) {
       res.writeHead(200, {
+        ...baseSecurityHeaders,
         'Content-Type': 'application/javascript; charset=utf-8',
         'Cache-Control': 'public, max-age=3600',
-        'Access-Control-Allow-Origin': '*',
       });
       if (isHead) res.end();
-      else fs.createReadStream(threeFile).pipe(res);
+      else pipeStaticFileSafely(res, threeFile);
       return true;
     }
     return false;
   }
 
   const safePath = reqPath === '/' ? '/index.html' : reqPath;
-  const fullPath = path.resolve(PUBLIC_DIR, `.${safePath}`);
-  if (!fullPath.startsWith(PUBLIC_DIR)) return false;
-  if (!fs.existsSync(fullPath) || fs.statSync(fullPath).isDirectory()) return false;
+  // Block dotfiles / hidden segments
+  const segments = safePath.split('/').filter(Boolean);
+  if (segments.some((seg) => seg.startsWith('.'))) return false;
 
-  const ext = path.extname(fullPath);
+  const fullPath = path.resolve(PUBLIC_DIR, `.${safePath}`);
+  if (!fullPath.startsWith(PUBLIC_DIR + path.sep)) return false;
+  if (!fs.existsSync(fullPath)) return false;
+
+  let realTarget: string;
+  try {
+    realTarget = fs.realpathSync(fullPath);
+  } catch {
+    return false;
+  }
+  if (!realTarget.startsWith(REAL_PUBLIC_DIR + path.sep)) return false;
+  if (fs.statSync(realTarget).isDirectory()) return false;
+
+  const ext = path.extname(realTarget).toLowerCase();
+  if (!(ext in MIME_TYPES)) return false;
+
   const headers: Record<string, string> = {
-    'Content-Type': MIME_TYPES[ext] ?? 'application/octet-stream',
+    ...baseSecurityHeaders,
+    'Content-Type': MIME_TYPES[ext],
   };
   if (ext === '.html' || ext === '.js' || ext === '.mjs' || ext === '.css') {
     headers['Cache-Control'] = 'no-store, no-cache, must-revalidate';
     headers['Pragma'] = 'no-cache';
+  }
+  if (ext === '.svg') {
+    headers['Content-Security-Policy'] = 'sandbox';
   }
   // Required by Coinbase Smart Wallet SDK popup communication
   if (ext === '.html') {
@@ -173,35 +475,198 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
   }
   res.writeHead(200, headers);
   if (isHead) res.end();
-  else fs.createReadStream(fullPath).pipe(res);
+  else pipeStaticFileSafely(res, realTarget);
   return true;
 }
 
-export function createSiphonServer() {
-  const scanCache = new Map<string, ScanReport>();
-  const jobStore = new BackgroundJobStore();
-  const agentEngine = new SiphonAgentEngine();
+export function createSiphonServer(opts: SiphonServerOptions = {}) {
+  const configuredAllowedOrigins = parseConfiguredAllowedOrigins(opts.allowedOrigins);
+  const configuredPublicBaseUrl =
+    opts.publicBaseUrl?.trim() || process.env.SIPHON_PUBLIC_BASE_URL?.trim() || null;
+  const normalizedPublicBaseUrl = configuredPublicBaseUrl
+    ? normalizeOrigin(configuredPublicBaseUrl)
+    : null;
+  const allowedHostnames = parseConfiguredAllowedHosts(
+    opts.allowedHosts,
+    configuredAllowedOrigins,
+    normalizedPublicBaseUrl ?? undefined
+  );
+  const isAllowedOrigin = (origin: string): boolean =>
+    isLoopbackOrigin(origin) || configuredAllowedOrigins.has(origin);
+
+  const envRequirePluginAuthRaw = process.env.SIPHON_REQUIRE_PLUGIN_AUTH?.trim().toLowerCase();
+  const forcePluginAuth =
+    opts.requirePluginAuth === true ||
+    envRequirePluginAuthRaw === 'true' ||
+    envRequirePluginAuthRaw === '1' ||
+    envRequirePluginAuthRaw === 'yes';
+  const requirePluginAuth =
+    opts.requirePluginAuth ??
+    (envRequirePluginAuthRaw !== undefined
+      ? !['false', '0', 'no'].includes(envRequirePluginAuthRaw)
+      : true);
+
+  const adminSessionToken =
+    opts.adminSessionToken?.trim() || process.env.SIPHON_ADMIN_SESSION_TOKEN?.trim() || null;
+
+  const scanCache = new BoundedTtlCache<string, ScanReport>({
+    maxEntries: opts.scanCacheMaxEntries ?? DEFAULT_SCAN_CACHE_MAX,
+    ttlMs: opts.scanCacheTtlMs ?? DEFAULT_SCAN_CACHE_TTL_MS,
+    nowMs: opts.nowMs,
+  });
+  const jobStore = new BackgroundJobStore({
+    maxJobs: opts.jobStoreMaxJobs,
+    ttlMs: opts.jobStoreTtlMs,
+    nowMs: opts.nowMs,
+  });
+  const agentEngine = new SiphonAgentEngine({ nowMs: opts.nowMs });
 
   const server = http.createServer(async (req, res) => {
-    const method = req.method ?? 'GET';
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-    const pathname = url.pathname;
-    const baseUrl = `${url.protocol}//${url.host}`;
-
-    if (method === 'OPTIONS') {
-      res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      });
-      res.end();
-      return;
-    }
-
     try {
+      const method = (req.method ?? 'GET').toUpperCase();
+      const rawUrl = req.url ?? '/';
+
+      // Reject non-origin-form or protocol-relative request targets (HIGH-5 & MED-4)
+      if (!rawUrl.startsWith('/') || rawUrl.startsWith('//') || rawUrl.includes('\\')) {
+        return sendJson(res, 400, { error: 'Invalid request target: origin-form path required.' });
+      }
+
+      // Validate Host header syntax & enforce DNS-rebinding allowlist (HIGH-5 & CRIT-3)
+      const hostCheck = validateHostHeader(
+        typeof req.headers.host === 'string' ? req.headers.host : undefined,
+        allowedHostnames
+      );
+      if (!hostCheck.ok) {
+        return sendJson(res, hostCheck.status, { error: hostCheck.error });
+      }
+
+      let url: URL;
+      try {
+        url = new URL(rawUrl, `http://${hostCheck.host}`);
+      } catch {
+        return sendJson(res, 400, { error: 'Malformed request URL.' });
+      }
+      // Double-check WHATWG URL did not override host via crafted request target
+      if (url.host !== hostCheck.host) {
+        return sendJson(res, 400, { error: 'Invalid request target host override.' });
+      }
+
+      const pathname = url.pathname;
+      const baseUrl = normalizedPublicBaseUrl ?? `${url.protocol}//${url.host}`;
+      const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+      const refererHeader = typeof req.headers.referer === 'string' ? req.headers.referer : undefined;
+      const secFetchSite =
+        typeof req.headers['sec-fetch-site'] === 'string'
+          ? req.headers['sec-fetch-site'].trim().toLowerCase()
+          : undefined;
+
+      const restrictedCors = isRestrictedCorsRoute(pathname, method);
+      const corsHeaders = buildCorsHeaders({
+        originHeader,
+        restricted: restrictedCors,
+        isAllowedOrigin,
+      });
+      const reply = (status: number, payload: unknown) => sendJson(res, status, payload, corsHeaders);
+
+      const normalizedOrigin = originHeader ? normalizeOrigin(originHeader) : null;
+      const originAllowed = !originHeader || (normalizedOrigin !== null && isAllowedOrigin(normalizedOrigin));
+
+      const isSameOriginLocalhostUi = (): boolean => {
+        if (!normalizedOrigin) return false;
+        if (normalizedOrigin !== url.origin) return false;
+        if (!isLoopbackOrigin(normalizedOrigin)) return false;
+        if (secFetchSite === 'cross-site') return false;
+        return true;
+      };
+
+      const checkCrossOriginAndCsrf = (requireJsonForBrowser: boolean): { ok: true } | { ok: false; status: number; error: string } => {
+        if (originHeader && !originAllowed) {
+          return { ok: false, status: 403, error: 'Cross-origin request blocked by Siphon CORS policy.' };
+        }
+        if (!originHeader && refererHeader) {
+          const refOrigin = normalizeOrigin(refererHeader);
+          if (!refOrigin || !isAllowedOrigin(refOrigin)) {
+            return { ok: false, status: 403, error: 'Cross-origin Referer blocked by Siphon CSRF policy.' };
+          }
+        }
+        if (
+          secFetchSite === 'cross-site' &&
+          (!normalizedOrigin || !configuredAllowedOrigins.has(normalizedOrigin))
+        ) {
+          return { ok: false, status: 403, error: 'Cross-site browser request blocked by Siphon CSRF policy.' };
+        }
+        if (requireJsonForBrowser && method === 'POST' && (originHeader || secFetchSite)) {
+          const ct = String(req.headers['content-type'] ?? '').toLowerCase();
+          if (!ct.includes('application/json')) {
+            return {
+              ok: false,
+              status: 415,
+              error: 'Browser state-mutating requests must use Content-Type: application/json.',
+            };
+          }
+        }
+        return { ok: true };
+      };
+
+      const hasValidAdminSession = (): boolean => {
+        if (!adminSessionToken) return true;
+        const supplied = req.headers['x-siphon-admin-session'];
+        const value = Array.isArray(supplied) ? supplied[0] : supplied;
+        return Boolean(value && timingSafeStringEqual(value.trim(), adminSessionToken));
+      };
+
+      const verifyAdminRequest = (): { ok: true } | { ok: false; status: number; error: string } => {
+        const csrf = checkCrossOriginAndCsrf(true);
+        if (!csrf.ok) return csrf;
+        if (adminSessionToken && !hasValidAdminSession()) {
+          return { ok: false, status: 401, error: 'Missing or invalid X-Siphon-Admin-Session header.' };
+        }
+        return { ok: true };
+      };
+
+      if (method === 'OPTIONS') {
+        const preflightRestricted = isPrivilegedCrossOriginProtectedRoute(pathname, 'POST');
+        const preflightCors = buildCorsHeaders({
+          originHeader,
+          restricted: preflightRestricted,
+          isAllowedOrigin,
+        });
+        if (preflightRestricted && originHeader && !originAllowed) {
+          sendJson(res, 403, { error: 'Cross-origin preflight blocked by Siphon CORS policy.' }, preflightCors);
+          return;
+        }
+        res.writeHead(204, preflightCors);
+        res.end();
+        return;
+      }
+
+      if (isPrivilegedCrossOriginProtectedRoute(pathname, method)) {
+        const originCheck = checkCrossOriginAndCsrf(method === 'POST');
+        if (!originCheck.ok) {
+          return reply(originCheck.status, { error: originCheck.error });
+        }
+      }
+
+      if (isAdminMutationRoute(pathname, method)) {
+        const adminCheck = verifyAdminRequest();
+        if (!adminCheck.ok) {
+          return reply(adminCheck.status, { error: adminCheck.error });
+        }
+      }
+
+      if (isAgentReadRoute(pathname, method) && adminSessionToken) {
+        const authHeader = req.headers.authorization;
+        const hasPluginToken = Boolean(authHeader && agentEngine.verifyPluginToken(authHeader));
+        if (!hasValidAdminSession() && !hasPluginToken) {
+          return reply(401, {
+            error: 'Authentication required: supply X-Siphon-Admin-Session or Authorization: Bearer <token>.',
+          });
+        }
+      }
+
       if (method === 'GET' && pathname === '/api/health') {
         const protocolFee = getProtocolFeeConfig();
-        return sendJson(res, 200, {
+        return reply(200, {
           status: 'ok',
           service: 'siphon-migrator',
           chains: CHAIN_LIST.length,
@@ -213,17 +678,19 @@ export function createSiphonServer() {
       }
 
       if (method === 'GET' && pathname === '/api/config') {
-        return sendJson(res, 200, {
+        return reply(200, {
           coinbaseSmartWalletEnabled: fs.existsSync(path.join(DIST_VENDOR_DIR, 'wallet-sdks.js')),
           walletConnectProjectId: process.env.WALLETCONNECT_PROJECT_ID?.trim() || null,
           l2IndexerProvider: getL2IndexerProvider(),
           protocolFee: getProtocolFeeConfig(),
           gaslessRelayerConfigured: isSponsorRelayerConfigured(),
+          requirePluginAuth,
+          adminSessionRequired: Boolean(adminSessionToken),
         });
       }
 
       if (method === 'GET' && pathname === '/api/chains') {
-        return sendJson(res, 200, {
+        return reply(200, {
           solanaCctpDomain: SOLANA_CCTP_DOMAIN,
           burnSink: DEAD_BURN_ADDRESS,
           protocolFeeBps: PROTOCOL_FEE_BPS,
@@ -237,7 +704,7 @@ export function createSiphonServer() {
       if (method === 'GET' && pathname === '/api/families') {
         const families = listAllFamilyMetas();
         const totalChains = families.reduce((s, f) => s + f.chains.length, 0);
-        return sendJson(res, 200, {
+        return reply(200, {
           totalFamilies: families.length,
           totalChains,
           families,
@@ -254,10 +721,9 @@ export function createSiphonServer() {
         }>(req);
         const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
         if (!scan) {
-          return sendJson(res, 400, { error: 'Valid scan or scanId is required' });
+          return reply(400, { error: 'Valid scan or scanId is required' });
         }
-        return sendJson(
-          res,
+        return reply(
           200,
           evaluatePortfolioRoi(scan, {
             protocolFeeBps: body.protocolFeeBps,
@@ -277,7 +743,7 @@ export function createSiphonServer() {
         const delegateSource = fs.existsSync(delegatePath) ? fs.readFileSync(delegatePath, 'utf8') : '';
         const agentVaultSource = fs.existsSync(agentVaultPath) ? fs.readFileSync(agentVaultPath, 'utf8') : '';
         const protocolFee = getProtocolFeeConfig();
-        return sendJson(res, 200, {
+        return reply(200, {
           name: 'SiphonRouter.sol',
           solidityVersion: '0.8.24',
           protocolFeeBps: protocolFee.feeBps,
@@ -310,18 +776,14 @@ export function createSiphonServer() {
           hasSolanaUsdcAta?: boolean;
         }>(req);
         if (!Array.isArray(body.wallets) || !body.wallets.length) {
-          return sendJson(res, 400, { error: 'wallets[] array with at least one wallet is required.' });
+          return reply(400, { error: 'wallets[] array with at least one wallet is required.' });
         }
         const report = await scanUnifiedWallets({
           wallets: body.wallets,
           hasSolanaUsdcAta: body.hasSolanaUsdcAta,
         });
         scanCache.set(report.scanId, report);
-        if (scanCache.size > 40) {
-          const firstKey = scanCache.keys().next().value;
-          if (firstKey) scanCache.delete(firstKey);
-        }
-        return sendJson(res, 200, report);
+        return reply(200, report);
       }
 
       if (method === 'POST' && pathname === '/api/dust/plan') {
@@ -334,10 +796,9 @@ export function createSiphonServer() {
         }>(req);
         const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
         if (!scan) {
-          return sendJson(res, 400, { error: 'Valid scan or scanId is required' });
+          return reply(400, { error: 'Valid scan or scanId is required' });
         }
-        return sendJson(
-          res,
+        return reply(
           200,
           planDustConversion({
             scan,
@@ -350,7 +811,7 @@ export function createSiphonServer() {
 
       // ================= SMART-CONTRACT AGENTS & PERMISSION GATE =================
       if (method === 'GET' && pathname === '/api/agents/mandates') {
-        return sendJson(res, 200, { mandates: agentEngine.listMandates() });
+        return reply(200, { mandates: agentEngine.listMandates() });
       }
 
       if (method === 'POST' && pathname === '/api/agents/mandates') {
@@ -366,9 +827,9 @@ export function createSiphonServer() {
           maxFeeBps?: number;
           minNetOutBps?: number;
           allowedActions?: AgentActionType[];
-        }>(req);
+        }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
         if (!body.ownerAddress || !body.lockedSolanaRecipient) {
-          return sendJson(res, 400, { error: 'ownerAddress and lockedSolanaRecipient are required.' });
+          return reply(400, { error: 'ownerAddress and lockedSolanaRecipient are required.' });
         }
         try {
           const mandate = agentEngine.createMandate({
@@ -384,9 +845,9 @@ export function createSiphonServer() {
             minNetOutBps: body.minNetOutBps,
             allowedActions: body.allowedActions,
           });
-          return sendJson(res, 200, mandate);
+          return reply(200, mandate);
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Invalid agent mandate parameters',
           });
         }
@@ -395,19 +856,19 @@ export function createSiphonServer() {
       if (method === 'POST' && pathname.startsWith('/api/agents/mandates/') && pathname.endsWith('/revoke')) {
         const mandateId = pathname.slice('/api/agents/mandates/'.length, -'/revoke'.length);
         const revoked = agentEngine.revokeMandate(mandateId);
-        if (!revoked) return sendJson(res, 404, { error: 'Agent mandate not found' });
-        return sendJson(res, 200, revoked);
+        if (!revoked) return reply(404, { error: 'Agent mandate not found' });
+        return reply(200, revoked);
       }
 
       if (method === 'GET' && pathname === '/api/agents/approvals') {
-        return sendJson(res, 200, { approvals: agentEngine.listApprovals() });
+        return reply(200, { approvals: agentEngine.listApprovals() });
       }
 
       if (method === 'POST' && pathname === '/api/agents/approvals') {
         const authHeader = req.headers.authorization;
         const verifiedToken = authHeader ? agentEngine.verifyPluginToken(authHeader) : null;
         if (authHeader && !verifiedToken) {
-          return sendJson(res, 401, { error: 'Invalid or revoked Siphon AI Plugin Bearer token.' });
+          return reply(401, { error: 'Invalid or revoked Siphon AI Plugin Bearer token.' });
         }
 
         const body = await readJsonBody<{
@@ -422,14 +883,29 @@ export function createSiphonServer() {
           estimatedNetUsdc?: number;
           protocolFeeBps?: number;
           assetIds?: string[];
-        }>(req);
+        }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
+
+        const resolvedClient: PluginClientKind =
+          verifiedToken?.client ?? body.client ?? 'smart_contract_agent';
+        const isExternalPluginClient =
+          resolvedClient === 'chatgpt_action' || resolvedClient === 'claude_mcp';
+
+        if (isExternalPluginClient && !verifiedToken) {
+          const allowLocalUiSimulation = !forcePluginAuth && isSameOriginLocalhostUi();
+          if (!allowLocalUiSimulation) {
+            return reply(401, {
+              error:
+                'Bearer token authentication is required for external plugin permission requests (chatgpt_action / claude_mcp).',
+            });
+          }
+        }
 
         if (!body.actionType || !body.solanaDestination) {
-          return sendJson(res, 400, { error: 'actionType and solanaDestination are required.' });
+          return reply(400, { error: 'actionType and solanaDestination are required.' });
         }
         try {
           const approval = agentEngine.requestPermission({
-            client: verifiedToken?.client ?? body.client ?? 'smart_contract_agent',
+            client: resolvedClient,
             mandateId: body.mandateId,
             actionType: body.actionType,
             summary: body.summary || `Permission request (${body.actionType})`,
@@ -440,10 +916,11 @@ export function createSiphonServer() {
             estimatedNetUsdc: Number(body.estimatedNetUsdc ?? 0),
             protocolFeeBps: body.protocolFeeBps,
             assetIds: body.assetIds,
+            scanCache: scanCache.values(),
           });
-          return sendJson(res, 200, approval);
+          return reply(200, approval);
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Could not create permission request',
           });
         }
@@ -451,30 +928,39 @@ export function createSiphonServer() {
 
       if (method === 'POST' && pathname.startsWith('/api/agents/approvals/') && pathname.endsWith('/decide')) {
         const approvalId = pathname.slice('/api/agents/approvals/'.length, -'/decide'.length);
-        const body = await readJsonBody<{ decision?: 'approve' | 'reject'; reason?: string }>(req);
+        const body = await readJsonBody<{ decision?: 'approve' | 'reject'; reason?: string }>(
+          req,
+          MAX_PRIVILEGED_JSON_BODY_BYTES
+        );
         if (body.decision !== 'approve' && body.decision !== 'reject') {
-          return sendJson(res, 400, { error: "decision must be 'approve' or 'reject'" });
+          return reply(400, { error: "decision must be 'approve' or 'reject'" });
         }
-        const decided = agentEngine.decideApproval({
-          approvalId,
-          decision: body.decision,
-          reason: body.reason,
-        });
-        if (!decided) return sendJson(res, 404, { error: 'Permission request not found' });
-        return sendJson(res, 200, decided);
+        try {
+          const decided = agentEngine.decideApproval({
+            approvalId,
+            decision: body.decision,
+            reason: body.reason,
+          });
+          if (!decided) return reply(404, { error: 'Permission request not found' });
+          return reply(200, decided);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Approval decision violated mandate policy',
+          });
+        }
       }
 
       // ================= CLAUDE MCP & CHATGPT ACTION PLUGIN =================
       if (method === 'GET' && pathname === '/.well-known/ai-plugin.json') {
-        return sendJson(res, 200, buildAiPluginManifest(baseUrl));
+        return reply(200, buildAiPluginManifest(baseUrl));
       }
 
       if (method === 'GET' && pathname === '/openapi.json') {
-        return sendJson(res, 200, buildOpenApiSpec(baseUrl));
+        return reply(200, buildOpenApiSpec(baseUrl));
       }
 
       if (method === 'GET' && pathname === '/api/plugin/setup') {
-        return sendJson(res, 200, {
+        return reply(200, {
           ...buildPluginSetupGuide({ baseUrl, rootDir: ROOT_DIR }),
           tokens: agentEngine.listPluginTokens(),
         });
@@ -485,39 +971,82 @@ export function createSiphonServer() {
           label?: string;
           client?: 'claude_mcp' | 'chatgpt_action';
           scopes?: string[];
-        }>(req);
+        }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
         const issued = agentEngine.issuePluginToken({
           label: body.label || 'AI Assistant Token',
           client: body.client === 'chatgpt_action' ? 'chatgpt_action' : 'claude_mcp',
           scopes: body.scopes,
         });
-        return sendJson(res, 200, issued);
+        return reply(200, issued);
       }
 
       if (method === 'POST' && pathname.startsWith('/api/plugin/tokens/') && pathname.endsWith('/revoke')) {
         const tokenId = pathname.slice('/api/plugin/tokens/'.length, -'/revoke'.length);
         const revoked = agentEngine.revokePluginToken(tokenId);
-        if (!revoked) return sendJson(res, 404, { error: 'Plugin token not found' });
-        return sendJson(res, 200, revoked);
+        if (!revoked) return reply(404, { error: 'Plugin token not found' });
+        return reply(200, revoked);
+      }
+
+      if ((method === 'GET' || method === 'DELETE') && pathname === '/mcp') {
+        res.writeHead(405, {
+          Allow: 'POST, OPTIONS',
+          'Content-Type': 'application/json; charset=utf-8',
+          ...corsHeaders,
+        });
+        res.end(JSON.stringify({ error: 'Method Not Allowed: use POST /mcp with JSON-RPC 2.0.' }));
+        return;
       }
 
       if (method === 'POST' && pathname === '/mcp') {
         const authHeader = req.headers.authorization;
-        if (authHeader && !agentEngine.verifyPluginToken(authHeader)) {
-          return sendJson(res, 401, {
+        const verifiedToken = authHeader ? agentEngine.verifyPluginToken(authHeader) : null;
+        if (authHeader && !verifiedToken) {
+          return reply(401, {
             jsonrpc: '2.0',
             id: null,
             error: { code: -32001, message: 'Invalid or revoked Siphon MCP Bearer token.' },
           });
         }
-        const rpcReq = await readJsonBody<{
-          jsonrpc?: string;
-          id?: string | number | null;
-          method?: string;
-          params?: Record<string, unknown>;
-        }>(req);
+        if (!verifiedToken && (requirePluginAuth || !isSameOriginLocalhostUi())) {
+          return reply(401, {
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32001,
+              message:
+                'Missing Siphon MCP Bearer token. Issue a scoped token in Siphon and pass Authorization: Bearer <token>.',
+            },
+          });
+        }
+        let rpcReq: Record<string, unknown>;
+        try {
+          rpcReq = await readJsonBody<Record<string, unknown>>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
+        } catch (err) {
+          if (err instanceof HttpError && err.status === 400) {
+            return reply(400, {
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: -32700, message: err.message },
+            });
+          }
+          throw err;
+        }
+        // JSON-RPC 2.0 notification (no `id` property): process and return 202 Accepted with empty body (MED-6)
+        const isNotification =
+          rpcReq.jsonrpc === '2.0' &&
+          typeof rpcReq.method === 'string' &&
+          !('id' in rpcReq);
         const rpcRes = await handleMcpJsonRpc(rpcReq, { agentEngine, scanCache });
-        return sendJson(res, 200, rpcRes);
+        if (isNotification) {
+          res.writeHead(202, {
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+            ...corsHeaders,
+          });
+          res.end();
+          return;
+        }
+        return reply(200, rpcRes);
       }
 
       if (method === 'POST' && pathname === '/api/scan') {
@@ -535,7 +1064,7 @@ export function createSiphonServer() {
         } else if (body.address) {
           const detected = detectAddressFamily(body.address, body.family);
           if (!detected) {
-            return sendJson(res, 400, {
+            return reply(400, {
               error:
                 'Invalid wallet address format. Supported: EVM (0x… / .eth), Cosmos (cosmos1…/osmo1…/noble1…/celestia1…/inj1…/neutron1…), Sui/Aptos (0x… 64-hex), TON (EQ…/UQ…), Tron (T…), Bitcoin (bc1…/1…/3…).',
             });
@@ -550,7 +1079,7 @@ export function createSiphonServer() {
           } catch (err) {
             const msg = err instanceof Error ? err.message : 'Invalid wallet address';
             if (msg.toLowerCase().includes('invalid')) {
-              return sendJson(res, 400, { error: msg });
+              return reply(400, { error: msg });
             }
             throw err;
           }
@@ -560,12 +1089,8 @@ export function createSiphonServer() {
         }
 
         scanCache.set(report.scanId, report);
-        if (scanCache.size > 40) {
-          const firstKey = scanCache.keys().next().value;
-          if (firstKey) scanCache.delete(firstKey);
-        }
 
-        return sendJson(res, 200, report);
+        return reply(200, report);
       }
 
       if (method === 'POST' && pathname === '/api/plan') {
@@ -585,19 +1110,21 @@ export function createSiphonServer() {
 
         const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
         if (!scan) {
-          return sendJson(res, 400, { error: 'Valid scan or scanId is required' });
+          return reply(400, { error: 'Valid scan or scanId is required' });
         }
 
         const solDest = body.solanaDestination?.trim();
         if (!solDest) {
-          return sendJson(res, 400, { error: 'solanaDestination is required' });
+          return reply(400, { error: 'solanaDestination is required' });
         }
 
         try {
           solanaAddressToBytes32(solDest);
         } catch {
-          return sendJson(res, 400, { error: 'Invalid Solana destination address (expected base58 public key).' });
+          return reply(400, { error: 'Invalid Solana destination address (expected base58 public key).' });
         }
+
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
 
         const plan = buildMigrationPlan({
           scan,
@@ -608,26 +1135,26 @@ export function createSiphonServer() {
           outputAsset: body.outputAsset ?? 'USDC',
           bridgePreference: body.bridgePreference ?? 'auto',
           protocolFeeBps: body.protocolFeeBps,
-          feeRecipientEvm: body.feeRecipientEvm,
+          feeRecipientEvm: undefined,
           hasSolanaUsdcAta: body.hasSolanaUsdcAta,
         });
 
-        return sendJson(res, 200, plan);
+        return reply(200, plan);
       }
 
       if (method === 'GET' && pathname === '/api/solana/balance') {
         const address = url.searchParams.get('address')?.trim();
-        if (!address) return sendJson(res, 400, { error: 'address query parameter is required' });
+        if (!address) return reply(400, { error: 'address query parameter is required' });
         try {
           solanaAddressToBytes32(address);
         } catch {
-          return sendJson(res, 400, { error: 'Invalid Solana address' });
+          return reply(400, { error: 'Invalid Solana address' });
         }
         try {
           const balances = await fetchSolanaWalletBalances(address);
-          return sendJson(res, 200, balances);
+          return reply(200, balances);
         } catch (err) {
-          return sendJson(res, 503, {
+          return reply(503, {
             rpcUnavailable: true,
             error: err instanceof Error ? err.message : 'Solana RPC temporarily unavailable',
           });
@@ -680,10 +1207,12 @@ export function createSiphonServer() {
         }>(req);
 
         if (!body.asset || !body.userAddress || !body.solanaDestination) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: 'asset, userAddress, and solanaDestination are required',
           });
         }
+
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
 
         try {
           const prepared = await prepareRealExecution({
@@ -693,11 +1222,11 @@ export function createSiphonServer() {
             outputAsset: body.outputAsset ?? 'USDC',
             bridgePreference: body.bridgePreference ?? 'auto',
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipientEvm: body.feeRecipientEvm,
+            feeRecipientEvm: undefined,
           });
-          return sendJson(res, 200, prepared);
+          return reply(200, prepared);
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Could not prepare real transaction',
           });
         }
@@ -718,10 +1247,12 @@ export function createSiphonServer() {
         }>(req);
 
         if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: 'chain, assets[], userAddress, and solanaDestination are required',
           });
         }
+
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
 
         try {
           const batch = await prepareChainBatchExecution({
@@ -733,12 +1264,12 @@ export function createSiphonServer() {
             bridgePreference: body.bridgePreference ?? 'auto',
             bundleDefiCctp: body.bundleDefiCctp ?? true,
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipientEvm: body.feeRecipientEvm,
+            feeRecipientEvm: undefined,
             allowHighCost: body.allowHighCost ?? false,
           });
-          return sendJson(res, 200, batch);
+          return reply(200, batch);
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Could not prepare EIP-5792 chain batch',
           });
         }
@@ -752,14 +1283,14 @@ export function createSiphonServer() {
           provider?: string;
         }>(req);
 
-        if (!body.chain) return sendJson(res, 400, { error: 'chain is required' });
+        if (!body.chain) return reply(400, { error: 'chain is required' });
         const status = await checkLiveExecutionStatus({
           chain: body.chain,
           txHash: body.txHash,
           requestId: body.requestId,
           provider: body.provider,
         });
-        return sendJson(res, 200, status);
+        return reply(200, status);
       }
 
       if (method === 'POST' && pathname === '/api/cctp/attestation') {
@@ -770,7 +1301,7 @@ export function createSiphonServer() {
         }>(req);
 
         if (!body.chain || !body.txHash || !/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim())) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: 'chain and a valid 32-byte 0x txHash are required',
           });
         }
@@ -781,9 +1312,9 @@ export function createSiphonServer() {
             txHash: body.txHash.trim(),
             solanaDestination: body.solanaDestination?.trim(),
           });
-          return sendJson(res, 200, att);
+          return reply(200, att);
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Could not fetch CCTP attestation',
           });
         }
@@ -804,10 +1335,12 @@ export function createSiphonServer() {
         }>(req);
 
         if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: 'chain, assets[], userAddress, and solanaDestination are required',
           });
         }
+
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
 
         try {
           if (isEvmChain(body.chain)) {
@@ -819,7 +1352,7 @@ export function createSiphonServer() {
               outputAsset: body.outputAsset ?? 'USDC',
               bridgePreference: body.bridgePreference ?? 'auto',
               protocolFeeBps: body.protocolFeeBps,
-              feeRecipientEvm: body.feeRecipientEvm,
+              feeRecipientEvm: undefined,
               bundleDefiCctp: body.bundleDefiCctp ?? false,
             });
             const proof = await buildPreSignSimulationProof({
@@ -827,7 +1360,7 @@ export function createSiphonServer() {
               assets: body.assets.filter((a) => a.chain === body.chain),
               nativePriceUsd: body.nativePriceUsd,
             });
-            return sendJson(res, 200, {
+            return reply(200, {
               proof: { ...proof, family: 'evm', simulationEndpoint: 'eth_call' },
               batch,
             });
@@ -842,12 +1375,12 @@ export function createSiphonServer() {
             outputAsset: body.outputAsset ?? 'USDC',
             bridgePreference: body.bridgePreference ?? 'auto',
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipient: body.feeRecipientEvm,
+            feeRecipient: undefined,
             nativePriceUsd: body.nativePriceUsd,
           });
-          return sendJson(res, 200, { proof, batch: null });
+          return reply(200, { proof, batch: null });
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Could not build real-time simulation proof',
           });
         }
@@ -867,15 +1400,17 @@ export function createSiphonServer() {
         }>(req);
 
         if (!body.chain || !body.txHash?.trim() || !body.solanaDestination) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: 'chain, txHash, and solanaDestination are required',
           });
         }
 
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
+
         try {
           if (isEvmChain(body.chain)) {
             if (!/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim())) {
-              return sendJson(res, 400, {
+              return reply(400, {
                 error: 'chain, valid 32-byte txHash, and solanaDestination are required',
               });
             }
@@ -886,11 +1421,11 @@ export function createSiphonServer() {
               solanaDestination: body.solanaDestination.trim(),
               requestId: body.requestId,
               provider: body.provider,
-              feeRecipientEvm: body.feeRecipientEvm,
+              feeRecipientEvm: undefined,
               preSolanaUsdc: body.preSolanaUsdc,
               preSolanaSol: body.preSolanaSol,
             });
-            return sendJson(res, 200, proof);
+            return reply(200, proof);
           }
 
           const adapter = getAdapterForChain(body.chain);
@@ -901,13 +1436,13 @@ export function createSiphonServer() {
             solanaDestination: body.solanaDestination.trim(),
             requestId: body.requestId,
             provider: body.provider,
-            feeRecipient: body.feeRecipientEvm,
+            feeRecipient: undefined,
             preSolanaUsdc: body.preSolanaUsdc,
             preSolanaSol: body.preSolanaSol,
           });
-          return sendJson(res, 200, result.proof);
+          return reply(200, result.proof);
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Could not verify onchain proof',
           });
         }
@@ -926,10 +1461,12 @@ export function createSiphonServer() {
         }>(req);
 
         if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: 'chain, assets[], userAddress, and solanaDestination are required',
           });
         }
+
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
 
         try {
           if (isEvmChain(body.chain)) {
@@ -940,17 +1477,17 @@ export function createSiphonServer() {
               solanaDestination: body.solanaDestination,
               outputAsset: body.outputAsset ?? 'USDC',
               protocolFeeBps: body.protocolFeeBps,
-              feeRecipientEvm: body.feeRecipientEvm,
+              feeRecipientEvm: undefined,
               preferredMode: body.preferredMode,
             });
             if (!plan.sponsorEligible) {
-              return sendJson(res, 400, {
+              return reply(400, {
                 ...plan,
                 family: 'evm',
                 error: plan.sponsorRejectionReason || 'Below gasless sponsorship break-even.',
               });
             }
-            return sendJson(res, 200, { ...plan, family: 'evm' });
+            return reply(200, { ...plan, family: 'evm' });
           }
 
           const adapter = getAdapterForChain(body.chain);
@@ -961,11 +1498,11 @@ export function createSiphonServer() {
             solanaDestination: body.solanaDestination,
             outputAsset: body.outputAsset ?? 'USDC',
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipient: body.feeRecipientEvm,
+            feeRecipient: undefined,
           });
-          return sendJson(res, 200, intent);
+          return reply(200, intent);
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Could not prepare gasless sweep intent',
           });
         }
@@ -982,7 +1519,7 @@ export function createSiphonServer() {
         }>(req);
 
         if (!body.intentId || !body.chain || !body.userAddress || !body.signature || !body.deadline) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: 'intentId, chain, userAddress, signature, and deadline are required',
           });
         }
@@ -996,7 +1533,7 @@ export function createSiphonServer() {
               signature: body.signature,
               deadline: body.deadline,
             });
-            return sendJson(res, 200, receipt);
+            return reply(200, receipt);
           }
 
           const adapter = getAdapterForChain(body.chain);
@@ -1008,16 +1545,16 @@ export function createSiphonServer() {
             deadline: body.deadline,
             solanaDestination: body.solanaDestination || '',
           });
-          return sendJson(res, 200, result.submitted);
+          return reply(200, result.submitted);
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Could not submit signed gasless intent',
           });
         }
       }
 
       if (method === 'GET' && pathname === '/api/jobs') {
-        return sendJson(res, 200, { jobs: jobStore.listJobs() });
+        return reply(200, { jobs: jobStore.listJobs() });
       }
 
       if (method === 'POST' && pathname === '/api/jobs') {
@@ -1038,17 +1575,24 @@ export function createSiphonServer() {
             estimatedNetUsd: number;
             estimatedFeeUsd?: number;
           }>;
-        }>(req);
+        }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
 
         if (!body.sourceWallet || !body.solanaDestination || !Array.isArray(body.legs)) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: 'sourceWallet, solanaDestination, and legs[] are required',
           });
         }
+        if (body.legs.length > MAX_JOB_LEGS) {
+          return reply(400, {
+            error: `legs[] exceeds maximum of ${MAX_JOB_LEGS} chain legs per job`,
+          });
+        }
+
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
 
         const feeCfg = getProtocolFeeConfig({
           feeBps: body.protocolFeeBps,
-          feeRecipientEvm: body.feeRecipientEvm,
+          feeRecipientEvm: undefined,
         });
         try {
           const job = jobStore.createJob({
@@ -1060,9 +1604,9 @@ export function createSiphonServer() {
             feeRecipientEvm: feeCfg.feeRecipientEvm,
             legs: body.legs,
           });
-          return sendJson(res, 200, job);
+          return reply(200, job);
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Invalid background job payload',
           });
         }
@@ -1071,8 +1615,8 @@ export function createSiphonServer() {
       if (method === 'GET' && pathname.startsWith('/api/jobs/')) {
         const jobId = pathname.slice('/api/jobs/'.length);
         const job = jobStore.getJob(jobId);
-        if (!job) return sendJson(res, 404, { error: 'Background job not found' });
-        return sendJson(res, 200, job);
+        if (!job) return reply(404, { error: 'Background job not found' });
+        return reply(200, job);
       }
 
       if (method === 'POST' && pathname.startsWith('/api/jobs/') && pathname.endsWith('/leg')) {
@@ -1092,10 +1636,13 @@ export function createSiphonServer() {
           requestId?: string;
           requiresSolanaClaim?: boolean;
           attestationStatus?: string;
-        }>(req);
+        }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
 
         if (!body.legId && !body.chain) {
-          return sendJson(res, 400, { error: 'legId or chain is required' });
+          return reply(400, { error: 'legId or chain is required' });
+        }
+        if (body.status !== undefined && !VALID_JOB_LEG_STATUSES.has(body.status)) {
+          return reply(400, { error: `Invalid job leg status: ${String(body.status)}` });
         }
 
         const patch: Partial<{
@@ -1132,10 +1679,10 @@ export function createSiphonServer() {
             },
             patch
           );
-          if (!updated) return sendJson(res, 404, { error: 'Background job or chain leg not found' });
-          return sendJson(res, 200, updated);
+          if (!updated) return reply(404, { error: 'Background job or chain leg not found' });
+          return reply(200, updated);
         } catch (err) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: err instanceof Error ? err.message : 'Invalid leg update payload',
           });
         }
@@ -1153,9 +1700,14 @@ export function createSiphonServer() {
         }>(req);
 
         const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
-        if (!scan) return sendJson(res, 400, { error: 'Valid scan or scanId is required' });
-        const solDest = body.solanaDestination?.trim();
-        if (!solDest) return sendJson(res, 400, { error: 'solanaDestination is required' });
+        if (!scan) return reply(400, { error: 'Valid scan or scanId is required' });
+        const solDest = typeof body.solanaDestination === 'string' ? body.solanaDestination.trim() : '';
+        if (!solDest) return reply(400, { error: 'solanaDestination is required' });
+        try {
+          solanaAddressToBytes32(solDest);
+        } catch {
+          return reply(400, { error: 'Invalid Solana destination address (expected base58 public key).' });
+        }
 
         const plan = buildMigrationPlan({
           scan,
@@ -1179,7 +1731,7 @@ export function createSiphonServer() {
           solanaMintSig: crypto.randomBytes(32).toString('base64url').slice(0, 44),
         }));
 
-        return sendJson(res, 200, {
+        return reply(200, {
           simulationId: `sim_${crypto.randomBytes(5).toString('hex')}`,
           executedAt: new Date().toISOString(),
           mode: 'dry_run_simulation',
@@ -1192,20 +1744,24 @@ export function createSiphonServer() {
         return;
       }
 
-      return sendJson(res, 404, { error: 'Not found' });
+      return reply(404, { error: 'Not found' });
     } catch (err) {
       if (err instanceof HttpError) {
         return sendJson(res, err.status, { error: err.message });
       }
       return sendJson(res, 500, {
-        error: err instanceof Error ? err.message : 'Internal server error',
+        error: 'Internal server error',
       });
     }
   });
+
+  server.headersTimeout = 10_000;
+  server.requestTimeout = 30_000;
+  server.keepAliveTimeout = 5_000;
 
   server.on('close', () => {
     jobStore.dispose();
   });
 
-  return { server };
+  return { server, scanCache, jobStore, agentEngine };
 }

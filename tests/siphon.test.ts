@@ -470,7 +470,9 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
     // Witness-bound Gasless 1-Signature Permit2 / EIP-7702 intent preparation & cryptographic signature verification
     const opAssets = report.assets.filter((a) => a.chain === 'optimism');
     const prevOpRouter = process.env.SIPHON_ROUTER_OPTIMISM;
+    const prevFeeRecip = process.env.SIPHON_FEE_RECIPIENT_EVM;
     process.env.SIPHON_ROUTER_OPTIMISM = '0x2222222222222222222222222222222222222222';
+    process.env.SIPHON_FEE_RECIPIENT_EVM = treasury;
     const testPrivKey = Buffer.from('11'.repeat(32), 'hex');
     const testPub = secp256k1.getPublicKey(testPrivKey, false).slice(1);
     const testUserAddress = '0x' + Buffer.from(keccak_256(testPub).slice(-20)).toString('hex');
@@ -484,7 +486,6 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
           userAddress: testUserAddress,
           solanaDestination: SAMPLE_SOLANA_WALLET,
           protocolFeeBps: 700,
-          feeRecipientEvm: treasury,
         }),
       }).then((r) => r.json());
       assert.equal(intent.userGasCostUsd, 0);
@@ -524,6 +525,8 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
     } finally {
       if (prevOpRouter === undefined) delete process.env.SIPHON_ROUTER_OPTIMISM;
       else process.env.SIPHON_ROUTER_OPTIMISM = prevOpRouter;
+      if (prevFeeRecip === undefined) delete process.env.SIPHON_FEE_RECIPIENT_EVM;
+      else process.env.SIPHON_FEE_RECIPIENT_EVM = prevFeeRecip;
     }
 
     // Real-time Pre-Sign Simulation Proof (POST /api/tx/simulate-proof)
@@ -537,7 +540,6 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
         solanaDestination: SAMPLE_SOLANA_WALLET,
         bridgePreference: 'cctp',
         protocolFeeBps: 700,
-        feeRecipientEvm: treasury,
       }),
     }).then((r) => r.json());
     assert.equal(simProofRes.proof.mintRecipientVerified, true);
@@ -555,7 +557,6 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
         outputAsset: 'USDC',
         bridgePreference: 'auto',
         protocolFeeBps: 700,
-        feeRecipientEvm: treasury,
         legs: [{ chain: 'base', assetCount: 4, estimatedNetUsd: 1200, estimatedFeeUsd: 90 }],
       }),
     }).then((r) => r.json());
@@ -1293,10 +1294,43 @@ test('Unified multi-wallet scan, Dust Conversion engine, Smart-Contract Agent Ma
     }).then((r) => r.json());
     assert.equal(autoApproval.status, 'auto_approved_by_mandate');
 
-    // Larger $150 sweep above $50 auto tier -> pending_approval until owner approves!
-    const pendingApproval = await fetch(`${base}/api/agents/approvals`, {
+    // 4. ChatGPT Plugin Manifest + OpenAPI 3.1 + Scoped Bearer Token Auth
+    const manifest = await fetch(`${base}/.well-known/ai-plugin.json`).then((r) => r.json());
+    assert.equal(manifest.name_for_model, 'siphon_migrator');
+    const openapi = await fetch(`${base}/openapi.json`).then((r) => r.json());
+    assert.equal(openapi.openapi, '3.1.0');
+    assert.ok(openapi.paths['/api/scan/unified']);
+    assert.ok(openapi.paths['/api/agents/approvals']);
+
+    const tok = await fetch(`${base}/api/plugin/tokens`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'ChatGPT Test', client: 'chatgpt_action' }),
+    }).then((r) => r.json());
+    assert.ok(tok.token.startsWith('siphon_gpt_'));
+
+    // Unauthenticated chatgpt_action approval call is rejected with 401
+    const unauthApproval = await fetch(`${base}/api/agents/approvals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client: 'chatgpt_action',
+        mandateId: mandate.mandateId,
+        actionType: 'bridge_solana',
+        summary: 'Unauthenticated ChatGPT attempt',
+        sourceWallets: ['0x71C7656EC7ab88b098defB751B7401B5f6d8976F'],
+        chains: ['arbitrum'],
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+        grossUsd: 150,
+        estimatedNetUsdc: 138,
+      }),
+    });
+    assert.equal(unauthApproval.status, 401);
+
+    // Larger $150 sweep above $50 auto tier with valid Bearer token -> pending_approval until owner approves!
+    const pendingApproval = await fetch(`${base}/api/agents/approvals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok.token}` },
       body: JSON.stringify({
         client: 'chatgpt_action',
         mandateId: mandate.mandateId,
@@ -1317,21 +1351,6 @@ test('Unified multi-wallet scan, Dust Conversion engine, Smart-Contract Agent Ma
       body: JSON.stringify({ decision: 'approve' }),
     }).then((r) => r.json());
     assert.equal(decided.status, 'approved');
-
-    // 4. ChatGPT Plugin Manifest + OpenAPI 3.1 + Scoped Bearer Token Auth
-    const manifest = await fetch(`${base}/.well-known/ai-plugin.json`).then((r) => r.json());
-    assert.equal(manifest.name_for_model, 'siphon_migrator');
-    const openapi = await fetch(`${base}/openapi.json`).then((r) => r.json());
-    assert.equal(openapi.openapi, '3.1.0');
-    assert.ok(openapi.paths['/api/scan/unified']);
-    assert.ok(openapi.paths['/api/agents/approvals']);
-
-    const tok = await fetch(`${base}/api/plugin/tokens`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: 'ChatGPT Test', client: 'chatgpt_action' }),
-    }).then((r) => r.json());
-    assert.ok(tok.token.startsWith('siphon_gpt_'));
 
     // Invalid bearer token rejected with 401
     const unauth = await fetch(`${base}/mcp`, {

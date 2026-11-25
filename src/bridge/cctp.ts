@@ -708,8 +708,13 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
       gasPriceGwei: chainSummary?.gasPriceGwei,
     });
 
+    const legFamily =
+      chainAssets[0]?.family ??
+      chainSummary?.family ??
+      (scan.family && scan.family !== 'mixed' ? scan.family : 'evm');
+
     legs.push({
-      family: scan.family ?? 'evm',
+      family: legFamily,
       chain: chainId,
       chainName,
       sourceDomain: cctpDomain,

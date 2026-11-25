@@ -45,6 +45,45 @@ const LIFI_SOLANA_CHAIN_ID = 1151111081099710;
 const SOLANA_NATIVE_MINT = '11111111111111111111111111111111';
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
+const ALLOWED_COMPOUND_V3_COMETS: Partial<Record<EvmChainId, string[]>> = {
+  ethereum: [
+    '0xc3d688b66703497daa19211eedff47f25384cdc3', // cUSDCv3
+    '0xa17581a9e3356d9a858b789d68b4d866e593ae94', // cWETHv3
+    '0x3afdc9bca9213a35503b077a6072f3d0d5ab0840', // cUSDTv3
+  ],
+  base: [
+    '0xb125e6687d4313864e53df431d5425969c15eb2f', // cUSDCv3
+    '0x46e6b214b524310239732d51387075e0e70970bf', // cWETHv3
+    '0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf',
+  ],
+  arbitrum: [
+    '0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf', // cUSDCv3
+    '0xa5edbdd9646f8dff606d7448e414884c7d905dca', // cUSDC.e v3
+    '0x6f7d514bbd4aff3bcd1140b7344b32f063dee486', // cWETHv3
+  ],
+  optimism: [
+    '0x2e44e174f7d53f0212823acc11c01a11d58c5bcb', // cUSDCv3
+    '0xe36a30d249f7761327fd973001a32010b521b6fd', // cWETHv3
+  ],
+  polygon: [
+    '0xf25212e676d1f7f89cd72ffee66158f541246445', // cUSDCv3
+  ],
+};
+
+function assertEvmAddress(val: string | undefined | null, label: string, allowZero = false): string {
+  if (typeof val !== 'string') {
+    throw new Error(`Invalid ${label}: expected 20-byte 0x EVM address.`);
+  }
+  const clean = val.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(clean)) {
+    throw new Error(`Invalid ${label}: must be a single 20-byte 0x EVM address.`);
+  }
+  if (!allowZero && clean.toLowerCase() === ZERO_ADDRESS) {
+    throw new Error(`Invalid ${label}: zero address is not allowed.`);
+  }
+  return clean;
+}
+
 /** Set when a quote provider was rate-limited or unreachable, as opposed to answering "no route". */
 interface QuoteState {
   throttled: boolean;
@@ -288,7 +327,8 @@ function toHexWei(val: string | number | bigint | undefined): string {
 }
 
 function pad32Hex(val: string): string {
-  return val.replace(/^0x/, '').toLowerCase().padStart(64, '0');
+  const clean = assertEvmAddress(val, 'ABI address parameter', true);
+  return clean.slice(2).toLowerCase().padStart(64, '0');
 }
 
 function encodeErc20Approve(spender: string, amount: bigint): string {
@@ -331,6 +371,7 @@ async function buildDefiWithdrawExecution(params: {
     aaveSafetyCheckFn = checkAaveV3AccountSafety,
     compoundSafetyCheckFn = checkCompoundAccountSafety,
   } = params;
+  assertEvmAddress(userAddress, 'userAddress');
   const evmChain = asEvmChain(asset.chain);
   const cfg = EVM_CHAINS[evmChain];
   const protocolId = identifyProtocolExtractorId(asset);
@@ -1158,7 +1199,8 @@ export async function prepareRealExecution(params: {
   const cfg = EVM_CHAINS[evmChain];
   if (!cfg) throw new Error(`Unsupported chain: ${asset.chain}`);
 
-  // Validate Solana destination up front
+  // Validate EVM userAddress and Solana destination up front (prevents comma-joined ABI corruption)
+  assertEvmAddress(userAddress, 'userAddress');
   solanaAddressToBytes32(solanaDestination);
 
   if (asset.action === 'SKIP_HONEYPOT') {
@@ -1285,6 +1327,7 @@ export async function prepareChainBatchExecution(params: {
   const cfg = EVM_CHAINS[chain];
   if (!cfg) throw new Error(`Unsupported chain: ${chain}`);
 
+  assertEvmAddress(userAddress, 'userAddress');
   const mintRecipientBytes32 = solanaOwnerToUsdcAtaBytes32(solanaDestination);
   const chainAssets = assets.filter((a) => a.chain === chain);
 
@@ -1827,6 +1870,8 @@ export async function checkLiveExecutionStatus(params: {
     } catch {
       clearTimeout(timer);
       // Keep polling
+    } finally {
+      clearTimeout(timer);
     }
   }
 

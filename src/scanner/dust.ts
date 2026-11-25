@@ -1,10 +1,12 @@
 import { resolveProtocolFeeBps } from './chains.js';
-import { evaluateAssetRoi, evaluateChainBatchRoi } from './roi.js';
+import { evaluateAssetRoi, evaluateChainBatchRoi, normalizeBatchWalletKey } from './roi.js';
 import type { AnyChainId, ScannedAsset, ScanReport } from './types.js';
 
 export interface DustChainPlan {
   chain: AnyChainId;
   chainName: string;
+  sourceWallet?: string;
+  sourceWalletLabel?: string;
   dustTokenCount: number;
   rescuedByBatchCount: number;
   directProfitableCount: number;
@@ -42,6 +44,9 @@ function round2(n: number): number {
  * Identifies all small balances (`0 < grossUsd <= maxDustThresholdUsd`), separates
  * batch-rescuable dust from permanently negative-ROI sub-fee dust, and computes exact
  * savings from converting dust locally into USDC before a single cross-chain bridge.
+ *
+ * Groups strictly by `(sourceWallet, chain)` so two separate EOAs on the same chain
+ * are modeled as two independent atomic batches rather than one impossible shared batch.
  */
 export function planDustConversion(params: {
   scan: ScanReport;
@@ -61,17 +66,33 @@ export function planDustConversion(params: {
       a.kind !== 'defi_position'
   );
 
-  const byChain = new Map<AnyChainId, ScannedAsset[]>();
+  // Group strictly by (sourceWallet, chain) to avoid impossible cross-wallet atomic batching
+  const byWalletAndChain = new Map<
+    string,
+    { chain: AnyChainId; sourceWallet?: string; sourceWalletLabel?: string; items: ScannedAsset[] }
+  >();
   for (const asset of dustCandidates) {
-    const arr = byChain.get(asset.chain) ?? [];
-    arr.push(asset);
-    byChain.set(asset.chain, arr);
+    const rawWallet = asset.sourceWallet || params.scan.walletAddress || '';
+    const walletKey = normalizeBatchWalletKey(rawWallet, asset.family);
+    const groupKey = `${walletKey}::${asset.chain}`;
+    const existing = byWalletAndChain.get(groupKey);
+    if (existing) {
+      existing.items.push(asset);
+    } else {
+      byWalletAndChain.set(groupKey, {
+        chain: asset.chain,
+        sourceWallet: asset.sourceWallet || (params.scan.walletAddress && !params.scan.walletAddress.includes(',') ? params.scan.walletAddress : undefined),
+        sourceWalletLabel: asset.sourceWalletLabel || params.scan.walletLabel,
+        items: [asset],
+      });
+    }
   }
 
   const chains: DustChainPlan[] = [];
   const allConvertibleIds: string[] = [];
 
-  for (const [chain, items] of byChain.entries()) {
+  for (const group of byWalletAndChain.values()) {
+    const { chain, sourceWallet, sourceWalletLabel, items } = group;
     const chainMeta = params.scan.chains.find((c) => c.chain === chain);
     const evals = items.map((asset) => ({
       asset,
@@ -89,6 +110,8 @@ export function planDustConversion(params: {
 
     const batchRoi = evaluateChainBatchRoi({
       chain,
+      sourceWallet,
+      sourceWalletLabel,
       assets: convertible.map((c) => c.asset),
       protocolFeeBps,
       gasSponsored: true,
@@ -111,6 +134,8 @@ export function planDustConversion(params: {
     chains.push({
       chain,
       chainName: chainMeta?.chainName || items[0].chainName,
+      sourceWallet,
+      sourceWalletLabel,
       dustTokenCount: items.length,
       rescuedByBatchCount: isLegProfitable ? rescuedByBatch.length : 0,
       directProfitableCount: isLegProfitable ? directProfitable.length : 0,

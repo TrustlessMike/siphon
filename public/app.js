@@ -2243,7 +2243,10 @@ async function proveLegOnchain(jobId, chain, btnEl = null) {
 }
 
 async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress, solDest) {
-  const isNonEvm = (currentScan.family || activeFamily) !== 'evm';
+  const legFamily =
+    chainAssets[0]?.family ||
+    (currentScan.family && currentScan.family !== 'mixed' ? currentScan.family : activeFamily);
+  const isNonEvm = legFamily !== 'evm';
 
   await patchJobLeg(jobId, chain, {
     status: 'preparing',
@@ -2272,7 +2275,7 @@ async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress,
     expectedSolanaDestination: solDest,
   };
   const signature = isNonEvm
-    ? await signFamilyGaslessIntent(currentScan.family || activeFamily, intent, signOpts)
+    ? await signFamilyGaslessIntent(legFamily, intent, signOpts)
     : await signGaslessTypedData(intent.typedData || intent.signPayload, intent.chainId, signOpts);
   const receipt = await api('/api/relayer/submit', {
     method: 'POST',

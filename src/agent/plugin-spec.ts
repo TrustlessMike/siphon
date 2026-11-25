@@ -49,6 +49,7 @@ export function buildOpenApiSpec(baseUrl: string) {
       '/api/scan/unified': {
         post: {
           operationId: 'scanUnifiedWallets',
+          'x-openai-isConsequential': false,
           summary: 'Scan & unify one or more wallets across 25 chains (EVM, Cosmos, Sui, Aptos, TON, Tron, Bitcoin)',
           requestBody: {
             required: true,
@@ -60,11 +61,13 @@ export function buildOpenApiSpec(baseUrl: string) {
                   properties: {
                     wallets: {
                       type: 'array',
+                      minItems: 1,
+                      maxItems: 20,
                       items: {
                         type: 'object',
                         properties: {
-                          address: { type: 'string', description: 'Wallet address (0x…, cosmos1…, bc1…, EQ…, T…)' },
-                          label: { type: 'string', description: 'Optional human label (e.g. Rabby Main, Keplr)' },
+                          address: { type: 'string', maxLength: 160, description: 'Wallet address (0x…, cosmos1…, bc1…, EQ…, T…)' },
+                          label: { type: 'string', maxLength: 64, description: 'Optional human label (e.g. Rabby Main, Keplr)' },
                           family: {
                             type: 'string',
                             enum: ['evm', 'cosmos', 'sui', 'aptos', 'ton', 'tron', 'btc'],
@@ -83,17 +86,19 @@ export function buildOpenApiSpec(baseUrl: string) {
       '/api/dust/plan': {
         post: {
           operationId: 'planDustConversion',
-          summary: 'Plan profitable batch dust conversion and compute exact batch-rescue savings',
+          'x-openai-isConsequential': false,
+          summary: 'Plan profitable batch dust conversion and compute exact per-(wallet, chain) batch-rescue savings',
           requestBody: {
             required: true,
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
+                  required: ['scanId'],
                   properties: {
-                    scanId: { type: 'string' },
-                    maxDustThresholdUsd: { type: 'number', default: 25 },
-                    protocolFeeBps: { type: 'integer', default: 700 },
+                    scanId: { type: 'string', maxLength: 128 },
+                    maxDustThresholdUsd: { type: 'number', minimum: 1, maximum: 250, default: 25 },
+                    protocolFeeBps: { type: 'integer', minimum: 500, maximum: 1000, default: 700 },
                   },
                 },
               },
@@ -105,18 +110,21 @@ export function buildOpenApiSpec(baseUrl: string) {
       '/api/agents/mandates': {
         get: {
           operationId: 'listAgentMandates',
+          'x-openai-isConsequential': false,
           summary: 'List policy-bounded SiphonAgentVault mandates and remaining daily caps',
-          responses: { '200': { description: 'List of AgentMandateRecord' } },
+          responses: { '200': { description: 'Object { mandates: AgentMandateRecord[] }' } },
         },
       },
       '/api/agents/approvals': {
         get: {
           operationId: 'listPermissionApprovals',
+          'x-openai-isConsequential': false,
           summary: 'List pending, approved, and rejected AI / smart-contract agent permission requests',
-          responses: { '200': { description: 'List of PermissionRequestRecord' } },
+          responses: { '200': { description: 'Object { approvals: PermissionRequestRecord[] }' } },
         },
         post: {
           operationId: 'requestSweepPermission',
+          'x-openai-isConsequential': true,
           summary:
             'Propose a dust conversion, DeFi withdrawal, or Solana sweep — enforces explicit human permission or active SiphonAgentVault mandate caps',
           security: [{ BearerAuth: [] }],
@@ -129,19 +137,19 @@ export function buildOpenApiSpec(baseUrl: string) {
                   required: ['actionType', 'summary', 'sourceWallets', 'chains', 'solanaDestination', 'grossUsd', 'estimatedNetUsdc'],
                   properties: {
                     client: { type: 'string', enum: ['chatgpt_action', 'claude_mcp', 'smart_contract_agent'] },
-                    mandateId: { type: 'string' },
+                    mandateId: { type: 'string', maxLength: 64 },
                     actionType: {
                       type: 'string',
                       enum: ['dust_convert', 'defi_withdraw', 'bridge_solana', 'burn_zero_liq'],
                     },
-                    summary: { type: 'string' },
-                    sourceWallets: { type: 'array', items: { type: 'string' } },
-                    chains: { type: 'array', items: { type: 'string' } },
-                    solanaDestination: { type: 'string' },
-                    grossUsd: { type: 'number' },
-                    estimatedNetUsdc: { type: 'number' },
-                    protocolFeeBps: { type: 'integer', default: 700 },
-                    assetIds: { type: 'array', items: { type: 'string' } },
+                    summary: { type: 'string', maxLength: 240 },
+                    sourceWallets: { type: 'array', maxItems: 20, items: { type: 'string', maxLength: 160 } },
+                    chains: { type: 'array', maxItems: 25, items: { type: 'string', maxLength: 32 } },
+                    solanaDestination: { type: 'string', minLength: 32, maxLength: 64 },
+                    grossUsd: { type: 'number', exclusiveMinimum: 0, maximum: 10_000_000 },
+                    estimatedNetUsdc: { type: 'number', minimum: -1_000_000, maximum: 10_000_000 },
+                    protocolFeeBps: { type: 'integer', minimum: 500, maximum: 1000, default: 700 },
+                    assetIds: { type: 'array', maxItems: 100, items: { type: 'string', maxLength: 160 } },
                   },
                 },
               },
@@ -170,15 +178,16 @@ export function buildPluginSetupGuide(params: { baseUrl: string; rootDir: string
           args: [mcpEntrypoint],
           env: {
             SIPHON_API_URL: cleanBase,
+            SIPHON_API_TOKEN: '<paste-scoped-claude-mcp-bearer-token>',
           },
         },
       },
     },
-    claudeCodeCommand: `claude mcp add --transport http siphon ${cleanBase}/mcp`,
+    claudeCodeCommand: `claude mcp add --transport http --header "Authorization: Bearer <SIPHON_API_TOKEN>" siphon ${cleanBase}/mcp`,
     mcpHttpEndpoint: `${cleanBase}/mcp`,
     chatgptPluginManifestUrl: `${cleanBase}/.well-known/ai-plugin.json`,
     chatgptOpenApiUrl: `${cleanBase}/openapi.json`,
     chatgptCustomGptInstructions:
-      'You are Siphon Assistant. Always scan wallets first via scanUnifiedWallets, check profitable batch dust via planDustConversion, and submit any value-moving sweep via requestSweepPermission so the user explicitly approves in Siphon or stays strictly within their SiphonAgentVault mandate.',
+      'You are Siphon Assistant. Always scan wallets first via scanUnifiedWallets, check profitable batch dust via planDustConversion, and submit any value-moving sweep via requestSweepPermission (with authentic scanned assetIds) so the user explicitly approves in Siphon or stays strictly within their owner-created SiphonAgentVault mandate.',
   };
 }
