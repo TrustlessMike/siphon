@@ -519,6 +519,24 @@ window.openApp = openApp;
 window.switchView = switchView;
 window.setUiMode = setUiMode;
 
+function dispatchSiphonBalanceUpdated() {
+  if (typeof window === 'undefined' || typeof CustomEvent !== 'function') return;
+  const solDest = document.getElementById('solanaDestInput')?.value.trim() || '';
+  const connectedSol = getConnectedSolanaAddress();
+  window.dispatchEvent(
+    new CustomEvent('siphon:balance-updated', {
+      detail: {
+        solanaUsdc: safeNum(solanaBalances?.usdcBalance),
+        solBalance: safeNum(solanaBalances?.solBalance),
+        projectedSweepUsdc: safeNum(currentPlan?.totals?.netSolanaUsdc),
+        solanaWallet: isValidSolanaBase58(solDest) ? solDest : '',
+        connectedSolanaWallet: connectedSol || '',
+        walletConnected: Boolean(connectedSol),
+      },
+    })
+  );
+}
+
 async function refreshSolanaBalance() {
   const seq = ++solBalSeq;
   const solDest = document.getElementById('solanaDestInput')?.value.trim() || '';
@@ -528,11 +546,13 @@ async function refreshSolanaBalance() {
   if (!solDest) {
     solanaBalances = null;
     if (badge) badge.textContent = 'Connect a Solana wallet or enter a destination address';
+    dispatchSiphonBalanceUpdated();
     return;
   }
   if (!isValidSolanaBase58(solDest)) {
     solanaBalances = null;
     if (badge) badge.textContent = 'Invalid Solana address';
+    dispatchSiphonBalanceUpdated();
     return;
   }
 
@@ -543,6 +563,7 @@ async function refreshSolanaBalance() {
     if (badge) {
       badge.textContent = `${safeNum(solanaBalances.usdcBalance).toFixed(2)} USDC · ${safeNum(solanaBalances.solBalance).toFixed(3)} SOL on Solana`;
     }
+    dispatchSiphonBalanceUpdated();
   } catch (err) {
     if (seq !== solBalSeq) return;
     const isInvalid = String(err?.message || '').toLowerCase().includes('invalid');
@@ -551,6 +572,7 @@ async function refreshSolanaBalance() {
         ? 'Invalid Solana address'
         : 'Valid Solana destination (RPC busy)';
     }
+    dispatchSiphonBalanceUpdated();
   }
 }
 
@@ -637,6 +659,7 @@ function renderEmptyScanState() {
   if (svgHost) svgHost.innerHTML = '';
   renderPreSignProofCard(null);
   updateWalletButtons();
+  dispatchSiphonBalanceUpdated();
 }
 
 function updateFamilyChrome() {
@@ -957,6 +980,7 @@ function renderAll() {
         ? `${t.netSolanaSol.toFixed(2)} SOL`
         : `$${t.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
   }
+  dispatchSiphonBalanceUpdated();
   const subEl = document.getElementById('kpiNetSub');
   if (subEl) {
     const eta = !isProMode()

@@ -3,7 +3,11 @@ import { BoundedTtlCache } from '../server/cache.js';
 
 export const JUPITER_PREDICTION_API_BASE = 'https://api.jup.ag/prediction/v1';
 export const JUPITER_PREDICTION_WEB_BASE = 'https://jup.ag/prediction';
+export const SOLANA_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 export const MICRO_USD_SCALE = 1_000_000;
+export const MIN_JUPITER_ORDER_USD = 5;
+export const DEFAULT_PRESERVED_YIELD_APY_PCT = 7;
+export const DEFAULT_YIELD_FUNDED_HORIZON_DAYS = 30;
 export const DEFAULT_JUPITER_TIMEOUT_MS = 4_500;
 export const DEFAULT_JUPITER_CACHE_TTL_MS = 30_000;
 export const DEFAULT_JUPITER_CACHE_MAX_ENTRIES = 64;
@@ -11,6 +15,8 @@ export const MAX_DEGEN_RISK_PCT = 50;
 export const DEFAULT_DEGEN_RISK_PCT = 10;
 export const HIGH_RISK_WARNING_THRESHOLD_PCT = 25;
 export const DEGEN_RISK_PRESETS_PCT = [5, 10, 15, 25] as const;
+
+export type DegenSidePocketMode = 'percent' | 'yield_funded';
 
 export const ALLOWED_JUPITER_CATEGORIES = [
   'all',
@@ -150,9 +156,13 @@ export interface NormalizedDegenEvent {
 export interface DegenSidePocketInput {
   availableUsdc: number;
   riskPct?: number;
+  mode?: DegenSidePocketMode;
+  yieldApyPct?: number;
+  yieldHorizonDays?: number;
 }
 
 export interface DegenSidePocketResult {
+  mode: DegenSidePocketMode;
   availableUsdc: number;
   requestedRiskPct: number;
   effectiveRiskPct: number;
@@ -161,6 +171,10 @@ export interface DegenSidePocketResult {
   preservedPct: number;
   preservedUsdc: number;
   maxDegenBudgetUsd: number;
+  yieldApyPct: number;
+  yieldHorizonDays: number;
+  projectedAnnualYieldUsd: number;
+  projected30dYieldUsd: number;
   highRiskWarning: string | null;
   presetsPct: readonly number[];
 }
@@ -179,6 +193,7 @@ export interface JupiterFeedResult {
   totalReturned: number;
   gameModes: readonly JupiterGameMode[];
   apiKeyConfigured: boolean;
+  geoBlocked?: boolean;
   error?: string;
 }
 
@@ -188,6 +203,8 @@ export interface DegenOrderPreviewInput {
   stakeUsd: number;
   availableUsdc: number;
   riskPct?: number;
+  sidePocketMode?: DegenSidePocketMode;
+  yieldApyPct?: number;
   priceUsd?: number;
   eventSlug?: string | null;
   eventTitle?: string | null;
@@ -199,6 +216,10 @@ export interface DegenOrderPreviewInput {
 export interface DegenLiveOrderResult {
   attempted: boolean;
   available: boolean;
+  depositMint?: string;
+  geoBlocked?: boolean;
+  apiKeyRequired?: boolean;
+  statusCode?: number;
   reason?: string;
   orderId?: string | null;
   transactionBase64?: string | null;
@@ -218,6 +239,72 @@ export interface DegenOrderPreviewResult {
   remainingSidePocketUsd: number;
   riskNotice: string;
   liveOrder: DegenLiveOrderResult;
+}
+
+export type DegenPositionStatus = 'open' | 'claimable' | 'settled' | 'closed';
+
+export interface NormalizedDegenPosition {
+  positionId: string;
+  ownerPubkey: string;
+  marketId: string;
+  eventId: string | null;
+  eventSlug: string | null;
+  eventTitle: string;
+  marketTitle: string;
+  jupiterUrl: string;
+  side: BinarySide;
+  status: DegenPositionStatus;
+  shares: number;
+  avgEntryPriceUsd: number;
+  markPriceUsd: number;
+  costBasisUsd: number;
+  currentValueUsd: number;
+  unrealizedPnlUsd: number;
+  unrealizedPnlPct: number;
+  claimable: boolean;
+  claimablePayoutUsd: number;
+  settledPayoutUsd: number;
+  canCloseEarly: boolean;
+  updatedAt: string | null;
+}
+
+export interface DegenPositionsSummary {
+  openCount: number;
+  claimableCount: number;
+  settledCount: number;
+  totalCostBasisUsd: number;
+  totalCurrentValueUsd: number;
+  totalUnrealizedPnlUsd: number;
+  totalClaimablePayoutUsd: number;
+  totalSettledPayoutUsd: number;
+}
+
+export interface JupiterPositionsResult {
+  ok: boolean;
+  live: boolean;
+  ownerPubkey: string;
+  fetchedAt: string;
+  positions: NormalizedDegenPosition[];
+  summary: DegenPositionsSummary;
+  apiKeyConfigured: boolean;
+  geoBlocked?: boolean;
+  error?: string;
+}
+
+export interface DegenPositionActionResult {
+  ok: boolean;
+  action: 'claim' | 'close';
+  positionId: string;
+  available: boolean;
+  transactionBase64: string | null;
+  orderId?: string | null;
+  expiresAt?: string | null;
+  jupiterUrl: string;
+  apiKeyConfigured: boolean;
+  geoBlocked?: boolean;
+  apiKeyRequired?: boolean;
+  statusCode?: number;
+  reason?: string;
 }
 
 export interface JupiterMarketsClientOptions {
@@ -275,6 +362,9 @@ const UNSAFE_CONTROL_RE = /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E
 const HTML_TAG_RE = /<[^>]*>/g;
 const SAFE_SLUG_RE = /^[a-zA-Z0-9_-]{1,160}$/;
 const SAFE_MARKET_ID_RE = /^[a-zA-Z0-9._:-]{1,120}$/;
+const SAFE_POSITION_ID_RE = /^[a-zA-Z0-9._:-]{1,128}$/;
+
+const GEO_BLOCK_TEXT_RE = /\b(geo|region|country|jurisdiction|restricted|not available in your|unavailable in your|blocked region|sanctioned)\b/i;
 
 const CATEGORY_SET = new Set<string>(ALLOWED_JUPITER_CATEGORIES);
 const FILTER_SET = new Set<string>(ALLOWED_JUPITER_FILTERS);
@@ -341,6 +431,17 @@ export function sanitizeHttpsUrl(raw?: unknown): string | null {
 }
 
 /**
+ * Strictly validates a Jupiter position ID / pubkey against `^[a-zA-Z0-9._:-]{1,128}$`.
+ * Rejects XSS payloads, path traversal (`..`), slashes, whitespace, and control characters.
+ */
+export function sanitizePositionId(raw?: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.includes('..') || !SAFE_POSITION_ID_RE.test(trimmed)) return null;
+  return trimmed;
+}
+
+/**
  * Converts Jupiter Prediction API micro-USD (`1e6`) numbers or numeric strings into USD.
  * Fails closed (`null`) on NaN, Infinity, negative values, or non-numeric strings.
  */
@@ -350,6 +451,37 @@ export function parseMicroUsd(raw: unknown): number | null {
   const num = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw.trim()) : NaN;
   if (!Number.isFinite(num) || num < 0) return null;
   return num / MICRO_USD_SCALE;
+}
+
+/**
+ * Converts signed micro-USD (`1e6`) values (such as unrealized P&L) into USD.
+ * Fails closed (`null`) on NaN, Infinity, booleans, or non-numeric strings.
+ */
+export function parseSignedMicroUsd(raw: unknown): number | null {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw === 'boolean') return null;
+  const num = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw.trim()) : NaN;
+  if (!Number.isFinite(num)) return null;
+  return num / MICRO_USD_SCALE;
+}
+
+function parseContractPriceUsd(raw: unknown): number | null {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw === 'boolean') return null;
+  const num = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw.trim()) : NaN;
+  if (!Number.isFinite(num) || num < 0) return null;
+  if (num === 0) return 0;
+  if (num <= 1) return roundTo(num, 6);
+  const scaled = num / MICRO_USD_SCALE;
+  return scaled <= 1 ? roundTo(scaled, 6) : null;
+}
+
+function parseFiniteNonNegNumber(raw: unknown): number | null {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw === 'boolean') return null;
+  const num = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw.trim()) : NaN;
+  if (!Number.isFinite(num) || num < 0) return null;
+  return num;
 }
 
 /**
@@ -409,6 +541,8 @@ export function computeProjectedPayout(stakeUsd: number, priceUsd: number): Proj
  * Capital-Preservation Side-Pocket Calculator.
  * Keeps migrated Solana USDC principal preserved (90% default) and strictly caps optional
  * Degen allocation (default 10%, hard-clamped <= 50%, explicit warning above 25%).
+ * In `yield_funded` mode, 100% of principal stays untouched and Degen stake is strictly
+ * capped to projected yield over `yieldHorizonDays` (default 30d at ~7% APY).
  */
 export function computeDegenSidePocket(input: DegenSidePocketInput): DegenSidePocketResult {
   if (!input || typeof input !== 'object') {
@@ -417,6 +551,64 @@ export function computeDegenSidePocket(input: DegenSidePocketInput): DegenSidePo
   const { availableUsdc } = input;
   if (typeof availableUsdc !== 'number' || !Number.isFinite(availableUsdc) || availableUsdc < 0) {
     throw new Error('availableUsdc must be a finite non-negative number.');
+  }
+
+  const mode: DegenSidePocketMode =
+    input.mode === 'yield_funded' ? 'yield_funded' : 'percent';
+
+  const yieldApyPct =
+    input.yieldApyPct === undefined ? DEFAULT_PRESERVED_YIELD_APY_PCT : input.yieldApyPct;
+  if (
+    typeof yieldApyPct !== 'number' ||
+    !Number.isFinite(yieldApyPct) ||
+    yieldApyPct < 0 ||
+    yieldApyPct > 100
+  ) {
+    throw new Error('yieldApyPct must be a finite number between 0 and 100.');
+  }
+
+  const yieldHorizonDays =
+    input.yieldHorizonDays === undefined
+      ? DEFAULT_YIELD_FUNDED_HORIZON_DAYS
+      : input.yieldHorizonDays;
+  if (
+    typeof yieldHorizonDays !== 'number' ||
+    !Number.isFinite(yieldHorizonDays) ||
+    yieldHorizonDays < 1 ||
+    yieldHorizonDays > 365
+  ) {
+    throw new Error('yieldHorizonDays must be a finite number between 1 and 365.');
+  }
+
+  const normalizedBalance = roundTo(availableUsdc, 2);
+
+  if (mode === 'yield_funded') {
+    // 100% principal preserved untouched; Degen budget strictly floored to projected yield
+    const preservedUsdc = normalizedBalance;
+    const projectedAnnualYieldUsd = roundTo(preservedUsdc * (yieldApyPct / 100), 2);
+    const projected30dYieldUsd =
+      Math.floor(preservedUsdc * (yieldApyPct / 100) * (yieldHorizonDays / 365) * 100 + 1e-9) / 100;
+    const maxDegenBudgetUsd = projected30dYieldUsd;
+    const effectiveRiskPct =
+      normalizedBalance > 0 ? roundTo((maxDegenBudgetUsd / normalizedBalance) * 100, 2) : 0;
+
+    return {
+      mode: 'yield_funded',
+      availableUsdc: normalizedBalance,
+      requestedRiskPct: 0,
+      effectiveRiskPct,
+      wasClamped: false,
+      maxRiskPct: MAX_DEGEN_RISK_PCT,
+      preservedPct: 100,
+      preservedUsdc,
+      maxDegenBudgetUsd,
+      yieldApyPct: roundTo(yieldApyPct, 2),
+      yieldHorizonDays: Math.round(yieldHorizonDays),
+      projectedAnnualYieldUsd,
+      projected30dYieldUsd,
+      highRiskWarning: null,
+      presetsPct: DEGEN_RISK_PRESETS_PCT,
+    };
   }
 
   const requestedRiskPct = input.riskPct === undefined ? DEFAULT_DEGEN_RISK_PCT : input.riskPct;
@@ -430,12 +622,16 @@ export function computeDegenSidePocket(input: DegenSidePocketInput): DegenSidePo
 
   const wasClamped = requestedRiskPct > MAX_DEGEN_RISK_PCT;
   const effectiveRiskPct = roundTo(Math.min(MAX_DEGEN_RISK_PCT, Math.max(0, requestedRiskPct)), 2);
-  const normalizedBalance = roundTo(availableUsdc, 2);
 
   // Floor to cents so the usable Degen cap never exceeds the requested percentage
   const maxDegenBudgetUsd = Math.floor(normalizedBalance * (effectiveRiskPct / 100) * 100 + 1e-9) / 100;
   const preservedUsdc = roundTo(Math.max(0, normalizedBalance - maxDegenBudgetUsd), 2);
   const preservedPct = roundTo(100 - effectiveRiskPct, 2);
+  const projectedAnnualYieldUsd = roundTo(preservedUsdc * (yieldApyPct / 100), 2);
+  const projected30dYieldUsd = roundTo(
+    preservedUsdc * (yieldApyPct / 100) * (yieldHorizonDays / 365),
+    2
+  );
 
   let highRiskWarning: string | null = null;
   if (wasClamped) {
@@ -449,6 +645,7 @@ export function computeDegenSidePocket(input: DegenSidePocketInput): DegenSidePo
   }
 
   return {
+    mode: 'percent',
     availableUsdc: normalizedBalance,
     requestedRiskPct: roundTo(requestedRiskPct, 2),
     effectiveRiskPct,
@@ -457,6 +654,10 @@ export function computeDegenSidePocket(input: DegenSidePocketInput): DegenSidePo
     preservedPct,
     preservedUsdc,
     maxDegenBudgetUsd,
+    yieldApyPct: roundTo(yieldApyPct, 2),
+    yieldHorizonDays: Math.round(yieldHorizonDays),
+    projectedAnnualYieldUsd,
+    projected30dYieldUsd,
     highRiskWarning,
     presetsPct: DEGEN_RISK_PRESETS_PCT,
   };
@@ -592,6 +793,210 @@ export function normalizeJupiterEvent(raw: RawJupiterEvent): NormalizedDegenEven
   };
 }
 
+export function normalizeJupiterPosition(
+  raw: unknown,
+  fallbackOwnerPubkey: string
+): NormalizedDegenPosition | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Record<string, unknown>;
+  const positionId = sanitizePositionId(obj.pubkey ?? obj.positionPubkey ?? obj.positionId ?? obj.id);
+  if (!positionId) return null;
+
+  const marketObj =
+    obj.market && typeof obj.market === 'object' ? (obj.market as Record<string, unknown>) : null;
+  const eventObj =
+    obj.event && typeof obj.event === 'object' ? (obj.event as Record<string, unknown>) : null;
+  const eventMeta =
+    eventObj?.metadata && typeof eventObj.metadata === 'object'
+      ? (eventObj.metadata as Record<string, unknown>)
+      : obj.metadata && typeof obj.metadata === 'object'
+        ? (obj.metadata as Record<string, unknown>)
+        : null;
+
+  const rawMarketId =
+    typeof obj.marketId === 'string'
+      ? obj.marketId.trim()
+      : typeof marketObj?.marketId === 'string'
+        ? marketObj.marketId.trim()
+        : '';
+  const marketId = rawMarketId && SAFE_MARKET_ID_RE.test(rawMarketId) ? rawMarketId : positionId;
+
+  const rawEventId =
+    typeof obj.eventId === 'string'
+      ? obj.eventId.trim()
+      : typeof eventObj?.eventId === 'string'
+        ? eventObj.eventId.trim()
+        : '';
+  const eventId = rawEventId && SAFE_MARKET_ID_RE.test(rawEventId) ? rawEventId : null;
+
+  const eventSlug = sanitizeJupiterSlug(
+    obj.eventSlug ?? eventObj?.slug ?? eventMeta?.slug ?? marketObj?.eventSlug
+  );
+  const jupiterUrl = buildJupiterEventUrl(eventSlug);
+
+  const eventTitle = sanitizeDegenText(
+    obj.eventTitle ?? eventObj?.title ?? eventMeta?.title,
+    160,
+    'Jupiter Prediction Position'
+  );
+  const marketTitle = sanitizeDegenText(
+    obj.marketTitle ?? marketObj?.title ?? obj.title,
+    120,
+    marketId
+  );
+
+  const side: BinarySide =
+    obj.isYes === false || String(obj.side ?? '').toLowerCase() === 'no' ? 'no' : 'yes';
+
+  const rawStatus = sanitizeDegenText(obj.status, 24, '').toLowerCase();
+  const isSettledFlag = Boolean(obj.settled ?? obj.isSettled ?? obj.claimed ?? obj.isClaimed);
+  const isClaimableFlag = Boolean(obj.claimable ?? obj.isClaimable ?? obj.canClaim);
+
+  const rawAvgPrice = parseContractPriceUsd(
+    obj.avgPriceUsd ?? obj.avgEntryPriceUsd ?? obj.entryPriceUsd ?? obj.priceUsd
+  );
+  const rawMarkPrice = parseContractPriceUsd(
+    obj.markPriceUsd ??
+      obj.currentPriceUsd ??
+      (side === 'yes'
+        ? (marketObj?.pricing as Record<string, unknown> | undefined)?.sellYesPriceUsd ??
+          (marketObj?.pricing as Record<string, unknown> | undefined)?.buyYesPriceUsd
+        : (marketObj?.pricing as Record<string, unknown> | undefined)?.sellNoPriceUsd ??
+          (marketObj?.pricing as Record<string, unknown> | undefined)?.buyNoPriceUsd)
+  );
+
+  let shares =
+    parseFiniteNonNegNumber(obj.contracts ?? obj.shares ?? obj.quantity ?? obj.size) ?? 0;
+  let costBasisUsd =
+    parseMicroUsd(obj.totalCostUsd ?? obj.costBasisUsd ?? obj.sizeUsd ?? obj.depositAmountUsd) ??
+    null;
+
+  const avgEntryPriceUsd = rawAvgPrice ?? (costBasisUsd !== null && shares > 0 ? roundTo(Math.min(1, costBasisUsd / shares), 6) : 0);
+  if (shares <= 0 && costBasisUsd !== null && avgEntryPriceUsd > 0) {
+    shares = costBasisUsd / avgEntryPriceUsd;
+  }
+  if (costBasisUsd === null) {
+    costBasisUsd = shares * avgEntryPriceUsd;
+  }
+  shares = roundTo(shares, 4);
+  costBasisUsd = roundTo(costBasisUsd, 2);
+
+  let status: DegenPositionStatus = 'open';
+  if (isClaimableFlag || rawStatus === 'claimable' || rawStatus === 'won') {
+    status = 'claimable';
+  } else if (isSettledFlag || rawStatus === 'settled' || rawStatus === 'claimed') {
+    status = 'settled';
+  } else if (rawStatus === 'closed' || rawStatus === 'lost' || rawStatus === 'expired') {
+    status = 'closed';
+  }
+
+  const claimable = status === 'claimable';
+  const markPriceUsd =
+    rawMarkPrice !== null
+      ? rawMarkPrice
+      : claimable
+        ? 1
+        : status === 'closed'
+          ? 0
+          : avgEntryPriceUsd;
+
+  const explicitCurrentVal = parseMicroUsd(obj.currentValueUsd ?? obj.valueUsd ?? obj.markValueUsd);
+  const claimablePayoutUsd = claimable
+    ? roundTo(parseMicroUsd(obj.claimablePayoutUsd ?? obj.payoutUsd) ?? shares, 2)
+    : 0;
+  const settledPayoutUsd =
+    status === 'settled'
+      ? roundTo(
+          parseMicroUsd(obj.settledPayoutUsd ?? obj.claimedPayoutUsd ?? obj.payoutUsd) ?? 0,
+          2
+        )
+      : 0;
+
+  const currentValueUsd =
+    explicitCurrentVal !== null
+      ? roundTo(explicitCurrentVal, 2)
+      : claimable
+        ? claimablePayoutUsd
+        : status === 'settled'
+          ? settledPayoutUsd
+          : roundTo(shares * markPriceUsd, 2);
+
+  const explicitPnl = parseSignedMicroUsd(obj.unrealizedPnlUsd ?? obj.pnlUsd);
+  const unrealizedPnlUsd =
+    explicitPnl !== null
+      ? roundTo(explicitPnl, 2)
+      : roundTo(currentValueUsd - costBasisUsd, 2);
+  const unrealizedPnlPct =
+    costBasisUsd > 0 ? roundTo((unrealizedPnlUsd / costBasisUsd) * 100, 2) : 0;
+
+  const ownerCandidate = typeof obj.ownerPubkey === 'string' ? obj.ownerPubkey.trim() : '';
+  const ownerPubkey = ownerCandidate || fallbackOwnerPubkey;
+
+  return {
+    positionId,
+    ownerPubkey,
+    marketId,
+    eventId,
+    eventSlug,
+    eventTitle,
+    marketTitle,
+    jupiterUrl,
+    side,
+    status,
+    shares,
+    avgEntryPriceUsd: roundTo(avgEntryPriceUsd, 6),
+    markPriceUsd: roundTo(markPriceUsd, 6),
+    costBasisUsd,
+    currentValueUsd,
+    unrealizedPnlUsd,
+    unrealizedPnlPct,
+    claimable,
+    claimablePayoutUsd,
+    settledPayoutUsd,
+    canCloseEarly: status === 'open' && !claimable && shares > 0,
+    updatedAt: normalizeIsoCloseTime(obj.updatedAt ?? obj.createdAt),
+  };
+}
+
+export function summarizeDegenPositions(positions: NormalizedDegenPosition[]): DegenPositionsSummary {
+  let openCount = 0;
+  let claimableCount = 0;
+  let settledCount = 0;
+  let totalCostBasisUsd = 0;
+  let totalCurrentValueUsd = 0;
+  let totalUnrealizedPnlUsd = 0;
+  let totalClaimablePayoutUsd = 0;
+  let totalSettledPayoutUsd = 0;
+
+  for (const pos of positions) {
+    if (pos.status === 'open') openCount += 1;
+    if (pos.claimable || pos.status === 'claimable') {
+      claimableCount += 1;
+      totalClaimablePayoutUsd += pos.claimablePayoutUsd;
+    }
+    if (pos.status === 'settled') {
+      settledCount += 1;
+      totalSettledPayoutUsd += pos.settledPayoutUsd;
+    }
+    if (pos.status === 'open' || pos.claimable) {
+      totalCostBasisUsd += pos.costBasisUsd;
+      totalCurrentValueUsd += pos.currentValueUsd;
+      totalUnrealizedPnlUsd += pos.unrealizedPnlUsd;
+    }
+  }
+
+  return {
+    openCount,
+    claimableCount,
+    settledCount,
+    totalCostBasisUsd: roundTo(totalCostBasisUsd, 2),
+    totalCurrentValueUsd: roundTo(totalCurrentValueUsd, 2),
+    totalUnrealizedPnlUsd: roundTo(totalUnrealizedPnlUsd, 2),
+    totalClaimablePayoutUsd: roundTo(totalClaimablePayoutUsd, 2),
+    totalSettledPayoutUsd: roundTo(totalSettledPayoutUsd, 2),
+  };
+}
+
 export function normalizeJupiterCategoryAndFilter(rawCategory?: string | null, rawFilter?: string | null): {
   category: JupiterCategory;
   filter: JupiterFilter;
@@ -680,7 +1085,10 @@ export class JupiterMarketsClient {
   private async fetchJsonWithTimeout(
     url: string,
     init: RequestInit = {}
-  ): Promise<{ ok: true; data: unknown } | { ok: false; status?: number; error: string }> {
+  ): Promise<
+    | { ok: true; data: unknown }
+    | { ok: false; status?: number; geoBlocked?: boolean; apiKeyRequired?: boolean; error: string }
+  > {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     if (typeof timer.unref === 'function') timer.unref();
@@ -690,10 +1098,50 @@ export class JupiterMarketsClient {
         signal: controller.signal,
       });
       if (!resp.ok) {
+        let upstreamDetail = '';
+        try {
+          const text = await resp.text();
+          if (text) {
+            try {
+              const parsed = JSON.parse(text) as Record<string, unknown>;
+              upstreamDetail = sanitizeDegenText(
+                parsed.message ?? parsed.error ?? parsed.code ?? '',
+                160
+              );
+            } catch {
+              upstreamDetail = sanitizeDegenText(text, 160);
+            }
+          }
+        } catch {
+          // ignore body read error
+        }
+
+        const geoBlocked =
+          resp.status === 451 ||
+          (resp.status === 403 && GEO_BLOCK_TEXT_RE.test(upstreamDetail));
+        const apiKeyRequired =
+          resp.status === 401 ||
+          (resp.status === 403 && !geoBlocked && /api.?key|unauthorized/i.test(upstreamDetail));
+
+        let error = `Jupiter Prediction API returned HTTP ${resp.status}.`;
+        if (geoBlocked) {
+          error =
+            'Jupiter Prediction API is geo-restricted in this region (HTTP ' +
+            `${resp.status}). Use "Open on Jupiter ↗" from an eligible jurisdiction.`;
+        } else if (apiKeyRequired) {
+          error =
+            `Jupiter Prediction API rejected API key (HTTP ${resp.status}). ` +
+            'Verify JUPITER_API_KEY or use "Open on Jupiter ↗".';
+        } else if (upstreamDetail) {
+          error = `Jupiter Prediction API returned HTTP ${resp.status}: ${upstreamDetail}`;
+        }
+
         return {
           ok: false,
           status: resp.status,
-          error: `Jupiter Prediction API returned HTTP ${resp.status}.`,
+          geoBlocked,
+          apiKeyRequired,
+          error,
         };
       }
       const data = (await resp.json()) as unknown;
@@ -772,6 +1220,7 @@ export class JupiterMarketsClient {
         totalReturned: 0,
         gameModes: JUPITER_GAME_MODES,
         apiKeyConfigured: this.hasApiKey(),
+        geoBlocked: Boolean(res.geoBlocked),
         error: res.error,
       };
     }
@@ -843,6 +1292,7 @@ export class JupiterMarketsClient {
         totalReturned: 0,
         gameModes: JUPITER_GAME_MODES,
         apiKeyConfigured: this.hasApiKey(),
+        geoBlocked: Boolean(res.geoBlocked),
         error: res.error,
       };
     }
@@ -890,20 +1340,31 @@ export class JupiterMarketsClient {
     if (typeof input.stakeUsd !== 'number' || !Number.isFinite(input.stakeUsd) || input.stakeUsd <= 0) {
       throw new Error('stakeUsd must be a finite positive number.');
     }
+    if (input.stakeUsd < MIN_JUPITER_ORDER_USD - 1e-9) {
+      throw new Error(
+        `Jupiter Prediction enforces a $${MIN_JUPITER_ORDER_USD.toFixed(2)} minimum order size (requested $${roundTo(input.stakeUsd, 2).toFixed(2)}).`
+      );
+    }
 
     const sidePocket = computeDegenSidePocket({
       availableUsdc: input.availableUsdc,
       riskPct: input.riskPct,
+      mode: input.sidePocketMode,
+      yieldApyPct: input.yieldApyPct,
     });
 
     if (sidePocket.maxDegenBudgetUsd <= 0) {
       throw new Error(
-        `Your capped Degen side-pocket budget is $0.00 (${sidePocket.effectiveRiskPct}% of $${sidePocket.availableUsdc.toFixed(2)} USDC). Add available Solana USDC or select a non-zero side-pocket cap.`
+        sidePocket.mode === 'yield_funded'
+          ? `Your Yield-Funded Degen budget is $0.00 (30d projected yield on $${sidePocket.preservedUsdc.toFixed(2)} USDC at ${sidePocket.yieldApyPct}% APY). Add Solana USDC or choose the 90/10 split.`
+          : `Your capped Degen side-pocket budget is $0.00 (${sidePocket.effectiveRiskPct}% of $${sidePocket.availableUsdc.toFixed(2)} USDC). Add available Solana USDC or select a non-zero side-pocket cap.`
       );
     }
     if (input.stakeUsd > sidePocket.maxDegenBudgetUsd + 1e-9) {
       throw new Error(
-        `Stake $${roundTo(input.stakeUsd, 2).toFixed(2)} exceeds your preservation-capped Degen side-pocket budget of $${sidePocket.maxDegenBudgetUsd.toFixed(2)} (${sidePocket.effectiveRiskPct}% of $${sidePocket.availableUsdc.toFixed(2)} USDC; $${sidePocket.preservedUsdc.toFixed(2)} remains preserved safe).`
+        sidePocket.mode === 'yield_funded'
+          ? `Stake $${roundTo(input.stakeUsd, 2).toFixed(2)} exceeds your Yield-Funded Degen cap of $${sidePocket.maxDegenBudgetUsd.toFixed(2)} (30d projected yield at ${sidePocket.yieldApyPct}% APY; 100% of your $${sidePocket.preservedUsdc.toFixed(2)} principal remains untouched).`
+          : `Stake $${roundTo(input.stakeUsd, 2).toFixed(2)} exceeds your preservation-capped Degen side-pocket budget of $${sidePocket.maxDegenBudgetUsd.toFixed(2)} (${sidePocket.effectiveRiskPct}% of $${sidePocket.availableUsdc.toFixed(2)} USDC; $${sidePocket.preservedUsdc.toFixed(2)} remains preserved safe).`
       );
     }
 
@@ -943,9 +1404,11 @@ export class JupiterMarketsClient {
     let liveOrder: DegenLiveOrderResult = {
       attempted: false,
       available: false,
+      depositMint: SOLANA_USDC_MINT,
+      apiKeyRequired: !this.hasApiKey(),
       reason: this.hasApiKey()
-        ? 'Direct Jupiter web launch ready. Connect a Solana wallet and enable inline transaction request to build a signable transaction.'
-        : 'Direct Jupiter web launch ready. Set JUPITER_API_KEY and connect a Solana wallet to request signable inline transactions.',
+        ? 'Direct Jupiter web launch ready. Connect a Solana wallet to sign & place inline.'
+        : 'Direct Jupiter web launch ready. Set JUPITER_API_KEY and connect a Solana wallet for 1-click inline signing.',
     };
 
     const walletAddress = typeof input.walletAddress === 'string' ? input.walletAddress.trim() : '';
@@ -954,25 +1417,19 @@ export class JupiterMarketsClient {
         liveOrder = {
           attempted: false,
           available: false,
-          reason: 'JUPITER_API_KEY is not configured on the server; use the direct Jupiter link instead.',
+          depositMint: SOLANA_USDC_MINT,
+          apiKeyRequired: true,
+          reason: 'JUPITER_API_KEY is not configured on the server; use "Open on Jupiter ↗" instead.',
         };
       } else if (!walletAddress) {
         liveOrder = {
           attempted: false,
           available: false,
+          depositMint: SOLANA_USDC_MINT,
           reason: 'Connect a valid Solana wallet address to build a signable Jupiter order transaction.',
         };
       } else {
-        let validWallet = false;
-        try {
-          solanaAddressToBytes32(walletAddress);
-          validWallet = true;
-        } catch {
-          validWallet = false;
-        }
-        if (!validWallet) {
-          throw new Error('Invalid Solana walletAddress (expected base58 public key).');
-        }
+        this.assertValidSolanaPubkey(walletAddress, 'walletAddress');
 
         const orderRes = await this.fetchJsonWithTimeout(`${this.apiBaseUrl}/orders`, {
           method: 'POST',
@@ -980,6 +1437,7 @@ export class JupiterMarketsClient {
           body: JSON.stringify({
             ownerPubkey: walletAddress,
             marketId,
+            depositMint: SOLANA_USDC_MINT,
             isYes: input.side === 'yes',
             isBuy: true,
             depositAmount: String(Math.round(payout.stakeUsd * MICRO_USD_SCALE)),
@@ -990,6 +1448,10 @@ export class JupiterMarketsClient {
           liveOrder = {
             attempted: true,
             available: false,
+            depositMint: SOLANA_USDC_MINT,
+            geoBlocked: Boolean(orderRes.geoBlocked),
+            apiKeyRequired: Boolean(orderRes.apiKeyRequired),
+            statusCode: orderRes.status,
             reason: orderRes.error,
           };
         } else {
@@ -1006,6 +1468,7 @@ export class JupiterMarketsClient {
           liveOrder = {
             attempted: true,
             available: Boolean(tx),
+            depositMint: SOLANA_USDC_MINT,
             orderId: typeof obj.orderId === 'string' ? sanitizeDegenText(obj.orderId, 80) : null,
             transactionBase64: tx,
             expiresAt: normalizeIsoCloseTime(obj.expiresAt),
@@ -1031,6 +1494,228 @@ export class JupiterMarketsClient {
       riskNotice:
         'Non-custodial preview only. Binary outcome contracts settle to $1.00 if right or $0.00 if wrong. Principal outside your side-pocket stays preserved in Solana USDC.',
       liveOrder,
+    };
+  }
+
+  private assertValidSolanaPubkey(pubkey: string, fieldName: string): string {
+    const clean = typeof pubkey === 'string' ? pubkey.trim() : '';
+    if (!clean) {
+      throw new Error(`Valid Solana ${fieldName} is required.`);
+    }
+    try {
+      solanaAddressToBytes32(clean);
+    } catch {
+      throw new Error(`Invalid Solana ${fieldName} (expected base58 public key).`);
+    }
+    return clean;
+  }
+
+  async fetchPositions(ownerPubkey: string): Promise<JupiterPositionsResult> {
+    const cleanOwner = this.assertValidSolanaPubkey(ownerPubkey, 'owner');
+    const fetchedAt = new Date(this.nowMs()).toISOString();
+    const qs = new URLSearchParams({ ownerPubkey: cleanOwner });
+    const url = `${this.apiBaseUrl}/positions?${qs.toString()}`;
+
+    const res = await this.fetchJsonWithTimeout(url, {
+      method: 'GET',
+      headers: this.buildHeaders(false),
+    });
+
+    if (!res.ok) {
+      return {
+        ok: false,
+        live: false,
+        ownerPubkey: cleanOwner,
+        fetchedAt,
+        positions: [],
+        summary: summarizeDegenPositions([]),
+        apiKeyConfigured: this.hasApiKey(),
+        geoBlocked: Boolean(res.geoBlocked),
+        error: res.error,
+      };
+    }
+
+    const rawList = Array.isArray(res.data)
+      ? res.data
+      : res.data && typeof res.data === 'object' && Array.isArray((res.data as { data?: unknown }).data)
+        ? (res.data as { data: unknown[] }).data
+        : res.data && typeof res.data === 'object' && Array.isArray((res.data as { positions?: unknown }).positions)
+          ? (res.data as { positions: unknown[] }).positions
+          : [];
+
+    const positions = rawList
+      .map((item) => normalizeJupiterPosition(item, cleanOwner))
+      .filter((p): p is NormalizedDegenPosition => p !== null);
+
+    // Prioritize claimable winning payouts first, then open active positions, then settled/closed
+    const statusOrder: Record<DegenPositionStatus, number> = {
+      claimable: 0,
+      open: 1,
+      settled: 2,
+      closed: 3,
+    };
+    positions.sort((a, b) => statusOrder[a.status] - statusOrder[b.status]);
+
+    return {
+      ok: true,
+      live: true,
+      ownerPubkey: cleanOwner,
+      fetchedAt,
+      positions,
+      summary: summarizeDegenPositions(positions),
+      apiKeyConfigured: this.hasApiKey(),
+    };
+  }
+
+  async claimPosition(
+    rawPositionId: string,
+    ownerPubkey?: string | null
+  ): Promise<DegenPositionActionResult> {
+    const positionId = sanitizePositionId(rawPositionId);
+    if (!positionId) {
+      throw new Error('Invalid positionId.');
+    }
+    const cleanOwner = ownerPubkey ? this.assertValidSolanaPubkey(ownerPubkey, 'ownerPubkey') : null;
+    const fallbackUrl = `${JUPITER_PREDICTION_WEB_BASE}/portfolio`;
+
+    if (!this.hasApiKey()) {
+      return {
+        ok: true,
+        action: 'claim',
+        positionId,
+        available: false,
+        transactionBase64: null,
+        jupiterUrl: fallbackUrl,
+        apiKeyConfigured: false,
+        apiKeyRequired: true,
+        reason:
+          'JUPITER_API_KEY is not configured on the server; claim your $1.00 winning payout directly on Jupiter.',
+      };
+    }
+
+    const res = await this.fetchJsonWithTimeout(
+      `${this.apiBaseUrl}/positions/${encodeURIComponent(positionId)}/claim`,
+      {
+        method: 'POST',
+        headers: this.buildHeaders(true),
+        body: JSON.stringify(cleanOwner ? { ownerPubkey: cleanOwner } : {}),
+      }
+    );
+
+    if (!res.ok) {
+      return {
+        ok: false,
+        action: 'claim',
+        positionId,
+        available: false,
+        transactionBase64: null,
+        jupiterUrl: fallbackUrl,
+        apiKeyConfigured: true,
+        geoBlocked: Boolean(res.geoBlocked),
+        apiKeyRequired: Boolean(res.apiKeyRequired),
+        statusCode: res.status,
+        reason: res.error,
+      };
+    }
+
+    const obj =
+      res.data && typeof res.data === 'object' ? (res.data as Record<string, unknown>) : {};
+    const tx =
+      typeof obj.transaction === 'string'
+        ? obj.transaction
+        : typeof obj.tx === 'string'
+          ? obj.tx
+          : null;
+
+    return {
+      ok: true,
+      action: 'claim',
+      positionId,
+      available: Boolean(tx),
+      transactionBase64: tx,
+      orderId: typeof obj.orderId === 'string' ? sanitizeDegenText(obj.orderId, 80) : null,
+      expiresAt: normalizeIsoCloseTime(obj.expiresAt),
+      jupiterUrl: fallbackUrl,
+      apiKeyConfigured: true,
+      reason: tx
+        ? undefined
+        : 'Jupiter claim endpoint returned no signable transaction; claim directly on Jupiter.',
+    };
+  }
+
+  async closePosition(
+    rawPositionId: string,
+    ownerPubkey?: string | null
+  ): Promise<DegenPositionActionResult> {
+    const positionId = sanitizePositionId(rawPositionId);
+    if (!positionId) {
+      throw new Error('Invalid positionId.');
+    }
+    const cleanOwner = ownerPubkey ? this.assertValidSolanaPubkey(ownerPubkey, 'ownerPubkey') : null;
+    const fallbackUrl = `${JUPITER_PREDICTION_WEB_BASE}/portfolio`;
+
+    if (!this.hasApiKey()) {
+      return {
+        ok: true,
+        action: 'close',
+        positionId,
+        available: false,
+        transactionBase64: null,
+        jupiterUrl: fallbackUrl,
+        apiKeyConfigured: false,
+        apiKeyRequired: true,
+        reason:
+          'JUPITER_API_KEY is not configured on the server; close or sell your position directly on Jupiter.',
+      };
+    }
+
+    const res = await this.fetchJsonWithTimeout(
+      `${this.apiBaseUrl}/positions/${encodeURIComponent(positionId)}`,
+      {
+        method: 'DELETE',
+        headers: this.buildHeaders(true),
+        body: JSON.stringify(cleanOwner ? { ownerPubkey: cleanOwner } : {}),
+      }
+    );
+
+    if (!res.ok) {
+      return {
+        ok: false,
+        action: 'close',
+        positionId,
+        available: false,
+        transactionBase64: null,
+        jupiterUrl: fallbackUrl,
+        apiKeyConfigured: true,
+        geoBlocked: Boolean(res.geoBlocked),
+        apiKeyRequired: Boolean(res.apiKeyRequired),
+        statusCode: res.status,
+        reason: res.error,
+      };
+    }
+
+    const obj =
+      res.data && typeof res.data === 'object' ? (res.data as Record<string, unknown>) : {};
+    const tx =
+      typeof obj.transaction === 'string'
+        ? obj.transaction
+        : typeof obj.tx === 'string'
+          ? obj.tx
+          : null;
+
+    return {
+      ok: true,
+      action: 'close',
+      positionId,
+      available: Boolean(tx),
+      transactionBase64: tx,
+      orderId: typeof obj.orderId === 'string' ? sanitizeDegenText(obj.orderId, 80) : null,
+      expiresAt: normalizeIsoCloseTime(obj.expiresAt),
+      jupiterUrl: fallbackUrl,
+      apiKeyConfigured: true,
+      reason: tx
+        ? undefined
+        : 'Jupiter close endpoint returned no signable transaction; exit directly on Jupiter.',
     };
   }
 }

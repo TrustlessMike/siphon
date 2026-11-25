@@ -1,10 +1,13 @@
 import type { IncomingMessage } from 'node:http';
 import {
+  sanitizePositionId,
   type BinarySide,
+  type DegenSidePocketMode,
   type JupiterMarketsClient,
 } from '../degen/jupiter-markets.js';
 
 const MAX_DEGEN_JSON_BODY_BYTES = 32_768; // 32 KiB strict cap for degen order previews
+const POSITION_ACTION_RE = /^\/api\/degen\/positions\/([^/]+)\/(claim|close)$/;
 
 export interface DegenRouteContext {
   method: string;
@@ -18,7 +21,7 @@ export interface DegenRouteContext {
 
 /**
  * Modular HTTP routes for the Siphon Degen tab (live Jupiter Prediction Markets +
- * Preservation-First Side-Pocket cap + Order Preview).
+ * Preservation-First Side-Pocket cap + Order Preview + Live Positions/Claims/Early Exit).
  */
 export async function handleDegenRoutes(ctx: DegenRouteContext): Promise<boolean> {
   const { method, pathname, url, req, reply, readJsonBody, client } = ctx;
@@ -74,6 +77,82 @@ export async function handleDegenRoutes(ctx: DegenRouteContext): Promise<boolean
     return true;
   }
 
+  if (method === 'GET' && pathname === '/api/degen/positions') {
+    const owner = (
+      url.searchParams.get('owner') ??
+      url.searchParams.get('ownerPubkey') ??
+      ''
+    ).trim();
+    if (!owner) {
+      reply(400, { error: 'Query parameter owner (Solana public key) is required.' });
+      return true;
+    }
+    try {
+      const positions = await client.fetchPositions(owner);
+      reply(200, positions);
+    } catch (err) {
+      reply(400, {
+        error: err instanceof Error ? err.message : 'Invalid Solana owner public key.',
+      });
+    }
+    return true;
+  }
+
+  if (method === 'POST' && pathname.startsWith('/api/degen/positions/')) {
+    const match = POSITION_ACTION_RE.exec(pathname);
+    if (!match) {
+      reply(400, { error: 'Invalid Degen position action route or position ID.' });
+      return true;
+    }
+    let decodedId = '';
+    try {
+      decodedId = decodeURIComponent(match[1]);
+    } catch {
+      reply(400, { error: 'Malformed position ID encoding.' });
+      return true;
+    }
+    const cleanId = sanitizePositionId(decodedId);
+    if (!cleanId) {
+      reply(400, { error: 'Invalid position ID.' });
+      return true;
+    }
+
+    const action = match[2] as 'claim' | 'close';
+    let body: { ownerPubkey?: string; walletAddress?: string } = {};
+    try {
+      const parsed = await readJsonBody<{ ownerPubkey?: string; walletAddress?: string }>(
+        req,
+        MAX_DEGEN_JSON_BODY_BYTES
+      );
+      if (parsed && typeof parsed === 'object') {
+        body = parsed;
+      }
+    } catch {
+      // Allow empty POST body for claim/close actions while rejecting malformed oversized payloads below
+      body = {};
+    }
+
+    const ownerPubkey =
+      typeof body.ownerPubkey === 'string' && body.ownerPubkey.trim()
+        ? body.ownerPubkey.trim()
+        : typeof body.walletAddress === 'string' && body.walletAddress.trim()
+          ? body.walletAddress.trim()
+          : null;
+
+    try {
+      const result =
+        action === 'claim'
+          ? await client.claimPosition(cleanId, ownerPubkey)
+          : await client.closePosition(cleanId, ownerPubkey);
+      reply(200, result);
+    } catch (err) {
+      reply(400, {
+        error: err instanceof Error ? err.message : `Invalid position ${action} payload.`,
+      });
+    }
+    return true;
+  }
+
   if (method === 'POST' && pathname === '/api/degen/order-preview') {
     const body = await readJsonBody<{
       marketId?: string;
@@ -81,6 +160,8 @@ export async function handleDegenRoutes(ctx: DegenRouteContext): Promise<boolean
       stakeUsd?: number;
       availableUsdc?: number;
       riskPct?: number;
+      sidePocketMode?: DegenSidePocketMode;
+      yieldApyPct?: number;
       priceUsd?: number;
       eventSlug?: string | null;
       eventTitle?: string | null;
@@ -96,6 +177,8 @@ export async function handleDegenRoutes(ctx: DegenRouteContext): Promise<boolean
         stakeUsd: body.stakeUsd as number,
         availableUsdc: body.availableUsdc as number,
         riskPct: body.riskPct,
+        sidePocketMode: body.sidePocketMode,
+        yieldApyPct: body.yieldApyPct,
         priceUsd: body.priceUsd,
         eventSlug: body.eventSlug,
         eventTitle: body.eventTitle,
