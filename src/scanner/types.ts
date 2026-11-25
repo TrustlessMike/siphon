@@ -157,7 +157,9 @@ export interface ChainConfig {
   multicall3: string;
   usdcAddress: string;
   cctpDomain: number | null; // null when chain relies on Relay/LI.FI instead of native Circle CCTP
+  cctpVersion?: 1 | 2 | null;
   cctpTokenMessenger: string | null;
+  cctpMessageTransmitter?: string | null;
   cctpAttestationSec: number;
   swapGasUnits: number;
   defiWithdrawGasUnits: number;
@@ -331,6 +333,7 @@ export interface CctpBridgeLeg {
   chainName: string;
   sourceDomain: number | null;
   destinationDomain: number; // 5 = Solana
+  cctpVersion?: 1 | 2 | null;
   tokenMessenger: string;
   usdcAddress: string;
   grossUsdc: number;
@@ -372,6 +375,7 @@ export interface MigrationPlan {
   createdAt: string;
   sourceWallet: string;
   solanaDestination: string;
+  solanaUsdcAta?: string;
   solanaMintRecipientBytes32: string;
   usePermit2Batch: boolean;
   includeBurns: boolean;

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { keccak_256 } from '@noble/hashes/sha3';
+import { secp256k1 } from '@noble/curves/secp256k1';
 import { aptosAdapter } from '../src/adapters/aptos.js';
 import { btcAdapter, classifyBtcUtxos } from '../src/adapters/btc.js';
 import { cosmosAdapter } from '../src/adapters/cosmos.js';
@@ -465,40 +467,64 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
     assert.ok(c.agentVaultSource.includes('contract SiphonAgentVault'));
     assert.equal(c.contracts.length, 4);
 
-    // Witness-bound Gasless 1-Signature Permit2 / EIP-7702 intent preparation & signature verification
+    // Witness-bound Gasless 1-Signature Permit2 / EIP-7702 intent preparation & cryptographic signature verification
     const opAssets = report.assets.filter((a) => a.chain === 'optimism');
-    const intent = await fetch(`http://127.0.0.1:${addr.port}/api/relayer/prepare-intent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chain: 'optimism',
-        assets: opAssets,
-        userAddress: report.walletAddress,
-        solanaDestination: SAMPLE_SOLANA_WALLET,
-        protocolFeeBps: 700,
-        feeRecipientEvm: treasury,
-      }),
-    }).then((r) => r.json());
-    assert.equal(intent.userGasCostUsd, 0);
-    assert.equal(intent.mode, 'permit2_batch');
-    assert.equal(intent.typedData.primaryType, 'PermitBatchWitnessTransferFrom');
-    assert.ok(intent.typedData.message.witness.solanaRecipient.startsWith('0x'));
-    assert.equal(intent.typedData.message.witness.feeBps, 700);
-    assert.match(intent.intentDigestSha256, /^0x[0-9a-f]{64}$/);
+    const prevOpRouter = process.env.SIPHON_ROUTER_OPTIMISM;
+    process.env.SIPHON_ROUTER_OPTIMISM = '0x2222222222222222222222222222222222222222';
+    const testPrivKey = Buffer.from('11'.repeat(32), 'hex');
+    const testPub = secp256k1.getPublicKey(testPrivKey, false).slice(1);
+    const testUserAddress = '0x' + Buffer.from(keccak_256(testPub).slice(-20)).toString('hex');
+    try {
+      const intent = await fetch(`http://127.0.0.1:${addr.port}/api/relayer/prepare-intent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chain: 'optimism',
+          assets: opAssets,
+          userAddress: testUserAddress,
+          solanaDestination: SAMPLE_SOLANA_WALLET,
+          protocolFeeBps: 700,
+          feeRecipientEvm: treasury,
+        }),
+      }).then((r) => r.json());
+      assert.equal(intent.userGasCostUsd, 0);
+      assert.equal(intent.mode, 'permit2_batch');
+      assert.equal(intent.routerConfigured, true);
+      assert.equal(intent.previewOnly, false);
+      assert.equal(intent.typedData.primaryType, 'PermitBatchWitnessTransferFrom');
+      assert.ok(intent.typedData.message.witness.solanaRecipient.startsWith('0x'));
+      assert.equal(intent.typedData.message.witness.feeBps, 700);
+      assert.match(intent.intentDigestSha256, /^0x[0-9a-f]{64}$/);
+      assert.match(intent.eip712Digest, /^0x[0-9a-f]{64}$/);
 
-    const sigReceipt = await fetch(`http://127.0.0.1:${addr.port}/api/relayer/submit`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        intentId: intent.intentId,
-        chain: 'optimism',
-        userAddress: report.walletAddress,
-        signature: '0x' + 'ab'.repeat(65),
-        deadline: intent.deadline,
-      }),
-    }).then((r) => r.json());
-    assert.equal(sigReceipt.accepted, true);
-    assert.equal(sigReceipt.signatureValid, true);
+      const sigObj = secp256k1.sign(Buffer.from(intent.eip712Digest.slice(2), 'hex'), testPrivKey, {
+        lowS: true,
+      });
+      const validSig =
+        '0x' +
+        sigObj.r.toString(16).padStart(64, '0') +
+        sigObj.s.toString(16).padStart(64, '0') +
+        (27 + (sigObj.recovery ?? 0)).toString(16).padStart(2, '0');
+
+      const sigReceipt = await fetch(`http://127.0.0.1:${addr.port}/api/relayer/submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          intentId: intent.intentId,
+          chain: 'optimism',
+          userAddress: testUserAddress,
+          signature: validSig,
+          deadline: intent.deadline,
+        }),
+      }).then((r) => r.json());
+      assert.equal(sigReceipt.signatureValid, true);
+      assert.equal(sigReceipt.recoveredSigner.toLowerCase(), testUserAddress.toLowerCase());
+      assert.equal(sigReceipt.broadcasted, false);
+      assert.notEqual(sigReceipt.settlementStatus, 'attested');
+    } finally {
+      if (prevOpRouter === undefined) delete process.env.SIPHON_ROUTER_OPTIMISM;
+      else process.env.SIPHON_ROUTER_OPTIMISM = prevOpRouter;
+    }
 
     // Real-time Pre-Sign Simulation Proof (POST /api/tx/simulate-proof)
     const simProofRes = await fetch(`http://127.0.0.1:${addr.port}/api/tx/simulate-proof`, {
