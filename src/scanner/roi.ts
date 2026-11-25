@@ -1,4 +1,30 @@
-import { EVM_CHAINS, getProtocolFeeConfig } from './chains.js';
+import {
+  computePreservationFee,
+  DEFAULT_PRESERVATION_FEE_CAP_USD,
+  EVM_CHAINS,
+  getProtocolFeeConfig,
+  MIN_PRESERVATION_FEE_BPS,
+  PRESERVATION_FEE_TIERS,
+  resolvePreservationFeeBps,
+  type PreservationFeeMode,
+  type PreservationFeeOptions,
+  type PreservationFeeResult,
+  type PreservationFeeTier,
+  type PreservationFeeTierId,
+} from './chains.js';
+
+export {
+  computePreservationFee,
+  DEFAULT_PRESERVATION_FEE_CAP_USD,
+  MIN_PRESERVATION_FEE_BPS,
+  PRESERVATION_FEE_TIERS,
+  resolvePreservationFeeBps,
+  type PreservationFeeMode,
+  type PreservationFeeOptions,
+  type PreservationFeeResult,
+  type PreservationFeeTier,
+  type PreservationFeeTierId,
+};
 import type {
   AnyChainId,
   ChainFamily,
@@ -141,6 +167,8 @@ export interface ChainBatchRoiReport {
   /** Positive USD bleed prevented by pruning negative-ROI dust */
   negativeBleedPreventedUsd: number;
   protocolFeeUsd: number;
+  /** Populated when feeSchedule: 'tiered' preservation fee calculation is enabled */
+  preservationFee?: PreservationFeeResult;
   totalGasUsd: number;
   totalSlippageUsd: number;
   bridgeFixedFeeUsd: number;
@@ -500,6 +528,8 @@ export function evaluateAssetRoi(
   asset: ScannedAsset,
   opts: {
     protocolFeeBps?: number;
+    feeSchedule?: 'flat' | 'tiered';
+    preservationFeeOpts?: PreservationFeeOptions;
     isBatched?: boolean;
     gasSponsored?: boolean;
     solanaAtaRentUsd?: number;
@@ -595,7 +625,11 @@ export function evaluateAssetRoi(
   }
 
   // Chain-specific sub-fee dust guard (e.g., BTC dust UTXO or pre-skipped chain-floor dust)
-  const protocolFeeUsd = r2((Math.max(0, grossUsd - slippageUsd) * feeCfg.feeBps) / 10_000);
+  const netAfterSlippageUsd = Math.max(0, grossUsd - slippageUsd);
+  const protocolFeeUsd =
+    opts.feeSchedule === 'tiered'
+      ? computePreservationFee(netAfterSlippageUsd, opts.preservationFeeOpts).feeUsd
+      : r2((netAfterSlippageUsd * feeCfg.feeBps) / 10_000);
   const bridgeShareUsd = opts.includeSingleBridgeShare
     ? r2(estimateBridgeFixedFeeUsd(asset.chain) / Math.max(1, opts.chainAssetCount ?? 1))
     : 0;
@@ -800,7 +834,12 @@ export function computeRelayerBreakEven(params: {
  */
 export function pruneNegativeRoiAssets(
   assets: ScannedAsset[],
-  opts: { protocolFeeBps?: number; isBatched?: boolean } = {}
+  opts: {
+    protocolFeeBps?: number;
+    feeSchedule?: 'flat' | 'tiered';
+    preservationFeeOpts?: PreservationFeeOptions;
+    isBatched?: boolean;
+  } = {}
 ): PrunedAssetBuckets {
   const kept: ScannedAsset[] = [];
   const lowEfficiency: ScannedAsset[] = [];
@@ -893,6 +932,8 @@ export function evaluateChainBatchRoi(params: {
   sourceWalletLabel?: string;
   assets: ScannedAsset[];
   protocolFeeBps?: number;
+  feeSchedule?: 'flat' | 'tiered';
+  preservationFeeOpts?: PreservationFeeOptions;
   gasSponsored?: boolean;
   fixedRelayerOverheadUsd?: number;
   hasSolanaUsdcAta?: boolean;
@@ -900,6 +941,7 @@ export function evaluateChainBatchRoi(params: {
   gasPriceGwei?: number;
 }): ChainBatchRoiReport {
   const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+  const useTieredFee = params.feeSchedule === 'tiered';
   const gasSponsored = params.gasSponsored ?? true;
   const solanaAtaRentUsd = estimateSolanaAtaRentUsd({
     hasUsdcAta: params.hasSolanaUsdcAta,
@@ -908,6 +950,8 @@ export function evaluateChainBatchRoi(params: {
 
   const buckets = pruneNegativeRoiAssets(params.assets, {
     protocolFeeBps: feeCfg.feeBps,
+    feeSchedule: params.feeSchedule,
+    preservationFeeOpts: params.preservationFeeOpts,
     isBatched: true,
   });
 
@@ -921,7 +965,13 @@ export function evaluateChainBatchRoi(params: {
     const cGross = r2(candidates.reduce((s, a) => s + (Number.isFinite(a.grossUsd) ? Math.max(0, a.grossUsd) : 0), 0));
     const cGas = r2(cEvals.reduce((s, e) => s + e.batchedGasUsd + e.l1DataFeeUsd, 0));
     const cSlippage = r2(cEvals.reduce((s, e) => s + e.slippageUsd, 0));
-    const cFee = r2((Math.max(0, cGross - cSlippage) * feeCfg.feeBps) / 10_000);
+    const cNetAfterSlippage = Math.max(0, cGross - cSlippage);
+    const cPreservationFee = useTieredFee
+      ? computePreservationFee(cNetAfterSlippage, params.preservationFeeOpts)
+      : undefined;
+    const cFee = cPreservationFee
+      ? cPreservationFee.feeUsd
+      : r2((cNetAfterSlippage * feeCfg.feeBps) / 10_000);
     const cRoute = compareChainRouteStrategies({
       chain: params.chain,
       assets: candidates,
@@ -948,6 +998,7 @@ export function evaluateChainBatchRoi(params: {
       totalGasUsd: cGas,
       totalSlippageUsd: cSlippage,
       protocolFeeUsd: cFee,
+      preservationFee: cPreservationFee,
       routeComparison: cRoute,
       bestChainLegNetUsd: cBestNet,
       bridgeFixedFeeUsd: cBridgeFee,
@@ -1101,6 +1152,7 @@ export function evaluateChainBatchRoi(params: {
     breakEvenHint,
     negativeBleedPreventedUsd,
     protocolFeeUsd,
+    ...(bestResult.preservationFee ? { preservationFee: bestResult.preservationFee } : {}),
     totalGasUsd,
     totalSlippageUsd,
     bridgeFixedFeeUsd,
@@ -1436,6 +1488,8 @@ export function evaluatePortfolioRoi(
   report: ScanReport,
   opts: {
     protocolFeeBps?: number;
+    feeSchedule?: 'flat' | 'tiered';
+    preservationFeeOpts?: PreservationFeeOptions;
     gasSponsored?: boolean;
     fixedRelayerOverheadUsd?: number;
     hasSolanaUsdcAta?: boolean;
@@ -1481,6 +1535,8 @@ export function evaluatePortfolioRoi(
       sourceWalletLabel: group.sourceWalletLabel,
       assets: group.assets,
       protocolFeeBps: feeCfg.feeBps,
+      feeSchedule: opts.feeSchedule,
+      preservationFeeOpts: opts.preservationFeeOpts,
       gasSponsored: opts.gasSponsored ?? true,
       fixedRelayerOverheadUsd: opts.fixedRelayerOverheadUsd,
       hasSolanaUsdcAta: true,
@@ -1508,6 +1564,8 @@ export function evaluatePortfolioRoi(
         sourceWalletLabel: group.sourceWalletLabel,
         assets: group.assets,
         protocolFeeBps: feeCfg.feeBps,
+        feeSchedule: opts.feeSchedule,
+        preservationFeeOpts: opts.preservationFeeOpts,
         gasSponsored: opts.gasSponsored ?? true,
         fixedRelayerOverheadUsd: opts.fixedRelayerOverheadUsd,
         hasSolanaUsdcAta: false,
@@ -1533,6 +1591,8 @@ export function evaluatePortfolioRoi(
         sourceWalletLabel: group.sourceWalletLabel,
         assets: group.assets,
         protocolFeeBps: feeCfg.feeBps,
+        feeSchedule: opts.feeSchedule,
+        preservationFeeOpts: opts.preservationFeeOpts,
         gasSponsored: opts.gasSponsored ?? true,
         fixedRelayerOverheadUsd: opts.fixedRelayerOverheadUsd,
         hasSolanaUsdcAta: false,

@@ -204,32 +204,37 @@ test('CRIT-04 Backtest: solanaOwnerToUsdcAtaBytes32 derives canonical SPL USDC A
   assert.equal('0x' + burnTx.data.slice(138, 202).toLowerCase(), expectedAtaBytes32);
 });
 
-test('CRIT-05 Backtest: All 14 EVM chains route CCTP V1 vs V2 selectors, Iris URLs, and Solana program IDs accurately', async () => {
-  const expectedV1: EvmChainId[] = ['ethereum', 'base', 'arbitrum', 'optimism', 'polygon', 'avalanche'];
-  const expectedV2: EvmChainId[] = ['sonic', 'unichain', 'linea', 'worldchain'];
+test('CRIT-05 Backtest: All 14 EVM chains route CCTP V2 (with V1 backward-compat encoder), Iris URLs, and Solana program IDs accurately', async () => {
+  const expectedV2: EvmChainId[] = [
+    'ethereum',
+    'base',
+    'arbitrum',
+    'optimism',
+    'polygon',
+    'avalanche',
+    'sonic',
+    'unichain',
+    'linea',
+    'worldchain',
+  ];
   const expectedNone: EvmChainId[] = ['bnb', 'scroll', 'mantle', 'blast'];
 
   assert.equal(CHAIN_LIST.length, 14);
   const ataBytes32 = solanaOwnerToUsdcAtaBytes32(SAMPLE_SOLANA_WALLETS[0]);
 
-  for (const chainId of expectedV1) {
-    const cfg = EVM_CHAINS[chainId];
-    assert.equal(cfg.cctpVersion, 1, `${chainId} should be CCTP V1`);
-    assert.ok(cfg.cctpTokenMessenger, `${chainId} missing tokenMessenger`);
-    assert.match(cfg.cctpMessageTransmitter ?? '', /^0x[0-9a-fA-F]{40}$/, `${chainId} missing MessageTransmitter`);
-    const calldata = encodeCctpDepositForBurn({
-      rawUsdcAmount: 50_000_000n,
-      destinationDomain: 5,
-      solanaMintRecipientBytes32: ataBytes32,
-      usdcAddress: cfg.usdcAddress,
-      cctpVersion: cfg.cctpVersion,
-    });
-    assert.ok(calldata.startsWith(`0x${CCTP_V1_DEPOSIT_FOR_BURN_SELECTOR}`));
-    assert.equal(calldata.length, 2 + 8 + 64 * 4);
-    assert.equal(getSolanaCctpPrograms(cfg.cctpVersion), SOLANA_CCTP_PROGRAMS);
-    const url = getCctpIrisAttestationUrl({ cctpVersion: 1, messageHash: '0x' + 'aa'.repeat(32) });
-    assert.ok(url.startsWith('https://iris-api.circle.com/v1/attestations/'));
-  }
+  // Verify V1 backwards-compatible encoder, Iris V1 URL, and Solana V1 programs still work when explicitly requested
+  const legacyV1Calldata = encodeCctpDepositForBurn({
+    rawUsdcAmount: 50_000_000n,
+    destinationDomain: 5,
+    solanaMintRecipientBytes32: ataBytes32,
+    usdcAddress: EVM_CHAINS.base.usdcAddress,
+    cctpVersion: 1,
+  });
+  assert.ok(legacyV1Calldata.startsWith(`0x${CCTP_V1_DEPOSIT_FOR_BURN_SELECTOR}`));
+  assert.equal(legacyV1Calldata.length, 2 + 8 + 64 * 4);
+  assert.equal(getSolanaCctpPrograms(1), SOLANA_CCTP_PROGRAMS);
+  const v1Url = getCctpIrisAttestationUrl({ cctpVersion: 1, messageHash: '0x' + 'aa'.repeat(32) });
+  assert.ok(v1Url.startsWith('https://iris-api.circle.com/v1/attestations/'));
 
   for (const chainId of expectedV2) {
     const cfg = EVM_CHAINS[chainId];
@@ -257,7 +262,7 @@ test('CRIT-05 Backtest: All 14 EVM chains route CCTP V1 vs V2 selectors, Iris UR
       `https://iris-api.circle.com/v2/messages/${cfg.cctpDomain}?transactionHash=${encodeURIComponent('0x' + 'bb'.repeat(32))}`
     );
 
-    // Direct preparation on V2 chain (e.g. Sonic) must emit 7-arg V2 depositForBurn calldata
+    // Direct preparation on V2 chain must emit 7-arg V2 depositForBurn calldata
     const v2Asset = makeAsset({
       id: `${chainId}:usdc`,
       chain: chainId,
@@ -1026,7 +1031,11 @@ test('CRIT-11 & MED-11 Adversarial Replay: rejects forged pre-state, 1-lamport d
   const cctpOnlyProof = await withMockFetch(
     async (url) => {
       if (url.includes('iris-api.circle.com')) {
-        return jsonResponse({ status: 'complete', attestation: '0x' + 'ee'.repeat(70) });
+        return jsonResponse({
+          status: 'complete',
+          attestation: '0x' + 'ee'.repeat(70),
+          messages: [{ status: 'complete', attestation: '0x' + 'ee'.repeat(70) }],
+        });
       }
       if (url.includes('solana')) {
         return jsonResponse([

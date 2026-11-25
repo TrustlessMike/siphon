@@ -16,6 +16,53 @@ import type { AnyChainId, CctpBridgeLeg, EvmChainId, MigrationPlan, ScanReport }
 export const CCTP_V1_DEPOSIT_FOR_BURN_SELECTOR = '6fd3504e';
 // Circle CCTP V2 TokenMessengerV2.depositForBurn(uint256,uint32,bytes32,address,bytes32,uint256,uint32)
 export const CCTP_V2_DEPOSIT_FOR_BURN_SELECTOR = '8e0250ee';
+export const CCTP_V2_FAST_FINALITY_THRESHOLD = 1000;
+export const CCTP_V2_STANDARD_FINALITY_THRESHOLD = 2000;
+export const CCTP_V2_IRIS_FEES_BASE_URL = 'https://iris-api.circle.com/v2/burn/USDC/fees';
+export const CCTP_V2_MAX_FEE_BPS_SAFETY_CAP = 50; // 0.50% hard cap protecting against malformed/spoofed fee quotes
+
+/**
+ * Fallback Circle CCTP V2 Fast Transfer fee schedule (bps) per source domain when Circle Iris
+ * fee endpoint is unreachable (Standard Transfer is always 0 bps).
+ */
+export const CCTP_V2_FALLBACK_FAST_FEE_BPS: Record<number, number> = {
+  0: 1.0,  // Ethereum (~15s soft finality vs 13m standard)
+  1: 1.0,  // Avalanche
+  2: 1.3,  // Optimism
+  3: 1.4,  // Arbitrum
+  6: 1.3,  // Base
+  7: 1.3,  // Polygon
+  10: 1.3, // Unichain
+  11: 1.4, // Linea
+  13: 1.0, // Sonic
+  14: 1.3, // World Chain
+};
+
+export type CctpTransferMode = 'fast' | 'standard';
+
+export interface CctpV2FeeTier {
+  finalityThreshold: number;
+  minimumFeeBps: number;
+  forwardFee?: {
+    low?: number;
+    medium?: number;
+    high?: number;
+  };
+}
+
+export interface CctpV2BurnFeeQuote {
+  sourceDomain: number;
+  destinationDomain: number;
+  mode: CctpTransferMode;
+  minFinalityThreshold: number;
+  feeBps: number;
+  forwardFeeUsdc6?: number;
+  maxFeeRaw?: bigint;
+  source: 'circle_iris_live' | 'fallback';
+  endpoint: string;
+  tiers: CctpV2FeeTier[];
+}
+
 const ZERO_BYTES32 = '0x' + '00'.repeat(32);
 
 // Canonical Solana SPL Token, Associated Token Account Program, and Native USDC Mint
@@ -119,9 +166,232 @@ export function solanaOwnerToUsdcAtaBytes32(ownerPubkey: string): string {
 }
 
 /**
+ * Computes a bounded raw USDC `maxFee` ceiling (6-decimal micro-USDC) for CCTP V2 `depositForBurn`
+ * from a bps fee quote (supports fractional bps such as 1.3 or 1.4 bps), rounding up to avoid
+ * 1-unit under-quoting while strictly guaranteeing `maxFee < rawUsdcAmount`.
+ */
+export function computeCctpV2MaxFeeRaw(
+  rawUsdcAmount: bigint,
+  feeBps: number,
+  options?: { bufferBps?: number; maxFeeBpsCap?: number }
+): bigint {
+  if (rawUsdcAmount <= 0n || !Number.isFinite(feeBps) || feeBps <= 0) {
+    return 0n;
+  }
+  const bufferBps =
+    options?.bufferBps !== undefined && Number.isFinite(options.bufferBps) && options.bufferBps > 0
+      ? options.bufferBps
+      : 0;
+  const capBps =
+    options?.maxFeeBpsCap !== undefined &&
+    Number.isFinite(options.maxFeeBpsCap) &&
+    options.maxFeeBpsCap > 0
+      ? options.maxFeeBpsCap
+      : CCTP_V2_MAX_FEE_BPS_SAFETY_CAP;
+
+  const effectiveBps = Math.min(capBps, feeBps + bufferBps);
+  // 1 bps = 1/10,000; scale by 100 for 0.01 bps precision => denominator = 1,000,000
+  const scaledHundredthsBps = BigInt(Math.ceil(effectiveBps * 100));
+  if (scaledHundredthsBps <= 0n) return 0n;
+
+  const ceilFee = (rawUsdcAmount * scaledHundredthsBps + 999_999n) / 1_000_000n;
+  if (rawUsdcAmount === 1n) return 0n;
+  const bounded = ceilFee >= rawUsdcAmount ? rawUsdcAmount - 1n : ceilFee;
+  return bounded > 0n ? bounded : 1n;
+}
+
+/**
+ * Queries Circle's live CCTP V2 burn fee schedule at:
+ *   GET https://iris-api.circle.com/v2/burn/USDC/fees/{sourceDomain}/{destDomain}
+ *
+ * Returns Fast Transfer (`minFinalityThreshold = 1000`, ~1–1.4 bps) or Standard Transfer
+ * (`minFinalityThreshold = 2000`, 0 bps) with a safe domain-calibrated fallback if the
+ * upstream Circle API is unreachable or returns malformed data.
+ */
+export async function fetchCctpV2BurnFee(params: {
+  sourceDomain: number;
+  destinationDomain?: number;
+  mode?: CctpTransferMode;
+  rawUsdcAmount?: bigint;
+  bufferBps?: number;
+  maxFeeBpsCap?: number;
+  timeoutMs?: number;
+  fetcher?: typeof fetch;
+}): Promise<CctpV2BurnFeeQuote> {
+  const { sourceDomain } = params;
+  const destinationDomain = params.destinationDomain ?? SOLANA_CCTP_DOMAIN;
+  const mode: CctpTransferMode = params.mode ?? 'fast';
+
+  if (!Number.isInteger(sourceDomain) || sourceDomain < 0 || sourceDomain > 0xffffffff) {
+    throw new Error(`Invalid CCTP V2 sourceDomain: ${sourceDomain}`);
+  }
+  if (
+    !Number.isInteger(destinationDomain) ||
+    destinationDomain < 0 ||
+    destinationDomain > 0xffffffff
+  ) {
+    throw new Error(`Invalid CCTP V2 destinationDomain: ${destinationDomain}`);
+  }
+
+  const capBps =
+    params.maxFeeBpsCap !== undefined &&
+    Number.isFinite(params.maxFeeBpsCap) &&
+    params.maxFeeBpsCap > 0
+      ? params.maxFeeBpsCap
+      : CCTP_V2_MAX_FEE_BPS_SAFETY_CAP;
+
+  const endpoint = `${CCTP_V2_IRIS_FEES_BASE_URL}/${sourceDomain}/${destinationDomain}`;
+  const fallbackFastBps = CCTP_V2_FALLBACK_FAST_FEE_BPS[sourceDomain] ?? 1.4;
+  const fallbackTiers: CctpV2FeeTier[] = [
+    { finalityThreshold: CCTP_V2_FAST_FINALITY_THRESHOLD, minimumFeeBps: fallbackFastBps },
+    { finalityThreshold: CCTP_V2_STANDARD_FINALITY_THRESHOLD, minimumFeeBps: 0 },
+  ];
+
+  const buildFallback = (): CctpV2BurnFeeQuote => {
+    const isFast = mode === 'fast';
+    const feeBps = isFast ? Math.min(capBps, fallbackFastBps) : 0;
+    const minFinalityThreshold = isFast
+      ? CCTP_V2_FAST_FINALITY_THRESHOLD
+      : CCTP_V2_STANDARD_FINALITY_THRESHOLD;
+    const maxFeeRaw =
+      params.rawUsdcAmount !== undefined
+        ? isFast
+          ? computeCctpV2MaxFeeRaw(params.rawUsdcAmount, feeBps, {
+              bufferBps: params.bufferBps,
+              maxFeeBpsCap: capBps,
+            })
+          : 0n
+        : undefined;
+    return {
+      sourceDomain,
+      destinationDomain,
+      mode,
+      minFinalityThreshold,
+      feeBps,
+      maxFeeRaw,
+      source: 'fallback',
+      endpoint,
+      tiers: fallbackTiers,
+    };
+  };
+
+  const fetchImpl = params.fetcher ?? globalThis.fetch;
+  if (typeof fetchImpl !== 'function') {
+    return buildFallback();
+  }
+
+  const controller = new AbortController();
+  const timeoutMs = params.timeoutMs && params.timeoutMs > 0 ? params.timeoutMs : 3500;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetchImpl(endpoint, { signal: controller.signal });
+    if (!res.ok) {
+      return buildFallback();
+    }
+    const rawJson = (await res.json()) as unknown;
+    const rawList = Array.isArray(rawJson)
+      ? rawJson
+      : rawJson && typeof rawJson === 'object' && Array.isArray((rawJson as { data?: unknown }).data)
+      ? (rawJson as { data: unknown[] }).data
+      : rawJson && typeof rawJson === 'object' && Array.isArray((rawJson as { fees?: unknown }).fees)
+      ? (rawJson as { fees: unknown[] }).fees
+      : null;
+
+    if (!rawList || rawList.length === 0) {
+      return buildFallback();
+    }
+
+    const tiers: CctpV2FeeTier[] = [];
+    for (const item of rawList) {
+      if (!item || typeof item !== 'object') continue;
+      const obj = item as {
+        finalityThreshold?: unknown;
+        minimumFee?: unknown;
+        forwardFee?: { low?: unknown; medium?: unknown; high?: unknown };
+      };
+      const finalityThreshold = Number(obj.finalityThreshold);
+      const minimumFeeBps = Number(obj.minimumFee);
+      if (
+        !Number.isInteger(finalityThreshold) ||
+        finalityThreshold < 0 ||
+        !Number.isFinite(minimumFeeBps) ||
+        minimumFeeBps < 0
+      ) {
+        continue;
+      }
+      const tier: CctpV2FeeTier = { finalityThreshold, minimumFeeBps };
+      if (obj.forwardFee && typeof obj.forwardFee === 'object') {
+        const low = Number(obj.forwardFee.low);
+        const medium = Number(obj.forwardFee.medium);
+        const high = Number(obj.forwardFee.high);
+        tier.forwardFee = {
+          ...(Number.isFinite(low) && low >= 0 ? { low } : {}),
+          ...(Number.isFinite(medium) && medium >= 0 ? { medium } : {}),
+          ...(Number.isFinite(high) && high >= 0 ? { high } : {}),
+        };
+      }
+      tiers.push(tier);
+    }
+
+    if (tiers.length === 0) {
+      return buildFallback();
+    }
+
+    const isFast = mode === 'fast';
+    const selected = isFast
+      ? tiers.find((t) => t.finalityThreshold === CCTP_V2_FAST_FINALITY_THRESHOLD) ??
+        tiers.find((t) => t.finalityThreshold <= CCTP_V2_FAST_FINALITY_THRESHOLD)
+      : tiers.find((t) => t.finalityThreshold === CCTP_V2_STANDARD_FINALITY_THRESHOLD) ??
+        tiers.find((t) => t.finalityThreshold >= CCTP_V2_STANDARD_FINALITY_THRESHOLD);
+
+    if (!selected) {
+      return buildFallback();
+    }
+
+    const boundedFeeBps = isFast
+      ? Math.min(capBps, selected.minimumFeeBps)
+      : Math.min(capBps, selected.minimumFeeBps);
+    const minFinalityThreshold = selected.finalityThreshold;
+    const forwardFeeUsdc6 =
+      selected.forwardFee?.medium ?? selected.forwardFee?.low ?? selected.forwardFee?.high;
+    const maxFeeRaw =
+      params.rawUsdcAmount !== undefined
+        ? boundedFeeBps > 0
+          ? computeCctpV2MaxFeeRaw(params.rawUsdcAmount, boundedFeeBps, {
+              bufferBps: params.bufferBps,
+              maxFeeBpsCap: capBps,
+            })
+          : 0n
+        : undefined;
+
+    return {
+      sourceDomain,
+      destinationDomain,
+      mode,
+      minFinalityThreshold,
+      feeBps: boundedFeeBps,
+      ...(forwardFeeUsdc6 !== undefined ? { forwardFeeUsdc6 } : {}),
+      maxFeeRaw,
+      source: 'circle_iris_live',
+      endpoint,
+      tiers,
+    };
+  } catch {
+    return buildFallback();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Encodes Circle CCTP `depositForBurn` calldata for either:
  *   - CCTP V1 (`0x6fd3504e`): depositForBurn(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken)
  *   - CCTP V2 (`0x8e0250ee`): depositForBurn(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold)
+ *
+ * For CCTP V2, supports:
+ *   - Fast Transfer (`transferMode: 'fast'`): defaults to `minFinalityThreshold = 1000` with bounded `maxFee` (~1–1.4 bps)
+ *   - Standard Transfer (`transferMode: 'standard'` or omitted): defaults to `minFinalityThreshold = 2000`, `maxFee = 0n` (0 bps)
  */
 export function encodeCctpDepositForBurn(params: {
   rawUsdcAmount: bigint;
@@ -129,6 +399,8 @@ export function encodeCctpDepositForBurn(params: {
   solanaMintRecipientBytes32: string;
   usdcAddress: string;
   cctpVersion?: 1 | 2;
+  transferMode?: CctpTransferMode;
+  fastFeeBps?: number;
   destinationCallerBytes32?: string;
   maxFee?: bigint;
   minFinalityThreshold?: number;
@@ -158,10 +430,21 @@ export function encodeCctpDepositForBurn(params: {
     if (!/^0x[0-9a-f]{64}$/.test(callerClean)) {
       throw new Error('Invalid 32-byte destinationCallerBytes32 for CCTP V2');
     }
-    const maxFee = params.maxFee ?? 0n;
+    const isFast = params.transferMode === 'fast';
+    const maxFee =
+      params.maxFee !== undefined
+        ? params.maxFee
+        : isFast
+        ? computeCctpV2MaxFeeRaw(params.rawUsdcAmount, params.fastFeeBps ?? 1.4)
+        : 0n;
     if (maxFee < 0n) throw new Error('CCTP V2 maxFee must be non-negative');
+    if (params.rawUsdcAmount > 0n && maxFee >= params.rawUsdcAmount) {
+      throw new Error('CCTP V2 maxFee must be strictly less than rawUsdcAmount');
+    }
     // Standard finality threshold is 2000 (Fast Transfer is 1000)
-    const minFinalityThreshold = params.minFinalityThreshold ?? 2000;
+    const minFinalityThreshold =
+      params.minFinalityThreshold ??
+      (isFast ? CCTP_V2_FAST_FINALITY_THRESHOLD : CCTP_V2_STANDARD_FINALITY_THRESHOLD);
     if (!Number.isInteger(minFinalityThreshold) || minFinalityThreshold < 0 || minFinalityThreshold > 0xffffffff) {
       throw new Error(`Invalid CCTP V2 minFinalityThreshold: ${minFinalityThreshold}`);
     }
@@ -443,6 +726,7 @@ export interface BuildPlanInput {
   includeBurns?: boolean;
   outputAsset?: 'USDC' | 'SOL';
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+  cctpTransferMode?: CctpTransferMode;
   protocolFeeBps?: number;
   feeRecipientEvm?: string | null;
   hasSolanaUsdcAta?: boolean;
@@ -618,6 +902,11 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
             solanaMintRecipientBytes32,
             usdcAddress: evmCfg.usdcAddress,
             cctpVersion: evmCfg.cctpVersion ?? 1,
+            transferMode: input.cctpTransferMode,
+            fastFeeBps:
+              evmCfg.cctpDomain !== null
+                ? CCTP_V2_FALLBACK_FAST_FEE_BPS[evmCfg.cctpDomain]
+                : undefined,
           })
         : '0x';
 

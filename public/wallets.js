@@ -232,14 +232,18 @@ function assertValidCallForSign(call, expectedSolanaDestination, expectedSolanaA
   ) {
     throw new Error('Pre-sign check failed: call Solana destination does not match UI destination.');
   }
-  if (
-    expectedSolanaDestination &&
-    typeof call?.data === 'string' &&
-    (call.data.toLowerCase().startsWith('0x6fd3504e') || call.data.toLowerCase().startsWith('0x05285a08')) &&
-    call.data.length >= 10 + 256
-  ) {
+  const dataLower = typeof call?.data === 'string' ? call.data.toLowerCase() : '';
+  const isCctpV1 = dataLower.startsWith('0x6fd3504e');
+  const isCctpV2 = dataLower.startsWith('0x8e0250ee');
+  if (expectedSolanaDestination && (isCctpV1 || isCctpV2)) {
+    const minCalldataLen = isCctpV2 ? 10 + 448 : 10 + 256;
+    if (dataLower.length < minCalldataLen) {
+      throw new Error(
+        'Pre-sign check failed: truncated CCTP depositForBurn calldata.'
+      );
+    }
     const expectedOwnerBytes32 = solanaBase58ToBytes32Hex(expectedSolanaDestination).toLowerCase();
-    const encodedRecipient = '0x' + call.data.slice(10 + 128, 10 + 192).toLowerCase();
+    const encodedRecipient = '0x' + dataLower.slice(10 + 128, 10 + 192);
     const expectedTarget = expectedSolanaAtaBytes32 || expectedOwnerBytes32;
     if (encodedRecipient !== expectedTarget) {
       throw new Error(

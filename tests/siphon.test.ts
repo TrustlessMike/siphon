@@ -207,7 +207,7 @@ test('Siphon HTTP API serves health, chains, scan, plan, simulate, contract, and
     }).then((r) => r.json());
     assert.equal(cctpPrep.provider, 'circle_cctp');
     assert.ok(
-      cctpPrep.transactions.some((tx: { data: string }) => tx.data.startsWith('0x6fd3504e'))
+      cctpPrep.transactions.some((tx: { data: string }) => tx.data.startsWith('0x8e0250ee'))
     );
 
     // EIP-5792 1-click-per-chain batch preparation: bundles DeFi withdraw + CCTP + burn + dedupes approvals
@@ -232,7 +232,7 @@ test('Siphon HTTP API serves health, chains, scan, plan, simulate, contract, and
     assert.equal(polyBatch.savings.popupsSaved, 2);
     assert.ok(polyBatch.calls[0].data.startsWith('0x69328dec')); // Aave withdraw
     assert.ok(polyBatch.calls[1].data.startsWith('0x095ea7b3')); // USDC approve
-    assert.ok(polyBatch.calls[2].data.startsWith('0x6fd3504e')); // Circle CCTP depositForBurn
+    assert.ok(polyBatch.calls[2].data.startsWith('0x8e0250ee')); // Circle CCTP V2 depositForBurn
     assert.equal(polyBatch.skippedAssets.length, 1); // Polygon honeypot safely skipped
 
     // Approval deduplication test: 2 CCTP USDC ops on Optimism merge their USDC->TokenMessenger approvals into 1!
@@ -253,7 +253,7 @@ test('Siphon HTTP API serves health, chains, scan, plan, simulate, contract, and
       1
     );
     assert.equal(
-      opBatch.calls.filter((c: { data: string }) => c.data.startsWith('0x6fd3504e')).length,
+      opBatch.calls.filter((c: { data: string }) => c.data.startsWith('0x8e0250ee')).length,
       2
     );
     assert.equal(opBatch.savings.walletPopupsEip5792, 1);
