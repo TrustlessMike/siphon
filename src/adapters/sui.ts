@@ -4,6 +4,7 @@ import { getProtocolFeeConfig, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
 import { applyTwoLevelRoiToReport } from '../scanner/roi.js';
+import { sanitizeTokenSymbol } from '../scanner/sanitize.js';
 import type { ChainScanSummary, ScannedAsset, ScanReport } from '../scanner/types.js';
 import type {
   ChainFamilyAdapter,
@@ -600,7 +601,7 @@ export const suiAdapter: ChainFamilyAdapter = {
           const dec = meta?.decimals ?? 9;
           return {
             tokenAddress: bc.coinType,
-            symbol: meta?.symbol ?? bc.coinType.split('::').pop() ?? 'COIN',
+            symbol: sanitizeTokenSymbol(meta?.symbol ?? bc.coinType.split('::').pop(), 'COIN'),
             from: params.userAddress,
             to: bc.owner?.AddressOwner || 'ptb',
             amountUi: Math.abs(unitsToUi(bc.amount.replace('-', ''), dec)),

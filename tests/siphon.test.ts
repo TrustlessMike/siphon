@@ -476,7 +476,6 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
         userAddress: report.walletAddress,
         solanaDestination: SAMPLE_SOLANA_WALLET,
         protocolFeeBps: 700,
-        feeRecipientEvm: treasury,
       }),
     }).then((r) => r.json());
     assert.equal(intent.userGasCostUsd, 0);
@@ -511,7 +510,6 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
         solanaDestination: SAMPLE_SOLANA_WALLET,
         bridgePreference: 'cctp',
         protocolFeeBps: 700,
-        feeRecipientEvm: treasury,
       }),
     }).then((r) => r.json());
     assert.equal(simProofRes.proof.mintRecipientVerified, true);
@@ -529,7 +527,6 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
         outputAsset: 'USDC',
         bridgePreference: 'auto',
         protocolFeeBps: 700,
-        feeRecipientEvm: treasury,
         legs: [{ chain: 'base', assetCount: 4, estimatedNetUsd: 1200, estimatedFeeUsd: 90 }],
       }),
     }).then((r) => r.json());

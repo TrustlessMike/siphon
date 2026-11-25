@@ -89,6 +89,8 @@ const MAX_JOB_LEGS = 50;
 
 export interface SiphonServerOptions {
   allowedOrigins?: string[];
+  allowedHosts?: string[];
+  publicBaseUrl?: string;
   requirePluginAuth?: boolean;
   adminSessionToken?: string;
   scanCacheMaxEntries?: number;
@@ -96,6 +98,104 @@ export interface SiphonServerOptions {
   jobStoreMaxJobs?: number;
   jobStoreTtlMs?: number;
   nowMs?: () => number;
+}
+
+const VALID_JOB_LEG_STATUSES = new Set<JobLegStatus>([
+  'queued',
+  'preparing',
+  'signing',
+  'confirming',
+  'relaying',
+  'attested',
+  'landed',
+  'failed',
+  'skipped',
+]);
+
+function isLoopbackHostname(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  return lower === '127.0.0.1' || lower === 'localhost' || lower === '[::1]' || lower === '::1';
+}
+
+function parseConfiguredAllowedHosts(explicit?: string[], extraOrigins?: Set<string>, publicBaseUrl?: string): Set<string> {
+  const set = new Set<string>(['127.0.0.1', 'localhost', '[::1]', '::1']);
+  const envHosts = process.env.SIPHON_ALLOWED_HOSTS
+    ? process.env.SIPHON_ALLOWED_HOSTS.split(',')
+    : [];
+  for (const h of [...(explicit ?? []), ...envHosts]) {
+    const clean = h.trim().toLowerCase().replace(/:\d+$/, '');
+    if (clean) set.add(clean);
+  }
+  if (extraOrigins) {
+    for (const orig of extraOrigins) {
+      try {
+        set.add(new URL(orig).hostname.toLowerCase());
+      } catch {
+        // ignore
+      }
+    }
+  }
+  if (publicBaseUrl) {
+    try {
+      set.add(new URL(publicBaseUrl).hostname.toLowerCase());
+    } catch {
+      // ignore
+    }
+  }
+  return set;
+}
+
+/**
+ * Validates HTTP `Host` header syntax (preventing `new URL()` crashes) and enforces
+ * a strict hostname allowlist to defeat localhost DNS-rebinding attacks (`HIGH-5` & `CRIT-3`).
+ */
+function validateHostHeader(
+  rawHost: string | undefined,
+  allowedHostnames: Set<string>
+): { ok: true; host: string; hostname: string } | { ok: false; status: 400 | 403; error: string } {
+  if (!rawHost || typeof rawHost !== 'string') {
+    return { ok: true, host: '127.0.0.1', hostname: '127.0.0.1' };
+  }
+  const trimmed = rawHost.trim();
+  if (!trimmed || /[\s/@\\]/.test(trimmed) || /[\u0000-\u001F\u007F]/.test(trimmed)) {
+    return { ok: false, status: 400, error: 'Malformed Host header.' };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(`http://${trimmed}`);
+  } catch {
+    return { ok: false, status: 400, error: 'Malformed Host header.' };
+  }
+  if (!parsed.hostname || parsed.username || parsed.password || parsed.pathname !== '/') {
+    return { ok: false, status: 400, error: 'Malformed Host header.' };
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (!isLoopbackHostname(hostname) && !allowedHostnames.has(hostname)) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'Disallowed Host header blocked by Siphon DNS-rebinding protection.',
+    };
+  }
+  return { ok: true, host: parsed.host, hostname };
+}
+
+/**
+ * Rejects client-supplied `feeRecipientEvm` overrides (`HIGH-7`).
+ * Protocol fee treasury must be configured exclusively on the server via `SIPHON_FEE_RECIPIENT_EVM`.
+ */
+function assertNoFeeRecipientOverride(supplied?: string | null): void {
+  if (supplied === undefined || supplied === null || supplied === '') return;
+  if (typeof supplied !== 'string') {
+    throw new HttpError(400, 'Invalid feeRecipientEvm value.');
+  }
+  const serverRecipient = process.env.SIPHON_FEE_RECIPIENT_EVM?.trim();
+  if (!serverRecipient || supplied.trim().toLowerCase() !== serverRecipient.toLowerCase()) {
+    throw new HttpError(
+      400,
+      'Client-supplied feeRecipientEvm override is forbidden; protocol fee treasury is server-configured only.'
+    );
+  }
 }
 
 class HttpError extends Error {
@@ -162,18 +262,32 @@ function isRestrictedCorsRoute(pathname: string, method: string): boolean {
 }
 
 function isAdminMutationRoute(pathname: string, method: string): boolean {
-  if (method === 'GET' && pathname === '/api/plugin/setup') return true;
+  if (method === 'GET' && (pathname === '/api/plugin/setup' || pathname === '/api/jobs' || pathname.startsWith('/api/jobs/'))) {
+    return true;
+  }
   if (method !== 'POST') return false;
   return (
     pathname === '/api/agents/mandates' ||
     (pathname.startsWith('/api/agents/mandates/') && pathname.endsWith('/revoke')) ||
     (pathname.startsWith('/api/agents/approvals/') && pathname.endsWith('/decide')) ||
     pathname === '/api/plugin/tokens' ||
-    (pathname.startsWith('/api/plugin/tokens/') && pathname.endsWith('/revoke'))
+    (pathname.startsWith('/api/plugin/tokens/') && pathname.endsWith('/revoke')) ||
+    pathname === '/api/jobs' ||
+    (pathname.startsWith('/api/jobs/') && pathname.endsWith('/leg'))
   );
 }
 
-function isPrivilegedCrossOriginProtectedRoute(pathname: string): boolean {
+function isAgentReadRoute(pathname: string, method: string): boolean {
+  return (
+    method === 'GET' &&
+    (pathname === '/api/agents/mandates' || pathname === '/api/agents/approvals')
+  );
+}
+
+function isPrivilegedCrossOriginProtectedRoute(pathname: string, method = 'GET'): boolean {
+  if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+    return true;
+  }
   return (
     pathname === '/mcp' ||
     pathname.startsWith('/api/agents/') ||
@@ -184,6 +298,13 @@ function isPrivilegedCrossOriginProtectedRoute(pathname: string): boolean {
 }
 
 async function readJsonBody<T>(req: IncomingMessage, maxBytes = MAX_JSON_BODY_BYTES): Promise<T> {
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+    const ct = String(req.headers['content-type'] ?? '').toLowerCase();
+    if (!ct.includes('application/json')) {
+      throw new HttpError(415, 'Content-Type must be application/json.');
+    }
+  }
   const contentLengthHeader = req.headers['content-length'];
   if (contentLengthHeader) {
     const declared = Number(Array.isArray(contentLengthHeader) ? contentLengthHeader[0] : contentLengthHeader);
@@ -221,7 +342,7 @@ function buildCorsHeaders(params: {
   isAllowedOrigin: (origin: string) => boolean;
 }): Record<string, string> {
   const headers: Record<string, string> = {
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Siphon-Admin-Session',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Siphon-Admin-Session, Mcp-Session-Id, MCP-Protocol-Version',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   };
   if (!params.restricted) {
@@ -244,25 +365,56 @@ function sendJson(
   payload: unknown,
   corsHeaders: Record<string, string> = {}
 ): void {
-  res.writeHead(status, {
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
     ...corsHeaders,
-  });
+  };
+  if (status === 413) {
+    headers.Connection = 'close';
+  }
+  res.writeHead(status, headers);
   res.end(JSON.stringify(payload));
 }
 
+function pipeStaticFileSafely(res: ServerResponse, filePath: string): void {
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', () => {
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Static asset read error.' }));
+    } else {
+      res.destroy();
+    }
+  });
+  res.on('close', () => {
+    stream.destroy();
+  });
+  stream.pipe(res);
+}
+
+const REAL_PUBLIC_DIR = fs.existsSync(PUBLIC_DIR) ? fs.realpathSync(PUBLIC_DIR) : PUBLIC_DIR;
+
 function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): boolean {
+  const baseSecurityHeaders: Record<string, string> = {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+  };
+
   if (reqPath === '/vendor/wallet-sdks.js') {
     const bundleFile = path.join(DIST_VENDOR_DIR, 'wallet-sdks.js');
     if (fs.existsSync(bundleFile)) {
       res.writeHead(200, {
+        ...baseSecurityHeaders,
         'Content-Type': 'application/javascript; charset=utf-8',
         'Cache-Control': 'public, max-age=3600',
-        'Access-Control-Allow-Origin': '*',
       });
       if (isHead) res.end();
-      else fs.createReadStream(bundleFile).pipe(res);
+      else pipeStaticFileSafely(res, bundleFile);
       return true;
     }
     return false;
@@ -273,29 +425,48 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
     const threeFile = path.join(THREE_BUILD_DIR, fileName);
     if (fs.existsSync(threeFile)) {
       res.writeHead(200, {
+        ...baseSecurityHeaders,
         'Content-Type': 'application/javascript; charset=utf-8',
         'Cache-Control': 'public, max-age=3600',
-        'Access-Control-Allow-Origin': '*',
       });
       if (isHead) res.end();
-      else fs.createReadStream(threeFile).pipe(res);
+      else pipeStaticFileSafely(res, threeFile);
       return true;
     }
     return false;
   }
 
   const safePath = reqPath === '/' ? '/index.html' : reqPath;
-  const fullPath = path.resolve(PUBLIC_DIR, `.${safePath}`);
-  if (!fullPath.startsWith(PUBLIC_DIR)) return false;
-  if (!fs.existsSync(fullPath) || fs.statSync(fullPath).isDirectory()) return false;
+  // Block dotfiles / hidden segments
+  const segments = safePath.split('/').filter(Boolean);
+  if (segments.some((seg) => seg.startsWith('.'))) return false;
 
-  const ext = path.extname(fullPath);
+  const fullPath = path.resolve(PUBLIC_DIR, `.${safePath}`);
+  if (!fullPath.startsWith(PUBLIC_DIR + path.sep)) return false;
+  if (!fs.existsSync(fullPath)) return false;
+
+  let realTarget: string;
+  try {
+    realTarget = fs.realpathSync(fullPath);
+  } catch {
+    return false;
+  }
+  if (!realTarget.startsWith(REAL_PUBLIC_DIR + path.sep)) return false;
+  if (fs.statSync(realTarget).isDirectory()) return false;
+
+  const ext = path.extname(realTarget).toLowerCase();
+  if (!(ext in MIME_TYPES)) return false;
+
   const headers: Record<string, string> = {
-    'Content-Type': MIME_TYPES[ext] ?? 'application/octet-stream',
+    ...baseSecurityHeaders,
+    'Content-Type': MIME_TYPES[ext],
   };
   if (ext === '.html' || ext === '.js' || ext === '.mjs' || ext === '.css') {
     headers['Cache-Control'] = 'no-store, no-cache, must-revalidate';
     headers['Pragma'] = 'no-cache';
+  }
+  if (ext === '.svg') {
+    headers['Content-Security-Policy'] = 'sandbox';
   }
   // Required by Coinbase Smart Wallet SDK popup communication
   if (ext === '.html') {
@@ -303,12 +474,22 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
   }
   res.writeHead(200, headers);
   if (isHead) res.end();
-  else fs.createReadStream(fullPath).pipe(res);
+  else pipeStaticFileSafely(res, realTarget);
   return true;
 }
 
 export function createSiphonServer(opts: SiphonServerOptions = {}) {
   const configuredAllowedOrigins = parseConfiguredAllowedOrigins(opts.allowedOrigins);
+  const configuredPublicBaseUrl =
+    opts.publicBaseUrl?.trim() || process.env.SIPHON_PUBLIC_BASE_URL?.trim() || null;
+  const normalizedPublicBaseUrl = configuredPublicBaseUrl
+    ? normalizeOrigin(configuredPublicBaseUrl)
+    : null;
+  const allowedHostnames = parseConfiguredAllowedHosts(
+    opts.allowedHosts,
+    configuredAllowedOrigins,
+    normalizedPublicBaseUrl ?? undefined
+  );
   const isAllowedOrigin = (origin: string): boolean =>
     isLoopbackOrigin(origin) || configuredAllowedOrigins.has(origin);
 
@@ -340,109 +521,148 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
   const agentEngine = new SiphonAgentEngine({ nowMs: opts.nowMs });
 
   const server = http.createServer(async (req, res) => {
-    const method = req.method ?? 'GET';
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-    const pathname = url.pathname;
-    const baseUrl = `${url.protocol}//${url.host}`;
-    const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
-    const refererHeader = typeof req.headers.referer === 'string' ? req.headers.referer : undefined;
-    const secFetchSite =
-      typeof req.headers['sec-fetch-site'] === 'string'
-        ? req.headers['sec-fetch-site'].trim().toLowerCase()
-        : undefined;
+    try {
+      const method = (req.method ?? 'GET').toUpperCase();
+      const rawUrl = req.url ?? '/';
 
-    const restrictedCors = isRestrictedCorsRoute(pathname, method);
-    const corsHeaders = buildCorsHeaders({
-      originHeader,
-      restricted: restrictedCors,
-      isAllowedOrigin,
-    });
-    const reply = (status: number, payload: unknown) => sendJson(res, status, payload, corsHeaders);
-
-    const normalizedOrigin = originHeader ? normalizeOrigin(originHeader) : null;
-    const originAllowed = !originHeader || (normalizedOrigin !== null && isAllowedOrigin(normalizedOrigin));
-
-    const isSameOriginLocalhostUi = (): boolean => {
-      if (!normalizedOrigin) return false;
-      if (normalizedOrigin !== url.origin) return false;
-      if (!isLoopbackOrigin(normalizedOrigin)) return false;
-      if (secFetchSite === 'cross-site') return false;
-      return true;
-    };
-
-    const checkCrossOriginAndCsrf = (requireJsonForBrowser: boolean): { ok: true } | { ok: false; status: number; error: string } => {
-      if (originHeader && !originAllowed) {
-        return { ok: false, status: 403, error: 'Cross-origin request blocked by Siphon CORS policy.' };
+      // Reject non-origin-form or protocol-relative request targets (HIGH-5 & MED-4)
+      if (!rawUrl.startsWith('/') || rawUrl.startsWith('//') || rawUrl.includes('\\')) {
+        return sendJson(res, 400, { error: 'Invalid request target: origin-form path required.' });
       }
-      if (!originHeader && refererHeader) {
-        const refOrigin = normalizeOrigin(refererHeader);
-        if (!refOrigin || !isAllowedOrigin(refOrigin)) {
-          return { ok: false, status: 403, error: 'Cross-origin Referer blocked by Siphon CSRF policy.' };
-        }
-      }
-      if (
-        secFetchSite === 'cross-site' &&
-        (!normalizedOrigin || !configuredAllowedOrigins.has(normalizedOrigin))
-      ) {
-        return { ok: false, status: 403, error: 'Cross-site browser request blocked by Siphon CSRF policy.' };
-      }
-      if (requireJsonForBrowser && method === 'POST' && (originHeader || secFetchSite)) {
-        const ct = String(req.headers['content-type'] ?? '').toLowerCase();
-        if (!ct.includes('application/json')) {
-          return {
-            ok: false,
-            status: 415,
-            error: 'Browser state-mutating requests must use Content-Type: application/json.',
-          };
-        }
-      }
-      return { ok: true };
-    };
 
-    const verifyAdminRequest = (): { ok: true } | { ok: false; status: number; error: string } => {
-      const csrf = checkCrossOriginAndCsrf(true);
-      if (!csrf.ok) return csrf;
-      if (adminSessionToken) {
-        const supplied = req.headers['x-siphon-admin-session'];
-        const value = Array.isArray(supplied) ? supplied[0] : supplied;
-        if (!value || !timingSafeStringEqual(value.trim(), adminSessionToken)) {
-          return { ok: false, status: 401, error: 'Missing or invalid X-Siphon-Admin-Session header.' };
-        }
+      // Validate Host header syntax & enforce DNS-rebinding allowlist (HIGH-5 & CRIT-3)
+      const hostCheck = validateHostHeader(
+        typeof req.headers.host === 'string' ? req.headers.host : undefined,
+        allowedHostnames
+      );
+      if (!hostCheck.ok) {
+        return sendJson(res, hostCheck.status, { error: hostCheck.error });
       }
-      return { ok: true };
-    };
 
-    if (method === 'OPTIONS') {
-      const preflightRestricted = isPrivilegedCrossOriginProtectedRoute(pathname);
-      const preflightCors = buildCorsHeaders({
+      let url: URL;
+      try {
+        url = new URL(rawUrl, `http://${hostCheck.host}`);
+      } catch {
+        return sendJson(res, 400, { error: 'Malformed request URL.' });
+      }
+      // Double-check WHATWG URL did not override host via crafted request target
+      if (url.host !== hostCheck.host) {
+        return sendJson(res, 400, { error: 'Invalid request target host override.' });
+      }
+
+      const pathname = url.pathname;
+      const baseUrl = normalizedPublicBaseUrl ?? `${url.protocol}//${url.host}`;
+      const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+      const refererHeader = typeof req.headers.referer === 'string' ? req.headers.referer : undefined;
+      const secFetchSite =
+        typeof req.headers['sec-fetch-site'] === 'string'
+          ? req.headers['sec-fetch-site'].trim().toLowerCase()
+          : undefined;
+
+      const restrictedCors = isRestrictedCorsRoute(pathname, method);
+      const corsHeaders = buildCorsHeaders({
         originHeader,
-        restricted: preflightRestricted,
+        restricted: restrictedCors,
         isAllowedOrigin,
       });
-      if (preflightRestricted && originHeader && !originAllowed) {
-        sendJson(res, 403, { error: 'Cross-origin preflight blocked by Siphon CORS policy.' }, preflightCors);
+      const reply = (status: number, payload: unknown) => sendJson(res, status, payload, corsHeaders);
+
+      const normalizedOrigin = originHeader ? normalizeOrigin(originHeader) : null;
+      const originAllowed = !originHeader || (normalizedOrigin !== null && isAllowedOrigin(normalizedOrigin));
+
+      const isSameOriginLocalhostUi = (): boolean => {
+        if (!normalizedOrigin) return false;
+        if (normalizedOrigin !== url.origin) return false;
+        if (!isLoopbackOrigin(normalizedOrigin)) return false;
+        if (secFetchSite === 'cross-site') return false;
+        return true;
+      };
+
+      const checkCrossOriginAndCsrf = (requireJsonForBrowser: boolean): { ok: true } | { ok: false; status: number; error: string } => {
+        if (originHeader && !originAllowed) {
+          return { ok: false, status: 403, error: 'Cross-origin request blocked by Siphon CORS policy.' };
+        }
+        if (!originHeader && refererHeader) {
+          const refOrigin = normalizeOrigin(refererHeader);
+          if (!refOrigin || !isAllowedOrigin(refOrigin)) {
+            return { ok: false, status: 403, error: 'Cross-origin Referer blocked by Siphon CSRF policy.' };
+          }
+        }
+        if (
+          secFetchSite === 'cross-site' &&
+          (!normalizedOrigin || !configuredAllowedOrigins.has(normalizedOrigin))
+        ) {
+          return { ok: false, status: 403, error: 'Cross-site browser request blocked by Siphon CSRF policy.' };
+        }
+        if (requireJsonForBrowser && method === 'POST' && (originHeader || secFetchSite)) {
+          const ct = String(req.headers['content-type'] ?? '').toLowerCase();
+          if (!ct.includes('application/json')) {
+            return {
+              ok: false,
+              status: 415,
+              error: 'Browser state-mutating requests must use Content-Type: application/json.',
+            };
+          }
+        }
+        return { ok: true };
+      };
+
+      const hasValidAdminSession = (): boolean => {
+        if (!adminSessionToken) return true;
+        const supplied = req.headers['x-siphon-admin-session'];
+        const value = Array.isArray(supplied) ? supplied[0] : supplied;
+        return Boolean(value && timingSafeStringEqual(value.trim(), adminSessionToken));
+      };
+
+      const verifyAdminRequest = (): { ok: true } | { ok: false; status: number; error: string } => {
+        const csrf = checkCrossOriginAndCsrf(true);
+        if (!csrf.ok) return csrf;
+        if (adminSessionToken && !hasValidAdminSession()) {
+          return { ok: false, status: 401, error: 'Missing or invalid X-Siphon-Admin-Session header.' };
+        }
+        return { ok: true };
+      };
+
+      if (method === 'OPTIONS') {
+        const preflightRestricted = isPrivilegedCrossOriginProtectedRoute(pathname, 'POST');
+        const preflightCors = buildCorsHeaders({
+          originHeader,
+          restricted: preflightRestricted,
+          isAllowedOrigin,
+        });
+        if (preflightRestricted && originHeader && !originAllowed) {
+          sendJson(res, 403, { error: 'Cross-origin preflight blocked by Siphon CORS policy.' }, preflightCors);
+          return;
+        }
+        res.writeHead(204, preflightCors);
+        res.end();
         return;
       }
-      res.writeHead(204, preflightCors);
-      res.end();
-      return;
-    }
 
-    if (isPrivilegedCrossOriginProtectedRoute(pathname)) {
-      const originCheck = checkCrossOriginAndCsrf(method === 'POST' && isAdminMutationRoute(pathname, method));
-      if (!originCheck.ok) {
-        return reply(originCheck.status, { error: originCheck.error });
+      if (isPrivilegedCrossOriginProtectedRoute(pathname, method)) {
+        const originCheck = checkCrossOriginAndCsrf(method === 'POST');
+        if (!originCheck.ok) {
+          return reply(originCheck.status, { error: originCheck.error });
+        }
       }
-    }
 
-    if (isAdminMutationRoute(pathname, method)) {
-      const adminCheck = verifyAdminRequest();
-      if (!adminCheck.ok) {
-        return reply(adminCheck.status, { error: adminCheck.error });
+      if (isAdminMutationRoute(pathname, method)) {
+        const adminCheck = verifyAdminRequest();
+        if (!adminCheck.ok) {
+          return reply(adminCheck.status, { error: adminCheck.error });
+        }
       }
-    }
 
-    try {
+      if (isAgentReadRoute(pathname, method) && adminSessionToken) {
+        const authHeader = req.headers.authorization;
+        const hasPluginToken = Boolean(authHeader && agentEngine.verifyPluginToken(authHeader));
+        if (!hasValidAdminSession() && !hasPluginToken) {
+          return reply(401, {
+            error: 'Authentication required: supply X-Siphon-Admin-Session or Authorization: Bearer <token>.',
+          });
+        }
+      }
+
       if (method === 'GET' && pathname === '/api/health') {
         const protocolFee = getProtocolFeeConfig();
         return reply(200, {
@@ -714,13 +934,19 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         if (body.decision !== 'approve' && body.decision !== 'reject') {
           return reply(400, { error: "decision must be 'approve' or 'reject'" });
         }
-        const decided = agentEngine.decideApproval({
-          approvalId,
-          decision: body.decision,
-          reason: body.reason,
-        });
-        if (!decided) return reply(404, { error: 'Permission request not found' });
-        return reply(200, decided);
+        try {
+          const decided = agentEngine.decideApproval({
+            approvalId,
+            decision: body.decision,
+            reason: body.reason,
+          });
+          if (!decided) return reply(404, { error: 'Permission request not found' });
+          return reply(200, decided);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Approval decision violated mandate policy',
+          });
+        }
       }
 
       // ================= CLAUDE MCP & CHATGPT ACTION PLUGIN =================
@@ -760,6 +986,16 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         return reply(200, revoked);
       }
 
+      if ((method === 'GET' || method === 'DELETE') && pathname === '/mcp') {
+        res.writeHead(405, {
+          Allow: 'POST, OPTIONS',
+          'Content-Type': 'application/json; charset=utf-8',
+          ...corsHeaders,
+        });
+        res.end(JSON.stringify({ error: 'Method Not Allowed: use POST /mcp with JSON-RPC 2.0.' }));
+        return;
+      }
+
       if (method === 'POST' && pathname === '/mcp') {
         const authHeader = req.headers.authorization;
         const verifiedToken = authHeader ? agentEngine.verifyPluginToken(authHeader) : null;
@@ -781,13 +1017,34 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
             },
           });
         }
-        const rpcReq = await readJsonBody<{
-          jsonrpc?: string;
-          id?: string | number | null;
-          method?: string;
-          params?: Record<string, unknown>;
-        }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
+        let rpcReq: Record<string, unknown>;
+        try {
+          rpcReq = await readJsonBody<Record<string, unknown>>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
+        } catch (err) {
+          if (err instanceof HttpError && err.status === 400) {
+            return reply(400, {
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: -32700, message: err.message },
+            });
+          }
+          throw err;
+        }
+        // JSON-RPC 2.0 notification (no `id` property): process and return 202 Accepted with empty body (MED-6)
+        const isNotification =
+          rpcReq.jsonrpc === '2.0' &&
+          typeof rpcReq.method === 'string' &&
+          !('id' in rpcReq);
         const rpcRes = await handleMcpJsonRpc(rpcReq, { agentEngine, scanCache });
+        if (isNotification) {
+          res.writeHead(202, {
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+            ...corsHeaders,
+          });
+          res.end();
+          return;
+        }
         return reply(200, rpcRes);
       }
 
@@ -866,6 +1123,8 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           return reply(400, { error: 'Invalid Solana destination address (expected base58 public key).' });
         }
 
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
+
         const plan = buildMigrationPlan({
           scan,
           selectedAssetIds: body.selectedAssetIds,
@@ -875,7 +1134,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           outputAsset: body.outputAsset ?? 'USDC',
           bridgePreference: body.bridgePreference ?? 'auto',
           protocolFeeBps: body.protocolFeeBps,
-          feeRecipientEvm: body.feeRecipientEvm,
+          feeRecipientEvm: undefined,
           hasSolanaUsdcAta: body.hasSolanaUsdcAta,
         });
 
@@ -919,6 +1178,8 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           });
         }
 
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
+
         try {
           const prepared = await prepareRealExecution({
             asset: body.asset,
@@ -927,7 +1188,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
             outputAsset: body.outputAsset ?? 'USDC',
             bridgePreference: body.bridgePreference ?? 'auto',
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipientEvm: body.feeRecipientEvm,
+            feeRecipientEvm: undefined,
           });
           return reply(200, prepared);
         } catch (err) {
@@ -957,6 +1218,8 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           });
         }
 
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
+
         try {
           const batch = await prepareChainBatchExecution({
             chain: body.chain,
@@ -967,7 +1230,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
             bridgePreference: body.bridgePreference ?? 'auto',
             bundleDefiCctp: body.bundleDefiCctp ?? true,
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipientEvm: body.feeRecipientEvm,
+            feeRecipientEvm: undefined,
             allowHighCost: body.allowHighCost ?? false,
           });
           return reply(200, batch);
@@ -1043,6 +1306,8 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           });
         }
 
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
+
         try {
           if (isEvmChain(body.chain)) {
             const batch = await prepareChainBatchExecution({
@@ -1053,7 +1318,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
               outputAsset: body.outputAsset ?? 'USDC',
               bridgePreference: body.bridgePreference ?? 'auto',
               protocolFeeBps: body.protocolFeeBps,
-              feeRecipientEvm: body.feeRecipientEvm,
+              feeRecipientEvm: undefined,
               bundleDefiCctp: body.bundleDefiCctp ?? false,
             });
             const proof = await buildPreSignSimulationProof({
@@ -1076,7 +1341,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
             outputAsset: body.outputAsset ?? 'USDC',
             bridgePreference: body.bridgePreference ?? 'auto',
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipient: body.feeRecipientEvm,
+            feeRecipient: undefined,
             nativePriceUsd: body.nativePriceUsd,
           });
           return reply(200, { proof, batch: null });
@@ -1106,6 +1371,8 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           });
         }
 
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
+
         try {
           if (isEvmChain(body.chain)) {
             if (!/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim())) {
@@ -1120,7 +1387,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
               solanaDestination: body.solanaDestination.trim(),
               requestId: body.requestId,
               provider: body.provider,
-              feeRecipientEvm: body.feeRecipientEvm,
+              feeRecipientEvm: undefined,
               preSolanaUsdc: body.preSolanaUsdc,
               preSolanaSol: body.preSolanaSol,
             });
@@ -1135,7 +1402,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
             solanaDestination: body.solanaDestination.trim(),
             requestId: body.requestId,
             provider: body.provider,
-            feeRecipient: body.feeRecipientEvm,
+            feeRecipient: undefined,
             preSolanaUsdc: body.preSolanaUsdc,
             preSolanaSol: body.preSolanaSol,
           });
@@ -1165,6 +1432,8 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           });
         }
 
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
+
         try {
           if (isEvmChain(body.chain)) {
             const plan = buildGaslessSweepIntent({
@@ -1174,7 +1443,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
               solanaDestination: body.solanaDestination,
               outputAsset: body.outputAsset ?? 'USDC',
               protocolFeeBps: body.protocolFeeBps,
-              feeRecipientEvm: body.feeRecipientEvm,
+              feeRecipientEvm: undefined,
               preferredMode: body.preferredMode,
             });
             if (!plan.sponsorEligible) {
@@ -1195,7 +1464,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
             solanaDestination: body.solanaDestination,
             outputAsset: body.outputAsset ?? 'USDC',
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipient: body.feeRecipientEvm,
+            feeRecipient: undefined,
           });
           return reply(200, intent);
         } catch (err) {
@@ -1282,9 +1551,11 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           });
         }
 
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
+
         const feeCfg = getProtocolFeeConfig({
           feeBps: body.protocolFeeBps,
-          feeRecipientEvm: body.feeRecipientEvm,
+          feeRecipientEvm: undefined,
         });
         const job = jobStore.createJob({
           sourceWallet: body.sourceWallet,
@@ -1322,18 +1593,27 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
 
         if (!body.chain) return reply(400, { error: 'chain is required' });
-        const updated = jobStore.updateLeg(jobId, body.chain, {
-          status: body.status,
-          statusText: body.statusText,
-          provider: body.provider,
-          callsBatched: body.callsBatched,
-          popupsSaved: body.popupsSaved,
-          evmTxHash: body.evmTxHash,
-          solanaTxHash: body.solanaTxHash,
-          requestId: body.requestId,
-          requiresSolanaClaim: body.requiresSolanaClaim,
-          attestationStatus: body.attestationStatus,
-        });
+        if (body.status !== undefined && !VALID_JOB_LEG_STATUSES.has(body.status)) {
+          return reply(400, { error: `Invalid job leg status: ${String(body.status)}` });
+        }
+        // Strip undefined keys so partial patches never overwrite existing leg fields (LOW-4 / Audit 3 CRIT-06)
+        const patch: Record<string, unknown> = {};
+        const patchKeys = [
+          'status',
+          'statusText',
+          'provider',
+          'callsBatched',
+          'popupsSaved',
+          'evmTxHash',
+          'solanaTxHash',
+          'requestId',
+          'requiresSolanaClaim',
+          'attestationStatus',
+        ] as const;
+        for (const k of patchKeys) {
+          if (body[k] !== undefined) patch[k] = body[k];
+        }
+        const updated = jobStore.updateLeg(jobId, body.chain, patch);
         if (!updated) return reply(404, { error: 'Background job or chain leg not found' });
         return reply(200, updated);
       }
@@ -1351,8 +1631,13 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
 
         const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
         if (!scan) return reply(400, { error: 'Valid scan or scanId is required' });
-        const solDest = body.solanaDestination?.trim();
+        const solDest = typeof body.solanaDestination === 'string' ? body.solanaDestination.trim() : '';
         if (!solDest) return reply(400, { error: 'solanaDestination is required' });
+        try {
+          solanaAddressToBytes32(solDest);
+        } catch {
+          return reply(400, { error: 'Invalid Solana destination address (expected base58 public key).' });
+        }
 
         const plan = buildMigrationPlan({
           scan,
@@ -1392,13 +1677,17 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
       return reply(404, { error: 'Not found' });
     } catch (err) {
       if (err instanceof HttpError) {
-        return reply(err.status, { error: err.message });
+        return sendJson(res, err.status, { error: err.message });
       }
-      return reply(500, {
-        error: err instanceof Error ? err.message : 'Internal server error',
+      return sendJson(res, 500, {
+        error: 'Internal server error',
       });
     }
   });
+
+  server.headersTimeout = 10_000;
+  server.requestTimeout = 30_000;
+  server.keepAliveTimeout = 5_000;
 
   server.on('close', () => {
     jobStore.dispose();

@@ -22,6 +22,45 @@ const LIFI_SOLANA_CHAIN_ID = 1151111081099710;
 const SOLANA_NATIVE_MINT = '11111111111111111111111111111111';
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
+const ALLOWED_COMPOUND_V3_COMETS: Partial<Record<EvmChainId, string[]>> = {
+  ethereum: [
+    '0xc3d688b66703497daa19211eedff47f25384cdc3', // cUSDCv3
+    '0xa17581a9e3356d9a858b789d68b4d866e593ae94', // cWETHv3
+    '0x3afdc9bca9213a35503b077a6072f3d0d5ab0840', // cUSDTv3
+  ],
+  base: [
+    '0xb125e6687d4313864e53df431d5425969c15eb2f', // cUSDCv3
+    '0x46e6b214b524310239732d51387075e0e70970bf', // cWETHv3
+    '0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf',
+  ],
+  arbitrum: [
+    '0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf', // cUSDCv3
+    '0xa5edbdd9646f8dff606d7448e414884c7d905dca', // cUSDC.e v3
+    '0x6f7d514bbd4aff3bcd1140b7344b32f063dee486', // cWETHv3
+  ],
+  optimism: [
+    '0x2e44e174f7d53f0212823acc11c01a11d58c5bcb', // cUSDCv3
+    '0xe36a30d249f7761327fd973001a32010b521b6fd', // cWETHv3
+  ],
+  polygon: [
+    '0xf25212e676d1f7f89cd72ffee66158f541246445', // cUSDCv3
+  ],
+};
+
+function assertEvmAddress(val: string | undefined | null, label: string, allowZero = false): string {
+  if (typeof val !== 'string') {
+    throw new Error(`Invalid ${label}: expected 20-byte 0x EVM address.`);
+  }
+  const clean = val.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(clean)) {
+    throw new Error(`Invalid ${label}: must be a single 20-byte 0x EVM address.`);
+  }
+  if (!allowZero && clean.toLowerCase() === ZERO_ADDRESS) {
+    throw new Error(`Invalid ${label}: zero address is not allowed.`);
+  }
+  return clean;
+}
+
 /** Set when a quote provider was rate-limited or unreachable, as opposed to answering "no route". */
 interface QuoteState {
   throttled: boolean;
@@ -250,7 +289,8 @@ function toHexWei(val: string | number | bigint | undefined): string {
 }
 
 function pad32Hex(val: string): string {
-  return val.replace(/^0x/, '').toLowerCase().padStart(64, '0');
+  const clean = assertEvmAddress(val, 'ABI address parameter', true);
+  return clean.slice(2).toLowerCase().padStart(64, '0');
 }
 
 function encodeErc20Approve(spender: string, amount: bigint): string {
@@ -277,9 +317,17 @@ async function buildDefiWithdrawExecution(params: {
   const cfg = EVM_CHAINS[evmChain];
   const rawBal = BigInt(asset.rawBalance);
   const proto = (asset.protocol ?? '').toLowerCase();
-  const aavePoolTarget = asset.protocolAddress || cfg.aaveV3Pool;
 
-  if (proto.includes('aave') && aavePoolTarget) {
+  if (proto.includes('aave') && cfg.aaveV3Pool) {
+    if (asset.protocolAddress) {
+      const suppliedPool = assertEvmAddress(asset.protocolAddress, 'asset.protocolAddress');
+      if (suppliedPool.toLowerCase() !== cfg.aaveV3Pool.toLowerCase()) {
+        throw new Error(
+          `Untrusted Aave v3 protocolAddress override rejected for ${evmChain}: expected ${cfg.aaveV3Pool}.`
+        );
+      }
+    }
+    const aavePoolTarget = cfg.aaveV3Pool;
     // Fund-safety guard: check live Aave v3 getUserAccountData(user).totalDebtBase
     // (or pre-flagged debt on asset) before allowing a MAX withdrawal!
     if (asset.aaveDebtUsd && asset.aaveDebtUsd > 0) {
@@ -336,40 +384,53 @@ async function buildDefiWithdrawExecution(params: {
     };
   }
 
-  const compoundTarget = asset.protocolAddress || asset.address || cfg.compoundV3Comet;
-  if (proto.includes('compound') && compoundTarget) {
-    // Compound v3 Comet.withdraw(address asset, uint256 amount) -> 0xf3fef3a3
-    const underlying = asset.underlyingAddress || cfg.usdcAddress;
-    const data = `0xf3fef3a3${pad32Hex(underlying)}${rawBal.toString(16).padStart(64, '0')}`;
-    return {
-      assetId: asset.id,
-      action: asset.action,
-      provider: 'compound_v3',
-      chain: evmChain,
-      chainId: cfg.chainId,
-      chainName: cfg.name,
-      explorerUrl: cfg.explorerUrl,
-      estimatedOutput: `${asset.uiBalance} ${asset.underlyingSymbol ?? 'USDC'} withdrawn to wallet`,
-      estimatedSeconds: 12,
-      transactions: [
-        {
-          stepId: 'compound_withdraw',
-          label: `Withdraw ${asset.symbol} from Compound v3`,
-          description: `Calls Compound v3 Comet.withdraw(${asset.underlyingSymbol ?? 'USDC'}, ${asset.uiBalance})`,
-          chain: evmChain,
-          chainId: cfg.chainId,
-          chainName: cfg.name,
-          explorerUrl: cfg.explorerUrl,
-          from: userAddress,
-          to: compoundTarget,
-          data,
-          value: '0x0',
-        },
-      ],
-      notes: [
-        'After Compound withdrawal confirms, bridge the unlocked asset directly to Solana via Relay or Circle CCTP.',
-      ],
-    };
+  if (proto.includes('compound')) {
+    const allowedComets = new Set<string>([
+      ...(ALLOWED_COMPOUND_V3_COMETS[evmChain] ?? []),
+      ...(cfg.compoundV3Comet ? [cfg.compoundV3Comet.toLowerCase()] : []),
+    ]);
+    const candidateComet = asset.protocolAddress || asset.address || cfg.compoundV3Comet;
+    if (candidateComet && allowedComets.size > 0) {
+      const checkedComet = assertEvmAddress(candidateComet, 'Compound v3 protocolAddress');
+      if (!allowedComets.has(checkedComet.toLowerCase())) {
+        throw new Error(
+          `Untrusted Compound v3 protocolAddress override rejected for ${evmChain}: ${checkedComet} is not an allowlisted Comet market.`
+        );
+      }
+      const compoundTarget = checkedComet;
+      // Compound v3 Comet.withdraw(address asset, uint256 amount) -> 0xf3fef3a3
+      const underlying = assertEvmAddress(asset.underlyingAddress || cfg.usdcAddress, 'underlyingAddress');
+      const data = `0xf3fef3a3${pad32Hex(underlying)}${rawBal.toString(16).padStart(64, '0')}`;
+      return {
+        assetId: asset.id,
+        action: asset.action,
+        provider: 'compound_v3',
+        chain: evmChain,
+        chainId: cfg.chainId,
+        chainName: cfg.name,
+        explorerUrl: cfg.explorerUrl,
+        estimatedOutput: `${asset.uiBalance} ${asset.underlyingSymbol ?? 'USDC'} withdrawn to wallet`,
+        estimatedSeconds: 12,
+        transactions: [
+          {
+            stepId: 'compound_withdraw',
+            label: `Withdraw ${asset.symbol} from Compound v3`,
+            description: `Calls Compound v3 Comet.withdraw(${asset.underlyingSymbol ?? 'USDC'}, ${asset.uiBalance})`,
+            chain: evmChain,
+            chainId: cfg.chainId,
+            chainName: cfg.name,
+            explorerUrl: cfg.explorerUrl,
+            from: userAddress,
+            to: compoundTarget,
+            data,
+            value: '0x0',
+          },
+        ],
+        notes: [
+          'After Compound withdrawal confirms, bridge the unlocked asset directly to Solana via Relay or Circle CCTP.',
+        ],
+      };
+    }
   }
 
   if (
@@ -384,7 +445,16 @@ async function buildDefiWithdrawExecution(params: {
     proto.includes('vault')
   ) {
     // ERC-4626 redeem(uint256 shares, address receiver, address owner) -> 0xba087652
-    const vaultTarget = asset.protocolAddress || asset.address;
+    const vaultTokenAddr = assertEvmAddress(asset.address, 'ERC-4626 vault asset.address');
+    if (asset.protocolAddress) {
+      const suppliedVault = assertEvmAddress(asset.protocolAddress, 'asset.protocolAddress');
+      if (suppliedVault.toLowerCase() !== vaultTokenAddr.toLowerCase()) {
+        throw new Error(
+          `Untrusted ERC-4626 protocolAddress override rejected: protocolAddress must match vault share token ${vaultTokenAddr}.`
+        );
+      }
+    }
+    const vaultTarget = vaultTokenAddr;
     const data = `0xba087652${rawBal.toString(16).padStart(64, '0')}${pad32Hex(userAddress)}${pad32Hex(userAddress)}`;
     return {
       assetId: asset.id,
@@ -980,7 +1050,8 @@ export async function prepareRealExecution(params: {
   const cfg = EVM_CHAINS[evmChain];
   if (!cfg) throw new Error(`Unsupported chain: ${asset.chain}`);
 
-  // Validate Solana destination up front
+  // Validate EVM userAddress and Solana destination up front (prevents comma-joined ABI corruption)
+  assertEvmAddress(userAddress, 'userAddress');
   solanaAddressToBytes32(solanaDestination);
 
   if (asset.action === 'SKIP_HONEYPOT') {
@@ -1102,6 +1173,7 @@ export async function prepareChainBatchExecution(params: {
   const cfg = EVM_CHAINS[chain];
   if (!cfg) throw new Error(`Unsupported chain: ${chain}`);
 
+  assertEvmAddress(userAddress, 'userAddress');
   const mintRecipientBytes32 = solanaAddressToBytes32(solanaDestination);
   const chainAssets = assets.filter((a) => a.chain === chain);
 
@@ -1454,9 +1526,12 @@ export async function checkLiveExecutionStatus(params: {
   let details: string | undefined;
 
   if (params.provider === 'relay' && params.requestId) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
     try {
       const res = await fetch(
-        `https://api.relay.link/intents/status/v2?requestId=${encodeURIComponent(params.requestId)}`
+        `https://api.relay.link/intents/status/v2?requestId=${encodeURIComponent(params.requestId)}`,
+        { signal: controller.signal }
       );
       if (res.ok) {
         const st = (await res.json()) as {
@@ -1470,6 +1545,8 @@ export async function checkLiveExecutionStatus(params: {
       }
     } catch {
       // Keep polling
+    } finally {
+      clearTimeout(timer);
     }
   }
 

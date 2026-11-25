@@ -1,6 +1,7 @@
 import { PublicKey } from '@solana/web3.js';
 import { DEAD_BURN_ADDRESS, EVM_CHAINS } from './chains.js';
 import { decodeMulticall3Aggregate3, encodeMulticall3Aggregate3, evmJsonRpcCall } from './rpc.js';
+import { sanitizeTokenName, sanitizeTokenSymbol } from './sanitize.js';
 import type { EvmChainId } from './types.js';
 
 export const SOLANA_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -203,8 +204,19 @@ export async function checkAaveV3AccountSafety(
   chain: EvmChainId,
   userAddress: string
 ): Promise<AaveAccountSafety> {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(userAddress)) {
+    return {
+      checked: true,
+      hasActiveDebt: true,
+      totalCollateralUsd: 0,
+      totalDebtUsd: 0,
+      healthFactor: 0,
+      safeForMaxWithdraw: false,
+      reason: 'Invalid EVM address supplied to Aave v3 account safety check (failing closed).',
+    };
+  }
   const cfg = EVM_CHAINS[chain];
-  if (!cfg?.aaveV3Pool || !/^0x[0-9a-fA-F]{40}$/.test(userAddress)) {
+  if (!cfg?.aaveV3Pool) {
     return {
       checked: false,
       hasActiveDebt: false,
@@ -468,8 +480,8 @@ export async function discoverEthereumTokens(
 
       out.push({
         address: info.address,
-        symbol: (info.symbol || 'UNKNOWN').slice(0, 18),
-        name: (info.name || info.symbol || 'ERC-20 Token').slice(0, 48),
+        symbol: sanitizeTokenSymbol(info.symbol, 'UNKNOWN'),
+        name: sanitizeTokenName(info.name || info.symbol, 'ERC-20 Token'),
         decimals,
         rawBalance: rawBal,
         ethplorerPriceUsd: priceUsd,
@@ -548,8 +560,8 @@ async function discoverBlockscoutTokens(
         const rate = Number(tok?.exchange_rate ?? 0);
         out.push({
           address: addr,
-          symbol: (tok?.symbol || 'UNKNOWN').slice(0, 18),
-          name: (tok?.name || tok?.symbol || 'ERC-20 Token').slice(0, 48),
+          symbol: sanitizeTokenSymbol(tok?.symbol, 'UNKNOWN'),
+          name: sanitizeTokenName(tok?.name || tok?.symbol, 'ERC-20 Token'),
           decimals,
           rawBalance,
           ethplorerPriceUsd: Number.isFinite(rate) && rate > 0 ? rate : 0,
@@ -606,8 +618,8 @@ async function discoverRoutescanTokens(
         const price = Number(item.tokenPrice ?? 0);
         out.push({
           address: item.tokenAddress,
-          symbol: (item.tokenSymbol || 'UNKNOWN').slice(0, 18),
-          name: (item.tokenName || item.tokenSymbol || 'ERC-20 Token').slice(0, 48),
+          symbol: sanitizeTokenSymbol(item.tokenSymbol, 'UNKNOWN'),
+          name: sanitizeTokenName(item.tokenName || item.tokenSymbol, 'ERC-20 Token'),
           decimals,
           rawBalance,
           ethplorerPriceUsd: Number.isFinite(price) && price > 0 ? price : 0,
@@ -661,8 +673,8 @@ export async function discoverChainTokens(
             if (rawBalance <= 0n) continue;
             out.push({
               address: b.address,
-              symbol: (b.symbol || 'UNKNOWN').slice(0, 18),
-              name: (b.name || b.symbol || 'ERC-20 Token').slice(0, 48),
+              symbol: sanitizeTokenSymbol(b.symbol, 'UNKNOWN'),
+              name: sanitizeTokenName(b.name || b.symbol, 'ERC-20 Token'),
               decimals: Math.min(36, Math.max(0, Number(b.decimals ?? 18))),
               rawBalance,
               ethplorerPriceUsd: Number(b.price_usd ?? 0),
@@ -704,8 +716,8 @@ export async function discoverChainTokens(
             if (rawBalance <= 0n) continue;
             out.push({
               address: item.token_address,
-              symbol: (item.symbol || 'UNKNOWN').slice(0, 18),
-              name: (item.name || item.symbol || 'ERC-20 Token').slice(0, 48),
+              symbol: sanitizeTokenSymbol(item.symbol, 'UNKNOWN'),
+              name: sanitizeTokenName(item.name || item.symbol, 'ERC-20 Token'),
               decimals: Math.min(36, Math.max(0, Number(item.decimals ?? 18))),
               rawBalance,
               ethplorerPriceUsd: 0,

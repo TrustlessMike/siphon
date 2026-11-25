@@ -4,6 +4,7 @@ import { getProtocolFeeConfig } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
 import { applyTwoLevelRoiToReport } from '../scanner/roi.js';
+import { sanitizeTokenName, sanitizeTokenSymbol } from '../scanner/sanitize.js';
 import type { ChainScanSummary, ScannedAsset, ScanReport } from '../scanner/types.js';
 import type {
   ChainFamilyAdapter,
@@ -140,14 +141,14 @@ export const tonAdapter: ChainFamilyAdapter = {
     }
 
     for (const j of jettons?.balances ?? []) {
-      const sym = (j.jetton?.symbol || '').toUpperCase();
-      const dec = Number(j.jetton?.decimals ?? 9);
+      const sym = sanitizeTokenSymbol(j.jetton?.symbol, 'JETTON').toUpperCase();
+      const dec = Math.min(36, Math.max(0, Number(j.jetton?.decimals ?? 9) || 9));
       const uiBal = unitsToUi(j.balance || '0', dec);
       if (uiBal <= 0) continue;
 
       const priceUsd =
         j.price?.prices?.USD ??
-        (sym === 'USDT' || sym === 'USD₮' || sym === 'JUSDC'
+        (sym === 'USDT' || sym === 'JUSDC'
           ? 1.0
           : sym === 'NOT'
           ? priceMap.get('coingecko:notcoin') ?? 0.0032
@@ -157,10 +158,11 @@ export const tonAdapter: ChainFamilyAdapter = {
       const grossUsd = Number((uiBal * priceUsd).toFixed(2));
       if (priceUsd <= 0 && grossUsd === 0) continue;
 
-      const isStable = sym === 'USDT' || sym === 'USD₮' || sym === 'JUSDC';
+      const isStable = sym === 'USDT' || sym === 'JUSDC';
       const gasUsd = 0.05;
       const slippageUsd = isStable ? Number((grossUsd * 0.001).toFixed(2)) : Number((grossUsd * 0.005).toFixed(2));
       const isDust = grossUsd < 0.5;
+      const safeName = sanitizeTokenName(j.jetton?.name, `${sym} Jetton`);
 
       assets.push({
         id: `ton:${j.jetton?.address || sym}`,
@@ -168,8 +170,8 @@ export const tonAdapter: ChainFamilyAdapter = {
         chain: 'ton',
         chainName: 'TON',
         address: j.jetton?.address || sym,
-        symbol: sym === 'USD₮' ? 'USDT' : sym,
-        name: j.jetton?.name || `${sym} Jetton`,
+        symbol: sym,
+        name: safeName,
         decimals: dec,
         kind: 'erc20',
         rawBalance: j.balance,

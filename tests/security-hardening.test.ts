@@ -124,8 +124,14 @@ test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden loca
   const base = `http://127.0.0.1:${addr.port}`;
 
   try {
-    // 1. Privileged routes MUST NEVER send Access-Control-Allow-Origin: *
-    const mandatesNoOrigin = await fetch(`${base}/api/agents/mandates`);
+    // 1. Privileged routes require auth when adminSessionToken is set and MUST NEVER send ACAO: *
+    const mandatesUnauth = await fetch(`${base}/api/agents/mandates`);
+    assert.equal(mandatesUnauth.status, 401);
+    assert.equal(mandatesUnauth.headers.get('access-control-allow-origin'), null);
+
+    const mandatesNoOrigin = await fetch(`${base}/api/agents/mandates`, {
+      headers: { 'X-Siphon-Admin-Session': 'admin_secret_xyz_789' },
+    });
     assert.equal(mandatesNoOrigin.status, 200);
     assert.equal(mandatesNoOrigin.headers.get('access-control-allow-origin'), null);
 
@@ -187,14 +193,20 @@ test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden loca
 
     // 3. Explicit loopback and configured SIPHON_ALLOWED_ORIGIN are reflected properly
     const loopbackAllowed = await fetch(`${base}/api/agents/mandates`, {
-      headers: { Origin: 'http://localhost:5173' },
+      headers: {
+        Origin: 'http://localhost:5173',
+        'X-Siphon-Admin-Session': 'admin_secret_xyz_789',
+      },
     });
     assert.equal(loopbackAllowed.status, 200);
     assert.equal(loopbackAllowed.headers.get('access-control-allow-origin'), 'http://localhost:5173');
     assert.equal(loopbackAllowed.headers.get('vary'), 'Origin');
 
     const configuredAllowed = await fetch(`${base}/api/agents/mandates`, {
-      headers: { Origin: 'https://trusted.siphon.example' },
+      headers: {
+        Origin: 'https://trusted.siphon.example',
+        'X-Siphon-Admin-Session': 'admin_secret_xyz_789',
+      },
     });
     assert.equal(configuredAllowed.status, 200);
     assert.equal(
@@ -595,7 +607,7 @@ test('Mandate engine resets spentTodayUsd after rolling 24h window and rejects s
   assert.equal(engine.getMandate(mandate.mandateId)?.spentTodayUsd, 80);
   assert.equal(engine.getMandate(mandate.mandateId)?.remainingDailyUsd, 0);
 
-  // Within the same 24h window -> exceeds daily cap -> cannot auto-approve
+  // Within the same 24h window -> exceeds daily cap -> hard mandate violation immediately rejected (HIGH-3)
   now += 12 * 3600 * 1000;
   const r3 = engine.requestPermission({
     client: 'smart_contract_agent',
@@ -608,7 +620,7 @@ test('Mandate engine resets spentTodayUsd after rolling 24h window and rejects s
     grossUsd: 25,
     estimatedNetUsdc: 22,
   });
-  assert.equal(r3.status, 'pending_approval');
+  assert.equal(r3.status, 'rejected');
 
   // Advance past 24h window -> spentTodayUsd resets cleanly matching SiphonAgentVault.sol!
   now += 12 * 3600 * 1000 + 1000;

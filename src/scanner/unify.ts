@@ -3,6 +3,7 @@ import { detectAddressFamily, getAdapterForFamily, getFamilyForChain } from '../
 import { PROTOCOL_FEE_BPS } from './chains.js';
 import { scanLiveWallet, scanPresetWallet } from './classifier.js';
 import { applyTwoLevelRoiToReport } from './roi.js';
+import { sanitizeFreeText, sanitizeTokenName, sanitizeTokenSymbol } from './sanitize.js';
 import type {
   ChainFamily,
   ChainScanSummary,
@@ -10,6 +11,9 @@ import type {
   ScanReport,
   UnifiedWalletSummary,
 } from './types.js';
+
+const MAX_UNIFIED_WALLETS = 20;
+const MAX_CONCURRENT_WALLET_SCANS = 4;
 
 export interface UnifiedWalletInput {
   address?: string;
@@ -112,53 +116,70 @@ export async function scanUnifiedWallets(params: {
   if (!deduped.length) {
     throw new Error('At least one wallet address or presetId is required for unified scan.');
   }
+  if (deduped.length > MAX_UNIFIED_WALLETS) {
+    throw new Error(`Unified scan supports at most ${MAX_UNIFIED_WALLETS} wallets per request.`);
+  }
 
-  const perWalletResults = await Promise.all(
-    deduped.map(async (w, idx) => {
-      const t0 = performance.now();
-      const fallbackLabel = w.label?.trim() || (w.presetId ? `Preset ${w.presetId}` : `Wallet ${idx + 1}`);
-      try {
-        let report: ScanReport;
-        let family: ChainFamily;
-        if (w.presetId) {
-          report = await scanPresetWallet(w.presetId);
-          family = 'evm';
-        } else {
-          const clean = (w.address || '').trim();
-          const detected = detectAddressFamily(clean, w.family);
-          if (!detected) {
-            throw new Error(`Unsupported wallet address format: ${shortAddr(clean)}`);
-          }
-          family = detected;
-          if (detected === 'evm') {
-            report = await scanLiveWallet(clean, fallbackLabel);
-            report.family = 'evm';
-          } else {
-            report = await getAdapterForFamily(detected).scanWallet(clean);
-          }
+  // Bound outbound wallet-scan concurrency to prevent socket / API quota exhaustion (HIGH-8)
+  const scanOne = async (w: UnifiedWalletInput, idx: number) => {
+    const t0 = performance.now();
+    const fallbackLabel =
+      sanitizeFreeText(w.label, 64) || (w.presetId ? `Preset ${w.presetId}` : `Wallet ${idx + 1}`);
+    try {
+      let report: ScanReport;
+      let family: ChainFamily;
+      if (w.presetId) {
+        report = await scanPresetWallet(w.presetId);
+        family = 'evm';
+      } else {
+        const clean = (w.address || '').trim();
+        const detected = detectAddressFamily(clean, w.family);
+        if (!detected) {
+          throw new Error(`Unsupported wallet address format: ${shortAddr(clean)}`);
         }
-        return {
-          ok: true as const,
-          idx,
-          family,
-          label: w.label?.trim() || report.walletLabel || shortAddr(report.walletAddress),
-          report,
-          durationMs: Math.max(1, Math.round(performance.now() - t0)),
-        };
-      } catch (err) {
-        const inferredFamily =
-          w.family || detectAddressFamily((w.address || '').trim()) || 'evm';
-        return {
-          ok: false as const,
-          idx,
-          family: inferredFamily,
-          address: (w.address || w.presetId || 'unknown').trim(),
-          label: fallbackLabel,
-          error: err instanceof Error ? err.message : String(err),
-          durationMs: Math.max(1, Math.round(performance.now() - t0)),
-        };
+        family = detected;
+        if (detected === 'evm') {
+          report = await scanLiveWallet(clean, fallbackLabel);
+          report.family = 'evm';
+        } else {
+          report = await getAdapterForFamily(detected).scanWallet(clean);
+        }
       }
-    })
+      return {
+        ok: true as const,
+        idx,
+        family,
+        label: sanitizeFreeText(w.label, 64) || report.walletLabel || shortAddr(report.walletAddress),
+        report,
+        durationMs: Math.max(1, Math.round(performance.now() - t0)),
+      };
+    } catch (err) {
+      const inferredFamily =
+        w.family || detectAddressFamily((w.address || '').trim()) || 'evm';
+      return {
+        ok: false as const,
+        idx,
+        family: inferredFamily,
+        address: (w.address || w.presetId || 'unknown').trim(),
+        label: fallbackLabel,
+        error: err instanceof Error ? err.message : String(err),
+        durationMs: Math.max(1, Math.round(performance.now() - t0)),
+      };
+    }
+  };
+
+  type WalletScanOutcome = Awaited<ReturnType<typeof scanOne>>;
+  const perWalletResults = new Array<WalletScanOutcome>(deduped.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < deduped.length) {
+      const i = cursor;
+      cursor += 1;
+      perWalletResults[i] = await scanOne(deduped[i], i);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(MAX_CONCURRENT_WALLET_SCANS, deduped.length) }, worker)
   );
 
   const mergedAssets: ScannedAsset[] = [];
@@ -203,6 +224,8 @@ export async function scanUnifiedWallets(params: {
       mergedAssets.push({
         ...a,
         id: `w${res.idx}_${a.id}`,
+        symbol: sanitizeTokenSymbol(a.symbol),
+        name: sanitizeTokenName(a.name),
         family: a.family || res.family || getFamilyForChain(a.chain),
         sourceWallet: a.sourceWallet || r.walletAddress,
         sourceWalletLabel: a.sourceWalletLabel || res.label,
@@ -255,7 +278,6 @@ export async function scanUnifiedWallets(params: {
   );
 
   const primaryWallet = unifiedWallets.find((w) => !w.error) || unifiedWallets[0];
-  const combinedAddresses = unifiedWallets.map((w) => w.address).join(',');
   const successfulFamilies = Array.from(
     new Set(perWalletResults.filter((r) => r.ok).map((r) => r.family))
   );
@@ -264,13 +286,15 @@ export async function scanUnifiedWallets(params: {
       ? successfulFamilies
       : Array.from(new Set(unifiedWallets.map((w) => w.family)));
 
+  // Never comma-join addresses into walletAddress (Audit 3 CRIT-05): keep primaryWallet.address
+  // so downstream ABI encoders / Aave v3 debt safety checks never receive corrupted strings.
   const report: ScanReport = {
     scanId: `scan_unified_${crypto.randomBytes(5).toString('hex')}`,
     family: familiesPresent.length === 1 ? familiesPresent[0] : 'mixed',
     families: familiesPresent,
     unifiedWallets,
     mode: primaryMode,
-    walletAddress: unifiedWallets.length === 1 ? primaryWallet.address : combinedAddresses,
+    walletAddress: primaryWallet.address,
     walletLabel:
       unifiedWallets.length === 1
         ? primaryWallet.label
