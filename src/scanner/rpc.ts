@@ -175,9 +175,23 @@ export async function evmJsonRpcCall<T = string>(
         continue;
       }
       const json = (await res.json()) as { result?: T; error?: { message?: string; code?: number } };
-      // Application-level revert (e.g. execution reverted on eth_call) is a valid onchain answer, not an RPC outage
-      if (json.result !== undefined || json.error !== undefined) {
+      if (json.result !== undefined) {
         return json;
+      }
+      if (json.error !== undefined) {
+        // Application-level EVM execution revert is a valid onchain answer;
+        // RPC provider errors (usage/rate limits, auth, internal errors) MUST fail over to the next RPC URL!
+        const errMsg = (json.error.message ?? '').toLowerCase();
+        const isExecutionRevert =
+          json.error.code === 3 ||
+          errMsg.includes('revert') ||
+          errMsg.includes('invalid opcode') ||
+          errMsg.includes('out of gas');
+        if (isExecutionRevert) {
+          return json;
+        }
+        lastErr = new Error(json.error.message ?? `RPC error ${json.error.code ?? ''}`);
+        continue;
       }
       lastErr = new Error('Empty JSON-RPC response');
     } catch (err) {

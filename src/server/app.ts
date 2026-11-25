@@ -15,6 +15,7 @@ import {
   fetchCctpAttestationForTx,
   solanaAddressToBytes32,
 } from '../bridge/cctp.js';
+import { runDefiPreflightBatch } from '../defi/preflight.js';
 import { buildPreSignSimulationProof, verifyOnchainExecutionProof } from '../execution/proof.js';
 import {
   checkLiveExecutionStatus,
@@ -631,6 +632,39 @@ export function createSiphonServer() {
             error: err instanceof Error ? err.message : 'Solana RPC temporarily unavailable',
           });
         }
+      }
+
+      if (method === 'POST' && pathname === '/api/defi/preflight') {
+        const body = await readJsonBody<{
+          walletAddress?: string;
+          scanId?: string;
+          asset?: ScannedAsset;
+          assets?: ScannedAsset[];
+          outputAsset?: 'USDC' | 'SOL';
+          skipRpc?: boolean;
+        }>(req);
+
+        const cachedScan = body.scanId ? scanCache.get(body.scanId) : undefined;
+        const walletAddress = body.walletAddress?.trim() || cachedScan?.walletAddress;
+        const targetAssets = body.assets
+          ? body.assets
+          : body.asset
+          ? [body.asset]
+          : cachedScan?.assets ?? [];
+
+        if (!walletAddress || !targetAssets.length) {
+          return sendJson(res, 400, {
+            error: 'walletAddress (or valid scanId) and at least one asset are required.',
+          });
+        }
+
+        const preflight = await runDefiPreflightBatch({
+          assets: targetAssets,
+          walletAddress,
+          outputAsset: body.outputAsset ?? 'USDC',
+          skipRpc: Boolean(body.skipRpc),
+        });
+        return sendJson(res, 200, preflight);
       }
 
       if (method === 'POST' && pathname === '/api/tx/prepare') {

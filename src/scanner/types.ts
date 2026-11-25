@@ -65,6 +65,86 @@ export interface RoiCostBreakdown {
 
 export type AssetKind = 'native' | 'erc20' | 'defi_position' | 'dead_token';
 
+export type DefiExitStrategy =
+  | 'instant_1click_unwind'
+  | 'direct_swap_bypass_cooldown'
+  | 'safe_partial_debt_exit'
+  | 'two_step_guided'
+  | 'cooldown_blocked';
+
+export type DefiRouteKind =
+  | 'direct_swap'
+  | 'protocol_unwind'
+  | 'partial_unwind'
+  | 'unbonding_required';
+
+export type DefiPreflightStatus = 'verified' | 'warning' | 'blocked';
+
+export type DefiProtocolExtractorId =
+  | 'erc4626'
+  | 'aave_v3'
+  | 'aave_v2'
+  | 'compound_v3'
+  | 'compound_v2'
+  | 'uniswap_v2_lp'
+  | 'uniswap_v3_nft'
+  | 'liquid_receipt';
+
+export interface DefiExitPlan {
+  protocolId: DefiProtocolExtractorId;
+  protocolName: string;
+  routeKind: DefiRouteKind;
+  exitStrategy: DefiExitStrategy;
+  preflightStatus: DefiPreflightStatus;
+  preflightReason: string;
+  plainEnglishSteps: string[];
+  cooldownDetected?: boolean;
+  expectedUnderlyingRaw?: string;
+  expectedUnderlyingUi?: number;
+  underlyingSymbol?: string;
+  underlyingAddress?: string;
+  underlyingDecimals?: number;
+  shareExchangeRate?: number;
+  maxRedeemRaw?: string;
+  safeMaxWithdrawRaw?: string;
+  safeMaxWithdrawUsd?: number;
+  projectedHealthFactor?: number;
+  minSafeHealthFactor?: number;
+  secondaryUnderlyingSymbol?: string;
+  secondaryUnderlyingAddress?: string;
+  secondaryUnderlyingDecimals?: number;
+  expectedSecondaryRaw?: string;
+  expectedSecondaryUi?: number;
+  nftTokenId?: string;
+  nftManagerAddress?: string;
+  supportsAtomicBatch?: boolean;
+  simulatedAtBlock?: number;
+  simulatedLive?: boolean;
+}
+
+export interface ChainedFollowUpAsset {
+  address: string;
+  symbol: string;
+  decimals: number;
+  expectedRawAmount: string;
+  expectedUiAmount: number;
+  estimatedUsd: number;
+}
+
+export interface ChainedFollowUpPlan {
+  sourceAssetId: string;
+  sourceSymbol: string;
+  protocol: string;
+  chain: EvmChainId;
+  unlockedAssets: ChainedFollowUpAsset[];
+  bundledInCurrentBatch: boolean;
+  bridgeProvider: 'relay' | 'lifi' | 'circle_cctp' | 'pending_after_unwind';
+  solanaDestination: string;
+  outputAsset: 'USDC' | 'SOL';
+  autoAdvanceAction: 'complete_in_single_batch' | 'auto_quote_and_bridge_unlocked';
+  plainEnglishSummary: string;
+}
+
 export interface ChainConfig {
   id: EvmChainId;
   name: string;
@@ -143,9 +223,27 @@ export interface ScannedAsset {
   permit2Approved?: boolean;
   aaveDebtUsd?: number;
   aaveHealthFactor?: number;
+  aaveTotalCollateralUsd?: number;
+  aaveLiquidationThresholdBps?: number;
+  compoundDebtUsd?: number;
+  compoundShortfallUsd?: number;
   dexLiquidityVerified?: boolean;
   stakedExitMode?: 'instant_liquid_stake' | 'scheduled_authz_autosweep' | 'native_unstake';
   calldataPreview?: string;
+  /** Structured DeFi exit route, preflight simulation verdict & plain-English plan */
+  defiExitPlan?: DefiExitPlan;
+  /** Optional LP / NFT position metadata for Uniswap v2/v3, Sushi & Aerodrome */
+  lpToken0Address?: string;
+  lpToken0Symbol?: string;
+  lpToken0Decimals?: number;
+  lpToken1Address?: string;
+  lpToken1Symbol?: string;
+  lpToken1Decimals?: number;
+  lpRouterAddress?: string;
+  lpStable?: boolean;
+  nftTokenId?: string;
+  nftLiquidity?: string;
+  nftManagerAddress?: string;
 }
 
 export interface ChainScanSummary {
@@ -255,10 +353,16 @@ export interface CctpBridgeLeg {
   skippedNegativeRoi?: boolean;
   solanaAtaRentUsd?: number;
   cctpCalldata: string;
+  defiExitPlans?: Array<{
+    assetId: string;
+    symbol: string;
+    plan: DefiExitPlan;
+  }>;
   steps: Array<{
     step: string;
     detail: string;
     target: string;
+    defiExitPlan?: DefiExitPlan;
   }>;
 }
 
@@ -279,6 +383,12 @@ export interface MigrationPlan {
   feeRecipientEvm: string | null;
   feeDestinationType: 'contract' | 'wallet';
   legs: CctpBridgeLeg[];
+  defiExitPlans?: Array<{
+    assetId: string;
+    symbol: string;
+    chain: AnyChainId;
+    plan: DefiExitPlan;
+  }>;
   totals: {
     selectedAssets: number;
     defiWithdrawnCount: number;

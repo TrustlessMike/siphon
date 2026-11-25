@@ -1,5 +1,18 @@
 import { encodeCctpDepositForBurn, solanaAddressToBytes32 } from '../bridge/cctp.js';
 import {
+  AAVE_V2_LENDING_POOLS,
+  checkCompoundAccountSafety,
+  type CompoundAccountSafety,
+  computeAaveSafePartialWithdrawal,
+  identifyProtocolExtractorId,
+  isKnownCooldownVault,
+  isLiquidReceiptToken,
+  MIN_SAFE_HEALTH_FACTOR,
+  PROTOCOL_EXTRACTOR_REGISTRY,
+  resolveDefiExitPlan,
+  validateTrustedProtocolTarget,
+} from '../defi/extractors.js';
+import {
   DEAD_BURN_ADDRESS,
   EVM_CHAINS,
   getProtocolFeeConfig,
@@ -7,6 +20,7 @@ import {
   SOLANA_CCTP_DOMAIN,
 } from '../scanner/chains.js';
 import {
+  type AaveAccountSafety,
   checkAaveV3AccountSafety,
   checkErc20Allowance,
   isEip2612Token,
@@ -15,7 +29,12 @@ import {
 } from '../scanner/discovery.js';
 import { evaluateLiveQuoteHaircut } from '../scanner/roi.js';
 import { evmJsonRpcCall } from '../scanner/rpc.js';
-import type { EvmChainId, ScannedAsset } from '../scanner/types.js';
+import type {
+  ChainedFollowUpPlan,
+  DefiExitPlan,
+  EvmChainId,
+  ScannedAsset,
+} from '../scanner/types.js';
 
 const RELAY_SOLANA_CHAIN_ID = 792703809;
 const LIFI_SOLANA_CHAIN_ID = 1151111081099710;
@@ -109,7 +128,18 @@ export interface FeeBreakdown {
 export interface PreparedExecution {
   assetId: string;
   action: ScannedAsset['action'];
-  provider: 'relay' | 'lifi' | 'circle_cctp' | 'aave_v3' | 'compound_v3' | 'erc4626' | 'erc20_burn';
+  provider:
+    | 'relay'
+    | 'lifi'
+    | 'circle_cctp'
+    | 'aave_v3'
+    | 'aave_v2'
+    | 'compound_v3'
+    | 'compound_v2'
+    | 'erc4626'
+    | 'uniswap_v2_lp'
+    | 'uniswap_v3_nft'
+    | 'erc20_burn';
   chain: EvmChainId;
   chainId: number;
   chainName: string;
@@ -123,6 +153,8 @@ export interface PreparedExecution {
   estimatedFeeUsd?: number;
   feeBreakdown?: FeeBreakdown;
   requestId?: string;
+  defiExitPlan?: DefiExitPlan;
+  chainedFollowUpPlan?: ChainedFollowUpPlan;
   transactions: ExecutableEvmTx[];
   notes: string[];
 }
@@ -175,6 +207,8 @@ export interface PreparedChainBatch {
   };
   feeBreakdown: FeeBreakdown;
   estimatedSeconds: number;
+  defiExitPlans?: Record<string, DefiExitPlan>;
+  chainedFollowUpPlans?: ChainedFollowUpPlan[];
   notes: string[];
 }
 
@@ -262,7 +296,14 @@ function encodeErc20Transfer(to: string, amount: bigint): string {
 }
 
 /**
- * Builds REAL directly signable DeFi withdrawal calldata for Aave v3, Compound v3, or ERC-4626 vaults.
+ * Builds REAL directly signable DeFi extraction calldata across ALL supported protocols:
+ *   - Smart Exit Router: liquid receipts (wstETH, rETH, cbETH, weETH, ezETH, sUSDe, sDAI, sUSDS, stETH)
+ *     bypass cooldowns & unwrap gas via Direct Swap & Bridge
+ *   - Aave v3 & Aave v2 (with Safe Partial Debt Exit calculator keeping Health Factor >= 1.6)
+ *   - Compound v3 (Comet.withdraw) & Compound v2 / Venus / Benqi (cToken.redeem)
+ *   - ERC-4626 vaults (Morpho, Yearn v3, Spark, Sky, Fluid, Euler) using previewRedeem/convertToAssets
+ *   - Uniswap v2 / Sushi / Aerodrome v2 LP (approve + removeLiquidity)
+ *   - Uniswap v3 / Aerodrome CL NFT (NonfungiblePositionManager.multicall([decreaseLiquidity, collect, burn]))
  */
 async function buildDefiWithdrawExecution(params: {
   asset: ScannedAsset;
@@ -271,159 +312,259 @@ async function buildDefiWithdrawExecution(params: {
   outputAsset: 'USDC' | 'SOL';
   bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp';
   feeConfig: ProtocolFeeConfig;
+  followUpQuoteFn?: FollowUpQuoteFn;
+  aaveSafetyCheckFn?: AaveSafetyCheckFn;
+  compoundSafetyCheckFn?: CompoundSafetyCheckFn;
 }): Promise<PreparedExecution> {
-  const { asset, userAddress, solanaDestination, outputAsset, bridgePreference, feeConfig } = params;
-  const evmChain = asEvmChain(asset.chain);
-  const cfg = EVM_CHAINS[evmChain];
-  const rawBal = BigInt(asset.rawBalance);
-  const proto = (asset.protocol ?? '').toLowerCase();
-  const aavePoolTarget = asset.protocolAddress || cfg.aaveV3Pool;
-
-  if (proto.includes('aave') && aavePoolTarget) {
-    // Fund-safety guard: check live Aave v3 getUserAccountData(user).totalDebtBase
-    // (or pre-flagged debt on asset) before allowing a MAX withdrawal!
-    if (asset.aaveDebtUsd && asset.aaveDebtUsd > 0) {
-      throw new Error(
-        `Aave v3 safety guard: wallet has $${asset.aaveDebtUsd.toFixed(2)} active debt (HF ${asset.aaveHealthFactor?.toFixed(2) ?? '—'}). Repay borrow before MAX withdrawal to prevent revert or liquidation.`
-      );
-    }
-    const safety = await checkAaveV3AccountSafety(evmChain, userAddress);
-    if (safety.checked && safety.hasActiveDebt) {
-      throw new Error(`Aave v3 safety guard: ${safety.reason}`);
-    }
-
-    // Aave v3 Pool.withdraw(address asset, uint256 amount, address to) -> 0x69328dec
-    // MUST pass the underlying ERC-20 token address (never the aToken receipt address!).
-    const underlying =
-      asset.underlyingAddress ||
-      (asset.underlyingSymbol === 'USDC' ? cfg.usdcAddress : undefined);
-    if (!underlying) {
-      throw new Error(
-        `Cannot build Aave v3 Pool.withdraw for ${asset.symbol}: missing underlying ERC-20 asset address.`
-      );
-    }
-    // Use type(uint256).max so accrued interest is withdrawn cleanly with zero dust left behind
-    const maxUint256 = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
-    const data = `0x69328dec${pad32Hex(underlying)}${maxUint256}${pad32Hex(userAddress)}`;
-    return {
-      assetId: asset.id,
-      action: asset.action,
-      provider: 'aave_v3',
-      chain: evmChain,
-      chainId: cfg.chainId,
-      chainName: cfg.name,
-      explorerUrl: cfg.explorerUrl,
-      estimatedOutput: `${asset.uiBalance} ${asset.underlyingSymbol ?? 'USDC'} withdrawn to wallet`,
-      estimatedSeconds: 12,
-      transactions: [
-        {
-          stepId: 'aave_withdraw',
-          label: `Withdraw ${asset.symbol} from Aave v3`,
-          description: `Calls Aave v3 Pool.withdraw(${asset.underlyingSymbol ?? 'asset'}, MAX, your wallet)`,
-          chain: evmChain,
-          chainId: cfg.chainId,
-          chainName: cfg.name,
-          explorerUrl: cfg.explorerUrl,
-          from: userAddress,
-          to: aavePoolTarget,
-          data,
-          value: '0x0',
-        },
-      ],
-      notes: [
-        'After Aave withdrawal confirms, re-scan or click Bridge to send the unlocked balance to Solana.',
-      ],
-    };
-  }
-
-  const compoundTarget = asset.protocolAddress || asset.address || cfg.compoundV3Comet;
-  if (proto.includes('compound') && compoundTarget) {
-    // Compound v3 Comet.withdraw(address asset, uint256 amount) -> 0xf3fef3a3
-    const underlying = asset.underlyingAddress || cfg.usdcAddress;
-    const data = `0xf3fef3a3${pad32Hex(underlying)}${rawBal.toString(16).padStart(64, '0')}`;
-    return {
-      assetId: asset.id,
-      action: asset.action,
-      provider: 'compound_v3',
-      chain: evmChain,
-      chainId: cfg.chainId,
-      chainName: cfg.name,
-      explorerUrl: cfg.explorerUrl,
-      estimatedOutput: `${asset.uiBalance} ${asset.underlyingSymbol ?? 'USDC'} withdrawn to wallet`,
-      estimatedSeconds: 12,
-      transactions: [
-        {
-          stepId: 'compound_withdraw',
-          label: `Withdraw ${asset.symbol} from Compound v3`,
-          description: `Calls Compound v3 Comet.withdraw(${asset.underlyingSymbol ?? 'USDC'}, ${asset.uiBalance})`,
-          chain: evmChain,
-          chainId: cfg.chainId,
-          chainName: cfg.name,
-          explorerUrl: cfg.explorerUrl,
-          from: userAddress,
-          to: compoundTarget,
-          data,
-          value: '0x0',
-        },
-      ],
-      notes: [
-        'After Compound withdrawal confirms, bridge the unlocked asset directly to Solana via Relay or Circle CCTP.',
-      ],
-    };
-  }
-
-  if (
-    proto.includes('erc-4626') ||
-    proto.includes('erc4626') ||
-    proto.includes('spark') ||
-    proto.includes('sky') ||
-    proto.includes('morpho') ||
-    proto.includes('ethena') ||
-    proto.includes('yearn') ||
-    proto.includes('fluid') ||
-    proto.includes('vault')
-  ) {
-    // ERC-4626 redeem(uint256 shares, address receiver, address owner) -> 0xba087652
-    const vaultTarget = asset.protocolAddress || asset.address;
-    const data = `0xba087652${rawBal.toString(16).padStart(64, '0')}${pad32Hex(userAddress)}${pad32Hex(userAddress)}`;
-    return {
-      assetId: asset.id,
-      action: asset.action,
-      provider: 'erc4626',
-      chain: evmChain,
-      chainId: cfg.chainId,
-      chainName: cfg.name,
-      explorerUrl: cfg.explorerUrl,
-      estimatedOutput: `${asset.uiBalance} ${asset.symbol} redeemed to ${asset.underlyingSymbol ?? 'underlying'}`,
-      estimatedSeconds: 15,
-      transactions: [
-        {
-          stepId: 'erc4626_redeem',
-          label: `Redeem ${asset.symbol} Vault Shares`,
-          description: `Calls ERC-4626 redeem(${asset.uiBalance} shares) directly on ${vaultTarget}`,
-          chain: evmChain,
-          chainId: cfg.chainId,
-          chainName: cfg.name,
-          explorerUrl: cfg.explorerUrl,
-          from: userAddress,
-          to: vaultTarget,
-          data,
-          value: '0x0',
-        },
-      ],
-      notes: ['Underlying tokens return to your wallet for direct Solana bridging.'],
-    };
-  }
-
-  // Lido stETH / wstETH are liquid ERC-20s that can swap & bridge directly to Solana via Relay/LI.FI!
-  return buildBridgeExecution(
+  const {
     asset,
     userAddress,
     solanaDestination,
     outputAsset,
     bridgePreference,
-    feeConfig
-  );
+    feeConfig,
+    followUpQuoteFn,
+    aaveSafetyCheckFn = checkAaveV3AccountSafety,
+    compoundSafetyCheckFn = checkCompoundAccountSafety,
+  } = params;
+  const evmChain = asEvmChain(asset.chain);
+  const cfg = EVM_CHAINS[evmChain];
+  const protocolId = identifyProtocolExtractorId(asset);
+  const quoteDirectBridge = followUpQuoteFn ?? buildBridgeExecution;
+
+  // 0. Security guard: verify protocolAddress against canonical trusted contracts before building calldata
+  if (!isLiquidReceiptToken(asset.symbol, asset.address) && asset.protocolAddress) {
+    const targetToVerify =
+      protocolId === 'uniswap_v2_lp'
+        ? asset.lpRouterAddress || asset.protocolAddress
+        : protocolId === 'uniswap_v3_nft'
+        ? asset.nftManagerAddress || asset.protocolAddress
+        : asset.protocolAddress;
+    const trust = validateTrustedProtocolTarget({
+      chain: evmChain,
+      protocolId,
+      assetAddress: asset.address,
+      protocolAddress: targetToVerify,
+    });
+    if (!trust.trusted) {
+      throw new Error(trust.reason || `Blocked untrusted protocol target for ${asset.symbol}.`);
+    }
+  }
+
+  // 1. Cooldown-locked vaults (like Ethena sUSDe) MUST bypass redeem() via Direct Swap when liquid!
+  const cooldownVault =
+    isKnownCooldownVault(asset.symbol, asset.address) || Boolean(asset.defiExitPlan?.cooldownDetected);
+  const shouldRouteDirectSwap =
+    protocolId === 'liquid_receipt' ||
+    (cooldownVault && isLiquidReceiptToken(asset.symbol, asset.address)) ||
+    asset.defiExitPlan?.exitStrategy === 'direct_swap_bypass_cooldown';
+
+  if (cooldownVault && !isLiquidReceiptToken(asset.symbol, asset.address)) {
+    throw new Error(
+      `${asset.protocol || 'Vault'} (${asset.symbol}) currently has a withdrawal cooldown lock and lacks deep DEX liquidity for an instant swap.`
+    );
+  }
+
+  if (shouldRouteDirectSwap) {
+    const directPlan =
+      asset.defiExitPlan ??
+      resolveDefiExitPlan({
+        asset,
+        outputAsset,
+      });
+    try {
+      const bridged = await quoteDirectBridge(
+        asset,
+        userAddress,
+        solanaDestination,
+        outputAsset,
+        bridgePreference,
+        feeConfig
+      );
+      return {
+        ...bridged,
+        defiExitPlan: directPlan,
+        notes: [directPlan.preflightReason, ...bridged.notes],
+      };
+    } catch (err) {
+      // If a non-cooldown ERC-4626 vault (e.g. sDAI / sUSDS) couldn't fetch a live direct bridge quote,
+      // fall back cleanly to ERC-4626 redeem instead of failing hard; for cooldown vaults/LSTs rethrow!
+      if (protocolId !== 'erc4626' || cooldownVault) {
+        throw err;
+      }
+    }
+  }
+
+  // 2. Aave v3 & Aave v2 live FAIL-CLOSED debt guard + Safe Partial Exit calculator (HF >= 1.6)
+  let resolvedExitPlan = asset.defiExitPlan;
+  if (protocolId === 'aave_v3' || protocolId === 'aave_v2') {
+    const poolTarget =
+      asset.protocolAddress ||
+      (protocolId === 'aave_v2' ? AAVE_V2_LENDING_POOLS[evmChain] : cfg.aaveV3Pool);
+    let debtUsd = asset.aaveDebtUsd ?? 0;
+    let healthFactor = asset.aaveHealthFactor;
+    let totalCollateralUsd = asset.aaveTotalCollateralUsd;
+    let ltBps = asset.aaveLiquidationThresholdBps;
+
+    if (debtUsd <= 0 && poolTarget) {
+      const safety = await aaveSafetyCheckFn(evmChain, userAddress, poolTarget);
+      if (!safety.checked) {
+        throw new Error(
+          `Aave v3 safety guard: could not verify onchain debt status (${safety.reason}). Blocking MAX withdrawal to protect against liquidation — please retry once RPC is reachable.`
+        );
+      }
+      if (safety.hasActiveDebt) {
+        debtUsd = safety.totalDebtUsd;
+        healthFactor = safety.healthFactor;
+        totalCollateralUsd = safety.totalCollateralUsd;
+        ltBps = safety.currentLiquidationThresholdBps;
+      }
+    }
+
+    if (debtUsd > 0) {
+      const partial = computeAaveSafePartialWithdrawal({
+        totalCollateralUsd,
+        totalDebtUsd: debtUsd,
+        liquidationThresholdBps: ltBps,
+        currentHealthFactor: healthFactor,
+        positionUsd: asset.grossUsd,
+        positionRawBalance: BigInt(asset.rawBalance),
+        positionDecimals: asset.decimals,
+        positionPriceUsd: asset.priceUsd,
+        minSafeHealthFactor: MIN_SAFE_HEALTH_FACTOR,
+      });
+
+      if (!partial.canWithdrawAny) {
+        throw new Error(
+          `Aave v3 safety guard: wallet has $${debtUsd.toFixed(2)} active debt (HF ${partial.currentHealthFactor.toFixed(2)}). ${partial.reason}`
+        );
+      }
+
+      resolvedExitPlan = resolveDefiExitPlan({
+        asset: {
+          ...asset,
+          aaveDebtUsd: debtUsd,
+          aaveHealthFactor: partial.currentHealthFactor,
+          aaveTotalCollateralUsd: totalCollateralUsd,
+          aaveLiquidationThresholdBps: ltBps,
+        },
+        outputAsset,
+      });
+    }
+  }
+
+  // 2b. Compound v3 & Compound v2 / Venus / Benqi FAIL-CLOSED active borrow guard
+  if (protocolId === 'compound_v3' || protocolId === 'compound_v2') {
+    if (
+      (asset.compoundDebtUsd && asset.compoundDebtUsd > 0) ||
+      (asset.compoundShortfallUsd && asset.compoundShortfallUsd > 0)
+    ) {
+      throw new Error(
+        `Compound safety guard: wallet has active borrow/shortfall on ${asset.protocol || 'Compound'}. Repay borrow before withdrawing collateral to prevent revert or liquidation.`
+      );
+    }
+    const targetAddr =
+      asset.protocolAddress ||
+      asset.address ||
+      (protocolId === 'compound_v3' ? cfg.compoundV3Comet : undefined);
+    if (targetAddr) {
+      const compSafety = await compoundSafetyCheckFn({
+        chain: evmChain,
+        userAddress,
+        protocolId,
+        targetAddress: targetAddr,
+      });
+      if (!compSafety.checked) {
+        throw new Error(
+          `Compound safety guard: could not verify onchain borrow status (${compSafety.reason}). Blocking withdrawal to protect against liquidation.`
+        );
+      }
+      if (compSafety.hasActiveBorrow) {
+        throw new Error(`Compound safety guard: ${compSafety.reason}`);
+      }
+    }
+  }
+
+  if (!resolvedExitPlan) {
+    resolvedExitPlan = resolveDefiExitPlan({ asset, outputAsset });
+  }
+
+  // 3. Build protocol extraction transactions via the Modular Protocol Extractor Registry
+  const extractor = PROTOCOL_EXTRACTOR_REGISTRY[protocolId];
+  const built = extractor.buildExtraction({
+    asset,
+    userAddress,
+    chain: evmChain,
+    exitPlan: resolvedExitPlan,
+  });
+
+  if (built.provider === 'direct_swap') {
+    const bridged = await quoteDirectBridge(
+      asset,
+      userAddress,
+      solanaDestination,
+      outputAsset,
+      bridgePreference,
+      feeConfig
+    );
+    return {
+      ...bridged,
+      defiExitPlan: resolvedExitPlan,
+    };
+  }
+
+  const transactions: ExecutableEvmTx[] = built.transactions.map((t) => ({
+    stepId: t.stepId,
+    label: t.label,
+    description: t.description,
+    chain: evmChain,
+    chainId: cfg.chainId,
+    chainName: cfg.name,
+    explorerUrl: cfg.explorerUrl,
+    from: userAddress,
+    to: t.to,
+    data: t.data,
+    value: t.value,
+  }));
+
+  const chainedFollowUpPlan: ChainedFollowUpPlan | undefined = built.unlockedAssets.length
+    ? {
+        sourceAssetId: asset.id,
+        sourceSymbol: asset.symbol,
+        protocol: asset.protocol || extractor.name,
+        chain: evmChain,
+        unlockedAssets: built.unlockedAssets.map((u) => ({
+          address: u.address,
+          symbol: u.symbol,
+          decimals: u.decimals,
+          expectedRawAmount: u.expectedRawAmount.toString(),
+          expectedUiAmount: u.expectedUiAmount,
+          estimatedUsd: u.estimatedUsd,
+        })),
+        bundledInCurrentBatch: false,
+        bridgeProvider: 'pending_after_unwind',
+        solanaDestination,
+        outputAsset,
+        autoAdvanceAction: 'auto_quote_and_bridge_unlocked',
+        plainEnglishSummary: `Auto-bridge ${built.unlockedAssets.map((u) => `${u.expectedUiAmount} ${u.symbol}`).join(' + ')} to Solana ${outputAsset} immediately after ${asset.protocol || extractor.name} unwind confirms.`,
+      }
+    : undefined;
+
+  return {
+    assetId: asset.id,
+    action: asset.action,
+    provider: built.provider,
+    chain: evmChain,
+    chainId: cfg.chainId,
+    chainName: cfg.name,
+    explorerUrl: cfg.explorerUrl,
+    estimatedOutput: built.estimatedOutput,
+    estimatedSeconds: built.estimatedSeconds,
+    defiExitPlan: resolvedExitPlan,
+    chainedFollowUpPlan,
+    transactions,
+    notes: built.notes,
+  };
 }
 
 /**
@@ -950,9 +1091,31 @@ async function buildBridgeExecution(
   );
 }
 
+export type FollowUpQuoteFn = (
+  asset: ScannedAsset,
+  userAddress: string,
+  solanaDestination: string,
+  outputAsset: 'USDC' | 'SOL',
+  bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp',
+  feeConfig: ProtocolFeeConfig
+) => Promise<PreparedExecution>;
+
+export type AaveSafetyCheckFn = (
+  chain: EvmChainId,
+  userAddress: string,
+  poolAddressOverride?: string
+) => Promise<AaveAccountSafety>;
+
+export type CompoundSafetyCheckFn = (params: {
+  chain: EvmChainId;
+  userAddress: string;
+  protocolId: 'compound_v3' | 'compound_v2';
+  targetAddress: string;
+}) => Promise<CompoundAccountSafety>;
+
 /**
  * Prepares REAL executable mainnet transaction(s) for any scanned asset:
- *   - DeFi Position -> Aave v3 / Compound v3 / ERC-4626 withdraw (or direct Lido bridge)
+ *   - DeFi Position -> Aave v2/v3 (full or safe partial exit) / Compound v2/v3 / ERC-4626 / Uni v2/v3 LP / Direct Swap liquid receipt
  *   - Liquid Dust / USDC -> Live Relay -> LI.FI -> Circle CCTP bridge directly to Solana
  *   - Zero-Liquidity Dead Token -> Live eth_call honeypot check + ERC20.transfer(0x...dEaD)
  */
@@ -964,6 +1127,9 @@ export async function prepareRealExecution(params: {
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
   protocolFeeBps?: number;
   feeRecipientEvm?: string | null;
+  followUpQuoteFn?: FollowUpQuoteFn;
+  aaveSafetyCheckFn?: AaveSafetyCheckFn;
+  compoundSafetyCheckFn?: CompoundSafetyCheckFn;
 }): Promise<PreparedExecution> {
   const {
     asset,
@@ -973,6 +1139,9 @@ export async function prepareRealExecution(params: {
     bridgePreference = 'auto',
     protocolFeeBps,
     feeRecipientEvm,
+    followUpQuoteFn,
+    aaveSafetyCheckFn,
+    compoundSafetyCheckFn,
   } = params;
   const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
 
@@ -1027,11 +1196,7 @@ export async function prepareRealExecution(params: {
     };
   }
 
-  if (
-    asset.action === 'WITHDRAW_AND_BRIDGE' &&
-    asset.protocol &&
-    !asset.protocol.toLowerCase().includes('lido')
-  ) {
+  if (asset.action === 'WITHDRAW_AND_BRIDGE' || asset.kind === 'defi_position') {
     return buildDefiWithdrawExecution({
       asset,
       userAddress,
@@ -1039,10 +1204,13 @@ export async function prepareRealExecution(params: {
       outputAsset,
       bridgePreference,
       feeConfig,
+      followUpQuoteFn,
+      aaveSafetyCheckFn,
+      compoundSafetyCheckFn,
     });
   }
 
-  return buildBridgeExecution(
+  return (followUpQuoteFn ?? buildBridgeExecution)(
     asset,
     userAddress,
     solanaDestination,
@@ -1084,6 +1252,9 @@ export async function prepareChainBatchExecution(params: {
   protocolFeeBps?: number;
   feeRecipientEvm?: string | null;
   allowHighCost?: boolean;
+  followUpQuoteFn?: FollowUpQuoteFn;
+  aaveSafetyCheckFn?: AaveSafetyCheckFn;
+  compoundSafetyCheckFn?: CompoundSafetyCheckFn;
 }): Promise<PreparedChainBatch> {
   const {
     chain,
@@ -1096,6 +1267,9 @@ export async function prepareChainBatchExecution(params: {
     protocolFeeBps,
     feeRecipientEvm,
     allowHighCost = false,
+    followUpQuoteFn,
+    aaveSafetyCheckFn,
+    compoundSafetyCheckFn,
   } = params;
   const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
 
@@ -1147,15 +1321,32 @@ export async function prepareChainBatchExecution(params: {
       bridgePreference,
       protocolFeeBps: feeConfig.feeBps,
       feeRecipientEvm: feeConfig.feeRecipientEvm,
+      followUpQuoteFn,
+      aaveSafetyCheckFn,
+      compoundSafetyCheckFn,
     })
   );
 
   const rawCalls: PreparedBatchCall[] = [];
   const bridgeTrackers: PreparedChainBatch['bridgeTrackers'] = [];
+  const chainedFollowUpPlans: ChainedFollowUpPlan[] = [];
+  const defiExitPlans: Record<string, DefiExitPlan> = {};
   const notes: string[] = [];
   let maxSeconds = 10;
 
-  results.forEach((res, idx) => {
+  const DEFI_UNWIND_PROVIDERS = new Set<PreparedExecution['provider']>([
+    'aave_v3',
+    'aave_v2',
+    'compound_v3',
+    'compound_v2',
+    'erc4626',
+    'uniswap_v2_lp',
+    'uniswap_v3_nft',
+  ]);
+  const quoteFollowUpBridge = followUpQuoteFn ?? buildBridgeExecution;
+
+  for (let idx = 0; idx < results.length; idx++) {
+    const res = results[idx];
     const asset = executableAssets[idx];
     if (res.status === 'rejected') {
       skippedAssets.push({
@@ -1163,10 +1354,13 @@ export async function prepareChainBatchExecution(params: {
         assetSymbol: asset.symbol,
         reason: res.reason instanceof Error ? res.reason.message : 'Route unavailable',
       });
-      return;
+      continue;
     }
 
     const prep = res.value;
+    if (prep.defiExitPlan) {
+      defiExitPlans[asset.id] = prep.defiExitPlan;
+    }
 
     // Live Quote Haircut Gate: drop any bridged/swapped quote that turns net-negative or >50% haircut
     if (
@@ -1187,7 +1381,7 @@ export async function prepareChainBatchExecution(params: {
           reason: gate.reason,
         });
         notes.push(`${asset.symbol}: ${gate.reason}`);
-        return;
+        continue;
       }
     }
 
@@ -1209,76 +1403,205 @@ export async function prepareChainBatchExecution(params: {
       });
     }
 
-    // Atomic DeFi USDC Withdraw + Circle CCTP depositForBurn in the SAME 1-click batch!
-    const isDefiUsdcWithdraw =
-      bundleDefiCctp &&
-      Boolean(cfg.cctpTokenMessenger && cfg.cctpDomain !== null) &&
-      outputAsset === 'USDC' &&
-      (prep.provider === 'aave_v3' || prep.provider === 'compound_v3') &&
-      asset.underlyingSymbol === 'USDC';
+    // 1-Click Withdraw -> Swap -> Bridge Chaining for ALL DeFi protocols
+    // (Aave v2/v3 USDC & non-USDC, Compound v2/v3, ERC-4626 using previewRedeem, Uni v2/v3 LP)
+    if (DEFI_UNWIND_PROVIDERS.has(prep.provider)) {
+      const unlockedList = prep.chainedFollowUpPlan?.unlockedAssets ?? [];
+      let bundledAny = false;
+      let lastBundledProvider: ChainedFollowUpPlan['bridgeProvider'] = 'pending_after_unwind';
 
-    if (isDefiUsdcWithdraw && cfg.cctpTokenMessenger) {
-      const messenger = cfg.cctpTokenMessenger;
-      const rawTotal = BigInt(asset.rawBalance);
-      const { feeRaw, netRaw } = splitRawAmountForFee(rawTotal, feeConfig);
-      const bridgeRaw = feeConfig.feeRecipientEvm ? netRaw : rawTotal;
-      const netUi = Number(bridgeRaw) / 1_000_000;
+      if (bundleDefiCctp && unlockedList.length > 0) {
+        for (const unlocked of unlockedList) {
+          let unlockedRaw = 0n;
+          try {
+            unlockedRaw = BigInt(unlocked.expectedRawAmount);
+          } catch {
+            unlockedRaw = 0n;
+          }
+          if (unlockedRaw <= 0n || !unlocked.address) continue;
 
-      if (feeConfig.feeRecipientEvm && feeRaw > 0n) {
-        rawCalls.push({
-          stepId: 'protocol_fee_transfer_after_defi',
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          action: asset.action,
-          provider: 'circle_cctp',
-          label: `Protocol Fee (${feeConfig.feePercent}% USDC → ${feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'SiphonFeeVault'})`,
-          description: `Routes ${(Number(feeRaw) / 1_000_000).toFixed(2)} USDC (${feeConfig.feeBps} bps) to ${feeConfig.feeRecipientEvm}`,
-          to: cfg.usdcAddress,
-          data: encodeErc20Transfer(feeConfig.feeRecipientEvm, feeRaw),
-          value: '0x0',
+          const isNativeUsdc = unlocked.address.toLowerCase() === cfg.usdcAddress.toLowerCase();
+          const canCctpBundle =
+            isNativeUsdc &&
+            outputAsset === 'USDC' &&
+            Boolean(cfg.cctpTokenMessenger && cfg.cctpDomain !== null) &&
+            (bridgePreference === 'cctp' ||
+              (bridgePreference === 'auto' &&
+                (prep.provider === 'aave_v3' ||
+                  prep.provider === 'aave_v2' ||
+                  prep.provider === 'compound_v3' ||
+                  prep.provider === 'compound_v2' ||
+                  prep.provider === 'erc4626')));
+
+          if (canCctpBundle && cfg.cctpTokenMessenger) {
+            const { feeRaw, netRaw } = splitRawAmountForFee(unlockedRaw, feeConfig);
+            const bridgeRaw = feeConfig.feeRecipientEvm ? netRaw : unlockedRaw;
+            const netUi = Number(bridgeRaw) / 10 ** unlocked.decimals;
+
+            if (feeConfig.feeRecipientEvm && feeRaw > 0n) {
+              rawCalls.push({
+                stepId: 'protocol_fee_transfer_after_defi',
+                assetId: asset.id,
+                assetSymbol: asset.symbol,
+                action: asset.action,
+                provider: 'circle_cctp',
+                label: `Protocol Fee (${feeConfig.feePercent}% USDC → ${feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'SiphonFeeVault'})`,
+                description: `Routes ${(Number(feeRaw) / 10 ** unlocked.decimals).toFixed(2)} USDC (${feeConfig.feeBps} bps) to ${feeConfig.feeRecipientEvm}`,
+                to: cfg.usdcAddress,
+                data: encodeErc20Transfer(feeConfig.feeRecipientEvm, feeRaw),
+                value: '0x0',
+              });
+            }
+            rawCalls.push({
+              stepId: 'approve_cctp_after_defi',
+              assetId: asset.id,
+              assetSymbol: asset.symbol,
+              action: asset.action,
+              provider: 'circle_cctp',
+              label: `Approve withdrawn ${netUi.toFixed(2)} USDC for Circle CCTP`,
+              description: `Batched immediately after ${asset.protocol} withdrawal in the same atomic call bundle`,
+              to: cfg.usdcAddress,
+              data: encodeErc20Approve(cfg.cctpTokenMessenger, bridgeRaw),
+              value: '0x0',
+            });
+            rawCalls.push({
+              stepId: 'cctp_deposit_for_burn_after_defi',
+              assetId: asset.id,
+              assetSymbol: asset.symbol,
+              action: asset.action,
+              provider: 'circle_cctp',
+              label: `Bridge withdrawn ${netUi.toFixed(2)} USDC → Solana (Circle CCTP)`,
+              description: `Native 1:1 Circle CCTP burn (Domain ${cfg.cctpDomain} → Domain 5 Solana) in the same click`,
+              to: cfg.cctpTokenMessenger,
+              data: encodeCctpDepositForBurn({
+                rawUsdcAmount: bridgeRaw,
+                destinationDomain: SOLANA_CCTP_DOMAIN,
+                solanaMintRecipientBytes32: mintRecipientBytes32,
+                usdcAddress: cfg.usdcAddress,
+              }),
+              value: '0x0',
+            });
+            maxSeconds = Math.max(maxSeconds, cfg.cctpAttestationSec);
+            bridgeTrackers.push({
+              assetId: asset.id,
+              assetSymbol: asset.symbol,
+              provider: 'circle_cctp',
+              estimatedOutput: `${netUi.toFixed(2)} USDC (Atomic DeFi Exit + CCTP)`,
+              estimatedSeconds: cfg.cctpAttestationSec,
+              requiresSolanaClaim: true,
+            });
+            notes.push(
+              `Bundled ${asset.protocol} ${asset.symbol} withdrawal + ${feeConfig.feePercent}% protocol fee + Circle CCTP bridge atomically in 1 click (poll /api/cctp/attestation for Solana receiveMessage claim).`
+            );
+            bundledAny = true;
+            lastBundledProvider = 'circle_cctp';
+            continue;
+          }
+
+          // Non-USDC underlying (aWETH, cWETHv3, ERC-4626 DAI/USDS/WETH, LP token0/token1, or SOL output):
+          // Chain live Relay / LI.FI swap+bridge call(s) in the SAME EIP-5792 atomic batch!
+          const syntheticUnderlyingAsset: ScannedAsset = {
+            ...asset,
+            id: `${asset.id}:unlocked:${unlocked.symbol.toLowerCase()}`,
+            address: unlocked.address,
+            symbol: unlocked.symbol,
+            name: `${unlocked.symbol} (unlocked from ${asset.symbol})`,
+            decimals: unlocked.decimals,
+            kind: 'erc20',
+            protocol: undefined,
+            protocolAddress: undefined,
+            rawBalance: unlockedRaw.toString(),
+            uiBalance: unlocked.expectedUiAmount,
+            grossUsd: unlocked.estimatedUsd,
+            action: isNativeUsdc ? 'BRIDGE_DIRECT_USDC' : 'SELL_AND_BRIDGE',
+          };
+
+          try {
+            const followUpPrep = await quoteFollowUpBridge(
+              syntheticUnderlyingAsset,
+              userAddress,
+              solanaDestination,
+              outputAsset,
+              bridgePreference,
+              feeConfig
+            );
+
+            const gateResult =
+              typeof followUpPrep.quotedOutUsd === 'number'
+                ? evaluateLiveQuoteHaircut({
+                    grossUsd: unlocked.estimatedUsd,
+                    quoteOutUsd: followUpPrep.quotedOutUsd,
+                    actualGasUsd: followUpPrep.estimatedGasUsd ?? asset.batchedGasUsd ?? 0,
+                    allowHighCost,
+                  })
+                : { passed: true, reason: '' };
+
+            if (!gateResult.passed) {
+              notes.push(`${unlocked.symbol} (post-${asset.symbol} unwind): ${gateResult.reason}`);
+              continue;
+            }
+
+            if (followUpPrep.transactions.length > 0) {
+              for (const ftx of followUpPrep.transactions) {
+                const taggedStepId = ftx.stepId.includes('after_defi')
+                  ? ftx.stepId
+                  : `${ftx.stepId}_after_defi`;
+                rawCalls.push({
+                  stepId: taggedStepId,
+                  assetId: asset.id,
+                  assetSymbol: unlocked.symbol,
+                  action: asset.action,
+                  provider: followUpPrep.provider,
+                  label: ftx.label,
+                  description: `${ftx.description} (chained immediately after ${asset.symbol} unwind)`,
+                  to: ftx.to,
+                  data: ftx.data,
+                  value: ftx.value || '0x0',
+                  gas: ftx.gas,
+                });
+              }
+              maxSeconds = Math.max(maxSeconds, followUpPrep.estimatedSeconds);
+              bridgeTrackers.push({
+                assetId: asset.id,
+                assetSymbol: `${asset.symbol}→${unlocked.symbol}`,
+                provider: followUpPrep.provider,
+                requestId: followUpPrep.requestId,
+                estimatedOutput: followUpPrep.estimatedOutput,
+                estimatedSeconds: followUpPrep.estimatedSeconds,
+                requiresSolanaClaim: followUpPrep.provider === 'circle_cctp',
+              });
+              notes.push(
+                `Chained ${asset.protocol || prep.provider} ${asset.symbol} unwind → ${unlocked.expectedUiAmount} ${unlocked.symbol} swap & bridge via ${followUpPrep.provider} in 1 EIP-5792 batch.`
+              );
+              bundledAny = true;
+              if (
+                followUpPrep.provider === 'relay' ||
+                followUpPrep.provider === 'lifi' ||
+                followUpPrep.provider === 'circle_cctp'
+              ) {
+                lastBundledProvider = followUpPrep.provider;
+              }
+            }
+          } catch {
+            // Non-fatal: keep the DeFi unwind call in the batch and emit clean chainedFollowUpPlan
+            // so legacy wallets / UI can auto-advance to bridging without manual re-scanning!
+          }
+        }
+      }
+
+      if (prep.chainedFollowUpPlan) {
+        chainedFollowUpPlans.push({
+          ...prep.chainedFollowUpPlan,
+          bundledInCurrentBatch: bundledAny,
+          bridgeProvider: bundledAny ? lastBundledProvider : 'pending_after_unwind',
+          autoAdvanceAction: bundledAny
+            ? 'complete_in_single_batch'
+            : 'auto_quote_and_bridge_unlocked',
+          plainEnglishSummary: bundledAny
+            ? `Atomic 1-click batch ready: unwind ${asset.symbol} and immediately bridge ${prep.chainedFollowUpPlan.unlockedAssets.map((u) => `${u.expectedUiAmount} ${u.symbol}`).join(' + ')} to Solana ${outputAsset}.`
+            : prep.chainedFollowUpPlan.plainEnglishSummary,
         });
       }
-      rawCalls.push({
-        stepId: 'approve_cctp_after_defi',
-        assetId: asset.id,
-        assetSymbol: asset.symbol,
-        action: asset.action,
-        provider: 'circle_cctp',
-        label: `Approve withdrawn ${netUi.toFixed(2)} USDC for Circle CCTP`,
-        description: `Batched immediately after ${asset.protocol} withdrawal in the same atomic call bundle`,
-        to: cfg.usdcAddress,
-        data: encodeErc20Approve(cfg.cctpTokenMessenger, bridgeRaw),
-        value: '0x0',
-      });
-      rawCalls.push({
-        stepId: 'cctp_deposit_for_burn_after_defi',
-        assetId: asset.id,
-        assetSymbol: asset.symbol,
-        action: asset.action,
-        provider: 'circle_cctp',
-        label: `Bridge withdrawn ${netUi.toFixed(2)} USDC → Solana (Circle CCTP)`,
-        description: `Native 1:1 Circle CCTP burn (Domain ${cfg.cctpDomain} → Domain 5 Solana) in the same click`,
-        to: cfg.cctpTokenMessenger,
-        data: encodeCctpDepositForBurn({
-          rawUsdcAmount: bridgeRaw,
-          destinationDomain: SOLANA_CCTP_DOMAIN,
-          solanaMintRecipientBytes32: mintRecipientBytes32,
-          usdcAddress: cfg.usdcAddress,
-        }),
-        value: '0x0',
-      });
-      maxSeconds = Math.max(maxSeconds, cfg.cctpAttestationSec);
-      bridgeTrackers.push({
-        assetId: asset.id,
-        assetSymbol: asset.symbol,
-        provider: 'circle_cctp',
-        estimatedOutput: `${netUi.toFixed(2)} USDC (Atomic DeFi Exit + CCTP)`,
-        estimatedSeconds: cfg.cctpAttestationSec,
-        requiresSolanaClaim: true,
-      });
-      notes.push(
-        `Bundled ${asset.protocol} ${asset.symbol} withdrawal + ${feeConfig.feePercent}% protocol fee + Circle CCTP bridge atomically in 1 click (poll /api/cctp/attestation for Solana receiveMessage claim).`
-      );
     } else if (prep.provider === 'relay' || prep.provider === 'lifi' || prep.provider === 'circle_cctp') {
       bridgeTrackers.push({
         assetId: asset.id,
@@ -1290,7 +1613,7 @@ export async function prepareChainBatchExecution(params: {
         requiresSolanaClaim: prep.provider === 'circle_cctp',
       });
     }
-  });
+  }
 
   // Deduplicate identical ERC-20 approve(spender, amount) calls by summing required amounts
   const mergedApprovals = new Map<
@@ -1406,6 +1729,8 @@ export async function prepareChainBatchExecution(params: {
       estimatedFeeUsd: estimatedBatchFeeUsd,
     },
     estimatedSeconds: maxSeconds,
+    defiExitPlans: Object.keys(defiExitPlans).length ? defiExitPlans : undefined,
+    chainedFollowUpPlans: chainedFollowUpPlans.length ? chainedFollowUpPlans : undefined,
     notes,
   };
 }
