@@ -1,7 +1,12 @@
 {
   "name": "siphon-migrator",
   "version": "0.1.0",
-  "description": "Agentic multi-chain EVM-to-Solana migrator with EIP-5792 1-click batching, background settlement tracking, and 5-10% protocol fee vault",
+  "license": "MIT",
+  "description": "Open-source multi-chain DeFi & dust migrator to Solana with 1-click DeFi extraction, EIP-5792/7702 batching, signed Two-Level ROI guard, and Claude MCP / ChatGPT plugins",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TrustlessMike/siphon.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server/index.ts",
