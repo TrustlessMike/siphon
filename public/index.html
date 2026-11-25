@@ -16,6 +16,7 @@
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/styles.css?v=8" />
+    <link rel="stylesheet" href="/preservation.css?v=1" />
   </head>
   <body>
     <!-- =============================================================== -->
@@ -267,6 +268,9 @@
               <button type="submit" class="btn-pill-dark btn-sm" id="unifiedAddSubmitBtn">Add &amp; Unify</button>
             </form>
           </div>
+
+          <!-- Capital-Preservation Strip (Visible in both Lite & Pro modes) -->
+          <div id="preservationStripHost" class="preservation-strip-host hidden" aria-live="polite"></div>
 
           <!-- 2-Column Calm Workspace -->
           <div class="sweep-workspace">
@@ -697,6 +701,39 @@
 
                 <div class="agents-list" id="agentMandatesHost" style="margin-top:14px;"></div>
               </div>
+
+              <div class="card agents-card preservation-agents-card" id="gasWatchAgentsCard">
+                <div class="card-head">
+                  <div>
+                    <h2>Gas-Window Watchdog</h2>
+                    <p class="muted-xs" style="margin:2px 0 0;">Alerts when chain gas drops at or below your target gwei. Never executes without a signed mandate.</p>
+                  </div>
+                  <div class="btn-row">
+                    <span class="gas-watch-live-badge mono" id="gasWatchLiveGweiBadge">Live L1: —</span>
+                    <button type="button" class="btn-outline-sm" id="refreshGasWatchBtn">Refresh</button>
+                  </div>
+                </div>
+                <form class="gas-watch-form" id="createGasWatchForm">
+                  <label class="gas-watch-field">
+                    <span class="mandate-label">Chain</span>
+                    <select id="gasWatchChainSelect" class="gas-watch-select mono">
+                      <option value="ethereum" selected>Ethereum L1</option>
+                      <option value="base">Base</option>
+                      <option value="arbitrum">Arbitrum</option>
+                      <option value="optimism">Optimism</option>
+                      <option value="polygon">Polygon</option>
+                    </select>
+                  </label>
+                  <label class="gas-watch-field">
+                    <span class="mandate-label">Target max gwei</span>
+                    <input type="number" id="gasWatchMaxGweiInput" class="gas-watch-input mono" value="15" min="1" max="500" step="1" />
+                  </label>
+                  <button type="submit" class="btn-pill-dark btn-sm">Watch Gas</button>
+                </form>
+                <div class="gas-watch-list" id="gasWatchListHost">
+                  <div class="muted-xs" style="padding:4px 0;">No gas-window triggers active yet.</div>
+                </div>
+              </div>
             </div>
 
             <!-- RIGHT: API Access Tokens -> Claude MCP -> ChatGPT Action -->
@@ -825,5 +862,6 @@
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>
 
     <script type="module" src="/app.js?v=8"></script>
+    <script type="module" src="/preservation.js?v=1"></script>
   </body>
 </html>

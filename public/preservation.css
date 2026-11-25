@@ -1,0 +1,351 @@
+/* =====================================================================
+   SIPHON — CAPITAL-PRESERVATION STRIP & GAS-WINDOW WATCHDOG AGENTS
+   Matches daylight porcelain (#FCFCFC), stark black ink (#0A0A0A),
+   1px hairlines (#E4E6EB), emerald allow (#059669), and ice-cyan (#C6F4FF).
+   Zero horizontal overflow across 1440px / 900px / 390px viewports.
+   ===================================================================== */
+
+.preservation-strip-host {
+  margin-bottom: 14px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.preservation-strip {
+  background: var(--bg-surface, #ffffff);
+  border: 1px solid var(--border, #e4e6eb);
+  border-radius: 12px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.preservation-main-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+  min-width: 0;
+}
+
+.preservation-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  min-width: 0;
+  flex: 1 1 320px;
+}
+
+.preservation-score-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-0, #0a0a0a);
+  letter-spacing: -0.01em;
+  min-width: 0;
+}
+
+.preservation-score-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--allow, #059669);
+  flex-shrink: 0;
+}
+
+.preservation-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.preservation-pill-saved {
+  background: var(--allow-bg, #ecfdf5);
+  border: 1px solid #a7f3d0;
+  color: #065f46;
+}
+
+.preservation-pill-popups {
+  background: var(--ice-soft, #e8faff);
+  border: 1px solid var(--ice-border, #7dd3fc);
+  color: #0c4a6e;
+}
+
+.preservation-pill-route {
+  background: var(--bg-well, #f4f5f7);
+  border: 1px solid var(--border, #e4e6eb);
+  color: var(--ink-1, #27272a);
+}
+
+.preservation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  max-width: 100%;
+}
+
+.preservation-apply-btn {
+  padding: 7px 14px;
+  font-size: 12.5px;
+  line-height: 1.25;
+}
+
+.preservation-apply-btn.is-applied {
+  background: var(--allow-bg, #ecfdf5);
+  border-color: #34d399;
+  color: #065f46;
+}
+
+.preservation-apply-btn.is-applied:hover {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.preservation-sub-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding-top: 9px;
+  border-top: 1px solid var(--border, #e4e6eb);
+  min-width: 0;
+}
+
+.preservation-gas-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  background: var(--hold-bg, #fffbeb);
+  border: 1px solid #fcd34d;
+  color: #92400e;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  max-width: 100%;
+  min-width: 0;
+  text-align: left;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.preservation-gas-pill:hover {
+  background: #fef3c7;
+  border-color: #f59e0b;
+}
+
+.preservation-gas-pill.is-watching {
+  background: var(--allow-bg, #ecfdf5);
+  border-color: #6ee7b7;
+  color: #065f46;
+}
+
+.preservation-gas-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #d97706;
+  flex-shrink: 0;
+}
+
+.preservation-gas-pill.is-watching .preservation-gas-dot {
+  background: var(--allow, #059669);
+}
+
+.preservation-unlock-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--bg-well, #f4f5f7);
+  border: 1px solid var(--border, #e4e6eb);
+  color: var(--ink-2, #52525b);
+  font-size: 11.5px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.preservation-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 11.5px;
+  color: var(--ink-2, #52525b);
+  min-width: 0;
+}
+
+/* Agents View: Gas-Window Watchdog Card */
+.preservation-agents-card {
+  margin-top: 16px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.gas-watch-live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--bg-well, #f4f5f7);
+  border: 1px solid var(--border, #e4e6eb);
+  font-size: 11.5px;
+  color: var(--ink-1, #27272a);
+  white-space: nowrap;
+}
+
+.gas-watch-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  padding: 14px 18px 0;
+}
+
+.gas-watch-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.gas-watch-input,
+.gas-watch-select {
+  width: 100%;
+  min-width: 0;
+  background: var(--bg-well, #f4f5f7);
+  border: 1px solid var(--border, #e4e6eb);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 12.5px;
+  color: var(--ink-0, #0a0a0a);
+}
+
+.gas-watch-list {
+  padding: 14px 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.gas-watch-item {
+  border: 1px solid var(--border, #e4e6eb);
+  border-radius: 10px;
+  padding: 11px 13px;
+  background: var(--bg-paper, #fcfcfc);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.gas-watch-item-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.gas-watch-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.gas-watch-status.is-watching {
+  background: var(--hold-bg, #fffbeb);
+  color: #92400e;
+  border: 1px solid #fde68a;
+}
+
+.gas-watch-status.is-ready {
+  background: var(--allow-bg, #ecfdf5);
+  color: #065f46;
+  border: 1px solid #a7f3d0;
+}
+
+.gas-watch-status.is-cancelled,
+.gas-watch-status.is-expired {
+  background: var(--bg-well, #f4f5f7);
+  color: var(--ink-3, #71717a);
+  border: 1px solid var(--border, #e4e6eb);
+}
+
+.gas-watch-meta {
+  font-size: 11.5px;
+  color: var(--ink-2, #52525b);
+  word-break: break-word;
+}
+
+.gas-watch-safety {
+  font-size: 11.5px;
+  color: var(--ink-3, #71717a);
+}
+
+@media (max-width: 900px) {
+  .gas-watch-form {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .gas-watch-form button[type='submit'] {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 560px) {
+  .preservation-strip {
+    padding: 11px 12px;
+  }
+  .preservation-metrics {
+    flex-basis: 100%;
+    gap: 6px;
+  }
+  .preservation-actions {
+    width: 100%;
+  }
+  .preservation-apply-btn {
+    width: 100%;
+    justify-content: center;
+  }
+  .preservation-gas-pill {
+    width: 100%;
+    border-radius: 10px;
+    white-space: normal;
+  }
+  .preservation-pill {
+    white-space: normal;
+  }
+  .gas-watch-form {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 12px 14px 0;
+  }
+  .gas-watch-list {
+    padding: 12px 14px 14px;
+  }
+}

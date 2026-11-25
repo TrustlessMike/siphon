@@ -41,6 +41,7 @@ import {
   type AgentActionType,
   type PluginClientKind,
 } from '../agent/mandate-engine.js';
+import { PreservationAgentStore } from '../agent/preservation-agents.js';
 import {
   buildAiPluginManifest,
   buildOpenApiSpec,
@@ -53,6 +54,7 @@ import { evaluatePortfolioRoi } from '../scanner/roi.js';
 import type { AnyChainId, ChainFamily, EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
 import { BoundedTtlCache } from './cache.js';
 import { BackgroundJobStore, type JobLegStatus } from './jobs.js';
+import { handlePreservationRoute } from './preservation-routes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -99,6 +101,7 @@ export interface SiphonServerOptions {
   jobStoreMaxJobs?: number;
   jobStoreTtlMs?: number;
   nowMs?: () => number;
+  liveGasFetcher?: (chain: EvmChainId) => Promise<number | null>;
 }
 
 const VALID_JOB_LEG_STATUSES = new Set<JobLegStatus>([
@@ -271,6 +274,8 @@ function isAdminMutationRoute(pathname: string, method: string): boolean {
     pathname === '/api/agents/mandates' ||
     (pathname.startsWith('/api/agents/mandates/') && pathname.endsWith('/revoke')) ||
     (pathname.startsWith('/api/agents/approvals/') && pathname.endsWith('/decide')) ||
+    pathname === '/api/agents/gas-watch' ||
+    (pathname.startsWith('/api/agents/gas-watch/') && pathname.endsWith('/cancel')) ||
     pathname === '/api/plugin/tokens' ||
     (pathname.startsWith('/api/plugin/tokens/') && pathname.endsWith('/revoke')) ||
     pathname === '/api/jobs' ||
@@ -281,7 +286,9 @@ function isAdminMutationRoute(pathname: string, method: string): boolean {
 function isAgentReadRoute(pathname: string, method: string): boolean {
   return (
     method === 'GET' &&
-    (pathname === '/api/agents/mandates' || pathname === '/api/agents/approvals')
+    (pathname === '/api/agents/mandates' ||
+      pathname === '/api/agents/approvals' ||
+      pathname === '/api/agents/gas-watch')
   );
 }
 
@@ -520,6 +527,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
     nowMs: opts.nowMs,
   });
   const agentEngine = new SiphonAgentEngine({ nowMs: opts.nowMs });
+  const preservationAgents = new PreservationAgentStore({ nowMs: opts.nowMs });
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -1775,6 +1783,24 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         });
       }
 
+      if (
+        await handlePreservationRoute({
+          req,
+          method,
+          pathname,
+          readJsonBody,
+          reply,
+          scanCache,
+          agentEngine,
+          preservationAgents,
+          maxPrivilegedBodyBytes: MAX_PRIVILEGED_JSON_BODY_BYTES,
+          nowMs: opts.nowMs,
+          liveGasFetcher: opts.liveGasFetcher,
+        })
+      ) {
+        return;
+      }
+
       if ((method === 'GET' || method === 'HEAD') && serveStaticFile(res, pathname, method === 'HEAD')) {
         return;
       }
@@ -1798,5 +1824,5 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
     jobStore.dispose();
   });
 
-  return { server, scanCache, jobStore, agentEngine };
+  return { server, scanCache, jobStore, agentEngine, preservationAgents };
 }
