@@ -129,9 +129,17 @@ function safeWalletIconUrl(iconUrl, fallbackLocal) {
 }
 
 function csvCell(val) {
-  let s = String(val ?? '');
-  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
-  return `"${s.replaceAll('"', '""')}"`;
+  const raw = String(val ?? '');
+  const hadLeadingTrigger = /^[=+\-@\t\r]/.test(raw);
+  // Strip CR/LF and NUL control characters so no cell can break CSV row boundaries
+  let cleaned = raw
+    .replace(/^[\r\n]+/, '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\u0000/g, '');
+  if (hadLeadingTrigger || /^[=+\-@\t\r]/.test(cleaned) || /^\s+[=+\-@]/.test(cleaned)) {
+    cleaned = `'${cleaned}`;
+  }
+  return `"${cleaned.replaceAll('"', '""')}"`;
 }
 
 function needsDarkLogoBacking(str) {
@@ -4423,7 +4431,7 @@ function wireEvents() {
     a.href = url;
     a.download = `siphon-burn-receipt-${Date.now()}.csv`;
     a.click();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
     showToast('Downloaded CSV burn receipt.');
   });
 

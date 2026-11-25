@@ -1434,6 +1434,302 @@ def main():
             }
             ctxM.close()
 
+            # ------------------------------------------------------------------
+            # 6. BURN CSV FORMULA-INJECTION EXPORT & JSON COPY, PLUGIN TOKENS
+            #    ISSUE/REVOKE, SOL OUTPUT TOGGLE, AND EVM 4001 REJECTION RECOVERY
+            # ------------------------------------------------------------------
+            ctxE = browser.new_context(viewport={"width": 1440, "height": 900}, accept_downloads=True)
+            pgE = ctxE.new_page()
+            errsE = []
+            badHttpE = []
+            pgE.on("pageerror", lambda e: errsE.append(f"pageerror: {e}"))
+            pgE.on("console", lambda m: errsE.append(f"console.{m.type}: {m.text}") if m.type == "error" else None)
+            pgE.on(
+                "response",
+                lambda r: badHttpE.append(f"{r.status} {r.request.method} {r.url}")
+                if r.status >= 400 and "/api/solana/balance" not in r.url
+                else None,
+            )
+
+            pgE.add_init_script(f"""
+              window.__copiedTexts = [];
+              try {{
+                Object.defineProperty(navigator, 'clipboard', {{
+                  configurable: true,
+                  value: {{
+                    async writeText(text) {{
+                      window.__copiedTexts.push(String(text));
+                    }},
+                  }},
+                }});
+              }} catch {{}}
+
+              window.__rejectNextConnect = true;
+              window.__rejectNextSendCalls = true;
+              window.__evm4001Rpc = [];
+              let chainHex = '0x2105';
+              const evmProvider = {{
+                isMetaMask: true,
+                on() {{}},
+                removeListener() {{}},
+                async request({{ method, params }}) {{
+                  window.__evm4001Rpc.push({{ method, params }});
+                  if (method === 'eth_requestAccounts') {{
+                    if (window.__rejectNextConnect) {{
+                      window.__rejectNextConnect = false;
+                      const err = new Error('User rejected the request.');
+                      err.code = 4001;
+                      throw err;
+                    }}
+                    return ['{VITALIK}'];
+                  }}
+                  if (method === 'eth_chainId') return chainHex;
+                  if (method === 'wallet_switchEthereumChain') {{
+                    chainHex = params[0].chainId;
+                    return null;
+                  }}
+                  if (method === 'wallet_getCapabilities') {{
+                    return {{
+                      '0x2105': {{ atomic: {{ status: 'supported' }} }},
+                    }};
+                  }}
+                  if (method === 'wallet_sendCalls') {{
+                    if (window.__rejectNextSendCalls) {{
+                      window.__rejectNextSendCalls = false;
+                      const err = new Error('User rejected the request.');
+                      err.code = 4001;
+                      throw err;
+                    }}
+                    return {{ id: '0xbatch_after_4001' }};
+                  }}
+                  if (method === 'wallet_getCallsStatus') {{
+                    return {{ status: 200, receipts: [{{ transactionHash: '0x' + 'dd'.repeat(32), status: '0x1' }}] }};
+                  }}
+                  if (method === 'eth_sendTransaction') {{
+                    return '0x' + 'ee'.repeat(32);
+                  }}
+                  return null;
+                }},
+              }};
+              window.ethereum = evmProvider;
+              window.phantom = {{
+                solana: {{
+                  isPhantom: true,
+                  on() {{}},
+                  removeListener() {{}},
+                  async connect() {{ return {{ publicKey: {{ toString: () => '{SOL_PUBKEY}' }} }}; }},
+                  async disconnect() {{}},
+                }},
+              }};
+            """)
+
+            def route_export_scan(route):
+                scan_copy = json.loads(json.dumps(veteran_fixture))
+                scan_copy["walletAddress"] = VITALIK
+                scan_copy["assets"].extend([
+                    {
+                        "id": "polygon-csv-honeypot",
+                        "chain": "polygon",
+                        "chainId": 137,
+                        "chainName": "Polygon",
+                        "address": "0x3333333333333333333333333333333333333333",
+                        "symbol": "=CMD|' /C calc'!A0",
+                        "name": "Formula Honeypot",
+                        "decimals": 18,
+                        "rawBalance": "1000000000000000000000",
+                        "uiBalance": 1000,
+                        "priceUsd": 0,
+                        "grossUsd": 0,
+                        "liquidityUsd": 0,
+                        "estimatedGasUsd": 0.01,
+                        "batchedGasUsd": 0.01,
+                        "estimatedSlippageUsd": 0,
+                        "netUsdcSingle": 0,
+                        "netUsdcBatched": 0,
+                        "kind": "dead_token",
+                        "action": "SKIP_HONEYPOT",
+                        "actionReason": "+SUM(A1:A2)\r\n=EVIL",
+                        "selectedByDefault": False,
+                        "honeypotSafe": False,
+                    },
+                    {
+                        "id": "base-csv-burn",
+                        "chain": "base",
+                        "chainId": 8453,
+                        "chainName": "Base",
+                        "address": "0x4444444444444444444444444444444444444444",
+                        "symbol": '@HYPERLINK("http://evil.example","x")',
+                        "name": "Formula Dead Token",
+                        "decimals": 18,
+                        "rawBalance": "50000000000000000000",
+                        "uiBalance": 50,
+                        "priceUsd": 0,
+                        "grossUsd": 0,
+                        "liquidityUsd": 0,
+                        "estimatedGasUsd": 0.01,
+                        "batchedGasUsd": 0.01,
+                        "estimatedSlippageUsd": 0,
+                        "netUsdcSingle": 0,
+                        "netUsdcBatched": 0,
+                        "kind": "dead_token",
+                        "action": "SKIP_HONEYPOT",
+                        "actionReason": "-1+1",
+                        "selectedByDefault": False,
+                        "honeypotSafe": False,
+                    },
+                ])
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(scan_copy))
+
+            pgE.route("**/api/scan", route_export_scan)
+            pgE.route("**/api/solana/balance*", route_sol_balance)
+            pgE.route("**/api/tx/prepare-chain-batch", route_prepare_base_eip5792)
+
+            pgE.goto(BASE, wait_until="networkidle")
+            pgE.wait_for_timeout(300)
+
+            # 6A. EVM Wallet 4001 User-Rejection on Connect -> Graceful Recovery on Retry
+            pgE.click("#heroConnectBtn")
+            pgE.wait_for_selector("#walletModalBackdrop:not(.hidden)")
+            pgE.click("[data-pick-evm]")
+            pgE.wait_for_function(
+                "() => (document.getElementById('walletModalBackdrop')?.innerText || '').toLowerCase().includes('rejected') || (document.getElementById('toastRegion')?.innerText || '').toLowerCase().includes('rejected')",
+                timeout=5000,
+            )
+            assert pgE.locator("#walletModalBackdrop:not(.hidden)").count() == 1, "Modal should stay open after 4001 connect rejection"
+
+            # Retry EVM connect -> succeeds cleanly
+            pgE.click("[data-pick-evm]")
+            pgE.wait_for_selector("#appShell:not(.hidden)", timeout=15000)
+            pgE.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=15000)
+
+            # Switch to Pro mode & connect Solana
+            pgE.click(".ui-mode-btn[data-ui-mode='pro']")
+            pgE.wait_for_function("() => document.documentElement.dataset.uiMode === 'pro'", timeout=5000)
+            pgE.click("#connectSolBtn")
+            pgE.wait_for_selector("[data-pick-sol]")
+            pgE.click("[data-pick-sol]")
+            pgE.wait_for_selector("#walletModalBackdrop", state="hidden")
+
+            # 6B. SOL Output Toggle (switches summary & payout logo to SOL, disables CCTP option, restores on USDC)
+            pgE.click(".seg-opt[data-out-asset='SOL']")
+            pgE.wait_for_function(
+                "() => document.querySelector('.seg-opt[data-out-asset=\"SOL\"]')?.classList.contains('active') && (document.getElementById('kpiNetUsdc')?.textContent || '').includes('SOL')",
+                timeout=8000,
+            )
+            sol_toggle = pgE.evaluate("""() => ({
+              netText: document.getElementById('kpiNetUsdc')?.textContent?.trim() || '',
+              logoSrc: document.getElementById('payoutAssetLogo')?.getAttribute('src') || '',
+              cctpDisabled: Boolean(document.querySelector("#bridgePrefSelect option[value='cctp']")?.disabled),
+              cctpLabel: document.querySelector("#bridgePrefSelect option[value='cctp']")?.textContent?.trim() || '',
+            })""")
+            assert "SOL" in sol_toggle["netText"], sol_toggle
+            assert "solana.svg" in sol_toggle["logoSrc"], sol_toggle
+            assert sol_toggle["cctpDisabled"] and "USDC only" in sol_toggle["cctpLabel"], sol_toggle
+
+            pgE.click(".seg-opt[data-out-asset='USDC']")
+            pgE.wait_for_function(
+                "() => document.querySelector('.seg-opt[data-out-asset=\"USDC\"]')?.classList.contains('active') && !(document.querySelector('#bridgePrefSelect option[value=\"cctp\"]')?.disabled)",
+                timeout=8000,
+            )
+
+            # 6C. EVM Wallet 4001 User-Rejection on Batch Execution -> No Sequential Fallback & Clean Retry Recovery
+            pgE.click("[data-exec-chain-batch='base']")
+            pgE.wait_for_function(
+                """() => (window.__evm4001Rpc || []).some(r => r.method === 'wallet_sendCalls')
+                  && !document.querySelector("[data-exec-chain-batch='base']")?.disabled
+                  && (document.getElementById('agentLegsFeed')?.innerText || '').toLowerCase().includes('rejected')""",
+                timeout=10000,
+            )
+            # Must NOT fall back to eth_sendTransaction after 4001 user rejection, and button must unlock for retry
+            after_4001_exec = pgE.evaluate("""() => ({
+              rpcMethods: (window.__evm4001Rpc || []).map(r => r.method),
+              baseBtnDisabled: Boolean(document.querySelector("[data-exec-chain-batch='base']")?.disabled),
+            })""")
+            assert "wallet_sendCalls" in after_4001_exec["rpcMethods"], after_4001_exec
+            assert "eth_sendTransaction" not in after_4001_exec["rpcMethods"], f"4001 rejection wrongly fell back to eth_sendTransaction: {after_4001_exec}"
+            assert not after_4001_exec["baseBtnDisabled"], f"Base batch button stuck disabled after 4001 rejection: {after_4001_exec}"
+
+            # Retry Base batch -> succeeds cleanly on second attempt
+            pgE.click("[data-exec-chain-batch='base']")
+            pgE.wait_for_function(
+                "() => (window.__evm4001Rpc || []).filter(r => r.method === 'wallet_sendCalls').length === 2",
+                timeout=10000,
+            )
+
+            # 6D. Burn Receipt CSV Formula-Injection Export (#downloadBurnCsvBtn) & JSON Copy (#copyBurnJsonBtn)
+            pgE.click(".app-tab[data-view='activity']")
+            pgE.wait_for_selector("#downloadBurnCsvBtn", timeout=5000)
+            pgE.wait_for_selector("#copyBurnJsonBtn", timeout=5000)
+
+            with pgE.expect_download(timeout=10000) as dl_info:
+                pgE.click("#downloadBurnCsvBtn")
+            download = dl_info.value
+            assert download.suggested_filename.startswith("siphon-burn-receipt-") and download.suggested_filename.endswith(".csv"), download.suggested_filename
+            csv_path = download.path()
+            with open(csv_path, "r", encoding="utf-8") as fh:
+                csv_text = fh.read()
+            assert "\r" not in csv_text, f"Raw CR leaked into CSV export: {csv_text!r}"
+            csv_lines = csv_text.split("\n")
+            assert csv_lines[0] == "chain,symbol,token_address,amount,status,burn_sink,reason", csv_lines[0]
+            assert len(csv_lines) >= 3, f"Expected header + >=2 burn rows, got {len(csv_lines)}: {csv_lines}"
+            assert "\"'=CMD|' /C calc'!A0\"" in csv_text, f"Missing neutralized =CMD payload in CSV: {csv_text}"
+            assert "\"'+SUM(A1:A2) =EVIL\"" in csv_text, f"Missing neutralized +SUM/CRLF payload in CSV: {csv_text}"
+            assert "\"'@HYPERLINK(\"\"http://evil.example\"\",\"\"x\"\")\"" in csv_text, f"Missing neutralized @HYPERLINK payload in CSV: {csv_text}"
+            assert "\"'-1+1\"" in csv_text, f"Missing neutralized -1+1 payload in CSV: {csv_text}"
+
+            pgE.click("#copyBurnJsonBtn")
+            pgE.wait_for_function("() => (window.__copiedTexts || []).length >= 1", timeout=5000)
+            copied_json_raw = pgE.evaluate("() => window.__copiedTexts[window.__copiedTexts.length - 1]")
+            copied_manifest = json.loads(copied_json_raw)
+            assert isinstance(copied_manifest, list) and len(copied_manifest) >= 2, copied_manifest
+            assert any(item.get("symbol") == "=CMD|' /C calc'!A0" for item in copied_manifest), copied_manifest
+
+            # 6E. Plugin Tokens Issue (#issueMcpTokenBtn & #issueGptTokenBtn) + Revoke ([data-revoke-token])
+            pgE.click(".app-tab[data-view='agents']")
+            pgE.wait_for_selector("#issueMcpTokenBtn", timeout=5000)
+            pgE.wait_for_selector("#issueGptTokenBtn", timeout=5000)
+
+            pgE.click("#issueMcpTokenBtn")
+            pgE.wait_for_selector("[data-revoke-token][data-token-client='claude_mcp']", timeout=8000)
+            pgE.wait_for_function(
+                "() => !(document.getElementById('claudeMcpConfigHost')?.innerText || '').includes('<generate Claude token above>')",
+                timeout=5000,
+            )
+
+            pgE.click("#issueGptTokenBtn")
+            pgE.wait_for_selector("[data-revoke-token][data-token-client='chatgpt_action']", timeout=8000)
+            pgE.wait_for_function(
+                "() => !(document.getElementById('chatgptPluginHost')?.innerText || '').includes('<generate ChatGPT token above>')",
+                timeout=5000,
+            )
+
+            # Revoke both tokens via [data-revoke-token]
+            pgE.locator("[data-revoke-token][data-token-client='claude_mcp']").first.click()
+            pgE.wait_for_function(
+                "() => (document.getElementById('pluginTokensHost')?.innerText || '').includes('Revoked')",
+                timeout=8000,
+            )
+            pgE.locator("[data-revoke-token][data-token-client='chatgpt_action']").first.click()
+            pgE.wait_for_function(
+                "() => document.querySelectorAll('#pluginTokensHost [data-revoke-token]').length === 0",
+                timeout=8000,
+            )
+
+            overflowE = pgE.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
+            assert overflowE <= 0, f"Export/Tokens/4001 view overflow: {overflowE}"
+            assert not errsE, f"Export/Tokens/4001 errors: {errsE}"
+            assert not badHttpE, f"Export/Tokens/4001 bad HTTP: {badHttpE}"
+            results["export_tokens_sol_4001"] = {
+                "ok": True,
+                "evm4001ConnectAndExecRecovered": True,
+                "solToggleVerified": True,
+                "burnCsvSanitizedRows": len(csv_lines) - 1,
+                "burnJsonCopiedCount": len(copied_manifest),
+                "pluginTokensIssuedAndRevoked": 2,
+                "overflowPx": overflowE,
+            }
+            ctxE.close()
+
             browser.close()
 
         print(json.dumps(results, indent=2))

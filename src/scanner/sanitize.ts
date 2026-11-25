@@ -32,3 +32,50 @@ export function sanitizeFreeText(raw?: string | null, maxLen = 200, fallback = '
     .slice(0, maxLen);
   return cleaned || fallback;
 }
+
+const CSV_FORMULA_TRIGGER_RE = /^[=+\-@\t\r]/;
+const CSV_LEADING_WS_FORMULA_RE = /^\s+[=+\-@]/;
+
+/**
+ * Neutralize spreadsheet formula injection (OWASP CSV Injection) and strip CR/LF control chars
+ * before RFC-4180 quoting so untrusted on-chain symbols/names/reasons cannot execute formulas
+ * or split rows in Excel, Google Sheets, or LibreOffice Calc.
+ */
+export function sanitizeCsvCell(val: unknown): string {
+  const raw = String(val ?? '');
+  const hadLeadingTrigger = CSV_FORMULA_TRIGGER_RE.test(raw);
+  // Strip CR/LF and NUL control characters so no cell can break CSV row boundaries
+  let cleaned = raw
+    .replace(/^[\r\n]+/, '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\u0000/g, '');
+  if (
+    hadLeadingTrigger ||
+    CSV_FORMULA_TRIGGER_RE.test(cleaned) ||
+    CSV_LEADING_WS_FORMULA_RE.test(cleaned)
+  ) {
+    cleaned = `'${cleaned}`;
+  }
+  return `"${cleaned.replaceAll('"', '""')}"`;
+}
+
+export interface BurnReceiptCsvRow {
+  chain: string;
+  symbol: string;
+  tokenAddress: string;
+  amount: string;
+  status: string;
+  burnSink: string;
+  reason: string;
+}
+
+export const BURN_RECEIPT_CSV_HEADER = 'chain,symbol,token_address,amount,status,burn_sink,reason';
+
+export function formatBurnReceiptCsv(rows: readonly BurnReceiptCsvRow[]): string {
+  const lines = rows.map((b) =>
+    [b.chain, b.symbol, b.tokenAddress, b.amount, b.status, b.burnSink, b.reason]
+      .map(sanitizeCsvCell)
+      .join(',')
+  );
+  return [BURN_RECEIPT_CSV_HEADER, ...lines].join('\n');
+}
