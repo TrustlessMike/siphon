@@ -2683,3 +2683,531 @@ select {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* =====================================================================
+   DEFI POSITIONS QUICK-UNWIND PANEL & AUTOMATIC GUIDED STEPPER
+   ===================================================================== */
+
+.defi-unwind-panel {
+  overflow: hidden;
+  border-color: var(--border-strong);
+  background: var(--bg-surface);
+}
+
+.defi-unwind-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  flex-wrap: wrap;
+  padding: 16px 18px;
+  background: linear-gradient(180deg, #f8fdff 0%, #ffffff 100%);
+  border-bottom: 1px solid var(--border);
+}
+
+.defi-unwind-title-wrap {
+  min-width: 0;
+  flex: 1 1 240px;
+}
+
+.defi-unwind-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.defi-unwind-title-row h2 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--ink-0);
+}
+
+.defi-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--ice-row);
+  border: 1px solid var(--ice-border);
+  color: #0369a1;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.defi-unwind-sub {
+  margin: 3px 0 0;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  line-height: 1.4;
+}
+
+.defi-unwind-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  max-width: 100%;
+}
+
+.defi-extract-all-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Automatic Guided Stepper */
+.defi-stepper {
+  padding: 14px 18px;
+  background: var(--bg-paper);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.defi-stepper-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+
+.defi-stepper-rail {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.defi-step {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+
+.defi-step.is-active {
+  border-color: var(--ice-border);
+  background: #f3fcff;
+}
+
+.defi-step.is-done {
+  border-color: #a7f3d0;
+  background: var(--allow-bg);
+}
+
+.defi-step.is-failed {
+  border-color: #fecaca;
+  background: var(--block-bg);
+}
+
+.defi-step-top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.defi-step-dot {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--bg-well);
+  border: 1px solid var(--border-strong);
+  color: var(--ink-2);
+  font-size: 10.5px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.defi-step.is-active .defi-step-dot {
+  background: var(--ink-0);
+  border-color: var(--ink-0);
+  color: #ffffff;
+}
+
+.defi-step.is-done .defi-step-dot {
+  background: var(--allow);
+  border-color: var(--allow);
+  color: #ffffff;
+}
+
+.defi-step.is-failed .defi-step-dot {
+  background: var(--block);
+  border-color: var(--block);
+  color: #ffffff;
+}
+
+.defi-step-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-0);
+  line-height: 1.3;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.defi-step-detail {
+  font-size: 11.5px;
+  color: var(--ink-2);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+/* Protocol Groups */
+.defi-protocol-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px 16px;
+}
+
+.defi-protocol-group {
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--bg-paper);
+  overflow: hidden;
+}
+
+.defi-proto-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 12px;
+  flex-wrap: wrap;
+  padding: 11px 14px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.defi-proto-id {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.defi-proto-logo-tile {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--bg-paper);
+  border: 1px solid var(--border);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 5px;
+}
+
+.defi-proto-logo-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.defi-proto-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.defi-proto-meta strong {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--ink-0);
+  line-height: 1.25;
+}
+
+.defi-proto-extract-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 999px;
+}
+
+.defi-proto-extract-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.defi-pos-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.defi-pos-row {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+  transition: background 110ms ease;
+}
+
+.defi-pos-row:last-child {
+  border-bottom: none;
+}
+
+.defi-pos-row.is-checked {
+  background: rgba(220, 247, 255, 0.24);
+}
+
+.defi-pos-row.is-restricted {
+  background: #fafafa;
+}
+
+.defi-pos-main {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+}
+
+.defi-pos-check-wrap {
+  padding-top: 2px;
+  display: inline-flex;
+  cursor: pointer;
+}
+
+.defi-pos-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.defi-pos-route-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-0);
+  line-height: 1.38;
+}
+
+.defi-route-text {
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.defi-pos-badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.defi-exit-badge,
+.defi-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  border: 1px solid transparent;
+  max-width: 100%;
+}
+
+.defi-badge-oneclick {
+  background: var(--ice-soft);
+  border-color: var(--ice-border);
+  color: #0369a1;
+}
+
+.defi-badge-swap {
+  background: #f5f3ff;
+  border-color: #ddd6fe;
+  color: #5b21b6;
+}
+
+.defi-badge-guard {
+  background: var(--hold-bg);
+  border-color: #fde68a;
+  color: #92400e;
+}
+
+.defi-badge-cooldown {
+  background: var(--bg-well);
+  border-color: var(--border-strong);
+  color: var(--ink-2);
+}
+
+.defi-status-verified {
+  background: var(--allow-bg);
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+
+.defi-status-warn {
+  background: var(--hold-bg);
+  border-color: #fde68a;
+  color: #92400e;
+}
+
+.defi-status-blocked {
+  background: var(--block-bg);
+  border-color: #fecaca;
+  color: #991b1b;
+}
+
+.defi-pos-warning {
+  font-size: 12px;
+  line-height: 1.42;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid #fde68a;
+  background: var(--hold-bg);
+  color: #92400e;
+  overflow-wrap: break-word;
+}
+
+.defi-pos-warning.is-blocked {
+  border-color: #fecaca;
+  background: var(--block-bg);
+  color: #991b1b;
+}
+
+.defi-pos-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  white-space: nowrap;
+}
+
+.defi-pos-usd {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink-0);
+}
+
+/* Collapsed Technical Details Disclosure */
+.defi-tech-details {
+  margin-top: 1px;
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+
+.defi-tech-details > summary {
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 500;
+  color: var(--ink-3);
+  padding: 2px 0;
+}
+
+.defi-tech-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.defi-tech-details > summary::before {
+  content: '▸';
+  font-size: 10px;
+  transition: transform 120ms ease;
+}
+
+.defi-tech-details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.defi-tech-details > summary:hover {
+  color: var(--ink-0);
+}
+
+.defi-tech-grid {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg-well);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.defi-tech-kv {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.defi-tech-kv span {
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+
+.defi-tech-kv code {
+  font-size: 11px;
+  color: var(--ink-1);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+@media (max-width: 720px) {
+  .defi-unwind-head {
+    padding: 13px 14px;
+    align-items: stretch;
+  }
+  .defi-unwind-actions {
+    width: 100%;
+  }
+  .defi-extract-all-btn {
+    width: 100%;
+    white-space: normal;
+    text-align: center;
+    padding: 9px 14px;
+  }
+  .defi-stepper {
+    padding: 12px 14px;
+  }
+  .defi-stepper-rail {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .defi-protocol-groups {
+    padding: 12px;
+    gap: 10px;
+  }
+  .defi-proto-head {
+    padding: 10px 12px;
+  }
+  .defi-proto-extract-btn {
+    width: 100%;
+  }
+  .defi-pos-row {
+    padding: 11px 12px;
+  }
+  .defi-pos-main {
+    grid-template-columns: 18px minmax(0, 1fr);
+    gap: 8px;
+  }
+  .defi-pos-right {
+    grid-column: 2;
+    flex-direction: row;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-top: 2px;
+  }
+}

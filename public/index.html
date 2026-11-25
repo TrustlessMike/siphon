@@ -15,7 +15,7 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=5" />
+    <link rel="stylesheet" href="/styles.css?v=6" />
   </head>
   <body>
     <!-- =============================================================== -->
@@ -276,8 +276,32 @@
 
           <!-- 2-Column Calm Workspace -->
           <div class="sweep-workspace">
-            <!-- LEFT COLUMN: Chain Filter Pills + Clean Selectable Asset List -->
+            <!-- LEFT COLUMN: Dedicated DeFi Quick-Unwind + Chain Filter Pills + Clean Selectable Asset List -->
             <div class="sweep-left">
+              <!-- Dedicated DeFi Positions Quick-Unwind Panel (Shown when DeFi assets are detected) -->
+              <section class="card defi-unwind-panel hidden" id="defiUnwindPanel" aria-label="DeFi Positions Quick-Unwind">
+                <div class="defi-unwind-head">
+                  <div class="defi-unwind-title-wrap">
+                    <div class="defi-unwind-title-row">
+                      <h2>DeFi Positions</h2>
+                      <span class="defi-count-badge mono" id="defiCountBadge">0</span>
+                    </div>
+                    <p class="defi-unwind-sub" id="defiUnwindSub">Withdraw protocol deposits and settle cleanly on Solana.</p>
+                  </div>
+                  <div class="defi-unwind-actions">
+                    <button type="button" class="btn-pill-dark btn-sm defi-extract-all-btn" id="extractAllDefiBtn">
+                      Extract All Ready DeFi → Solana
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Automatic Guided Stepper (Visible during and after DeFi extraction) -->
+                <div class="defi-stepper hidden" id="defiGuidedStepper" aria-live="polite"></div>
+
+                <!-- Protocol-Grouped DeFi Positions -->
+                <div class="defi-protocol-groups" id="defiProtocolGroups"></div>
+              </section>
+
               <!-- Chain Filter Chips with Official Logos -->
               <div class="chain-filter-bar" id="chainFilterBar" role="group" aria-label="Filter by source chain"></div>
 
@@ -694,6 +718,6 @@
 
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>
 
-    <script type="module" src="/app.js?v=5"></script>
+    <script type="module" src="/app.js?v=6"></script>
   </body>
 </html>

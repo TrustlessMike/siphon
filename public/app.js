@@ -1,5 +1,5 @@
-import { mountSiphonFunnelScene } from './siphon-3d.js?v=5';
-import { renderConvergenceSvg } from './siphon-svg.js?v=5';
+import { mountSiphonFunnelScene } from './siphon-3d.js?v=6';
+import { renderConvergenceSvg } from './siphon-svg.js?v=6';
 import {
   connectCoinbaseSmartWallet,
   connectEvmWallet,
@@ -31,7 +31,7 @@ import {
   signGaslessTypedData,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
-} from './wallets.js?v=5';
+} from './wallets.js?v=6';
 
 let currentScan = null;
 let currentPlan = null;
@@ -55,6 +55,7 @@ let unifiedWallets = []; // [{ address, label, family }]
 let agentMandates = [];
 let agentApprovals = [];
 let pluginSetupData = null;
+let defiStepperState = null;
 
 const FEE_RECIPIENT_STORAGE_KEY = 'siphon_fee_recipient_evm';
 
@@ -63,7 +64,16 @@ function escapeHtml(str) {
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+const escHtml = escapeHtml;
+
+function safeHttpUrl(url) {
+  const raw = String(url || '').trim();
+  if (/^https?:\/\//i.test(raw)) return escHtml(raw);
+  return '#';
 }
 
 function shortAddr(addr) {
@@ -171,10 +181,21 @@ function getChainLogoPath(chain) {
 
 function getProtocolLogoPath(protocol) {
   const p = String(protocol || '').toLowerCase();
+  if (!p) return null;
   if (p.includes('aave')) return '/logos/aave.svg';
   if (p.includes('lido')) return '/logos/lido.svg';
   if (p.includes('compound')) return '/logos/compound.svg';
-  return null;
+  if (p.includes('morpho')) return '/logos/morpho.svg';
+  if (p.includes('uniswap')) return '/logos/uniswap.svg';
+  if (p.includes('curve')) return '/logos/curve.svg';
+  if (p.includes('spark')) return '/logos/spark.svg';
+  if (p.includes('osmosis')) return '/logos/osmosis.svg';
+  if (p.includes('cosmos')) return '/logos/cosmos.svg';
+  if (p.includes('sui')) return '/logos/sui.svg';
+  if (p.includes('vault') || p.includes('4626') || p.includes('sky') || p.includes('ethena') || p.includes('yearn')) {
+    return '/logos/vault.svg';
+  }
+  return '/logos/vault.svg';
 }
 
 function getBridgeProviderLogosHtml(pref) {
@@ -462,6 +483,7 @@ async function runScan({ address = null, family = null, presetId = null, autoOpe
     }
     updateFamilyChrome();
     activeChainFilter = 'all';
+    defiStepperState = null;
     renderPreSignProofCard(null);
 
     selectedAssetIds = new Set(
@@ -616,6 +638,7 @@ function renderAll() {
   const svgHost = document.getElementById('convergenceSvgHost');
   if (svgHost) svgHost.innerHTML = renderConvergenceSvg(currentPlan, currentScan);
 
+  renderDefiUnwindPanel();
   renderChainFilterBar();
   renderAssetList();
   renderChainQueueList();
@@ -693,12 +716,627 @@ function renderRoiVerdictBadge(a) {
 }
 
 function compactActionTag(action) {
-  if (action === 'WITHDRAW_AND_BRIDGE') return `<span class="action-tag tag-defi">DeFi Exit</span>`;
+  if (action === 'WITHDRAW_AND_BRIDGE') return `<span class="action-tag tag-defi">1-Click Exit</span>`;
   if (action === 'BRIDGE_DIRECT_USDC') return `<span class="action-tag tag-direct">USDC</span>`;
   if (action === 'SELL_AND_BRIDGE') return `<span class="action-tag tag-sell">Swap</span>`;
   if (action === 'BURN_ZERO_LIQUIDITY') return `<span class="action-tag tag-burn">Burn</span>`;
   if (action === 'SKIP_HONEYPOT') return `<span class="action-tag tag-skip">Honeypot</span>`;
   return `<span class="action-tag tag-skip">Dust</span>`;
+}
+
+// =====================================================================
+// DEDICATED DEFI QUICK-UNWIND PANEL & AUTOMATIC GUIDED STEPPER
+// =====================================================================
+
+function isDefiAsset(a) {
+  return Boolean(a && (a.kind === 'defi_position' || a.action === 'WITHDRAW_AND_BRIDGE' || a.defiExitPlan));
+}
+
+function sanitizePlainDefiText(raw) {
+  if (!raw) return '';
+  return String(raw)
+    .replace(/\bWITHDRAW_AND_BRIDGE\b/g, 'protocol withdrawal')
+    .replace(/\bSELL_AND_BRIDGE\b/g, 'instant swap')
+    .replace(/\bBRIDGE_DIRECT_USDC\b/g, 'direct bridge')
+    .replace(/\bComet\.withdraw\([^)]*\)/gi, 'Compound withdrawal')
+    .replace(/\bPool\.withdraw\([^)]*\)/gi, 'Aave withdrawal')
+    .replace(/\bERC4626\.redeem\([^)]*\)/gi, 'Vault withdrawal')
+    .replace(/\b0x[0-9a-fA-F]{8,}\b/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function getProtocolGroupName(asset) {
+  const raw = String(
+    asset?.defiExitPlan?.protocolName || asset?.defiExitPlan?.protocol || asset?.protocol || ''
+  ).trim();
+  const low = raw.toLowerCase();
+  if (low.includes('aave')) return 'Aave v3';
+  if (low.includes('compound')) return 'Compound v3';
+  if (low.includes('morpho')) return 'Morpho / Vaults';
+  if (low.includes('lido')) return 'Lido';
+  if (low.includes('uniswap')) return 'Uniswap LP';
+  if (low.includes('curve')) return 'Curve';
+  if (low.includes('spark')) return 'Spark Vaults';
+  if (low.includes('sky')) return 'Sky Vaults';
+  if (low.includes('ethena')) return 'Ethena Vaults';
+  if (low.includes('erc-4626') || low.includes('erc4626') || low === 'vault') return 'Morpho / Vaults';
+  if (low.includes('cosmos')) return 'Cosmos Staking';
+  if (low.includes('sui')) return 'Sui Staking';
+  return raw || 'DeFi Vaults';
+}
+
+function getPlainDisplayToken(asset, plan) {
+  const sym = String(asset?.symbol || '').trim();
+  const underlying = String(plan?.underlyingSymbol || asset?.underlyingSymbol || '').trim();
+  if (!underlying) return sym || 'Token';
+  const lowSym = sym.toLowerCase();
+  const isReceiptToken =
+    lowSym.startsWith('aeth') ||
+    lowSym.startsWith('aarb') ||
+    lowSym.startsWith('apol') ||
+    lowSym.startsWith('abas') ||
+    lowSym.startsWith('aopt') ||
+    lowSym.startsWith('aava') ||
+    lowSym.startsWith('cusdc') ||
+    lowSym.startsWith('cweth') ||
+    lowSym.startsWith('sdai') ||
+    lowSym.startsWith('susds') ||
+    lowSym.startsWith('susde') ||
+    lowSym.startsWith('gt') ||
+    lowSym.startsWith('mw') ||
+    lowSym.includes('vault');
+  if (isReceiptToken) return underlying;
+  return sym || underlying;
+}
+
+function normalizeDefiPosition(asset, targetOut = outputAsset) {
+  const plan = asset?.defiExitPlan && typeof asset.defiExitPlan === 'object' ? asset.defiExitPlan : null;
+  const protocolGroup = getProtocolGroupName(asset);
+  const protocolLogo = getProtocolLogoPath(protocolGroup) || getProtocolLogoPath(asset?.protocol) || '/logos/vault.svg';
+  const chainLogo = getChainLogoPath(asset?.chain);
+  const modeRaw = String(plan?.mode || plan?.exitMode || plan?.strategy || '').toLowerCase();
+  const statusRaw = String(plan?.preflightStatus || plan?.status || plan?.healthStatus || '').toLowerCase();
+  const protoLow = protocolGroup.toLowerCase();
+
+  const hasDebt = Boolean(
+    plan?.debtGuardActive ||
+      modeRaw.includes('debt') ||
+      modeRaw.includes('partial') ||
+      (typeof asset?.aaveDebtUsd === 'number' && asset.aaveDebtUsd > 0)
+  );
+  const hasCooldown = Boolean(
+    modeRaw.includes('cooldown') ||
+      modeRaw.includes('lock') ||
+      modeRaw.includes('unstake') ||
+      statusRaw === 'cooldown' ||
+      statusRaw === 'locked' ||
+      asset?.stakedExitMode === 'native_unstake' ||
+      asset?.stakedExitMode === 'scheduled_authz_autosweep'
+  );
+  const isInstantSwap = Boolean(
+    modeRaw.includes('instant') ||
+      modeRaw.includes('swap') ||
+      asset?.stakedExitMode === 'instant_liquid_stake' ||
+      protoLow.includes('lido')
+  );
+
+  let category = 'one_click';
+  if (hasCooldown) category = 'cooldown';
+  else if (hasDebt) category = 'debt_guard';
+  else if (isInstantSwap) category = 'instant_swap';
+
+  const defaultBadges = {
+    one_click: '⚡ 1-Click Extract → Solana',
+    instant_swap: '🔄 Instant Swap (Skips Cooldown)',
+    debt_guard: '🛡️ Safe Partial (Debt Guard)',
+    cooldown: '⏳ Cooldown / Locked',
+  };
+  const badgeText =
+    plan?.badgeLabel || plan?.humanBadge
+      ? sanitizePlainDefiText(plan.badgeLabel || plan.humanBadge)
+      : defaultBadges[category];
+
+  const underlyingSym = String(plan?.underlyingSymbol || asset?.underlyingSymbol || asset?.symbol || 'USDC');
+  const displayToken = getPlainDisplayToken(asset, plan);
+  const withdrawableUi =
+    typeof plan?.withdrawableUi === 'number'
+      ? plan.withdrawableUi
+      : typeof plan?.maxSafeWithdrawUi === 'number'
+      ? plan.maxSafeWithdrawUi
+      : Number(asset?.uiBalance || 0);
+  const amountFmt = withdrawableUi.toLocaleString(undefined, { maximumFractionDigits: 4 });
+
+  const isNonUsdcContractExit =
+    category === 'one_click' &&
+    !isInstantSwap &&
+    underlyingSym.toUpperCase() !== 'USDC' &&
+    asset?.family !== 'cosmos' &&
+    asset?.family !== 'sui';
+  const requiresTwoStep = Boolean(
+    plan?.requiresSecondStep || plan?.twoStep || plan?.requiresFollowUpBridge || isNonUsdcContractExit
+  );
+  const sigCount =
+    typeof plan?.signaturesRequired === 'number'
+      ? plan.signaturesRequired
+      : typeof plan?.signatureCount === 'number'
+      ? plan.signatureCount
+      : requiresTwoStep || category === 'cooldown'
+      ? 2
+      : 1;
+  const sigLabel = sigCount <= 1 ? '1 signature' : `${sigCount} guided steps`;
+
+  const customRoute = plan?.routeLine || plan?.routeSummary || plan?.plainRoute;
+  const routeLine = customRoute
+    ? sanitizePlainDefiText(customRoute)
+    : `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken} → Solana ${targetOut} · ${sigLabel}`;
+
+  // Pre-flight status pill & plain-English warning reason
+  let preflightLevel = 'verified'; // 'verified' | 'warn' | 'blocked'
+  let preflightLabel = '✓ Verified withdrawable';
+  let warningReason = '';
+
+  const explicitlyBlocked = Boolean(
+    plan?.blocked ||
+      statusRaw === 'blocked' ||
+      statusRaw === 'reverted' ||
+      statusRaw === 'failed' ||
+      asset?.action === 'SKIP_HONEYPOT'
+  );
+
+  if (explicitlyBlocked) {
+    preflightLevel = 'blocked';
+    preflightLabel = '✕ Cannot withdraw';
+    warningReason =
+      sanitizePlainDefiText(plan?.blockReason || plan?.preflightMessage || plan?.warning || plan?.reason) ||
+      'Pre-flight check detected a restriction on this position.';
+  } else if (hasCooldown) {
+    preflightLevel = 'warn';
+    preflightLabel = '⏳ Cooldown required';
+    warningReason =
+      sanitizePlainDefiText(plan?.preflightMessage || plan?.cooldownLabel || plan?.warning || plan?.reason) ||
+      'This protocol requires an unbonding cooldown period before tokens can be bridged to Solana.';
+  } else if (hasDebt) {
+    const safePartialReady = Boolean(plan?.safePartialSupported || (typeof plan?.maxSafeWithdrawUi === 'number' && plan.maxSafeWithdrawUi > 0));
+    preflightLevel = safePartialReady ? 'warn' : 'blocked';
+    preflightLabel = safePartialReady ? '🛡️ Safe partial ready' : '🛡️ Debt guard active';
+    const debtStr = typeof asset?.aaveDebtUsd === 'number' ? `$${asset.aaveDebtUsd.toFixed(2)}` : 'active';
+    const hfStr = typeof asset?.aaveHealthFactor === 'number' ? ` (health factor ${asset.aaveHealthFactor.toFixed(2)})` : '';
+    warningReason =
+      sanitizePlainDefiText(plan?.preflightMessage || plan?.warning || plan?.reason) ||
+      (safePartialReady
+        ? `Active borrow of ${debtStr}${hfStr}. Siphon withdraws only the safe excess collateral.`
+        : `Active borrow of ${debtStr}${hfStr}. Repay borrow before full withdrawal to protect your position.`);
+  } else if (asset?.roiVerdict === 'negative_roi') {
+    preflightLevel = 'blocked';
+    preflightLabel = '✕ Fees exceed value';
+    warningReason =
+      sanitizePlainDefiText(plan?.preflightMessage || asset?.actionReason) ||
+      'Estimated network and bridge costs exceed the withdrawable value.';
+  } else if (asset?.roiVerdict === 'low_efficiency') {
+    preflightLevel = 'warn';
+    preflightLabel = '⚠ High network cost';
+    const pct = typeof asset?.effectiveCostPct === 'number' ? `${asset.effectiveCostPct.toFixed(0)}%` : 'elevated';
+    warningReason = `Verified withdrawable, though total fees are ${pct} of position value.`;
+  } else if (statusRaw === 'warn' || statusRaw === 'warning' || statusRaw === 'caution') {
+    preflightLevel = 'warn';
+    preflightLabel = sanitizePlainDefiText(plan?.preflightLabel) || '⚠ Review before exit';
+    warningReason = sanitizePlainDefiText(plan?.preflightMessage || plan?.warning || plan?.reason) || '';
+  }
+
+  const isReady =
+    preflightLevel === 'verified' ||
+    (preflightLevel === 'warn' && !hasCooldown && (!hasDebt || Boolean(plan?.safePartialSupported || (typeof plan?.maxSafeWithdrawUi === 'number' && plan.maxSafeWithdrawUi > 0))));
+
+  const contractAddress =
+    plan?.contractAddress || plan?.targetContract || plan?.poolAddress || asset?.protocolAddress || asset?.address || '—';
+  const calldataPreview = plan?.calldataPreview || plan?.calldata || asset?.calldataPreview || '';
+  const methodLabel = plan?.methodName || plan?.methodSignature || '';
+
+  return {
+    asset,
+    protocolGroup,
+    protocolLogo,
+    chainLogo,
+    category,
+    badgeText,
+    routeLine,
+    preflightLevel,
+    preflightLabel,
+    warningReason,
+    isReady,
+    requiresTwoStep,
+    sigCount,
+    underlyingSym,
+    displayToken,
+    contractAddress,
+    calldataPreview,
+    methodLabel,
+  };
+}
+
+function renderDefiGuidedStepper() {
+  const host = document.getElementById('defiGuidedStepper');
+  if (!host) return;
+  if (!defiStepperState) {
+    host.classList.add('hidden');
+    host.innerHTML = '';
+    return;
+  }
+
+  host.classList.remove('hidden');
+  const st = defiStepperState;
+  const stepsHtml = st.steps
+    .map((step, idx) => {
+      const icon =
+        step.status === 'done'
+          ? '✓'
+          : step.status === 'failed'
+          ? '!'
+          : step.status === 'active'
+          ? '◉'
+          : String(idx + 1);
+      const txHtml = step.txUrl
+        ? ` <a class="explorer-link" href="${safeHttpUrl(step.txUrl)}" target="_blank" rel="noreferrer">${escHtml(step.txLabel || 'View tx ↗')}</a>`
+        : '';
+      return `
+        <div class="defi-step is-${escHtml(step.status)}" data-stepper-step="${escHtml(step.id)}">
+          <div class="defi-step-top">
+            <span class="defi-step-dot mono">${escHtml(icon)}</span>
+            <strong class="defi-step-title">${escHtml(step.title)}</strong>
+          </div>
+          <div class="defi-step-detail">${escHtml(step.detail || '')}${txHtml}</div>
+        </div>
+      `;
+    })
+    .join('');
+
+  host.innerHTML = `
+    <div class="defi-stepper-head">
+      <div class="inline-logo-row">
+        <span class="agent-pulse-dot ${st.active ? '' : 'is-idle'}"></span>
+        <strong>${escHtml(st.title)}</strong>
+        <span class="mono muted-xs">${escHtml(st.mode === 'two_stage' ? 'Guided 2-Stage Auto-Bridge' : '1-Click Atomic Extract')}</span>
+      </div>
+      ${
+        st.dismissible
+          ? `<button type="button" class="text-action muted" id="dismissDefiStepperBtn">Dismiss</button>`
+          : `<span class="mono muted-xs">Auto-continuing…</span>`
+      }
+    </div>
+    <div class="defi-stepper-rail">${stepsHtml}</div>
+  `;
+
+  document.getElementById('dismissDefiStepperBtn')?.addEventListener('click', () => {
+    defiStepperState = null;
+    renderDefiGuidedStepper();
+    renderDefiUnwindPanel();
+  });
+}
+
+function initDefiStepper({ title, mode = 'atomic', jobId = null }) {
+  defiStepperState = {
+    active: true,
+    dismissible: false,
+    jobId,
+    title,
+    mode,
+    steps: [
+      {
+        id: 'withdraw',
+        title: 'Step 1: Withdraw from Protocol',
+        status: 'active',
+        detail: 'Preparing protocol withdrawal…',
+      },
+      {
+        id: 'bridge',
+        title: 'Step 2: Bridge Unlocked Asset to Solana',
+        status: 'pending',
+        detail: mode === 'two_stage' ? 'Starts automatically once Step 1 confirms' : `Bundled into Solana ${outputAsset} route`,
+      },
+      {
+        id: 'confirm',
+        title: 'Step 3: Confirmed on Solana',
+        status: 'pending',
+        detail: `Waiting for ${outputAsset} arrival on Solana`,
+      },
+    ],
+  };
+  renderDefiGuidedStepper();
+}
+
+function updateDefiStepperStep(stepId, patch, metaPatch = {}) {
+  if (!defiStepperState) return;
+  const target = defiStepperState.steps.find((s) => s.id === stepId);
+  if (target) Object.assign(target, patch);
+  Object.assign(defiStepperState, metaPatch);
+  renderDefiGuidedStepper();
+}
+
+function renderDefiUnwindPanel() {
+  const panel = document.getElementById('defiUnwindPanel');
+  const groupsHost = document.getElementById('defiProtocolGroups');
+  const countBadge = document.getElementById('defiCountBadge');
+  const subEl = document.getElementById('defiUnwindSub');
+  const extractAllBtn = document.getElementById('extractAllDefiBtn');
+  if (!panel || !groupsHost || !currentScan) return;
+
+  const defiRaw = currentScan.assets.filter(isDefiAsset);
+  if (!defiRaw.length && !defiStepperState) {
+    panel.classList.add('hidden');
+    groupsHost.innerHTML = '';
+    return;
+  }
+
+  panel.classList.remove('hidden');
+  renderDefiGuidedStepper();
+
+  const normalized = defiRaw.map((a) => normalizeDefiPosition(a, outputAsset));
+  const readyPositions = normalized.filter((n) => n.isReady);
+  const totalDefiUsd = normalized.reduce((s, n) => s + Number(n.asset.grossUsd || 0), 0);
+  const readyUsd = readyPositions.reduce((s, n) => s + Number(n.asset.grossUsd || 0), 0);
+  const uniqueChains = new Set(normalized.map((n) => n.asset.chain)).size;
+
+  if (countBadge) countBadge.textContent = String(normalized.length);
+  if (subEl) {
+    const readyPart =
+      readyPositions.length === normalized.length
+        ? `${readyPositions.length} ready ${readyPositions.length === 1 ? 'position' : 'positions'}`
+        : `${readyPositions.length} of ${normalized.length} ready`;
+    subEl.textContent = `${readyPart} · $${totalDefiUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} across ${uniqueChains} ${uniqueChains === 1 ? 'chain' : 'chains'} → Solana ${outputAsset}`;
+  }
+
+  if (extractAllBtn) {
+    extractAllBtn.disabled = readyPositions.length === 0;
+    extractAllBtn.textContent =
+      readyPositions.length > 0
+        ? `Extract All Ready DeFi → Solana (${fmtUsd(readyUsd)})`
+        : 'No Ready DeFi Positions';
+  }
+
+  // Group by normalized protocol name, sorted by descending USD value
+  const groupMap = new Map();
+  for (const pos of normalized) {
+    const key = pos.protocolGroup;
+    if (!groupMap.has(key)) {
+      groupMap.set(key, {
+        name: key,
+        logo: pos.protocolLogo,
+        positions: [],
+        totalUsd: 0,
+        readyCount: 0,
+      });
+    }
+    const grp = groupMap.get(key);
+    grp.positions.push(pos);
+    grp.totalUsd += Number(pos.asset.grossUsd || 0);
+    if (pos.isReady) grp.readyCount += 1;
+  }
+  const groups = Array.from(groupMap.values()).sort((a, b) => b.totalUsd - a.totalUsd);
+
+  groupsHost.innerHTML = groups
+    .map((grp) => {
+      const posRowsHtml = grp.positions
+        .map((pos) => {
+          const a = pos.asset;
+          const checked = selectedAssetIds.has(a.id);
+          const badgeClass =
+            pos.category === 'one_click'
+              ? 'defi-badge-oneclick'
+              : pos.category === 'instant_swap'
+              ? 'defi-badge-swap'
+              : pos.category === 'debt_guard'
+              ? 'defi-badge-guard'
+              : 'defi-badge-cooldown';
+          const statusClass =
+            pos.preflightLevel === 'verified'
+              ? 'defi-status-verified'
+              : pos.preflightLevel === 'warn'
+              ? 'defi-status-warn'
+              : 'defi-status-blocked';
+          const usdStr = `$${Number(a.grossUsd || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+
+          const techDetailsRows = [
+            `<div class="defi-tech-kv"><span>Protocol contract</span><code class="mono">${escHtml(pos.contractAddress)}</code></div>`,
+            `<div class="defi-tech-kv"><span>Position token</span><code class="mono">${escHtml(a.symbol)} (${escHtml(a.address)})</code></div>`,
+            `<div class="defi-tech-kv"><span>Raw balance</span><code class="mono">${escHtml(String(a.rawBalance || '0'))} (${escHtml(String(a.decimals ?? 18))} dec)</code></div>`,
+            pos.methodLabel
+              ? `<div class="defi-tech-kv"><span>Method</span><code class="mono">${escHtml(pos.methodLabel)}</code></div>`
+              : '',
+            pos.calldataPreview
+              ? `<div class="defi-tech-kv"><span>Calldata preview</span><code class="mono">${escHtml(pos.calldataPreview)}</code></div>`
+              : '',
+          ]
+            .filter(Boolean)
+            .join('');
+
+          return `
+            <div class="defi-pos-row ${checked ? 'is-checked' : ''} ${pos.isReady ? '' : 'is-restricted'}" data-defi-asset-id="${escHtml(a.id)}">
+              <div class="defi-pos-main">
+                <label class="defi-pos-check-wrap" title="Include in Sweep">
+                  <input type="checkbox" class="defi-pos-chk" data-defi-chk="${escHtml(a.id)}" ${checked ? 'checked' : ''} ${pos.preflightLevel === 'blocked' ? 'disabled' : ''} aria-label="Select ${escHtml(pos.routeLine)}" />
+                </label>
+                <div class="defi-pos-body">
+                  <div class="defi-pos-route-line">
+                    <img src="${escHtml(pos.chainLogo)}" alt="" class="chain-logo-xs" />
+                    <span class="defi-route-text">${escHtml(pos.routeLine)}</span>
+                  </div>
+                  <div class="defi-pos-badges">
+                    <span class="defi-exit-badge ${badgeClass}">${escHtml(pos.badgeText)}</span>
+                    <span class="defi-status-pill ${statusClass}">${escHtml(pos.preflightLabel)}</span>
+                  </div>
+                  ${
+                    pos.warningReason
+                      ? `<div class="defi-pos-warning is-${escHtml(pos.preflightLevel)}">${escHtml(pos.warningReason)}</div>`
+                      : ''
+                  }
+                  <details class="defi-tech-details">
+                    <summary>Technical details</summary>
+                    <div class="defi-tech-grid">${techDetailsRows}</div>
+                  </details>
+                </div>
+                <div class="defi-pos-right">
+                  <strong class="mono defi-pos-usd">${escHtml(usdStr)}</strong>
+                  <span class="mono muted-xs">${escHtml(a.chainName)}</span>
+                </div>
+              </div>
+            </div>
+          `;
+        })
+        .join('');
+
+      return `
+        <div class="defi-protocol-group" data-protocol-group="${escHtml(grp.name)}">
+          <div class="defi-proto-head">
+            <div class="defi-proto-id">
+              <span class="defi-proto-logo-tile">
+                <img src="${escHtml(grp.logo)}" alt="" class="defi-proto-logo-img" />
+              </span>
+              <div class="defi-proto-meta">
+                <strong>${escHtml(grp.name)}</strong>
+                <span class="mono muted-xs">${grp.positions.length} ${grp.positions.length === 1 ? 'position' : 'positions'} · $${grp.totalUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+              </div>
+            </div>
+            <button
+              type="button"
+              class="btn-outline-sm defi-proto-extract-btn"
+              data-extract-protocol="${escHtml(grp.name)}"
+              ${grp.readyCount === 0 ? 'disabled' : ''}
+            >
+              ${grp.readyCount > 0 ? `Extract ${escHtml(grp.name)} →` : 'Locked / Guarded'}
+            </button>
+          </div>
+          <div class="defi-pos-list">${posRowsHtml}</div>
+        </div>
+      `;
+    })
+    .join('');
+
+  // Wire checkboxes inside DeFi panel to stay 100% synced with selectedAssetIds & plan
+  groupsHost.querySelectorAll('.defi-pos-chk').forEach((chk) => {
+    chk.addEventListener('change', () => {
+      const id = chk.dataset.defiChk;
+      if (chk.checked) selectedAssetIds.add(id);
+      else selectedAssetIds.delete(id);
+      recomputePlan();
+    });
+  });
+
+  // Wire per-protocol 1-click Extract buttons
+  groupsHost.querySelectorAll('[data-extract-protocol]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const protoName = btn.dataset.extractProtocol;
+      const protoReady = normalized
+        .filter((n) => n.protocolGroup === protoName && n.isReady)
+        .map((n) => n.asset);
+      extractDefiAssets(protoReady, protoName);
+    });
+  });
+}
+
+function buildUnlockedUnderlyingAssets(chain, withdrawnDefiAssets) {
+  const chainUsdcMap = {
+    ethereum: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+    base: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    arbitrum: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+    optimism: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',
+    polygon: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
+    avalanche: '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E',
+  };
+
+  const unlocked = [];
+  for (const a of withdrawnDefiAssets) {
+    const plan = a.defiExitPlan || {};
+    const sym = String(plan.underlyingSymbol || a.underlyingSymbol || 'USDC');
+    const addr =
+      plan.underlyingAddress ||
+      a.underlyingAddress ||
+      (sym.toUpperCase() === 'USDC' ? chainUsdcMap[chain] : null);
+    if (!addr) continue;
+    const isUsdc = sym.toUpperCase() === 'USDC';
+    unlocked.push({
+      ...a,
+      id: `${a.id}:unlocked`,
+      kind: 'erc20',
+      address: addr,
+      symbol: sym,
+      name: `${sym} (Unlocked from ${a.protocol || 'DeFi'})`,
+      protocol: undefined,
+      protocolAddress: undefined,
+      defiExitPlan: undefined,
+      action: isUsdc ? 'BRIDGE_DIRECT_USDC' : 'SELL_AND_BRIDGE',
+      actionReason: `Automatically bridging unlocked ${sym} to Solana ${outputAsset}`,
+      selectedByDefault: true,
+    });
+  }
+  return unlocked;
+}
+
+async function extractDefiAssets(assetsToExtract, scopeTitle = 'DeFi Positions') {
+  if (!currentScan || !assetsToExtract?.length) {
+    showToast('No ready DeFi positions to extract.');
+    return;
+  }
+
+  const srcSession = getActiveSourceWallet();
+  const connectedSrc = srcSession?.address || null;
+  if (!connectedSrc) {
+    showToast('Connect your wallet to extract DeFi positions to Solana.');
+    openWalletModal('evm');
+    return;
+  }
+
+  const byChain = new Map();
+  for (const a of assetsToExtract) {
+    const list = byChain.get(a.chain) || [];
+    list.push(a);
+    byChain.set(a.chain, list);
+  }
+
+  const chains = Array.from(byChain.keys());
+  const solDest = document.getElementById('solanaDestInput').value.trim();
+  const hasTwoStage = assetsToExtract.some((a) => normalizeDefiPosition(a, outputAsset).requiresTwoStep);
+
+  const job = await api('/api/jobs', {
+    method: 'POST',
+    body: JSON.stringify({
+      sourceWallet: connectedSrc,
+      solanaDestination: solDest,
+      outputAsset,
+      bridgePreference: getActiveBridgePreference(),
+      protocolFeeBps: getActiveProtocolFeeBps(),
+      feeRecipientEvm: getActiveFeeRecipientEvm(),
+      legs: chains.map((c) => {
+        const list = byChain.get(c);
+        const gross = list.reduce((s, x) => s + Number(x.grossUsd || 0), 0);
+        const feePct = getActiveProtocolFeeBps() / 10000;
+        return {
+          chain: c,
+          chainName: list[0]?.chainName || c,
+          assetCount: list.length,
+          estimatedNetUsd: Math.max(0, Number((gross * (1 - feePct)).toFixed(2))),
+          estimatedFeeUsd: Number((gross * feePct).toFixed(2)),
+        };
+      }),
+    }),
+  });
+  activeJobId = job.jobId;
+  backgroundJobs.unshift(job);
+  renderBackgroundAgentUI();
+
+  initDefiStepper({
+    title: `${scopeTitle} (${chains.length} ${chains.length === 1 ? 'chain' : 'chains'})`,
+    mode: hasTwoStage ? 'two_stage' : 'atomic',
+    jobId: job.jobId,
+  });
+
+  for (const chain of chains) {
+    await executeChainBatchLive(chain, job.jobId, {
+      overrideAssets: byChain.get(chain),
+      defiGuided: true,
+      scopeTitle,
+    });
+  }
 }
 
 function renderAssetList() {
@@ -753,37 +1391,45 @@ function renderAssetList() {
           ? 'Blocked'
           : `$${a.grossUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
       const balStr = `${a.uiBalance.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${a.symbol}`;
+      const defiNorm = isDefiAsset(a) ? normalizeDefiPosition(a, outputAsset) : null;
       const debtBadge =
-        a.aaveDebtUsd > 0
+        defiNorm && defiNorm.category === 'debt_guard'
+          ? `<span class="micro-pill" style="background:var(--hold-bg);border-color:#fde68a;color:#92400e;">Debt Guard</span>`
+          : defiNorm && defiNorm.category === 'cooldown'
+          ? `<span class="micro-pill" style="background:var(--hold-bg);border-color:#fde68a;color:#92400e;">Cooldown</span>`
+          : a.aaveDebtUsd > 0
           ? `<span class="micro-pill" style="background:var(--block-bg);border-color:#fecaca;color:#991b1b;">Debt Guard</span>`
           : '';
       const walletTag =
         currentScan?.unifiedWallets?.length > 1 && a.sourceWalletLabel
-          ? `<span class="micro-pill">${escapeHtml(a.sourceWalletLabel)}</span>`
+          ? `<span class="micro-pill">${escHtml(a.sourceWalletLabel)}</span>`
           : '';
 
-      const rowTip = escapeHtml(formatRoiTooltip(a));
+      const rowTip = escHtml(formatRoiTooltip(a));
+      const subMeta = defiNorm
+        ? `${defiNorm.protocolGroup} · ${a.chainName} · ${defiNorm.preflightLabel}`
+        : `${a.name} · ${a.chainName}`;
       return `
-        <div class="asset-row ${checked ? 'is-checked' : ''} ${disabled ? 'is-blocked' : ''}" data-row-asset="${escapeHtml(a.id)}" title="${rowTip}">
-          <input type="checkbox" class="asset-chk" data-asset-id="${escapeHtml(a.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="Select ${escapeHtml(a.symbol)} on ${escapeHtml(a.chainName)}" />
+        <div class="asset-row ${checked ? 'is-checked' : ''} ${disabled ? 'is-blocked' : ''}" data-row-asset="${escHtml(a.id)}" title="${rowTip}">
+          <input type="checkbox" class="asset-chk" data-asset-id="${escHtml(a.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="Select ${escHtml(a.symbol)} on ${escHtml(a.chainName)}" />
           <div class="asset-row-id">
             <span class="asset-logo-wrap">
-              <img src="${escapeHtml(mainLogo)}" alt="" class="asset-logo-main" />
-              ${showSubLogo ? `<img src="${escapeHtml(chainLogo)}" alt="" class="asset-logo-sub" />` : ''}
+              <img src="${escHtml(mainLogo)}" alt="" class="asset-logo-main" />
+              ${showSubLogo ? `<img src="${escHtml(chainLogo)}" alt="" class="asset-logo-sub" />` : ''}
             </span>
             <div class="asset-row-name-col">
               <div class="asset-row-sym">
-                <span>${escapeHtml(a.symbol)}</span>
-                ${a.protocol ? `<span class="muted-xs" style="font-weight:400;">${escapeHtml(a.protocol)}</span>` : ''}
+                <span>${escHtml(a.symbol)}</span>
+                ${a.protocol ? `<span class="muted-xs" style="font-weight:400;">${escHtml(defiNorm ? defiNorm.protocolGroup : a.protocol)}</span>` : ''}
                 ${walletTag}
                 ${debtBadge}
               </div>
-              <div class="asset-row-meta">${escapeHtml(a.name)} · ${escapeHtml(a.chainName)}</div>
+              <div class="asset-row-meta">${escHtml(subMeta)}</div>
             </div>
           </div>
           <div class="asset-row-val-col">
-            <div class="asset-row-usd">${escapeHtml(usdStr)}</div>
-            <div class="asset-row-bal">${escapeHtml(balStr)}</div>
+            <div class="asset-row-usd">${escHtml(usdStr)}</div>
+            <div class="asset-row-bal">${escHtml(balStr)}</div>
           </div>
           <div class="asset-row-tag">${renderRoiVerdictBadge(a)}</div>
         </div>
@@ -1042,13 +1688,13 @@ function renderBackgroundAgentUI() {
           const b = legStatusBadge(leg.status);
           const links = [
             leg.evmTxHash
-              ? `<a class="explorer-link" href="${escapeHtml(leg.explorerUrl)}/tx/${escapeHtml(leg.evmTxHash)}" target="_blank" rel="noreferrer">EVM ↗</a>`
+              ? `<a class="explorer-link" href="${safeHttpUrl(`${leg.explorerUrl}/tx/${leg.evmTxHash}`)}" target="_blank" rel="noreferrer">EVM ↗</a>`
               : '',
             leg.solanaTxHash
-              ? `<a class="explorer-link" href="https://solscan.io/tx/${escapeHtml(leg.solanaTxHash)}" target="_blank" rel="noreferrer">Solscan ↗</a>`
+              ? `<a class="explorer-link" href="${safeHttpUrl(`https://solscan.io/tx/${leg.solanaTxHash}`)}" target="_blank" rel="noreferrer">Solscan ↗</a>`
               : '',
             leg.evmTxHash
-              ? `<button type="button" class="text-action" data-prove-leg="${escapeHtml(activeJob.jobId)}:${escapeHtml(leg.chain)}">Prove ✓</button>`
+              ? `<button type="button" class="text-action" data-prove-leg="${escHtml(activeJob.jobId)}:${escHtml(leg.chain)}">Prove ✓</button>`
               : '',
           ]
             .filter(Boolean)
@@ -1113,9 +1759,9 @@ function renderBackgroundAgentUI() {
             <td class="mono">$${leg.estimatedNetUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} ${escapeHtml(job.outputAsset)}</td>
             <td><span class="action-tag ${b.cls}">${escapeHtml(leg.status)}</span></td>
             <td class="mono" style="font-size:11.5px;">
-              ${leg.evmTxHash ? `<a class="explorer-link" href="${escapeHtml(leg.explorerUrl)}/tx/${escapeHtml(leg.evmTxHash)}" target="_blank" rel="noreferrer">EVM Tx ↗</a>` : '—'}
-              ${leg.solanaTxHash ? ` · <a class="explorer-link" href="https://solscan.io/tx/${escapeHtml(leg.solanaTxHash)}" target="_blank" rel="noreferrer">Solscan ↗</a>` : ''}
-              ${leg.requiresSolanaClaim && leg.evmTxHash ? ` · <button type="button" class="text-action" data-check-cctp="${escapeHtml(job.jobId)}:${escapeHtml(leg.chain)}">Check CCTP Iris</button>` : ''}
+              ${leg.evmTxHash ? `<a class="explorer-link" href="${safeHttpUrl(`${leg.explorerUrl}/tx/${leg.evmTxHash}`)}" target="_blank" rel="noreferrer">EVM Tx ↗</a>` : '—'}
+              ${leg.solanaTxHash ? ` · <a class="explorer-link" href="${safeHttpUrl(`https://solscan.io/tx/${leg.solanaTxHash}`)}" target="_blank" rel="noreferrer">Solscan ↗</a>` : ''}
+              ${leg.requiresSolanaClaim && leg.evmTxHash ? ` · <button type="button" class="text-action" data-check-cctp="${escHtml(job.jobId)}:${escHtml(leg.chain)}">Check CCTP Iris</button>` : ''}
             </td>
           </tr>
         `);
@@ -1167,6 +1813,32 @@ async function syncBackgroundJobs() {
     const res = await api('/api/jobs');
     backgroundJobs = Array.isArray(res.jobs) ? res.jobs : [];
     renderBackgroundAgentUI();
+
+    if (defiStepperState?.jobId) {
+      const tracked = backgroundJobs.find((j) => j.jobId === defiStepperState.jobId);
+      if (tracked) {
+        const allSettled =
+          tracked.legs.length > 0 &&
+          tracked.legs.every((l) => l.status === 'landed' || l.status === 'attested');
+        const anyFailed = tracked.legs.some((l) => l.status === 'failed');
+        const solLeg = tracked.legs.find((l) => l.solanaTxHash);
+        if (allSettled) {
+          updateDefiStepperStep(
+            'confirm',
+            {
+              status: 'done',
+              detail: `Settled on Solana (${tracked.legs.length}/${tracked.legs.length} chains confirmed)`,
+              txUrl: solLeg?.solanaTxHash ? `https://solscan.io/tx/${solLeg.solanaTxHash}` : undefined,
+              txLabel: 'Solscan ↗',
+            },
+            { active: false, dismissible: true }
+          );
+        } else if (anyFailed && !defiStepperState.dismissible) {
+          updateDefiStepperStep('confirm', { status: 'failed', detail: 'Check Background Agent for leg status' }, { active: false, dismissible: true });
+        }
+      }
+    }
+
     const hasActive = backgroundJobs.some((j) => j.status === 'active');
     if (hasActive && !bgPollTimer) {
       bgPollTimer = setInterval(syncBackgroundJobs, 3000);
@@ -1297,16 +1969,96 @@ async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress,
   showToast(receipt.nextStep);
 }
 
-async function executeChainBatchLive(chain, existingJobId = null) {
+async function sendCallsWithFallback({ chainId, chain, chainName, calls, jobId, primaryProvider, stepLabelPrefix = '' }) {
+  const chainCap = isChainBatchSupported(chainId);
+  let submittedHashes = [];
+  let usedEip5792 = false;
+
+  if (chainCap.supported || calls.length > 1) {
+    try {
+      await patchJobLeg(jobId, chain, {
+        status: 'signing',
+        provider: primaryProvider,
+        callsBatched: calls.length,
+        statusText: `${stepLabelPrefix}Confirm 1 batch (${calls.length} calls) in your wallet…`,
+      });
+
+      const { batchId } = await sendEip5792Batch({ chainId, calls });
+      usedEip5792 = true;
+
+      await patchJobLeg(jobId, chain, {
+        status: 'confirming',
+        statusText: `${stepLabelPrefix}Batch submitted (${shortAddr(batchId)}) · confirming…`,
+      });
+
+      const settled = await waitForEip5792Batch(batchId, (upd) => {
+        patchJobLeg(jobId, chain, {
+          status: 'confirming',
+          evmTxHash: upd.txHashes?.[0],
+          statusText: `${stepLabelPrefix}Confirming on ${chainName}…`,
+        });
+      });
+
+      submittedHashes = settled.txHashes || [];
+      if (settled.failed) {
+        return { failed: true, submittedHashes, usedEip5792 };
+      }
+    } catch (err) {
+      if (err?.code === 4001) throw err;
+      if (!err?.unsupportedEip5792) throw err;
+      showToast(`${chainName}: wallet lacks EIP-5792 — using sequential signing.`);
+    }
+  }
+
+  if (!usedEip5792) {
+    for (let i = 0; i < calls.length; i++) {
+      const call = calls[i];
+      await patchJobLeg(jobId, chain, {
+        status: 'signing',
+        provider: primaryProvider,
+        statusText: `${stepLabelPrefix}Sign step ${i + 1}/${calls.length}: ${call.label}`,
+      });
+      const txHash = await sendRealEvmTransaction({
+        chainId,
+        to: call.to,
+        data: call.data,
+        value: call.value,
+        gas: call.gas,
+      });
+      submittedHashes.push(txHash);
+      const needsMining =
+        i < calls.length - 1 &&
+        (call.stepId.includes('withdraw') ||
+          call.stepId.includes('redeem') ||
+          call.stepId.includes('approve'));
+      if (needsMining) {
+        await patchJobLeg(jobId, chain, {
+          status: 'confirming',
+          evmTxHash: txHash,
+          statusText: `${stepLabelPrefix}Waiting for step ${i + 1}/${calls.length} confirmation…`,
+        });
+        await waitForEvmReceipt(chain, txHash);
+      }
+    }
+  }
+
+  return { failed: false, submittedHashes, usedEip5792 };
+}
+
+async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
   if (!currentScan || !currentPlan) return;
-  const chainAssets = currentScan.assets.filter(
-    (a) => a.chain === chain && selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
-  );
+  const overrideAssets = Array.isArray(opts?.overrideAssets) ? opts.overrideAssets : null;
+  const chainAssets = overrideAssets
+    ? overrideAssets.filter((a) => a.chain === chain && a.action !== 'SKIP_HONEYPOT')
+    : currentScan.assets.filter(
+        (a) => a.chain === chain && selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
+      );
   if (!chainAssets.length) {
     showToast(`No selected assets on ${chain}.`);
     return;
   }
 
+  const isDefiGuided = Boolean(opts?.defiGuided || chainAssets.some(isDefiAsset));
   const solDest = document.getElementById('solanaDestInput').value.trim();
   const bridgePreference = getActiveBridgePreference();
   const protocolFeeBps = getActiveProtocolFeeBps();
@@ -1329,7 +2081,7 @@ async function executeChainBatchLive(chain, existingJobId = null) {
         legs: [
           {
             chain,
-            chainName: legSummary?.chainName || chain,
+            chainName: legSummary?.chainName || chainAssets[0]?.chainName || chain,
             assetCount: chainAssets.length,
             estimatedNetUsd: legSummary?.bridgedUsdc ?? 0,
             estimatedFeeUsd: legSummary?.feeUsdc ?? 0,
@@ -1343,10 +2095,25 @@ async function executeChainBatchLive(chain, existingJobId = null) {
     renderBackgroundAgentUI();
   }
 
+  if (isDefiGuided && !defiStepperState) {
+    const hasTwoStage = chainAssets.some((a) => isDefiAsset(a) && normalizeDefiPosition(a, outputAsset).requiresTwoStep);
+    initDefiStepper({
+      title: opts?.scopeTitle || `${legSummary?.chainName || chainAssets[0]?.chainName || chain} DeFi Exit`,
+      mode: hasTwoStage ? 'two_stage' : 'atomic',
+      jobId,
+    });
+  }
+
   await patchJobLeg(jobId, chain, {
     status: 'preparing',
     statusText: `Preparing ${chainAssets.length} asset(s) & live routes…`,
   });
+  if (isDefiGuided) {
+    updateDefiStepperStep('withdraw', {
+      status: 'active',
+      detail: `Preparing protocol withdrawal on ${legSummary?.chainName || chainAssets[0]?.chainName || chain}…`,
+    });
+  }
 
   try {
     const isNonEvm = (currentScan.family || activeFamily) !== 'evm';
@@ -1362,6 +2129,11 @@ async function executeChainBatchLive(chain, existingJobId = null) {
         return;
       }
       await executeGaslessIntentChain(chain, jobId, chainAssets, connectedSrc, solDest);
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'done', detail: 'Signed 1-click withdrawal & bridge intent' });
+        updateDefiStepperStep('bridge', { status: 'done', detail: `Relaying to Solana ${outputAsset}` });
+        updateDefiStepperStep('confirm', { status: 'active', detail: 'Confirming arrival on Solana…' }, { dismissible: true });
+      }
       return;
     }
 
@@ -1382,10 +2154,16 @@ async function executeChainBatchLive(chain, existingJobId = null) {
     });
 
     if (!batch.calls.length) {
+      const skipReason =
+        batch.skippedAssets.map((s) => `${s.assetSymbol}: ${sanitizePlainDefiText(s.reason)}`).join(' · ') ||
+        'No executable calls';
       await patchJobLeg(jobId, chain, {
         status: 'skipped',
-        statusText: batch.skippedAssets.map((s) => `${s.assetSymbol}: ${s.reason}`).join(' · ') || 'No executable calls',
+        statusText: skipReason,
       });
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'failed', detail: skipReason }, { active: false, dismissible: true });
+      }
       return;
     }
 
@@ -1396,6 +2174,9 @@ async function executeChainBatchLive(chain, existingJobId = null) {
         popupsSaved: batch.savings.popupsSaved,
         statusText: `${batch.calls.length} calls ready in 1 click — connect EVM wallet to sign`,
       });
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'active', detail: 'Connect your EVM wallet to sign withdrawal' }, { dismissible: true });
+      }
       openWalletModal('evm');
       return;
     }
@@ -1419,134 +2200,280 @@ async function executeChainBatchLive(chain, existingJobId = null) {
 
     if (executionMode === 'gasless' && !hasDefiContractExits) {
       await executeGaslessIntentChain(chain, jobId, chainAssets, connectedEvm, solDest);
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'done', detail: `Signed instant swap on ${batch.chainName}` });
+        updateDefiStepperStep('bridge', { status: 'done', detail: `Relaying to Solana ${outputAsset}` });
+        updateDefiStepperStep('confirm', { status: 'active', detail: 'Tracking confirmation on Solana…' }, { dismissible: true });
+      }
       return;
     }
     if (executionMode === 'gasless' && hasDefiContractExits) {
       showToast(
-        `${batch.chainName}: executing smart-contract DeFi withdrawal directly via wallet batch (Permit2 cannot call Pool.withdraw/ERC-4626 redeem directly).`
+        `${batch.chainName}: withdrawing from DeFi protocol directly via wallet batch so funds unlock cleanly.`
       );
     }
 
-    const chainCap = isChainBatchSupported(batch.chainId);
     const requiresSolanaClaim = batch.bridgeTrackers.some((t) => t.requiresSolanaClaim);
     const primaryRelay = batch.bridgeTrackers.find((t) => t.provider === 'relay' && t.requestId);
     const primaryProvider = primaryRelay?.provider || batch.bridgeTrackers[0]?.provider || 'eip5792_batch';
-    let submittedHashes = [];
-    let usedEip5792 = false;
 
-    if (chainCap.supported || batch.calls.length > 1) {
-      try {
-        await patchJobLeg(jobId, chain, {
-          status: 'signing',
-          provider: primaryProvider,
-          callsBatched: batch.calls.length,
-          popupsSaved: batch.savings.popupsSaved,
-          statusText: `Confirm 1 batch (${batch.calls.length} calls) in your wallet…`,
-        });
-
-        const { batchId } = await sendEip5792Batch({
-          chainId: batch.chainId,
-          calls: batch.calls,
-        });
-        usedEip5792 = true;
-
-        await patchJobLeg(jobId, chain, {
-          status: 'confirming',
-          statusText: `Batch submitted (${shortAddr(batchId)}) · confirming…`,
-        });
-
-        const settled = await waitForEip5792Batch(batchId, (upd) => {
-          patchJobLeg(jobId, chain, {
-            status: 'confirming',
-            evmTxHash: upd.txHashes?.[0],
-            statusText: `Confirming on ${batch.chainName}…`,
-          });
-        });
-
-        submittedHashes = settled.txHashes || [];
-        if (settled.failed) {
-          await patchJobLeg(jobId, chain, {
-            status: 'failed',
-            evmTxHash: submittedHashes[0],
-            statusText: 'Batch reverted onchain',
-          });
-          return;
-        }
-      } catch (err) {
-        if (err?.code === 4001) throw err;
-        if (!err?.unsupportedEip5792) throw err;
-        showToast(`${batch.chainName}: wallet lacks EIP-5792 — using sequential signing.`);
-      }
+    if (isDefiGuided) {
+      updateDefiStepperStep('withdraw', {
+        status: 'active',
+        detail: `Confirm withdrawal on ${batch.chainName} (${batch.calls.length} ${batch.calls.length === 1 ? 'call' : 'calls'})…`,
+      });
     }
 
-    if (!usedEip5792) {
-      for (let i = 0; i < batch.calls.length; i++) {
-        const call = batch.calls[i];
-        await patchJobLeg(jobId, chain, {
-          status: 'signing',
-          provider: primaryProvider,
-          statusText: `Sign step ${i + 1}/${batch.calls.length}: ${call.label}`,
-        });
-        const txHash = await sendRealEvmTransaction({
-          chainId: batch.chainId,
-          to: call.to,
-          data: call.data,
-          value: call.value,
-          gas: call.gas,
-        });
-        submittedHashes.push(txHash);
-        const needsMining =
-          i < batch.calls.length - 1 &&
-          (call.stepId.includes('withdraw') ||
-            call.stepId.includes('redeem') ||
-            call.stepId.includes('approve'));
-        if (needsMining) {
-          await patchJobLeg(jobId, chain, {
-            status: 'confirming',
-            evmTxHash: txHash,
-            statusText: `Waiting for step ${i + 1}/${batch.calls.length} confirmation…`,
-          });
-          await waitForEvmReceipt(batch.chain, txHash);
-        }
+    const stage1 = await sendCallsWithFallback({
+      chainId: batch.chainId,
+      chain,
+      chainName: batch.chainName,
+      calls: batch.calls,
+      jobId,
+      primaryProvider,
+    });
+
+    if (stage1.failed) {
+      await patchJobLeg(jobId, chain, {
+        status: 'failed',
+        evmTxHash: stage1.submittedHashes[0],
+        statusText: 'Batch reverted onchain',
+      });
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'failed', detail: 'Withdrawal transaction reverted onchain' }, { active: false, dismissible: true });
       }
+      return;
     }
 
+    const stage1TxHash = stage1.submittedHashes[stage1.submittedHashes.length - 1];
     const hasDefiExitCall = batch.calls.some(
       (c) =>
         c.stepId === 'aave_withdraw' ||
         c.stepId === 'compound_withdraw' ||
-        c.stepId === 'erc4626_redeem'
+        c.stepId === 'erc4626_redeem' ||
+        c.stepId.includes('withdraw') ||
+        c.stepId.includes('redeem')
     );
     const hasCctpAfterDefi = batch.calls.some((c) => c.stepId === 'cctp_deposit_for_burn_after_defi');
+    const needsAutoStage2Bridge = hasDefiExitCall && !hasCctpAfterDefi && !batch.bridgeTrackers.length;
+    const explorerBase = currentScan.chains.find((c) => c.chain === chain)?.explorerUrl || '';
+    const stage1TxUrl = explorerBase && stage1TxHash ? `${explorerBase}/tx/${stage1TxHash}` : undefined;
 
-    // Hand off to Siphon's server-side background settlement watcher!
+    if (needsAutoStage2Bridge) {
+      // Wait for Stage 1 withdrawal confirmation, then AUTOMATICALLY launch Stage 2 Bridge!
+      if (!stage1.usedEip5792 && stage1TxHash) {
+        await patchJobLeg(jobId, chain, {
+          status: 'confirming',
+          evmTxHash: stage1TxHash,
+          statusText: `Step 1/2: Confirming protocol withdrawal on ${batch.chainName}…`,
+        });
+        if (isDefiGuided) {
+          updateDefiStepperStep(
+            'withdraw',
+            {
+              status: 'active',
+              detail: `Waiting for withdrawal confirmation on ${batch.chainName}…`,
+              txUrl: stage1TxUrl,
+              txLabel: 'EVM ↗',
+            },
+            { mode: 'two_stage' }
+          );
+        }
+        const receipt1 = await waitForEvmReceipt(batch.chain, stage1TxHash);
+        if (receipt1?.evmFailed) {
+          await patchJobLeg(jobId, chain, {
+            status: 'failed',
+            evmTxHash: stage1TxHash,
+            statusText: 'Step 1 protocol withdrawal failed onchain',
+          });
+          if (isDefiGuided) {
+            updateDefiStepperStep('withdraw', { status: 'failed', detail: 'Protocol withdrawal reverted onchain' }, { active: false, dismissible: true });
+          }
+          return;
+        }
+      }
+
+      if (isDefiGuided) {
+        updateDefiStepperStep(
+          'withdraw',
+          {
+            status: 'done',
+            detail: `Withdrawn on ${batch.chainName}`,
+            txUrl: stage1TxUrl,
+            txLabel: 'EVM ↗',
+          },
+          { mode: 'two_stage' }
+        );
+        updateDefiStepperStep('bridge', {
+          status: 'active',
+          detail: `Withdrawal confirmed — auto-preparing bridge to Solana ${outputAsset}…`,
+        });
+      }
+
+      await patchJobLeg(jobId, chain, {
+        status: 'preparing',
+        evmTxHash: stage1TxHash,
+        statusText: `Step 2/2: Unlocked on ${batch.chainName} — auto-preparing bridge to Solana…`,
+      });
+
+      const unlockedAssets = buildUnlockedUnderlyingAssets(chain, chainAssets.filter(isDefiAsset));
+      if (unlockedAssets.length > 0) {
+        const stage2Batch = await api('/api/tx/prepare-chain-batch', {
+          method: 'POST',
+          body: JSON.stringify({
+            chain,
+            assets: unlockedAssets,
+            userAddress: connectedEvm,
+            solanaDestination: solDest,
+            outputAsset,
+            bridgePreference,
+            protocolFeeBps,
+            feeRecipientEvm,
+            bundleDefiCctp: false,
+          }),
+        });
+
+        if (stage2Batch.calls.length > 0) {
+          const s2Relay = stage2Batch.bridgeTrackers.find((t) => t.provider === 'relay' && t.requestId);
+          const s2Provider = s2Relay?.provider || stage2Batch.bridgeTrackers[0]?.provider || primaryProvider;
+          const s2NeedsClaim = stage2Batch.bridgeTrackers.some((t) => t.requiresSolanaClaim);
+
+          if (isDefiGuided) {
+            updateDefiStepperStep('bridge', {
+              status: 'active',
+              detail: `Confirm bridge to Solana ${outputAsset} (${stage2Batch.calls.length} ${stage2Batch.calls.length === 1 ? 'call' : 'calls'})…`,
+            });
+          }
+
+          const stage2 = await sendCallsWithFallback({
+            chainId: stage2Batch.chainId,
+            chain,
+            chainName: stage2Batch.chainName,
+            calls: stage2Batch.calls,
+            jobId,
+            primaryProvider: s2Provider,
+            stepLabelPrefix: 'Step 2/2: ',
+          });
+
+          if (stage2.failed) {
+            await patchJobLeg(jobId, chain, {
+              status: 'failed',
+              evmTxHash: stage2.submittedHashes[0] || stage1TxHash,
+              statusText: 'Step 2 bridge transaction reverted — unlocked tokens remain safely in your wallet.',
+            });
+            if (isDefiGuided) {
+              updateDefiStepperStep(
+                'bridge',
+                { status: 'failed', detail: 'Bridge reverted — unlocked tokens are safely in your wallet' },
+                { active: false, dismissible: true }
+              );
+            }
+            return;
+          }
+
+          const stage2TxHash = stage2.submittedHashes[stage2.submittedHashes.length - 1];
+          const stage2TxUrl = explorerBase && stage2TxHash ? `${explorerBase}/tx/${stage2TxHash}` : undefined;
+
+          await patchJobLeg(jobId, chain, {
+            status: stage2Batch.bridgeTrackers.length ? 'relaying' : 'landed',
+            provider: s2Provider,
+            evmTxHash: stage2TxHash || stage1TxHash,
+            requestId: s2Relay?.requestId,
+            requiresSolanaClaim: s2NeedsClaim,
+            statusText: `Withdrawn & bridging unlocked funds on ${batch.chainName} → Solana ${outputAsset}…`,
+          });
+
+          if (isDefiGuided) {
+            updateDefiStepperStep('bridge', {
+              status: 'done',
+              detail: `Bridge submitted on ${batch.chainName}`,
+              txUrl: stage2TxUrl,
+              txLabel: 'Bridge Tx ↗',
+            });
+            updateDefiStepperStep(
+              'confirm',
+              { status: 'active', detail: `Relaying ${outputAsset} to your Solana wallet…` },
+              { dismissible: true }
+            );
+          }
+
+          showToast(`${batch.chainName}: withdrawal confirmed and bridge to Solana ${outputAsset} submitted automatically!`);
+          syncBackgroundJobs();
+          return;
+        }
+      }
+
+      // Graceful fallback if Stage 2 bridge calls weren't available (e.g., unsupported underlying)
+      await patchJobLeg(jobId, chain, {
+        status: 'landed',
+        provider: primaryProvider,
+        evmTxHash: stage1TxHash,
+        statusText: `Withdrawn from protocol on ${batch.chainName} — unlocked tokens are in your wallet.`,
+      });
+      if (isDefiGuided) {
+        updateDefiStepperStep(
+          'bridge',
+          { status: 'done', detail: 'Unlocked tokens delivered to your wallet — ready for Solana sweep' },
+          { active: false, dismissible: true }
+        );
+      }
+      showToast(`${batch.chainName}: protocol withdrawal confirmed! Refreshing balances…`);
+      syncBackgroundJobs();
+      setTimeout(() => runScan({ address: connectedEvm, family: 'evm', autoOpen: false }), 2200);
+      return;
+    }
+
+    // Atomic 1-Click path (Instant swap or Atomic Withdraw + CCTP/Relay)
     await patchJobLeg(jobId, chain, {
       status: batch.bridgeTrackers.length ? 'relaying' : 'landed',
       provider: primaryProvider,
-      evmTxHash: submittedHashes[submittedHashes.length - 1],
+      evmTxHash: stage1TxHash,
       requestId: primaryRelay?.requestId,
       requiresSolanaClaim,
       statusText: batch.bridgeTrackers.length
         ? `Confirmed on ${batch.chainName} · relaying to Solana in background…`
-        : hasDefiExitCall && !hasCctpAfterDefi
-        ? `Withdrawn from DeFi contract on ${batch.chainName} — rescanning unlocked balance…`
         : `Confirmed on ${batch.chainName}`,
     });
 
-    showToast(
-      hasDefiExitCall && !hasCctpAfterDefi
-        ? `${batch.chainName} smart-contract withdrawal confirmed! Rescanning wallet so you can bridge unlocked tokens.`
-        : `${batch.chainName} submitted — Siphon Background Agent is tracking Solana settlement.`
-    );
-    syncBackgroundJobs();
-    if (hasDefiExitCall && !hasCctpAfterDefi) {
-      setTimeout(() => runScan({ address: connectedEvm, family: 'evm', autoOpen: false }), 2500);
+    if (isDefiGuided) {
+      updateDefiStepperStep('withdraw', {
+        status: 'done',
+        detail: `Confirmed on ${batch.chainName}`,
+        txUrl: stage1TxUrl,
+        txLabel: 'EVM ↗',
+      });
+      updateDefiStepperStep('bridge', {
+        status: 'done',
+        detail: batch.bridgeTrackers.length
+          ? `Routed atomically to Solana ${outputAsset}`
+          : `Settled on ${batch.chainName}`,
+      });
+      updateDefiStepperStep(
+        'confirm',
+        {
+          status: batch.bridgeTrackers.length ? 'active' : 'done',
+          detail: batch.bridgeTrackers.length
+            ? `Tracking ${outputAsset} confirmation on Solana…`
+            : 'Confirmed onchain',
+        },
+        { active: Boolean(batch.bridgeTrackers.length), dismissible: true }
+      );
     }
+
+    showToast(`${batch.chainName} submitted — Siphon Background Agent is tracking Solana settlement.`);
+    syncBackgroundJobs();
   } catch (err) {
     await patchJobLeg(jobId, chain, {
       status: 'failed',
       statusText: err?.message || 'Cancelled or failed',
     });
+    if (isDefiGuided) {
+      updateDefiStepperStep(
+        'withdraw',
+        { status: 'failed', detail: err?.message || 'Cancelled or failed' },
+        { active: false, dismissible: true }
+      );
+    }
     showToast(err?.message || 'Execution failed');
   }
 }
@@ -1786,7 +2713,7 @@ function renderWalletModalContent() {
         `<div class="wallet-install-strip">${meta.wallets
           .map(
             (w) =>
-              `<a class="wallet-install-chip" href="${escapeHtml(w.installUrl)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(w.logo)}" alt="" class="chain-logo-xs" />${escapeHtml(w.name)} ↗</a>`
+              `<a class="wallet-install-chip" href="${safeHttpUrl(w.installUrl)}" target="_blank" rel="noreferrer"><img src="${escHtml(w.logo)}" alt="" class="chain-logo-xs" />${escHtml(w.name)} ↗</a>`
           )
           .join('')}</div>`
       );
@@ -2395,6 +3322,14 @@ function wireEvents() {
   document.getElementById('clearSelectionBtn').addEventListener('click', () => {
     selectedAssetIds.clear();
     recomputePlan();
+  });
+
+  document.getElementById('extractAllDefiBtn')?.addEventListener('click', () => {
+    if (!currentScan) return;
+    const readyDefi = currentScan.assets
+      .filter(isDefiAsset)
+      .filter((a) => normalizeDefiPosition(a, outputAsset).isReady);
+    extractDefiAssets(readyDefi, 'All Ready DeFi');
   });
 
   document.getElementById('runLiveQueueBtn').addEventListener('click', executeSelectedLiveQueue);

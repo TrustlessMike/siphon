@@ -414,20 +414,245 @@ def main():
             pgL.click("[data-pick-evm]")
             pgL.wait_for_selector("#appShell:not(.hidden)", timeout=15000)
             pgL.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent === '6'", timeout=15000)
+
+            # Verify Dedicated DeFi Positions Quick-Unwind Panel on veteran_defi (Desktop 1440px)
+            pgL.wait_for_selector("#defiUnwindPanel:not(.hidden)", timeout=10000)
+            defi_check = pgL.evaluate("""() => {
+              const panel = document.getElementById('defiUnwindPanel');
+              const groups = Array.from(panel.querySelectorAll('[data-protocol-group]')).map(el => el.dataset.protocolGroup);
+              const imgs = Array.from(panel.querySelectorAll('img'));
+              const brokenImgs = imgs.filter(i => !i.complete || i.naturalWidth === 0).map(i => i.src);
+              const badges = Array.from(panel.querySelectorAll('.defi-exit-badge')).map(el => el.innerText.trim());
+              const statuses = Array.from(panel.querySelectorAll('.defi-status-pill')).map(el => el.innerText.trim());
+              const routes = Array.from(panel.querySelectorAll('.defi-route-text')).map(el => el.innerText.trim());
+              const details = Array.from(panel.querySelectorAll('.defi-tech-details'));
+              const allCollapsed = details.length > 0 && details.every(d => !d.open);
+              const visibleText = panel.innerText;
+              const overflow = document.documentElement.scrollWidth - window.innerWidth;
+              return { groups, brokenImgs, badges, statuses, routes, detailsCount: details.length, allCollapsed, visibleText, overflow };
+            }""")
+            assert "Aave v3" in defi_check["groups"], defi_check
+            assert "Compound v3" in defi_check["groups"], defi_check
+            assert "Lido" in defi_check["groups"], defi_check
+            assert not defi_check["brokenImgs"], f"Broken DeFi panel logos: {defi_check['brokenImgs']}"
+            assert any("1-Click Extract → Solana" in b for b in defi_check["badges"]), defi_check["badges"]
+            assert any("Instant Swap (Skips Cooldown)" in b for b in defi_check["badges"]), defi_check["badges"]
+            assert any("Verified withdrawable" in s for s in defi_check["statuses"]), defi_check["statuses"]
+            assert any("→ Solana USDC · 1 signature" in r for r in defi_check["routes"]), defi_check["routes"]
+            assert defi_check["allCollapsed"], defi_check
+            assert "WITHDRAW_AND_BRIDGE" not in defi_check["visibleText"], defi_check["visibleText"]
+            assert "Comet.withdraw" not in defi_check["visibleText"], defi_check["visibleText"]
+            assert "0x69328dec" not in defi_check["visibleText"], defi_check["visibleText"]
+            assert defi_check["overflow"] <= 0, f"Desktop DeFi overflow: {defi_check['overflow']}"
+
+            # Expand Technical details disclosure and verify contract info appears cleanly
+            pgL.locator(".defi-tech-details > summary").first.click()
+            first_details_open = pgL.evaluate("() => document.querySelector('.defi-tech-details')?.open === true")
+            assert first_details_open, "Expected Technical details <details> to expand on click"
+            assert pgL.evaluate("() => document.documentElement.scrollWidth - window.innerWidth") <= 0
+
             pgL.select_option("#bridgePrefSelect", "cctp")
             pgL.click("[data-exec-chain-batch='polygon']")
             pgL.wait_for_function(
                 "() => (window.__legacyMethods || []).filter(m => m === 'eth_sendTransaction').length === 3",
                 timeout=20000,
             )
+            pgL.wait_for_selector("#defiGuidedStepper:not(.hidden)", timeout=10000)
+            stepper_text = pgL.locator("#defiGuidedStepper").inner_text()
+            assert "Step 1: Withdraw from Protocol" in stepper_text, stepper_text
+            assert "Step 2: Bridge Unlocked Asset to Solana" in stepper_text, stepper_text
+            assert "Step 3: Confirmed on Solana" in stepper_text, stepper_text
+
             legacyMethods = pgL.evaluate("() => window.__legacyMethods")
             assert legacyMethods.count("eth_sendTransaction") == 3
             assert not errsL, f"Legacy fallback errors: {errsL}"
             results["legacy_sequential_fallback"] = {
                 "ok": True,
                 "ethSendTransactionCount": legacyMethods.count("eth_sendTransaction"),
+                "defiProtocolGroups": defi_check["groups"],
             }
             ctxL.close()
+
+            # ------------------------------------------------------------------
+            # 2B. DEFI EXIT PLAN COMPATIBILITY + XSS ESCAPING + 2-STAGE AUTO-BRIDGE
+            # ------------------------------------------------------------------
+            ctxX = browser.new_context(viewport={"width": 1440, "height": 900})
+            pgX = ctxX.new_page()
+            errsX = []
+            pgX.on("pageerror", lambda e: errsX.append(str(e)))
+            pgX.add_init_script(f"""
+              window.__xssFired = false;
+              window.__stage2BatchCalls = [];
+              let txCount = 0;
+              window.ethereum = {{
+                isMetaMask: true,
+                on() {{}},
+                async request({{ method, params }}) {{
+                  if (method === 'eth_requestAccounts') return ['{VET_ADDR}'];
+                  if (method === 'eth_chainId') return '0x2105';
+                  if (method === 'wallet_switchEthereumChain') return null;
+                  if (method === 'wallet_getCapabilities' || method === 'wallet_sendCalls') {{
+                    const err = new Error('Method not found');
+                    err.code = -32601;
+                    throw err;
+                  }}
+                  if (method === 'eth_sendTransaction') {{
+                    txCount++;
+                    window.__stage2BatchCalls.push(params[0]);
+                    return '0x' + String(txCount).padStart(64, 'e');
+                  }}
+                  return null;
+                }}
+              }};
+            """)
+
+            def route_defi_plan_scan(route):
+                req = urllib.request.Request(
+                    f"{BASE}/api/scan",
+                    data=json.dumps({"presetId": "veteran_defi"}).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req) as resp:
+                    payload = json.loads(resp.read().decode())
+                # Enrich assets with defiExitPlan & XSS probe strings
+                for a in payload["assets"]:
+                    if a["symbol"] == "aEthUSDC":
+                        a["defiExitPlan"] = {
+                            "mode": "safe_partial",
+                            "safePartialSupported": True,
+                            "maxSafeWithdrawUi": 900,
+                            "preflightStatus": "warning",
+                            "preflightMessage": "Debt guard: <img src=x onerror=\"window.__xssFired=true\"> safe excess only",
+                            "underlyingSymbol": "USDC",
+                            "signaturesRequired": 1,
+                        }
+                        a["aaveDebtUsd"] = 320.5
+                        a["aaveHealthFactor"] = 1.92
+                    elif a["symbol"] == "cUSDCv3":
+                        a["defiExitPlan"] = {
+                            "mode": "one_click",
+                            "protocolName": "Morpho / Vaults <script>window.__xssFired=true</script>",
+                            "preflightStatus": "verified",
+                            "underlyingSymbol": "USDC",
+                            "signaturesRequired": 2,
+                            "requiresSecondStep": True,
+                            "calldataPreview": "0x69328dec000000000000000000000000deadbeef",
+                        }
+                    elif a["symbol"] == "aArbUSDCn":
+                        a["defiExitPlan"] = {
+                            "mode": "cooldown",
+                            "preflightStatus": "cooldown",
+                            "cooldownLabel": "7-day unbonding queue",
+                            "underlyingSymbol": "USDC",
+                        }
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+
+            prepare_call_count = {"n": 0}
+
+            def route_prepare_two_stage(route):
+                prepare_call_count["n"] += 1
+                if prepare_call_count["n"] == 1:
+                    # Stage 1: withdraw-only (no bundled CCTP -> must auto-trigger Stage 2!)
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({
+                            "chain": "base",
+                            "chainId": 8453,
+                            "chainName": "Base",
+                            "calls": [{
+                                "stepId": "erc4626_redeem",
+                                "assetId": "base-vault",
+                                "assetSymbol": "cUSDCv3",
+                                "action": "WITHDRAW_AND_BRIDGE",
+                                "provider": "erc4626",
+                                "label": "Withdraw from Vault",
+                                "description": "Redeem vault shares",
+                                "to": "0xb125E6687d4313864e53df431d5425969c15Eb2F",
+                                "data": "0x12345678",
+                                "value": "0x0",
+                            }],
+                            "bridgeTrackers": [],
+                            "skippedAssets": [],
+                            "savings": {"popupsSaved": 0},
+                        }),
+                    )
+                else:
+                    # Stage 2: automatic bridge of unlocked USDC -> Solana!
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps({
+                            "chain": "base",
+                            "chainId": 8453,
+                            "chainName": "Base",
+                            "calls": [{
+                                "stepId": "relay_bridge_unlocked",
+                                "assetId": "base-vault:unlocked",
+                                "assetSymbol": "USDC",
+                                "action": "BRIDGE_DIRECT_USDC",
+                                "provider": "relay",
+                                "label": "Bridge unlocked USDC → Solana",
+                                "description": "Relay fast bridge",
+                                "to": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                                "data": "0xabcdef01",
+                                "value": "0x0",
+                            }],
+                            "bridgeTrackers": [{
+                                "assetId": "base-vault:unlocked",
+                                "assetSymbol": "USDC",
+                                "provider": "relay",
+                                "requestId": "req_auto_stage2",
+                                "estimatedOutput": "804.45 USDC",
+                                "estimatedSeconds": 4,
+                                "requiresSolanaClaim": False,
+                            }],
+                            "skippedAssets": [],
+                            "savings": {"popupsSaved": 0},
+                        }),
+                    )
+
+            pgX.route("**/api/scan", route_defi_plan_scan)
+            pgX.route("**/api/tx/prepare-chain-batch", route_prepare_two_stage)
+            pgX.route("**/api/tx/status", route_tx_status)
+            pgX.goto(BASE, wait_until="networkidle")
+            pgX.click("#siteConnectBtn")
+            pgX.wait_for_selector("[data-pick-evm]")
+            pgX.click("[data-pick-evm]")
+            pgX.wait_for_selector("#defiUnwindPanel:not(.hidden)", timeout=15000)
+
+            xss_and_badges = pgX.evaluate("""() => {
+              const panel = document.getElementById('defiUnwindPanel');
+              const badges = Array.from(panel.querySelectorAll('.defi-exit-badge')).map(el => el.innerText.trim());
+              return {
+                xssFired: Boolean(window.__xssFired),
+                badges,
+                hasScriptTag: panel.querySelectorAll('script').length,
+                hasRawCalldataVisible: panel.innerText.includes('0x69328dec'),
+              };
+            }""")
+            assert not xss_and_badges["xssFired"], "XSS payload executed!"
+            assert xss_and_badges["hasScriptTag"] == 0, "Unescaped script tag found!"
+            assert not xss_and_badges["hasRawCalldataVisible"], "Raw calldata leaked outside <details>!"
+            assert any("Safe Partial (Debt Guard)" in b for b in xss_and_badges["badges"]), xss_and_badges["badges"]
+            assert any("Cooldown / Locked" in b for b in xss_and_badges["badges"]), xss_and_badges["badges"]
+            assert any("1-Click Extract → Solana" in b for b in xss_and_badges["badges"]), xss_and_badges["badges"]
+            assert any("Instant Swap (Skips Cooldown)" in b for b in xss_and_badges["badges"]), xss_and_badges["badges"]
+
+            # Trigger per-protocol Extract on Morpho / Vaults -> assert automatic 2-stage bridge fires without manual re-click!
+            pgX.locator("[data-extract-protocol='Morpho / Vaults']").click()
+            pgX.wait_for_function("() => (window.__stage2BatchCalls || []).length === 2", timeout=15000)
+            step1_done = pgX.locator("[data-stepper-step='withdraw'].is-done").count()
+            step2_done = pgX.locator("[data-stepper-step='bridge'].is-done").count()
+            assert step1_done == 1 and step2_done == 1, f"Expected automatic 2-stage stepper done (step1={step1_done}, step2={step2_done})"
+            assert not errsX, f"DeFi 2-stage / XSS test errors: {errsX}"
+            results["defi_ux_and_two_stage_stepper"] = {
+                "ok": True,
+                "xssBlocked": True,
+                "autoStage2TxCount": 2,
+                "badges": xss_and_badges["badges"],
+            }
+            ctxX.close()
 
             # ------------------------------------------------------------------
             # 3. MOBILE 390x844: All 5 Views + Wallet Modal + 3D Graphics
@@ -453,6 +678,13 @@ def main():
             pgM.wait_for_selector("#appShell:not(.hidden)")
             pgM.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=15000)
             pgM.wait_for_timeout(300)
+
+            # Also load Sample DeFi on Mobile 390px and verify 0px overflow with DeFi panel + expanded Technical details!
+            pgM.click("#sourcePresetsBar [data-preset='veteran_defi']")
+            pgM.wait_for_selector("#defiUnwindPanel:not(.hidden)", timeout=10000)
+            pgM.locator(".defi-tech-details > summary").first.click()
+            pgM.wait_for_timeout(150)
+            overflowM["scanner_defi"] = pgM.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
 
             for view in ["scanner", "activity", "agents", "contract"]:
                 pgM.click(f".app-tab[data-view='{view}']")
