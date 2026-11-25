@@ -1,10 +1,14 @@
 import crypto from 'node:crypto';
 import { keccak_256 } from '@noble/hashes/sha3';
 import {
+  AddressLookupTableAccount,
+  ComputeBudgetProgram,
   PublicKey,
   SystemProgram,
   Transaction,
   TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
 } from '@solana/web3.js';
 import { SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import {
@@ -16,9 +20,22 @@ import {
   solanaAddressToBytes32,
   solanaOwnerToUsdcAtaBytes32,
 } from './cctp.js';
+import {
+  buildCloseTokenAccountInstruction,
+  SOLANA_MAX_PACKET_BYTES,
+  type ReclaimableSolanaTokenAccount,
+} from './solana-rent.js';
 
 const ZERO_BYTES32 = '0x' + '00'.repeat(32);
 const CCTP_V1_NONCES_PER_ACCOUNT = 6400n;
+
+export const DEFAULT_CLAIM_COMPUTE_UNIT_LIMIT_WITH_ATA = 280_000;
+export const DEFAULT_CLAIM_COMPUTE_UNIT_LIMIT_NO_ATA = 250_000;
+export const COMPUTE_UNITS_PER_CLOSE_ATA = 8_000;
+export const DEFAULT_CLAIM_PRIORITY_FEE_MICRO_LAMPORTS = 25_000;
+export const MIN_PRIORITY_FEE_MICRO_LAMPORTS = 5_000;
+export const MAX_PRIORITY_FEE_MICRO_LAMPORTS = 500_000;
+export const MAX_BUNDLED_CLOSE_ATAS_IN_CLAIM = 12;
 
 // Anchor discriminator: sha256("global:receive_message")[0..8]
 const RECEIVE_MESSAGE_DISCRIMINATOR = crypto
@@ -93,8 +110,17 @@ export interface SerializableSolanaInstruction {
   dataHex: string;
 }
 
+export interface SolanaPriorityFeeConfig {
+  computeUnitLimit: number;
+  computeUnitPriceMicroLamports: number;
+  estimatedPriorityFeeLamports: number;
+  estimatedPriorityFeeSol: number;
+  source: 'explicit' | 'rpc_p75' | 'default';
+}
+
 export interface SolanaCctpClaimPlan {
   planVersion: 'siphon-solana-cctp-claim-v1';
+  transactionVersion: 0;
   cctpVersion: 1 | 2;
   messageHash: string;
   decodedMessage: DecodedCctpMessage;
@@ -110,14 +136,24 @@ export interface SolanaCctpClaimPlan {
     tokenMessengerMinter: string;
     tokenProgram: string;
     associatedTokenProgram: string;
+    computeBudgetProgram: string;
     systemProgram: string;
     usdcMint: string;
   };
   pdas: SolanaCctpClaimPdas;
+  priorityFee: SolanaPriorityFeeConfig;
+  bundledCloseAtaCount: number;
+  bundledClosedAccounts: string[];
+  bundledReclaimedSol: number;
+  addressLookupTables: string[];
   instructions: SerializableSolanaInstruction[];
+  v0Instructions: SerializableSolanaInstruction[];
   recentBlockhash: string | null;
   serializedTransactionBase64: string | null;
   serializedMessageBase64: string | null;
+  serializedVersionedTransactionBase64: string | null;
+  serializedVersionedMessageBase64: string | null;
+  v0SerializedByteLength: number | null;
   claimSummary: string;
   fallbackInstructions: string[];
 }
@@ -129,6 +165,11 @@ export interface BuildSolanaCctpClaimParams {
   payer?: string;
   includeCreateAta?: boolean;
   recentBlockhash?: string | null;
+  computeUnitLimit?: number;
+  computeUnitPriceMicroLamports?: number;
+  priorityFeeSource?: 'explicit' | 'rpc_p75' | 'default';
+  closeEmptyAtas?: ReclaimableSolanaTokenAccount[];
+  addressLookupTableAccounts?: AddressLookupTableAccount[];
 }
 
 function cleanHexBytes(hex: string, label: string): Buffer {
@@ -413,11 +454,78 @@ export async function fetchLatestSolanaBlockhash(timeoutMs = 4200): Promise<stri
 }
 
 /**
+ * Queries Solana RPC `getRecentPrioritizationFees` to compute a dynamic 75th-percentile
+ * priority fee (in microLamports per compute unit) clamped to safe bounds so CCTP claims
+ * land reliably during congestion without blind overpaying.
+ */
+export async function fetchDynamicSolanaPriorityFeeMicroLamports(opts?: {
+  accounts?: string[];
+  rpcUrls?: string[];
+  timeoutMs?: number;
+}): Promise<{
+  microLamports: number;
+  source: 'rpc_p75' | 'default';
+}> {
+  const rpcUrls =
+    Array.isArray(opts?.rpcUrls) && opts.rpcUrls.length > 0 ? opts.rpcUrls : SOLANA_RPC_URLS;
+  const timeoutMs = opts?.timeoutMs ?? 3_500;
+  const accountFilters =
+    Array.isArray(opts?.accounts) && opts.accounts.length > 0
+      ? opts.accounts
+      : [SOLANA_USDC_MINT_PUBKEY.toBase58()];
+
+  for (const rpcUrl of rpcUrls) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getRecentPrioritizationFees',
+          params: [accountFilters],
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) continue;
+      const json = (await res.json()) as {
+        result?: Array<{ prioritizationFee?: number; slot?: number }>;
+      };
+      if (!Array.isArray(json.result) || json.result.length === 0) continue;
+
+      const fees = json.result
+        .map((item) => item?.prioritizationFee)
+        .filter((f): f is number => typeof f === 'number' && Number.isFinite(f) && f > 0)
+        .sort((a, b) => a - b);
+
+      if (fees.length === 0) {
+        return { microLamports: MIN_PRIORITY_FEE_MICRO_LAMPORTS, source: 'rpc_p75' };
+      }
+
+      const p75Index = Math.min(fees.length - 1, Math.floor((fees.length - 1) * 0.75));
+      const clamped = Math.max(
+        MIN_PRIORITY_FEE_MICRO_LAMPORTS,
+        Math.min(MAX_PRIORITY_FEE_MICRO_LAMPORTS, Math.round(fees[p75Index]))
+      );
+      return { microLamports: clamped, source: 'rpc_p75' };
+    } catch {
+      clearTimeout(timer);
+    }
+  }
+
+  return { microLamports: DEFAULT_CLAIM_PRIORITY_FEE_MICRO_LAMPORTS, source: 'default' };
+}
+
+/**
  * Parses a Circle CCTP `MessageSent` payload + Iris attestation hex, derives every required
  * Solana CCTP PDA via `PublicKey.findProgramAddressSync`, validates fail-closed that the
  * message's `mintRecipient` equals the user's canonical Solana USDC ATA PDA, and returns a
- * structured, serializable claim transaction plan (plus compiled transaction bytes when a
- * recentBlockhash is provided).
+ * structured, serializable claim transaction plan including a compiled V0 `VersionedTransaction`
+ * (`MessageV0`) with dynamic `ComputeBudget` priority fees and optional empty-ATA `closeAccount`
+ * bundling (while preserving backwards-compatible legacy fields).
  */
 export function buildSolanaCctpClaimInstructionPlan(
   params: BuildSolanaCctpClaimParams
@@ -586,25 +694,164 @@ export function buildSolanaCctpClaimInstructionPlan(
     })
   );
 
+  // Validate optional bundled empty-ATA closeAccount instructions (fail-closed!)
+  const closeAtasInput = Array.isArray(params.closeEmptyAtas) ? params.closeEmptyAtas : [];
+  if (closeAtasInput.length > MAX_BUNDLED_CLOSE_ATAS_IN_CLAIM) {
+    throw new Error(
+      `Cannot bundle more than ${MAX_BUNDLED_CLOSE_ATAS_IN_CLAIM} empty-ATA closeAccount instructions in a single CCTP claim transaction.`
+    );
+  }
+
+  const closeAtaWeb3Instructions: TransactionInstruction[] = [];
+  const closeAtaSerializableInstructions: SerializableSolanaInstruction[] = [];
+  const bundledClosedAccounts: string[] = [];
+  const seenCloseAccounts = new Set<string>();
+  let bundledReclaimedLamports = 0;
+
+  for (const emptyAta of closeAtasInput) {
+    // Only the transaction signer (`payer`) can act as authority to close empty ATAs.
+    const { instruction, serializable, rentLamports } = buildCloseTokenAccountInstruction(
+      payerClean,
+      emptyAta
+    );
+    const accKey = emptyAta.tokenAccount.trim();
+    if (accKey === expectedUsdcAtaPubkey.toBase58()) {
+      throw new Error(
+        `Refusing to bundle closeAccount for destination USDC ATA ${accKey} inside a USDC claim transaction.`
+      );
+    }
+    if (seenCloseAccounts.has(accKey)) {
+      throw new Error(`Duplicate empty ATA in bundled closeEmptyAtas: ${accKey}.`);
+    }
+    seenCloseAccounts.add(accKey);
+    bundledClosedAccounts.push(accKey);
+    bundledReclaimedLamports += rentLamports;
+    closeAtaWeb3Instructions.push(instruction);
+    closeAtaSerializableInstructions.push(serializable);
+  }
+
+  const defaultCuLimit =
+    (includeCreateAta
+      ? DEFAULT_CLAIM_COMPUTE_UNIT_LIMIT_WITH_ATA
+      : DEFAULT_CLAIM_COMPUTE_UNIT_LIMIT_NO_ATA) +
+    closeAtaWeb3Instructions.length * COMPUTE_UNITS_PER_CLOSE_ATA;
+
+  const computeUnitLimit = params.computeUnitLimit ?? Math.min(1_400_000, defaultCuLimit);
+  if (
+    !Number.isInteger(computeUnitLimit) ||
+    computeUnitLimit < 50_000 ||
+    computeUnitLimit > 1_400_000
+  ) {
+    throw new Error('computeUnitLimit must be an integer between 50,000 and 1,400,000.');
+  }
+
+  const hasExplicitPriorityFee = params.computeUnitPriceMicroLamports !== undefined;
+  const computeUnitPriceMicroLamports =
+    params.computeUnitPriceMicroLamports ?? DEFAULT_CLAIM_PRIORITY_FEE_MICRO_LAMPORTS;
+  if (
+    !Number.isInteger(computeUnitPriceMicroLamports) ||
+    computeUnitPriceMicroLamports < 0 ||
+    computeUnitPriceMicroLamports > 10_000_000
+  ) {
+    throw new Error('computeUnitPriceMicroLamports must be an integer between 0 and 10,000,000.');
+  }
+
+  const priorityFeeSource: SolanaPriorityFeeConfig['source'] =
+    params.priorityFeeSource ?? (hasExplicitPriorityFee ? 'explicit' : 'default');
+  const estimatedPriorityFeeLamports = Math.ceil(
+    (computeUnitLimit * computeUnitPriceMicroLamports) / 1_000_000
+  );
+  const priorityFee: SolanaPriorityFeeConfig = {
+    computeUnitLimit,
+    computeUnitPriceMicroLamports,
+    estimatedPriorityFeeLamports,
+    estimatedPriorityFeeSol: Number((estimatedPriorityFeeLamports / 1_000_000_000).toFixed(9)),
+    source: priorityFeeSource,
+  };
+
+  const cuLimitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit });
+  const cuPriceIx = ComputeBudgetProgram.setComputeUnitPrice({
+    microLamports: computeUnitPriceMicroLamports,
+  });
+
+  const computeBudgetSerializable: SerializableSolanaInstruction[] = [
+    {
+      name: 'setComputeUnitLimit',
+      programId: ComputeBudgetProgram.programId.toBase58(),
+      keys: [],
+      dataBase64: Buffer.from(cuLimitIx.data).toString('base64'),
+      dataHex: '0x' + Buffer.from(cuLimitIx.data).toString('hex'),
+    },
+    {
+      name: 'setComputeUnitPrice',
+      programId: ComputeBudgetProgram.programId.toBase58(),
+      keys: [],
+      dataBase64: Buffer.from(cuPriceIx.data).toString('base64'),
+      dataHex: '0x' + Buffer.from(cuPriceIx.data).toString('hex'),
+    },
+  ];
+
+  const v0Web3Instructions: TransactionInstruction[] = [
+    cuLimitIx,
+    cuPriceIx,
+    ...web3Instructions,
+    ...closeAtaWeb3Instructions,
+  ];
+  const v0SerializableInstructions: SerializableSolanaInstruction[] = [
+    ...computeBudgetSerializable,
+    ...serializableInstructions,
+    ...closeAtaSerializableInstructions,
+  ];
+
+  const lookupTables = Array.isArray(params.addressLookupTableAccounts)
+    ? params.addressLookupTableAccounts
+    : [];
+  const addressLookupTables = lookupTables.map((alt) => alt.key.toBase58());
+
   let recentBlockhash: string | null = params.recentBlockhash?.trim() || null;
   let serializedTransactionBase64: string | null = null;
   let serializedMessageBase64: string | null = null;
+  let serializedVersionedTransactionBase64: string | null = null;
+  let serializedVersionedMessageBase64: string | null = null;
+  let v0SerializedByteLength: number | null = null;
 
   if (recentBlockhash) {
-    const tx = new Transaction({
+    // Preserve backwards-compatible legacy Transaction serialization for legacy callers/tests
+    const legacyTx = new Transaction({
       feePayer: payerPubkey,
       recentBlockhash,
     });
-    for (const ix of web3Instructions) tx.add(ix);
-    serializedTransactionBase64 = tx
+    for (const ix of web3Instructions) legacyTx.add(ix);
+    serializedTransactionBase64 = legacyTx
       .serialize({ requireAllSignatures: false, verifySignatures: false })
       .toString('base64');
-    serializedMessageBase64 = tx.serializeMessage().toString('base64');
+    serializedMessageBase64 = legacyTx.serializeMessage().toString('base64');
+
+    // Compile upgraded VersionedTransaction (MessageV0) with ComputeBudget + optional closeAccount[] + ALTs
+    const messageV0 = new TransactionMessage({
+      payerKey: payerPubkey,
+      recentBlockhash,
+      instructions: v0Web3Instructions,
+    }).compileToV0Message(lookupTables);
+    const versionedTx = new VersionedTransaction(messageV0);
+    const v0TxBytes = Buffer.from(versionedTx.serialize());
+    if (v0TxBytes.length > SOLANA_MAX_PACKET_BYTES) {
+      throw new Error(
+        `Compiled V0 CCTP claim transaction exceeds Solana's ${SOLANA_MAX_PACKET_BYTES}-byte packet limit (${v0TxBytes.length} bytes). Supply an Address Lookup Table or close fewer ATAs in the claim tx.`
+      );
+    }
+    v0SerializedByteLength = v0TxBytes.length;
+    serializedVersionedTransactionBase64 = v0TxBytes.toString('base64');
+    serializedVersionedMessageBase64 = Buffer.from(messageV0.serialize()).toString('base64');
   } else {
     recentBlockhash = null;
   }
 
-  const claimSummary = `Claim ${decoded.burnMessage.amountUsdc.toFixed(2)} native USDC on Solana (CCTP V${decoded.cctpVersion}, domain ${decoded.sourceDomain} → 5) into ATA ${pdas.recipientUsdcAta}`;
+  const bundledReclaimedSol = Number((bundledReclaimedLamports / 1_000_000_000).toFixed(8));
+  const claimSummary =
+    bundledClosedAccounts.length > 0
+      ? `Claim ${decoded.burnMessage.amountUsdc.toFixed(2)} native USDC on Solana (CCTP V${decoded.cctpVersion}, domain ${decoded.sourceDomain} → 5) into ATA ${pdas.recipientUsdcAta} + reclaim ${bundledReclaimedSol} SOL from ${bundledClosedAccounts.length} empty ATA(s)`
+      : `Claim ${decoded.burnMessage.amountUsdc.toFixed(2)} native USDC on Solana (CCTP V${decoded.cctpVersion}, domain ${decoded.sourceDomain} → 5) into ATA ${pdas.recipientUsdcAta}`;
 
   const fallbackInstructions = [
     `Ensure your Solana wallet (${payerClean}) holds at least 0.003 SOL for transaction fees and USDC ATA rent.`,
@@ -614,6 +861,7 @@ export function buildSolanaCctpClaimInstructionPlan(
 
   return {
     planVersion: 'siphon-solana-cctp-claim-v1',
+    transactionVersion: 0,
     cctpVersion: decoded.cctpVersion,
     messageHash: decoded.messageHash,
     decodedMessage: decoded,
@@ -629,14 +877,24 @@ export function buildSolanaCctpClaimInstructionPlan(
       tokenMessengerMinter: programs.tokenMessengerMinter,
       tokenProgram: SOLANA_TOKEN_PROGRAM_ID.toBase58(),
       associatedTokenProgram: SOLANA_ASSOCIATED_TOKEN_PROGRAM_ID.toBase58(),
+      computeBudgetProgram: ComputeBudgetProgram.programId.toBase58(),
       systemProgram: SystemProgram.programId.toBase58(),
       usdcMint: SOLANA_USDC_MINT_PUBKEY.toBase58(),
     },
     pdas,
+    priorityFee,
+    bundledCloseAtaCount: bundledClosedAccounts.length,
+    bundledClosedAccounts,
+    bundledReclaimedSol,
+    addressLookupTables,
     instructions: serializableInstructions,
+    v0Instructions: v0SerializableInstructions,
     recentBlockhash,
     serializedTransactionBase64,
     serializedMessageBase64,
+    serializedVersionedTransactionBase64,
+    serializedVersionedMessageBase64,
+    v0SerializedByteLength,
     claimSummary,
     fallbackInstructions,
   };
