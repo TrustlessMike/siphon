@@ -3,6 +3,7 @@ import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { getProtocolFeeConfig } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
+import { applyTwoLevelRoiToReport } from '../scanner/roi.js';
 import type { ChainScanSummary, ScannedAsset, ScanReport } from '../scanner/types.js';
 import type {
   ChainFamilyAdapter,
@@ -260,7 +261,7 @@ export const btcAdapter: ChainFamilyAdapter = {
       sponsorshipMechanism: 'Single PSBT (BIP-174) — miner fee & 5–10% affiliate bps deducted inside vault swap',
     };
 
-    return {
+    return applyTwoLevelRoiToReport({
       scanId: `scan_btc_${crypto.randomBytes(4).toString('hex')}`,
       family: 'btc',
       mode: 'live_rpc',
@@ -291,7 +292,7 @@ export const btcAdapter: ChainFamilyAdapter = {
         gasNegativeCount: summary.skippedCount,
       },
       warnings,
-    };
+    });
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {

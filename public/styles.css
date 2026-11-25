@@ -2482,3 +2482,44 @@ select {
     font-size: 11.5px;
   }
 }
+
+.roi-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.roi-worth {
+  background: #ecfdf5;
+  color: #065f46;
+  border-color: #a7f3d0;
+}
+
+.roi-low {
+  background: #fffbeb;
+  color: #92400e;
+  border-color: #fde68a;
+}
+
+.roi-neg {
+  background: #fef2f2;
+  color: #991b1b;
+  border-color: #fecaca;
+}
+
+.breakeven-banner {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #991b1b;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 7px;
+  padding: 5px 9px;
+}

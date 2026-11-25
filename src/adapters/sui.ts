@@ -3,6 +3,7 @@ import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { getProtocolFeeConfig, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
+import { applyTwoLevelRoiToReport } from '../scanner/roi.js';
 import type { ChainScanSummary, ScannedAsset, ScanReport } from '../scanner/types.js';
 import type {
   ChainFamilyAdapter,
@@ -272,7 +273,7 @@ export const suiAdapter: ChainFamilyAdapter = {
       sponsorshipMechanism: 'Sui Native Sponsored Transaction (gasData.owner = Siphon Relayer)',
     };
 
-    return {
+    return applyTwoLevelRoiToReport({
       scanId: `scan_sui_${crypto.randomBytes(4).toString('hex')}`,
       family: 'sui',
       mode: 'live_rpc',
@@ -303,7 +304,7 @@ export const suiAdapter: ChainFamilyAdapter = {
         gasNegativeCount: summary.skippedCount,
       },
       warnings,
-    };
+    });
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {

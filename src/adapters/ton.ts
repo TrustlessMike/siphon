@@ -3,6 +3,7 @@ import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { getProtocolFeeConfig } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
+import { applyTwoLevelRoiToReport } from '../scanner/roi.js';
 import type { ChainScanSummary, ScannedAsset, ScanReport } from '../scanner/types.js';
 import type {
   ChainFamilyAdapter,
@@ -225,7 +226,7 @@ export const tonAdapter: ChainFamilyAdapter = {
       sponsorshipMechanism: 'Wallet W5 Gasless (up to 255 batched msgs, relayer reimbursed in Jettons)',
     };
 
-    return {
+    return applyTwoLevelRoiToReport({
       scanId: `scan_ton_${crypto.randomBytes(4).toString('hex')}`,
       family: 'ton',
       mode: 'live_rpc',
@@ -256,7 +257,7 @@ export const tonAdapter: ChainFamilyAdapter = {
         gasNegativeCount: summary.skippedCount,
       },
       warnings,
-    };
+    });
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {

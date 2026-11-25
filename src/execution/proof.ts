@@ -2,8 +2,13 @@ import crypto from 'node:crypto';
 import { fetchCctpAttestationForTx, solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { DEAD_BURN_ADDRESS, EVM_CHAINS, TOKEN_REGISTRY } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
+import {
+  classifyRoiVerdict,
+  estimateBridgeFixedFeeUsd,
+  estimateSolanaAtaRentUsd,
+} from '../scanner/roi.js';
 import { evmJsonRpcCall, formatUnits } from '../scanner/rpc.js';
-import type { EvmChainId, ScannedAsset } from '../scanner/types.js';
+import type { EvmChainId, RoiVerdict, ScannedAsset } from '../scanner/types.js';
 import { checkLiveExecutionStatus, type PreparedChainBatch } from './tx-builder.js';
 
 const ERC20_TRANSFER_TOPIC =
@@ -48,6 +53,18 @@ export interface PreSignSimulationProof {
   guaranteedMinNetUsd: number;
   estimatedNetUsd: number;
   outputAsset: 'USDC' | 'SOL';
+  quotedCostBreakdown?: {
+    grossUsd: number;
+    estimatedGasUsd: number;
+    bridgeAndSlippageUsd: number;
+    protocolFeeUsd: number;
+    solanaAtaRentUsd: number;
+    liveNetUsd: number;
+    effectiveCostPct: number;
+    roiVerdict: RoiVerdict;
+    routeStrategy?: 'local_batch_single_bridge' | 'direct_per_token_bridge';
+  };
+  haircutDroppedAssets?: Array<{ assetId: string; assetSymbol: string; reason: string }>;
   preSolanaSnapshot?: {
     usdcBalance: number;
     solBalance: number;
@@ -267,8 +284,33 @@ export async function buildPreSignSimulationProof(params: {
       .toFixed(2)
   );
   const feeUsd = batch.feeBreakdown.estimatedFeeUsd;
+  const solanaAtaRentUsd = solSnap
+    ? estimateSolanaAtaRentUsd({ hasUsdcAta: solSnap.hasUsdcAta, solPriceUsd: 70 })
+    : 0;
+  const bridgeAndSlippageUsd = Number(
+    (
+      estimateBridgeFixedFeeUsd(batch.chain) +
+      assets
+        .filter((a) => a.action !== 'BURN_ZERO_LIQUIDITY' && a.action !== 'SKIP_HONEYPOT')
+        .reduce((s, a) => s + (a.estimatedSlippageUsd || 0), 0)
+    ).toFixed(2)
+  );
+  const liveNetUsd = Number(
+    (grossUsd - feeUsd - estimatedGasUsd - bridgeAndSlippageUsd - solanaAtaRentUsd).toFixed(2)
+  );
   const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
   const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
+  const effectiveCostPct =
+    grossUsd > 0 ? Number((((grossUsd - liveNetUsd) / grossUsd) * 100).toFixed(2)) : 100;
+  const roiVerdict = classifyRoiVerdict(liveNetUsd, effectiveCostPct);
+  const haircutDroppedAssets = batch.skippedAssets.filter((s) =>
+    s.reason.toLowerCase().includes('haircut')
+  );
+  if (haircutDroppedAssets.length > 0) {
+    warnings.push(
+      `Live Quote Haircut Gate dropped ${haircutDroppedAssets.length} asset(s) exceeding 50% cost cap.`
+    );
+  }
 
   const proofPayload = {
     chainId: cfg.chainId,
@@ -326,6 +368,18 @@ export async function buildPreSignSimulationProof(params: {
     guaranteedMinNetUsd,
     estimatedNetUsd,
     outputAsset: batch.outputAsset,
+    quotedCostBreakdown: {
+      grossUsd,
+      estimatedGasUsd,
+      bridgeAndSlippageUsd,
+      protocolFeeUsd: feeUsd,
+      solanaAtaRentUsd,
+      liveNetUsd,
+      effectiveCostPct,
+      roiVerdict,
+      routeStrategy: assets.length > 1 ? 'local_batch_single_bridge' : 'direct_per_token_bridge',
+    },
+    haircutDroppedAssets: haircutDroppedAssets.length ? haircutDroppedAssets : undefined,
     preSolanaSnapshot: solSnap
       ? {
           usdcBalance: solSnap.usdcBalance,

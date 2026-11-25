@@ -163,6 +163,8 @@ contract SiphonSweepDelegate {
     error InvalidFeeBps(uint16 feeBps);
     error InvalidAddress();
     error GasReimbursementTooHigh(uint256 requested, uint256 maxAllowed);
+    error ZeroMinNetOutput();
+    error RelayerBreakEvenNotMet(uint256 relayerRevenueUsdc, uint256 requiredCoverageUsdc);
     error SwapCallFailed(address router);
     error SlippageFloorNotMet(uint256 actualUsdc, uint256 minRequired);
     error Reentrancy();
@@ -218,6 +220,7 @@ contract SiphonSweepDelegate {
         ds.locked = 1;
 
         if (block.timestamp > intent.deadline) revert ExpiredIntent();
+        if (intent.minNetUsdcOut == 0) revert ZeroMinNetOutput();
         if (ds.usedNonces[intent.nonce]) revert NonceAlreadyUsed(intent.nonce);
         if (intent.feeBps < MIN_FEE_BPS || intent.feeBps > MAX_FEE_BPS) {
             revert InvalidFeeBps(intent.feeBps);
@@ -289,6 +292,14 @@ contract SiphonSweepDelegate {
         uint256 usdcAfter = IERC20Delegate(intent.usdc).balanceOf(address(this));
         uint256 grossUsdc = usdcAfter > usdcBefore ? (usdcAfter - usdcBefore) : usdcAfter;
         uint256 protocolFeeUsdc = (grossUsdc * intent.feeBps) / 10_000;
+        // Onchain Relayer Break-Even Protection: require protocolFee + gasReimbursement >= 1.5x sponsored gas
+        if (gasReimbursementUsdc > 0) {
+            uint256 relayerRevenue = protocolFeeUsdc + gasReimbursementUsdc;
+            uint256 requiredCoverage = (gasReimbursementUsdc * 3) / 2;
+            if (relayerRevenue < requiredCoverage) {
+                revert RelayerBreakEvenNotMet(relayerRevenue, requiredCoverage);
+            }
+        }
         uint256 totalDeductions = protocolFeeUsdc + gasReimbursementUsdc;
         if (grossUsdc <= totalDeductions) revert SlippageFloorNotMet(0, intent.minNetUsdcOut);
 

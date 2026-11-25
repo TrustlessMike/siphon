@@ -17,6 +17,7 @@ import {
   simulateBurnTransferOnchain,
 } from './discovery.js';
 import { formatUnits, isValidEvmAddress, scanSingleEvmChain } from './rpc.js';
+import { applyTwoLevelRoiToReport, estimateLiquidityScaledSlippageUsd } from './roi.js';
 import type {
   AssetAction,
   ChainScanSummary,
@@ -160,12 +161,15 @@ function classifyAndBuildReport(params: {
       estimatedGasUsd * (chainItemCount > 1 ? 0.54 : 0.85)
     );
 
-    const slippageRate =
-      item.kind === 'dead_token' || isDirectUsdc || item.underlyingSymbol === 'USDC' ? 0 : 0.0015;
-    const estimatedSlippageUsd = round2(grossUsd * slippageRate);
+    const estimatedSlippageUsd = estimateLiquidityScaledSlippageUsd({
+      grossUsd,
+      liquidityUsd: item.liquidityUsd,
+      isDirectUsdc: isDirectUsdc || item.underlyingSymbol === 'USDC',
+      isDead: item.kind === 'dead_token',
+    });
 
-    const netUsdcSingle = round2(Math.max(0, grossUsd - estimatedGasUsd - estimatedSlippageUsd));
-    const netUsdcBatched = round2(Math.max(0, grossUsd - batchedGasUsd - estimatedSlippageUsd));
+    const netUsdcSingle = round2(grossUsd - estimatedGasUsd - estimatedSlippageUsd);
+    const netUsdcBatched = round2(grossUsd - batchedGasUsd - estimatedSlippageUsd);
 
     let action: AssetAction;
     let actionReason: string;
@@ -327,7 +331,7 @@ function classifyAndBuildReport(params: {
     Math.max(0, grossUsd - estimatedSlippageUsd - batchedGasUsd - protocolFeeUsd)
   );
 
-  return {
+  const report: ScanReport = {
     scanId: `scan_${crypto.randomBytes(5).toString('hex')}`,
     mode,
     walletAddress,
@@ -360,6 +364,8 @@ function classifyAndBuildReport(params: {
     },
     warnings,
   };
+
+  return applyTwoLevelRoiToReport(report);
 }
 
 /**

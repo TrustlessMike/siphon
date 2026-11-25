@@ -19,9 +19,16 @@ import { CHAIN_LIST, EVM_CHAINS, getProtocolFeeConfig, resolveProtocolFeeBps } f
 import { scanPresetWallet } from '../src/scanner/classifier.js';
 import { decodeAaveAccountData } from '../src/scanner/discovery.js';
 import {
+  buildGaslessSweepIntent,
+  submitSignedGaslessIntent,
+} from '../src/relayer/sponsor.js';
+import {
+  applyTwoLevelRoiToReport,
+  classifyRoiVerdict,
   computeRelayerBreakEven,
   evaluateAssetRoi,
   evaluateChainBatchRoi,
+  evaluateLiveQuoteHaircut,
   evaluatePortfolioRoi,
   pruneNegativeRoiAssets,
 } from '../src/scanner/roi.js';
@@ -845,10 +852,11 @@ test('Two-Level Signed Negative-ROI Engine & Relayer Break-Even math prunes nega
   assert.ok(beHigh.relayerNetMarginUsd > 6);
   assert.equal(beHigh.shortfallToBreakEvenUsd, 0);
 
-  // Level 2: pruning prevents bad dust from dragging down a profitable Ethereum bundle
+  // Level 2: pruning separates worth_it (whale), low_efficiency (marginal 47% fees), and negative_roi (badDust)
   const whale = mk({ id: 'eth:usdc', symbol: 'USDC', grossUsd: 200, estimatedGasUsd: 3.0, batchedGasUsd: 1.2, estimatedSlippageUsd: 0 });
   const buckets = pruneNegativeRoiAssets([whale, marginal, badDust], { protocolFeeBps: 700 });
-  assert.equal(buckets.kept.length, 2);
+  assert.equal(buckets.kept.length, 1);
+  assert.equal(buckets.lowEfficiency.length, 1);
   assert.equal(buckets.prunedNegativeRoi.length, 1);
 
   const chainRoi = evaluateChainBatchRoi({
@@ -867,4 +875,226 @@ test('Two-Level Signed Negative-ROI Engine & Relayer Break-Even math prunes nega
   const portfolioRoi = evaluatePortfolioRoi(report, { protocolFeeBps: 700 });
   assert.equal(portfolioRoi.overallRelayerProfitable, true);
   assert.ok(portfolioRoi.totalRelayerNetMarginUsd > 0);
+});
+
+test('Two-Level Negative-ROI Guard: L1 dust, 10 L2 tokens batch rescue, ATA rent, live-quote >50% haircut gate & relayer break-even rejection', async () => {
+  const mk = (overrides: Partial<ScannedAsset>): ScannedAsset => ({
+    id: 'eth:dust',
+    chain: 'ethereum',
+    chainName: 'Ethereum',
+    address: '0x0000000000000000000000000000000000000001',
+    symbol: 'DUST',
+    name: 'Dust Token',
+    decimals: 18,
+    kind: 'erc20',
+    rawBalance: '1000000000000000000',
+    uiBalance: 1,
+    priceUsd: 2.0,
+    grossUsd: 2.0,
+    liquidityUsd: 200_000,
+    estimatedGasUsd: 4.5,
+    batchedGasUsd: 2.8,
+    estimatedSlippageUsd: 0.01,
+    netUsdcSingle: -2.51,
+    netUsdcBatched: -0.81,
+    action: 'SELL_AND_BRIDGE',
+    actionReason: 'Test',
+    selectedByDefault: true,
+    honeypotSafe: true,
+    ...overrides,
+  });
+
+  // 1. 3-tier ROI verdict boundaries
+  assert.equal(classifyRoiVerdict(5.0, 12), 'worth_it');
+  assert.equal(classifyRoiVerdict(0.9, 45), 'low_efficiency');
+  assert.equal(classifyRoiVerdict(-1.42, 170), 'negative_roi');
+  assert.equal(classifyRoiVerdict(0.5, 68), 'negative_roi');
+
+  // 2. Single L1 dust token -> signed negative ROI + SKIP_CHAIN_NEGATIVE_ROI + concrete break-even hint
+  const l1Dust = mk({ id: 'eth:tiny', grossUsd: 2.0, estimatedGasUsd: 4.5, batchedGasUsd: 3.1 });
+  const l1Eval = evaluateAssetRoi(l1Dust, { protocolFeeBps: 700 });
+  assert.ok(l1Eval.netRoiUsd < 0, `Expected negative netRoiUsd, got ${l1Eval.netRoiUsd}`);
+  assert.equal(l1Eval.roiVerdict, 'negative_roi');
+  assert.equal(l1Eval.shouldIncludeByDefault, false);
+
+  const l1Chain = evaluateChainBatchRoi({
+    chain: 'ethereum',
+    assets: [l1Dust],
+    protocolFeeBps: 700,
+    gasPriceGwei: 12,
+  });
+  assert.equal(l1Chain.skipChainNegativeRoi, true);
+  assert.ok(l1Chain.chainLegNetUsd < 0);
+  assert.ok(l1Chain.breakEvenHint?.includes('Becomes profitable'));
+
+  // 3. 10 small L2 tokens ($0.85 each = $8.50 total) rescued by Local Batch Swap + Single Bridge!
+  const tenL2Tokens = Array.from({ length: 10 }, (_, i) =>
+    mk({
+      id: `base:tok_${i}`,
+      chain: 'base',
+      chainName: 'Base',
+      symbol: `T${i}`,
+      grossUsd: 0.85,
+      liquidityUsd: 500_000,
+      estimatedGasUsd: 0.03,
+      batchedGasUsd: 0.015,
+      estimatedSlippageUsd: 0.002,
+    })
+  );
+  const baseBatchRoi = evaluateChainBatchRoi({
+    chain: 'base',
+    assets: tenL2Tokens,
+    protocolFeeBps: 700,
+    hasSolanaUsdcAta: true,
+  });
+  assert.equal(baseBatchRoi.routeComparison.recommendedStrategy, 'local_batch_single_bridge');
+  assert.ok(
+    baseBatchRoi.routeComparison.batchAdvantageUsd > 1.0,
+    `Expected batch route to save >$1 vs 10 separate bridges, got ${baseBatchRoi.routeComparison.batchAdvantageUsd}`
+  );
+  assert.ok(baseBatchRoi.chainLegNetUsd > 5.0);
+  assert.equal(baseBatchRoi.skipChainNegativeRoi, false);
+  assert.equal(baseBatchRoi.roiVerdict, 'worth_it');
+
+  // 4. First-time Solana USDC ATA rent (~0.00204 SOL) impact when !hasSolanaUsdcAta
+  const smallBaseWithAta = evaluateChainBatchRoi({
+    chain: 'base',
+    assets: [
+      mk({
+        id: 'base:small',
+        chain: 'base',
+        chainName: 'Base',
+        grossUsd: 0.5,
+        estimatedGasUsd: 0.02,
+        batchedGasUsd: 0.01,
+        estimatedSlippageUsd: 0,
+      }),
+    ],
+    protocolFeeBps: 700,
+    hasSolanaUsdcAta: false,
+    solPriceUsd: 150, // 0.00203928 * 150 = ~$0.31 ATA rent
+  });
+  assert.ok(smallBaseWithAta.solanaAtaRentUsd >= 0.3);
+  assert.ok(smallBaseWithAta.chainLegNetUsd <= 0.1);
+  assert.equal(smallBaseWithAta.skipChainNegativeRoi, true);
+
+  // 5. Live Quote Haircut Gate: >50% haircut auto-drops unless allowHighCost: true
+  const badQuote = evaluateLiveQuoteHaircut({
+    grossUsd: 10,
+    quoteOutUsd: 4.5,
+    actualGasUsd: 0.5, // liveNetUsd = $4.00 -> 60% haircut!
+  });
+  assert.equal(badQuote.passed, false);
+  assert.equal(badQuote.liveNetUsd, 4.0);
+  assert.equal(badQuote.liveHaircutPct, 60);
+
+  const overriddenQuote = evaluateLiveQuoteHaircut({
+    grossUsd: 10,
+    quoteOutUsd: 4.5,
+    actualGasUsd: 0.5,
+    allowHighCost: true,
+  });
+  assert.equal(overriddenQuote.passed, true);
+  assert.equal(overriddenQuote.overridden, true);
+
+  // Also test prepareChainBatchExecution auto-dropping a >50% haircut Circle CCTP quote
+  const hugeFeeCctpAsset = mk({
+    id: 'eth:usdc_tiny',
+    chain: 'ethereum',
+    chainName: 'Ethereum',
+    address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+    symbol: 'USDC',
+    decimals: 6,
+    rawBalance: '4000000', // $4.00 USDC
+    uiBalance: 4,
+    priceUsd: 1,
+    grossUsd: 4.0,
+    estimatedGasUsd: 3.2,
+    batchedGasUsd: 2.6, // liveNetUsd = 3.72 - 2.6 = $1.12 -> 72% haircut!
+    action: 'BRIDGE_DIRECT_USDC',
+  });
+  const gatedBatch = await prepareChainBatchExecution({
+    chain: 'ethereum',
+    assets: [hugeFeeCctpAsset],
+    userAddress: '0x71C7656EC7ab88b098defB751B7401B5f6d8976F',
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+    bridgePreference: 'cctp',
+    protocolFeeBps: 700,
+    feeRecipientEvm: '0x1111111111111111111111111111111111111111',
+  });
+  assert.equal(gatedBatch.calls.length, 0);
+  assert.ok(
+    gatedBatch.skippedAssets.some((s) => s.reason.includes('Live Quote Haircut Gate')),
+    `Expected Live Quote Haircut Gate skip, got ${JSON.stringify(gatedBatch.skippedAssets)}`
+  );
+
+  // With allowHighCost: true, the user can explicitly override the >50% cap (since liveNetUsd > 0)
+  const overrideBatch = await prepareChainBatchExecution({
+    chain: 'ethereum',
+    assets: [hugeFeeCctpAsset],
+    userAddress: '0x71C7656EC7ab88b098defB751B7401B5f6d8976F',
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+    bridgePreference: 'cctp',
+    protocolFeeBps: 700,
+    feeRecipientEvm: '0x1111111111111111111111111111111111111111',
+    allowHighCost: true,
+  });
+  assert.ok(overrideBatch.calls.length >= 2);
+
+  // 6. Relayer Break-Even Protection: refuses gasless intent & submit when relayer would lose money
+  const losingIntent = buildGaslessSweepIntent({
+    chain: 'ethereum',
+    assets: [l1Dust], // $2 gross vs $3.10 sponsored gas -> relayer & user lose money!
+    userAddress: '0x71C7656EC7ab88b098defB751B7401B5f6d8976F',
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+    protocolFeeBps: 700,
+  });
+  assert.equal(losingIntent.sponsorEligible, false);
+  assert.ok(losingIntent.sponsorRejectionReason?.includes('Below gasless sponsorship break-even'));
+  assert.throws(
+    () =>
+      submitSignedGaslessIntent({
+        intentId: losingIntent.intentId,
+        chain: 'ethereum',
+        userAddress: '0x71C7656EC7ab88b098defB751B7401B5f6d8976F',
+        signature: '0x' + 'ab'.repeat(65),
+        deadline: losingIntent.deadline,
+      }),
+    /Below gasless sponsorship break-even/
+  );
+
+  // HTTP /api/relayer/prepare-intent returns 400 with sponsorRejectionReason, and contracts enforce RelayerBreakEvenNotMet
+  const { server } = createSiphonServer();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = server.address();
+  assert.ok(addr && typeof addr !== 'string');
+  const base = `http://127.0.0.1:${addr.port}`;
+  try {
+    const rejRes = await fetch(`${base}/api/relayer/prepare-intent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chain: 'ethereum',
+        assets: [l1Dust],
+        userAddress: '0x71C7656EC7ab88b098defB751B7401B5f6d8976F',
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+      }),
+    });
+    assert.equal(rejRes.status, 400);
+    const rejJson = await rejRes.json();
+    assert.equal(rejJson.sponsorEligible, false);
+    assert.ok(rejJson.sponsorRejectionReason.includes('Below gasless sponsorship break-even'));
+
+    const c = await fetch(`${base}/api/contract`).then((r) => r.json());
+    assert.ok(c.source.includes('error RelayerBreakEvenNotMet'));
+    assert.ok(c.delegateSource.includes('error RelayerBreakEvenNotMet'));
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  // Verify BTC sub-fee dust is stamped negative_roi when applyTwoLevelRoiToReport runs
+  const btcReport = await scanPresetWallet('veteran_defi');
+  applyTwoLevelRoiToReport(btcReport, { hasSolanaUsdcAta: false });
+  assert.ok(btcReport.assets.every((a) => typeof a.netRoiUsd === 'number' && Boolean(a.roiVerdict)));
 });

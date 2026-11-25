@@ -8,6 +8,7 @@ import {
   SOLANA_CCTP_DOMAIN,
 } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
+import { evaluateChainBatchRoi } from '../scanner/roi.js';
 import { evmJsonRpcCall } from '../scanner/rpc.js';
 import type { AnyChainId, CctpBridgeLeg, EvmChainId, MigrationPlan, ScanReport } from '../scanner/types.js';
 
@@ -214,6 +215,7 @@ export interface BuildPlanInput {
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
   protocolFeeBps?: number;
   feeRecipientEvm?: string | null;
+  hasSolanaUsdcAta?: boolean;
 }
 
 function getBridgeProviderMeta(
@@ -446,6 +448,17 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
       });
     }
 
+    const chainRoi = evaluateChainBatchRoi({
+      chain: chainId,
+      chainName,
+      assets: chainAssets,
+      protocolFeeBps: feeConfig.feeBps,
+      gasSponsored: Boolean(usePermit2Batch && chainSummary?.needsGasSponsorship),
+      hasSolanaUsdcAta: legs.length === 0 ? input.hasSolanaUsdcAta : true,
+      solPriceUsd: scan.totals.solPriceUsd || 70,
+      gasPriceGwei: chainSummary?.gasPriceGwei,
+    });
+
     legs.push({
       family: scan.family ?? 'evm',
       chain: chainId,
@@ -466,6 +479,13 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
       honeypotsSkipped: skippedOnChain,
       gasSponsored: Boolean(usePermit2Batch && chainSummary?.needsGasSponsorship),
       sponsorshipMechanism: chainSummary?.sponsorshipMechanism,
+      chainLegNetUsd: chainRoi.chainLegNetUsd,
+      effectiveCostPct: chainRoi.chainLegCostPct,
+      roiVerdict: chainRoi.roiVerdict,
+      routeStrategy: chainRoi.routeComparison.recommendedStrategy,
+      breakEvenHint: chainRoi.breakEvenHint,
+      skippedNegativeRoi: chainRoi.skipChainNegativeRoi,
+      solanaAtaRentUsd: chainRoi.solanaAtaRentUsd,
       cctpCalldata,
       steps,
     });

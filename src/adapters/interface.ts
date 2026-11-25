@@ -94,6 +94,18 @@ export interface UniversalPreSignProof {
   guaranteedMinNetUsd: number;
   estimatedNetUsd: number;
   outputAsset: 'USDC' | 'SOL';
+  quotedCostBreakdown?: {
+    grossUsd: number;
+    estimatedGasUsd: number;
+    bridgeAndSlippageUsd: number;
+    protocolFeeUsd: number;
+    solanaAtaRentUsd: number;
+    liveNetUsd: number;
+    effectiveCostPct: number;
+    roiVerdict: 'worth_it' | 'low_efficiency' | 'negative_roi';
+    routeStrategy?: 'local_batch_single_bridge' | 'direct_per_token_bridge';
+  };
+  haircutDroppedAssets?: Array<{ assetId: string; assetSymbol: string; reason: string }>;
   preSolanaSnapshot?: {
     usdcBalance: number;
     solBalance: number;

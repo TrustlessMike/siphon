@@ -1,9 +1,12 @@
 import crypto from 'node:crypto';
 import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { EVM_CHAINS, getProtocolFeeConfig } from '../scanner/chains.js';
+import { computeRelayerBreakEven, RELAYER_BREAK_EVEN_MULTIPLIER } from '../scanner/roi.js';
 import type { EvmChainId, ScannedAsset } from '../scanner/types.js';
 
 export const CANONICAL_PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
+
+const issuedIntentEligibility = new Map<string, { eligible: boolean; rejectionReason?: string }>();
 
 export interface GaslessSweepIntentPlan {
   intentId: string;
@@ -26,6 +29,10 @@ export interface GaslessSweepIntentPlan {
   feeRecipientEvm: string | null;
   minNetUsdcOut: string; // 6 decimals raw string
   estimatedNetUsd: number;
+  sponsorEligible: boolean;
+  sponsorRejectionReason?: string;
+  relayerRequiredCoverageUsd: number;
+  relayerExpectedCoverageUsd: number;
   coveredAssets: Array<{ id: string; symbol: string; address: string; rawBalance: string; grossUsd: number }>;
   uncoveredNativeAssets: Array<{ id: string; symbol: string; reason: string }>;
   relayerConfigured: boolean;
@@ -111,15 +118,43 @@ export function buildGaslessSweepIntent(params: {
       erc20Assets.reduce((s, a) => s + (a.batchedGasUsd || a.estimatedGasUsd || 0), 0)
     ).toFixed(2)
   );
-  const maxGasReimbursementUsd = Number(Math.max(0.25, sponsoredGasEstUsd * 2.5).toFixed(2));
   const protocolFeeUsd = Number(((grossUsd * feeConfig.feeBps) / 10_000).toFixed(2));
-  const estimatedNetUsd = Number(
-    Math.max(0, grossUsd - protocolFeeUsd - sponsoredGasEstUsd).toFixed(2)
+  // Cap reimbursement to what the user's swept gross proceeds can actually fund after fee
+  const affordableReimbursementUsd = Number(Math.max(0, grossUsd - protocolFeeUsd - 0.01).toFixed(2));
+  const maxGasReimbursementUsd = Number(
+    Math.min(Math.max(0.25, sponsoredGasEstUsd * 2.5), affordableReimbursementUsd).toFixed(2)
   );
-  const minNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
+  const estimatedNetUsd = Number(
+    (grossUsd - protocolFeeUsd - sponsoredGasEstUsd).toFixed(2)
+  );
+  const minNetUsd = Number(Math.max(0, estimatedNetUsd * 0.985).toFixed(2));
 
   const maxGasReimbursementUsdc = BigInt(Math.round(maxGasReimbursementUsd * 1_000_000)).toString();
   const minNetUsdcOut = BigInt(Math.round(minNetUsd * 1_000_000)).toString();
+
+  // Relayer Break-Even Protection:
+  // Require expectedProtocolFeeUsd + maxGasReimbursementUsd >= sponsoredGasEstUsd * 1.5
+  // AND userMinNetUsdcOut > 0 so neither relayer nor user burns value on dust sweeps!
+  const relayerRequiredCoverageUsd = Number(
+    (sponsoredGasEstUsd * RELAYER_BREAK_EVEN_MULTIPLIER).toFixed(2)
+  );
+  const relayerExpectedCoverageUsd = Number((protocolFeeUsd + maxGasReimbursementUsd).toFixed(2));
+  const relayerCheck = computeRelayerBreakEven({
+    sponsoredGasUsd: sponsoredGasEstUsd,
+    protocolFeeBps: feeConfig.feeBps,
+    grossUsd,
+    maxGasReimbursementUsd,
+  });
+  const userMinNetPositive = BigInt(minNetUsdcOut) > 0n;
+  const sponsorEligible =
+    relayerExpectedCoverageUsd >= relayerRequiredCoverageUsd &&
+    userMinNetPositive &&
+    relayerCheck.isRelayerProfitable;
+  const sponsorRejectionReason = !sponsorEligible
+    ? !userMinNetPositive
+      ? `Below gasless sponsorship break-even: user minNetUsdcOut is $0.00 on $${grossUsd.toFixed(2)} gross vs $${sponsoredGasEstUsd.toFixed(2)} sponsored gas.`
+      : `Below gasless sponsorship break-even: expected fee + reimbursement ($${relayerExpectedCoverageUsd.toFixed(2)}) < 1.5x sponsored gas ($${relayerRequiredCoverageUsd.toFixed(2)}).`
+    : undefined;
 
   // Witness-bound Uniswap Permit2 PermitBatchWitnessTransferFrom EIP-712 typed data:
   // cryptographically locks solanaRecipient, minNetUsdcOut, maxGasReimbursementUsdc, feeBps, and feeRecipient!
@@ -221,8 +256,18 @@ export function buildGaslessSweepIntent(params: {
       .update(JSON.stringify({ mode, chainId: cfg.chainId, user: params.userAddress, typedData }))
       .digest('hex');
 
+  const intentId = `int_${crypto.randomBytes(5).toString('hex')}`;
+  issuedIntentEligibility.set(intentId, {
+    eligible: sponsorEligible,
+    rejectionReason: sponsorRejectionReason,
+  });
+  if (issuedIntentEligibility.size > 200) {
+    const oldest = issuedIntentEligibility.keys().next().value;
+    if (oldest) issuedIntentEligibility.delete(oldest);
+  }
+
   return {
-    intentId: `int_${crypto.randomBytes(5).toString('hex')}`,
+    intentId,
     mode,
     chain: params.chain,
     chainId: cfg.chainId,
@@ -242,6 +287,10 @@ export function buildGaslessSweepIntent(params: {
     feeRecipientEvm: feeConfig.feeRecipientEvm,
     minNetUsdcOut,
     estimatedNetUsd,
+    sponsorEligible,
+    sponsorRejectionReason,
+    relayerRequiredCoverageUsd,
+    relayerExpectedCoverageUsd,
     coveredAssets: erc20Assets.map((a) => ({
       id: a.id,
       symbol: a.symbol,
@@ -285,6 +334,10 @@ export function submitSignedGaslessIntent(params: {
   }
   if (Math.floor(Date.now() / 1000) > params.deadline) {
     throw new Error('Signed gasless sweep intent has expired. Re-sign a fresh intent.');
+  }
+  const tracked = issuedIntentEligibility.get(params.intentId);
+  if (tracked && !tracked.eligible) {
+    throw new Error(tracked.rejectionReason || 'Below gasless sponsorship break-even.');
   }
 
   const signatureFingerprint =

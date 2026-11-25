@@ -327,6 +327,7 @@ export function createSiphonServer() {
           bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
           protocolFeeBps?: number;
           feeRecipientEvm?: string | null;
+          hasSolanaUsdcAta?: boolean;
         }>(req);
 
         const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
@@ -355,6 +356,7 @@ export function createSiphonServer() {
           bridgePreference: body.bridgePreference ?? 'auto',
           protocolFeeBps: body.protocolFeeBps,
           feeRecipientEvm: body.feeRecipientEvm,
+          hasSolanaUsdcAta: body.hasSolanaUsdcAta,
         });
 
         return sendJson(res, 200, plan);
@@ -388,6 +390,7 @@ export function createSiphonServer() {
           bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
           protocolFeeBps?: number;
           feeRecipientEvm?: string | null;
+          hasSolanaUsdcAta?: boolean;
         }>(req);
 
         if (!body.asset || !body.userAddress || !body.solanaDestination) {
@@ -425,6 +428,7 @@ export function createSiphonServer() {
           bundleDefiCctp?: boolean;
           protocolFeeBps?: number;
           feeRecipientEvm?: string | null;
+          allowHighCost?: boolean;
         }>(req);
 
         if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
@@ -444,6 +448,7 @@ export function createSiphonServer() {
             bundleDefiCctp: body.bundleDefiCctp ?? true,
             protocolFeeBps: body.protocolFeeBps,
             feeRecipientEvm: body.feeRecipientEvm,
+            allowHighCost: body.allowHighCost ?? false,
           });
           return sendJson(res, 200, batch);
         } catch (err) {
@@ -652,6 +657,13 @@ export function createSiphonServer() {
               feeRecipientEvm: body.feeRecipientEvm,
               preferredMode: body.preferredMode,
             });
+            if (!plan.sponsorEligible) {
+              return sendJson(res, 400, {
+                ...plan,
+                family: 'evm',
+                error: plan.sponsorRejectionReason || 'Below gasless sponsorship break-even.',
+              });
+            }
             return sendJson(res, 200, { ...plan, family: 'evm' });
           }
 

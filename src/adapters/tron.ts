@@ -3,6 +3,7 @@ import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { getProtocolFeeConfig } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
+import { applyTwoLevelRoiToReport } from '../scanner/roi.js';
 import type { ChainScanSummary, ScannedAsset, ScanReport } from '../scanner/types.js';
 import type {
   ChainFamilyAdapter,
@@ -250,7 +251,7 @@ export const tronAdapter: ChainFamilyAdapter = {
       sponsorshipMechanism: 'Tron Energy Delegation (DelegateResourceContract) + TIP-712 Permit ($0 TRX)',
     };
 
-    return {
+    return applyTwoLevelRoiToReport({
       scanId: `scan_tron_${crypto.randomBytes(4).toString('hex')}`,
       family: 'tron',
       mode: 'live_rpc',
@@ -281,7 +282,7 @@ export const tronAdapter: ChainFamilyAdapter = {
         gasNegativeCount: summary.skippedCount,
       },
       warnings,
-    };
+    });
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {

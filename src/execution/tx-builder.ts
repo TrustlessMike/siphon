@@ -13,6 +13,7 @@ import {
   simulateBurnTransferOnchain,
   SOLANA_USDC_MINT,
 } from '../scanner/discovery.js';
+import { evaluateLiveQuoteHaircut } from '../scanner/roi.js';
 import { evmJsonRpcCall } from '../scanner/rpc.js';
 import type { EvmChainId, ScannedAsset } from '../scanner/types.js';
 
@@ -115,6 +116,9 @@ export interface PreparedExecution {
   explorerUrl: string;
   estimatedOutput: string;
   estimatedSeconds: number;
+  quotedOutUsd?: number;
+  liveNetUsd?: number;
+  liveHaircutPct?: number;
   estimatedGasUsd?: number;
   estimatedFeeUsd?: number;
   feeBreakdown?: FeeBreakdown;
@@ -456,7 +460,7 @@ async function tryRelayBridgeQuote(params: {
         requestId?: string;
         details?: {
           timeEstimate?: number;
-          currencyOut?: { amountFormatted?: string; currency?: { symbol?: string } };
+          currencyOut?: { amountFormatted?: string; amountUsd?: string; currency?: { symbol?: string } };
         };
         fees?: {
           gas?: { amountUsd?: string };
@@ -523,6 +527,15 @@ async function tryRelayBridgeQuote(params: {
       const outFormatted = json.details?.currencyOut?.amountFormatted ?? '0';
       const outSym = json.details?.currencyOut?.currency?.symbol ?? outputAsset;
       const appFeeUsd = Number(json.fees?.app?.amountUsd ?? estFeeUsd);
+      const quotedOutUsd =
+        Number(json.details?.currencyOut?.amountUsd) ||
+        (outSym.toUpperCase() === 'USDC' ? Number(outFormatted) : asset.grossUsd);
+      const actualGasUsd = Number(json.fees?.gas?.amountUsd ?? asset.batchedGasUsd ?? 0);
+      const haircut = evaluateLiveQuoteHaircut({
+        grossUsd: asset.grossUsd,
+        quoteOutUsd: quotedOutUsd,
+        actualGasUsd,
+      });
 
       return {
         assetId: asset.id,
@@ -534,7 +547,10 @@ async function tryRelayBridgeQuote(params: {
         explorerUrl: cfg.explorerUrl,
         estimatedOutput: `${Number(outFormatted).toLocaleString(undefined, { maximumFractionDigits: 4 })} ${outSym}`,
         estimatedSeconds: Math.max(2, Number(json.details?.timeEstimate ?? 10)),
-        estimatedGasUsd: Number(json.fees?.gas?.amountUsd ?? 0),
+        quotedOutUsd: haircut.quoteOutUsd,
+        liveNetUsd: haircut.liveNetUsd,
+        liveHaircutPct: haircut.liveHaircutPct,
+        estimatedGasUsd: actualGasUsd,
         estimatedFeeUsd: Number(json.fees?.relayer?.amountUsd ?? 0) + (feeConfig.feeRecipientEvm ? appFeeUsd : 0),
         feeBreakdown: {
           feeBps: feeConfig.feeBps,
@@ -608,6 +624,7 @@ async function tryLifiBridgeQuote(params: {
       toolDetails?: { name?: string };
       estimate?: {
         toAmount?: string;
+        toAmountUSD?: string;
         executionDuration?: number;
         approvalAddress?: string;
       };
@@ -678,6 +695,15 @@ async function tryLifiBridgeQuote(params: {
     const outDecimals = json.action?.toToken?.decimals ?? (outputAsset === 'SOL' ? 9 : 6);
     const outRaw = BigInt(json.estimate?.toAmount ?? '0');
     const outUi = Number(outRaw) / 10 ** outDecimals;
+    const quotedOutUsd =
+      Number(json.estimate?.toAmountUSD) ||
+      (outputAsset === 'USDC' ? outUi : asset.grossUsd);
+    const actualGasUsd = asset.batchedGasUsd || asset.estimatedGasUsd || 0;
+    const haircut = evaluateLiveQuoteHaircut({
+      grossUsd: asset.grossUsd,
+      quoteOutUsd: quotedOutUsd,
+      actualGasUsd,
+    });
 
     return {
       assetId: asset.id,
@@ -689,6 +715,10 @@ async function tryLifiBridgeQuote(params: {
       explorerUrl: cfg.explorerUrl,
       estimatedOutput: `${outUi.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${outputAsset}`,
       estimatedSeconds: Math.max(5, Number(json.estimate?.executionDuration ?? 30)),
+      quotedOutUsd: haircut.quoteOutUsd,
+      liveNetUsd: haircut.liveNetUsd,
+      liveHaircutPct: haircut.liveHaircutPct,
+      estimatedGasUsd: actualGasUsd,
       estimatedFeeUsd: estFeeUsd,
       feeBreakdown: {
         feeBps: feeConfig.feeBps,
@@ -789,6 +819,13 @@ async function buildDirectCctpUsdcExecution(params: {
     value: '0x0',
   });
 
+  const cctpActualGasUsd = asset.batchedGasUsd || asset.estimatedGasUsd || 0;
+  const cctpHaircut = evaluateLiveQuoteHaircut({
+    grossUsd: asset.grossUsd,
+    quoteOutUsd: netUiUsdc,
+    actualGasUsd: cctpActualGasUsd,
+  });
+
   return {
     assetId: asset.id,
     action: asset.action,
@@ -799,6 +836,10 @@ async function buildDirectCctpUsdcExecution(params: {
     explorerUrl: cfg.explorerUrl,
     estimatedOutput: `${netUiUsdc.toFixed(2)} USDC (1:1 Native CCTP)`,
     estimatedSeconds: cfg.cctpAttestationSec,
+    quotedOutUsd: cctpHaircut.quoteOutUsd,
+    liveNetUsd: cctpHaircut.liveNetUsd,
+    liveHaircutPct: cctpHaircut.liveHaircutPct,
+    estimatedGasUsd: cctpActualGasUsd,
     estimatedFeeUsd: estFeeUsd,
     feeBreakdown: {
       feeBps: feeConfig.feeBps,
@@ -1001,6 +1042,7 @@ export async function prepareChainBatchExecution(params: {
   bundleDefiCctp?: boolean;
   protocolFeeBps?: number;
   feeRecipientEvm?: string | null;
+  allowHighCost?: boolean;
 }): Promise<PreparedChainBatch> {
   const {
     chain,
@@ -1012,6 +1054,7 @@ export async function prepareChainBatchExecution(params: {
     bundleDefiCctp = true,
     protocolFeeBps,
     feeRecipientEvm,
+    allowHighCost = false,
   } = params;
   const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
 
@@ -1027,6 +1070,7 @@ export async function prepareChainBatchExecution(params: {
     BRIDGE_DIRECT_USDC: 3,
     BURN_ZERO_LIQUIDITY: 4,
     SKIP_GAS_NEGATIVE: 5,
+    SKIP_NEGATIVE_ROI: 5,
     SKIP_HONEYPOT: 6,
   };
 
@@ -1082,6 +1126,30 @@ export async function prepareChainBatchExecution(params: {
     }
 
     const prep = res.value;
+
+    // Live Quote Haircut Gate: drop any bridged/swapped quote that turns net-negative or >50% haircut
+    if (
+      asset.action !== 'BURN_ZERO_LIQUIDITY' &&
+      (prep.provider === 'relay' || prep.provider === 'lifi' || prep.provider === 'circle_cctp') &&
+      typeof prep.quotedOutUsd === 'number'
+    ) {
+      const gate = evaluateLiveQuoteHaircut({
+        grossUsd: asset.grossUsd,
+        quoteOutUsd: prep.quotedOutUsd,
+        actualGasUsd: prep.estimatedGasUsd ?? asset.batchedGasUsd ?? 0,
+        allowHighCost,
+      });
+      if (!gate.passed) {
+        skippedAssets.push({
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          reason: gate.reason,
+        });
+        notes.push(`${asset.symbol}: ${gate.reason}`);
+        return;
+      }
+    }
+
     maxSeconds = Math.max(maxSeconds, prep.estimatedSeconds);
 
     for (const tx of prep.transactions) {

@@ -528,6 +528,7 @@ async function recomputePlan() {
         bridgePreference,
         protocolFeeBps,
         feeRecipientEvm,
+        hasSolanaUsdcAta: solanaBalances ? Boolean(solanaBalances.hasUsdcAta) : undefined,
       }),
     });
     renderAll();
@@ -651,6 +652,41 @@ function renderChainFilterBar() {
   });
 }
 
+function formatRoiTooltip(a) {
+  const bd = a.roiCostBreakdown;
+  if (!bd) return a.actionReason || '';
+  const parts = [
+    `Gas $${(bd.gasUsd || 0).toFixed(2)}`,
+    bd.l1DataFeeUsd > 0 ? `L1 data $${bd.l1DataFeeUsd.toFixed(3)}` : null,
+    `Slippage $${(bd.slippageUsd || 0).toFixed(2)}`,
+    bd.bridgeFeeUsd > 0 ? `Bridge $${bd.bridgeFeeUsd.toFixed(2)}` : null,
+    bd.solanaAtaRentUsd > 0 ? `Solana ATA rent $${bd.solanaAtaRentUsd.toFixed(2)}` : null,
+    `Siphon fee $${(bd.protocolFeeUsd || 0).toFixed(2)}`,
+  ].filter(Boolean);
+  return `${parts.join(' + ')} = $${(bd.totalCostUsd || 0).toFixed(2)} total cost`;
+}
+
+function renderRoiVerdictBadge(a) {
+  if (a.action === 'SKIP_HONEYPOT') return `<span class="action-tag tag-skip">Honeypot</span>`;
+  if (a.action === 'BURN_ZERO_LIQUIDITY') return `<span class="action-tag tag-burn">Burn $0</span>`;
+  const v = a.roiVerdict;
+  const pct = typeof a.effectiveCostPct === 'number' ? a.effectiveCostPct.toFixed(0) : null;
+  const net = typeof a.netRoiUsd === 'number' ? a.netRoiUsd : null;
+  const tip = escapeHtml(formatRoiTooltip(a));
+  if (v === 'worth_it') {
+    return `<span class="roi-pill roi-worth" title="${tip}">Worth It</span>`;
+  }
+  if (v === 'low_efficiency') {
+    return `<span class="roi-pill roi-low" title="${tip}">High Cost (${pct ?? '—'}% fees)</span>`;
+  }
+  if (v === 'negative_roi' || a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_NEGATIVE_ROI') {
+    const signedStr =
+      net !== null ? `${net < 0 ? '-' : ''}$${Math.abs(net).toFixed(2)}` : '-$0.00';
+    return `<span class="roi-pill roi-neg" title="${tip}">Negative ROI (${signedStr})</span>`;
+  }
+  return compactActionTag(a.action);
+}
+
 function compactActionTag(action) {
   if (action === 'WITHDRAW_AND_BRIDGE') return `<span class="action-tag tag-defi">DeFi Exit</span>`;
   if (action === 'BRIDGE_DIRECT_USDC') return `<span class="action-tag tag-direct">USDC</span>`;
@@ -668,10 +704,19 @@ function renderAssetList() {
     if (activeChainFilter !== 'all' && a.chain !== activeChainFilter) return false;
     if (activeFilter === 'defi') return a.action === 'WITHDRAW_AND_BRIDGE';
     if (activeFilter === 'liquid')
-      return a.action === 'SELL_AND_BRIDGE' || a.action === 'BRIDGE_DIRECT_USDC';
+      return (
+        (a.action === 'SELL_AND_BRIDGE' || a.action === 'BRIDGE_DIRECT_USDC') &&
+        a.roiVerdict !== 'low_efficiency'
+      );
+    if (activeFilter === 'low_efficiency') return a.roiVerdict === 'low_efficiency';
     if (activeFilter === 'burn') return a.action === 'BURN_ZERO_LIQUIDITY';
     if (activeFilter === 'skipped')
-      return a.action === 'SKIP_HONEYPOT' || a.action === 'SKIP_GAS_NEGATIVE';
+      return (
+        a.action === 'SKIP_HONEYPOT' ||
+        a.action === 'SKIP_GAS_NEGATIVE' ||
+        a.action === 'SKIP_NEGATIVE_ROI' ||
+        a.roiVerdict === 'negative_roi'
+      );
     return true;
   });
 
@@ -700,8 +745,9 @@ function renderAssetList() {
           ? `<span class="micro-pill" style="background:var(--block-bg);border-color:#fecaca;color:#991b1b;">Debt Guard</span>`
           : '';
 
+      const rowTip = escapeHtml(formatRoiTooltip(a));
       return `
-        <div class="asset-row ${checked ? 'is-checked' : ''} ${disabled ? 'is-blocked' : ''}" data-row-asset="${escapeHtml(a.id)}">
+        <div class="asset-row ${checked ? 'is-checked' : ''} ${disabled ? 'is-blocked' : ''}" data-row-asset="${escapeHtml(a.id)}" title="${rowTip}">
           <input type="checkbox" class="asset-chk" data-asset-id="${escapeHtml(a.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="Select ${escapeHtml(a.symbol)} on ${escapeHtml(a.chainName)}" />
           <div class="asset-row-id">
             <span class="asset-logo-wrap">
@@ -721,7 +767,7 @@ function renderAssetList() {
             <div class="asset-row-usd">${escapeHtml(usdStr)}</div>
             <div class="asset-row-bal">${escapeHtml(balStr)}</div>
           </div>
-          <div class="asset-row-tag">${compactActionTag(a.action)}</div>
+          <div class="asset-row-tag">${renderRoiVerdictBadge(a)}</div>
         </div>
       `;
     })
@@ -764,18 +810,32 @@ function renderChainQueueList() {
       const noGasBadge = chainMeta?.needsGasSponsorship
         ? `<span class="gas-warn-pill" title="Low native gas on ${escapeHtml(leg.chainName)} — use Gasless 1-Sig sponsored mode">No Gas · Sponsor</span>`
         : '';
+      const legRoiPill =
+        leg.roiVerdict === 'negative_roi'
+          ? `<span class="roi-pill roi-neg" title="${escapeHtml(leg.breakEvenHint || '')}">Neg ROI</span>`
+          : leg.roiVerdict === 'low_efficiency'
+          ? `<span class="roi-pill roi-low">${Number(leg.effectiveCostPct || 0).toFixed(0)}% fees</span>`
+          : `<span class="roi-pill roi-worth">Worth It</span>`;
+      const breakEvenHtml =
+        leg.skippedNegativeRoi && leg.breakEvenHint
+          ? `<div class="breakeven-banner mono">${escapeHtml(leg.breakEvenHint)}</div>`
+          : '';
       return `
-      <div class="chain-queue-item">
-        <span class="inline-logo-row">
-          <img src="${escapeHtml(getChainLogoPath(leg.chain))}" alt="" class="chain-logo-xs" />
-          <strong>${escapeHtml(leg.chainName)}</strong>
-          <span class="mono muted-xs">${leg.defiExits + leg.swaps + leg.burns} items</span>
-          ${noGasBadge}
-        </span>
-        <span class="inline-logo-row">
-          <span class="mono" style="font-weight:600;">$${leg.bridgedUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-          <button type="button" class="chain-queue-run" data-exec-chain-batch="${escapeHtml(leg.chain)}">${executionMode === 'gasless' ? '1-Sig' : 'Run'}</button>
-        </span>
+      <div>
+        <div class="chain-queue-item">
+          <span class="inline-logo-row">
+            <img src="${escapeHtml(getChainLogoPath(leg.chain))}" alt="" class="chain-logo-xs" />
+            <strong>${escapeHtml(leg.chainName)}</strong>
+            <span class="mono muted-xs">${leg.defiExits + leg.swaps + leg.burns} items</span>
+            ${legRoiPill}
+            ${noGasBadge}
+          </span>
+          <span class="inline-logo-row">
+            <span class="mono" style="font-weight:600;">$${leg.bridgedUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+            <button type="button" class="chain-queue-run" data-exec-chain-batch="${escapeHtml(leg.chain)}">${executionMode === 'gasless' ? '1-Sig' : 'Run'}</button>
+          </span>
+        </div>
+        ${breakEvenHtml}
       </div>
     `;
     })
@@ -825,6 +885,16 @@ function renderPreSignProofCard(proof) {
     <div class="proof-kv"><span>Solana Recipient bytes32</span><span class="mono">${proof.mintRecipientVerified ? '✓ Matched bit-for-bit' : '✕ Mismatch'}</span></div>
     <div class="proof-kv"><span>Guaranteed Min Output</span><strong class="mono">≥ $${proof.guaranteedMinNetUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} ${escapeHtml(proof.outputAsset)}</strong></div>
     <div class="proof-kv"><span>Protocol Fee (${proof.protocolFee.feePercent}%)</span><span class="mono">$${proof.protocolFee.estimatedFeeUsd.toFixed(2)} (${escapeHtml(proof.protocolFee.collectionMethod)})</span></div>
+    ${
+      proof.quotedCostBreakdown
+        ? `<div class="proof-kv"><span>All-In Quoted Cost</span><span class="mono">${proof.quotedCostBreakdown.effectiveCostPct.toFixed(1)}% · gas $${proof.quotedCostBreakdown.estimatedGasUsd.toFixed(2)} + bridge/slip $${proof.quotedCostBreakdown.bridgeAndSlippageUsd.toFixed(2)}${proof.quotedCostBreakdown.solanaAtaRentUsd > 0 ? ` + ATA $${proof.quotedCostBreakdown.solanaAtaRentUsd.toFixed(2)}` : ''}</span></div>`
+        : ''
+    }
+    ${
+      proof.haircutDroppedAssets?.length
+        ? `<div class="breakeven-banner mono">Haircut Gate dropped ${proof.haircutDroppedAssets.length} high-cost asset(s) (&gt;50% fee).</div>`
+        : ''
+    }
     ${proof.preSolanaSnapshot ? `<div class="proof-kv"><span>Pre-Sweep Solana Snapshot</span><span class="mono">${proof.preSolanaSnapshot.usdcBalance.toFixed(2)} USDC · slot #${proof.preSolanaSnapshot.slot.toLocaleString()}</span></div>` : ''}
     ${checkRows ? `<div class="proof-checks">${checkRows}</div>` : ''}
     <div style="display:flex; justify-content:flex-end; padding-top:4px;">

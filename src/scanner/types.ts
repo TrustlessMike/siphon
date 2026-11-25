@@ -41,13 +41,27 @@ export type NonEvmChainId =
 
 export type AnyChainId = EvmChainId | NonEvmChainId;
 
+export type RoiVerdict = 'worth_it' | 'low_efficiency' | 'negative_roi';
+export type ChainRouteStrategy = 'local_batch_single_bridge' | 'direct_per_token_bridge';
+
 export type AssetAction =
   | 'WITHDRAW_AND_BRIDGE'
   | 'SELL_AND_BRIDGE'
   | 'BRIDGE_DIRECT_USDC'
   | 'BURN_ZERO_LIQUIDITY'
   | 'SKIP_GAS_NEGATIVE'
+  | 'SKIP_NEGATIVE_ROI'
   | 'SKIP_HONEYPOT';
+
+export interface RoiCostBreakdown {
+  gasUsd: number;
+  l1DataFeeUsd: number;
+  slippageUsd: number;
+  bridgeFeeUsd: number;
+  protocolFeeUsd: number;
+  solanaAtaRentUsd: number;
+  totalCostUsd: number;
+}
 
 export type AssetKind = 'native' | 'erc20' | 'defi_position' | 'dead_token';
 
@@ -112,6 +126,12 @@ export interface ScannedAsset {
   estimatedSlippageUsd: number;
   netUsdcSingle: number;
   netUsdcBatched: number;
+  /** Signed marginal net ROI in USD (negative when costs exceed gross value) */
+  netRoiUsd?: number;
+  /** Total estimated cost (gas + L1 data + slippage + bridge + protocol fee) as % of gross */
+  effectiveCostPct?: number;
+  roiVerdict?: RoiVerdict;
+  roiCostBreakdown?: RoiCostBreakdown;
   action: AssetAction;
   actionReason: string;
   selectedByDefault: boolean;
@@ -149,6 +169,14 @@ export interface ChainScanSummary {
   cctpAttestationSec: number;
   needsGasSponsorship: boolean;
   sponsorshipMechanism?: string;
+  /** Level 2 signed chain-leg total net USD (can be negative) */
+  chainLegNetUsd?: number;
+  chainLegCostPct?: number;
+  roiVerdict?: RoiVerdict;
+  skipChainNegativeRoi?: boolean;
+  routeStrategy?: ChainRouteStrategy;
+  breakEvenHint?: string;
+  solanaAtaRentUsd?: number;
 }
 
 export interface ScanReport {
@@ -204,6 +232,13 @@ export interface CctpBridgeLeg {
   honeypotsSkipped: number;
   gasSponsored: boolean;
   sponsorshipMechanism?: string;
+  chainLegNetUsd?: number;
+  effectiveCostPct?: number;
+  roiVerdict?: RoiVerdict;
+  routeStrategy?: ChainRouteStrategy;
+  breakEvenHint?: string;
+  skippedNegativeRoi?: boolean;
+  solanaAtaRentUsd?: number;
   cctpCalldata: string;
   steps: Array<{
     step: string;

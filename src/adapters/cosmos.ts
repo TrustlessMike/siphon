@@ -3,6 +3,7 @@ import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { getProtocolFeeConfig, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
+import { applyTwoLevelRoiToReport } from '../scanner/roi.js';
 import type {
   AnyChainId,
   ChainScanSummary,
@@ -462,7 +463,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
         : 'x/feegrant BasicAllowance (fee_granter = Siphon Relayer)',
     };
 
-    return {
+    return applyTwoLevelRoiToReport({
       scanId: `scan_cosmos_${crypto.randomBytes(4).toString('hex')}`,
       family: 'cosmos',
       mode: 'live_rpc',
@@ -493,7 +494,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
         gasNegativeCount: summary.skippedCount,
       },
       warnings,
-    };
+    });
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {

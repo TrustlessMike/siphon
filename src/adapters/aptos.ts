@@ -3,6 +3,7 @@ import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { getProtocolFeeConfig, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
+import { applyTwoLevelRoiToReport } from '../scanner/roi.js';
 import type { ChainScanSummary, ScannedAsset, ScanReport } from '../scanner/types.js';
 import type {
   ChainFamilyAdapter,
@@ -244,7 +245,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
       sponsorshipMechanism: 'Aptos Native Fee Payer Transaction (FeePayerRawTransaction)',
     };
 
-    return {
+    return applyTwoLevelRoiToReport({
       scanId: `scan_aptos_${crypto.randomBytes(4).toString('hex')}`,
       family: 'aptos',
       mode: 'live_rpc',
@@ -275,7 +276,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
         gasNegativeCount: summary.skippedCount,
       },
       warnings,
-    };
+    });
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {

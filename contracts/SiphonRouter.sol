@@ -209,6 +209,8 @@ contract SiphonRouter {
     error AggregatorSwapFailed(address aggregator);
     error SlippageExceeded(uint256 actualUsdc, uint256 minExpected);
     error ZeroUsdcOutput();
+    error ZeroMinNetOutput();
+    error RelayerBreakEvenNotMet(uint256 relayerRevenueUsdc, uint256 requiredCoverageUsdc);
     error Unauthorized();
     error FeeOutOfBounds(uint16 feeBps);
     error Reentrancy();
@@ -427,6 +429,7 @@ contract SiphonRouter {
     ) external nonReentrant returns (uint256 bridgedUsdc, uint64 cctpNonce) {
         if (user == address(0) || witness.feeRecipient == address(0)) revert InvalidAddress();
         if (witness.solanaRecipient == bytes32(0)) revert InvalidSolanaRecipient();
+        if (witness.minNetUsdcOut == 0) revert ZeroMinNetOutput();
         if (block.timestamp > permit.deadline) revert ExpiredDeadline();
         if (witness.feeBps < MIN_FEE_BPS || witness.feeBps > MAX_FEE_BPS) {
             revert FeeOutOfBounds(witness.feeBps);
@@ -484,6 +487,14 @@ contract SiphonRouter {
         if (grossUsdc == 0) revert ZeroUsdcOutput();
 
         uint256 feeUsdc = (grossUsdc * witness.feeBps) / 10_000;
+        // Onchain Relayer Break-Even Protection: require protocolFee + gasReimbursement >= 1.5x sponsored gas
+        if (gasReimbursementUsdc > 0) {
+            uint256 relayerRevenue = feeUsdc + gasReimbursementUsdc;
+            uint256 requiredCoverage = (gasReimbursementUsdc * 3) / 2;
+            if (relayerRevenue < requiredCoverage) {
+                revert RelayerBreakEvenNotMet(relayerRevenue, requiredCoverage);
+            }
+        }
         uint256 deductions = feeUsdc + gasReimbursementUsdc;
         if (grossUsdc <= deductions) revert SlippageExceeded(0, witness.minNetUsdcOut);
 
