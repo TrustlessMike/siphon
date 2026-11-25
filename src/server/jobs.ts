@@ -18,8 +18,12 @@ const NON_EVM_EXPLORERS: Record<string, string> = {
   btc: 'https://mempool.space',
 };
 
-function isEvmChainId(chain: AnyChainId): chain is EvmChainId {
-  return chain in EVM_CHAINS;
+export const DEFAULT_POLL_INTERVAL_MS = 3500;
+export const DEFAULT_POLL_WINDOW_MS = 180_000; // 3 min for fast L2/Relay legs
+export const ETHEREUM_CCTP_POLL_WINDOW_MS = 1_020_000; // 17 min (> 780s ETH CCTP finality + buffer)
+
+export function isEvmChainId(chain: string): chain is EvmChainId {
+  return typeof chain === 'string' && Object.hasOwn(EVM_CHAINS, chain);
 }
 
 export type JobLegStatus =
@@ -33,7 +37,28 @@ export type JobLegStatus =
   | 'failed'
   | 'skipped';
 
+export const VALID_JOB_LEG_STATUSES = new Set<JobLegStatus>([
+  'queued',
+  'preparing',
+  'signing',
+  'confirming',
+  'relaying',
+  'attested',
+  'landed',
+  'failed',
+  'skipped',
+]);
+
+export function isValidJobLegStatus(status: unknown): status is JobLegStatus {
+  return typeof status === 'string' && VALID_JOB_LEG_STATUSES.has(status as JobLegStatus);
+}
+
+const POLLER_EXIT_STATUSES = new Set<JobLegStatus>(['landed', 'attested', 'failed', 'skipped']);
+const TERMINAL_JOB_LEG_STATUSES = new Set<JobLegStatus>(['landed', 'failed', 'skipped']);
+
 export interface BackgroundJobLeg {
+  legId: string;
+  sourceWallet: string;
   chain: AnyChainId;
   chainName: string;
   explorerUrl: string;
@@ -53,6 +78,20 @@ export interface BackgroundJobLeg {
   updatedAt: string;
 }
 
+export type BackgroundJobLegPatch = Partial<
+  Omit<BackgroundJobLeg, 'legId' | 'sourceWallet' | 'chain' | 'chainName' | 'explorerUrl'>
+>;
+
+export type JobLegTarget =
+  | AnyChainId
+  | string
+  | {
+      legId?: string;
+      chain?: AnyChainId;
+      sourceWallet?: string;
+      walletAddress?: string;
+    };
+
 export interface BackgroundJob {
   jobId: string;
   createdAt: string;
@@ -63,15 +102,90 @@ export interface BackgroundJob {
   bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp';
   protocolFeeBps: number;
   feeRecipientEvm: string | null;
-  status: 'active' | 'completed' | 'partial' | 'failed';
+  status: 'active' | 'completed' | 'partial' | 'failed' | 'skipped';
   totalNetUsd: number;
   settledNetUsd: number;
+  attestedNetUsd: number;
   legs: BackgroundJobLeg[];
+}
+
+export interface BackgroundJobStoreOptions {
+  maxJobs?: number;
+  pollIntervalMs?: number;
+  statusChecker?: typeof checkLiveExecutionStatus;
+  attestationFetcher?: typeof fetchCctpAttestationForTx;
+}
+
+/**
+ * Computes the polling window and maxAttempts for a leg so Ethereum CCTP legs cover
+ * the full ~780s Circle Iris finality window (+ buffer) instead of timing out at 140s.
+ */
+export function computePollerMaxAttempts(
+  chain: EvmChainId,
+  leg: Pick<BackgroundJobLeg, 'provider' | 'requiresSolanaClaim'>,
+  pollIntervalMs = DEFAULT_POLL_INTERVAL_MS
+): number {
+  const interval = Math.max(10, pollIntervalMs);
+  const cfg = EVM_CHAINS[chain];
+  const cctpWindowMs = cfg ? (cfg.cctpAttestationSec + 240) * 1000 : DEFAULT_POLL_WINDOW_MS;
+  const isEthCctp =
+    chain === 'ethereum' &&
+    (Boolean(leg.requiresSolanaClaim) || leg.provider === 'circle_cctp' || !leg.provider);
+  const targetWindowMs = isEthCctp
+    ? Math.max(ETHEREUM_CCTP_POLL_WINDOW_MS, cctpWindowMs)
+    : leg.requiresSolanaClaim || leg.provider === 'circle_cctp'
+    ? Math.max(DEFAULT_POLL_WINDOW_MS, cctpWindowMs)
+    : DEFAULT_POLL_WINDOW_MS;
+  return Math.max(40, Math.ceil(targetWindowMs / interval));
+}
+
+export function sanitizeLegPatch(patch: BackgroundJobLegPatch): BackgroundJobLegPatch {
+  const clean: BackgroundJobLegPatch = {};
+  if (patch.status !== undefined) {
+    if (!isValidJobLegStatus(patch.status)) {
+      throw new Error(`Invalid leg status: ${String(patch.status)}`);
+    }
+    clean.status = patch.status;
+  }
+  if (patch.statusText !== undefined) clean.statusText = String(patch.statusText);
+  if (patch.provider !== undefined) clean.provider = String(patch.provider);
+  if (patch.callsBatched !== undefined) {
+    if (typeof patch.callsBatched !== 'number' || !Number.isInteger(patch.callsBatched) || patch.callsBatched < 0) {
+      throw new Error('Invalid callsBatched: must be a non-negative integer');
+    }
+    clean.callsBatched = patch.callsBatched;
+  }
+  if (patch.popupsSaved !== undefined) {
+    if (typeof patch.popupsSaved !== 'number' || !Number.isInteger(patch.popupsSaved) || patch.popupsSaved < 0) {
+      throw new Error('Invalid popupsSaved: must be a non-negative integer');
+    }
+    clean.popupsSaved = patch.popupsSaved;
+  }
+  if (patch.evmTxHash !== undefined) clean.evmTxHash = String(patch.evmTxHash);
+  if (patch.solanaTxHash !== undefined) clean.solanaTxHash = String(patch.solanaTxHash);
+  if (patch.requestId !== undefined) clean.requestId = String(patch.requestId);
+  if (patch.requiresSolanaClaim !== undefined) {
+    clean.requiresSolanaClaim = Boolean(patch.requiresSolanaClaim);
+  }
+  if (patch.attestationStatus !== undefined) clean.attestationStatus = String(patch.attestationStatus);
+  return clean;
 }
 
 export class BackgroundJobStore {
   private jobs = new Map<string, BackgroundJob>();
   private pollTimers = new Map<string, NodeJS.Timeout>();
+  private pollInFlight = new Set<string>();
+  private maxJobs: number;
+  private pollIntervalMs: number;
+  private statusChecker: typeof checkLiveExecutionStatus;
+  private attestationFetcher: typeof fetchCctpAttestationForTx;
+
+  constructor(opts: BackgroundJobStoreOptions = {}) {
+    this.maxJobs = Math.max(1, opts.maxJobs ?? 30);
+    this.pollIntervalMs = Math.max(10, opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
+    this.statusChecker = opts.statusChecker ?? checkLiveExecutionStatus;
+    this.attestationFetcher = opts.attestationFetcher ?? fetchCctpAttestationForTx;
+  }
 
   createJob(input: {
     sourceWallet: string;
@@ -81,6 +195,9 @@ export class BackgroundJobStore {
     protocolFeeBps: number;
     feeRecipientEvm: string | null;
     legs: Array<{
+      legId?: string;
+      sourceWallet?: string;
+      walletAddress?: string;
       chain: AnyChainId;
       chainName?: string;
       assetCount: number;
@@ -88,17 +205,57 @@ export class BackgroundJobStore {
       estimatedFeeUsd?: number;
     }>;
   }): BackgroundJob {
+    if (!Array.isArray(input.legs)) {
+      throw new Error('legs must be an array');
+    }
+
     const now = new Date().toISOString();
     const jobId = `job_${crypto.randomBytes(5).toString('hex')}`;
-    const legs: BackgroundJobLeg[] = input.legs.map((l) => {
+    const seenLegIds = new Set<string>();
+
+    const legs: BackgroundJobLeg[] = input.legs.map((l, idx) => {
+      if (!l || typeof l !== 'object' || typeof l.chain !== 'string' || !l.chain.trim()) {
+        throw new Error(`Invalid leg at index ${idx}: chain is required`);
+      }
+      if (
+        typeof l.assetCount !== 'number' ||
+        !Number.isInteger(l.assetCount) ||
+        l.assetCount < 0
+      ) {
+        throw new Error(`Invalid leg assetCount at index ${idx}: must be a non-negative integer`);
+      }
+      if (typeof l.estimatedNetUsd !== 'number' || !Number.isFinite(l.estimatedNetUsd)) {
+        throw new Error(`Invalid leg estimatedNetUsd at index ${idx}: must be a finite number`);
+      }
+      const feeUsd = l.estimatedFeeUsd ?? 0;
+      if (typeof feeUsd !== 'number' || !Number.isFinite(feeUsd) || feeUsd < 0) {
+        throw new Error(`Invalid leg estimatedFeeUsd at index ${idx}: must be a finite non-negative number`);
+      }
+
+      const legWallet = (l.sourceWallet || l.walletAddress || input.sourceWallet || '').trim();
+      const baseLegId = (l.legId && l.legId.trim()) || `${legWallet}:${l.chain}`;
+      let legId = baseLegId;
+      let suffix = 1;
+      while (seenLegIds.has(legId)) {
+        legId = `${baseLegId}#${suffix}`;
+        suffix += 1;
+      }
+      seenLegIds.add(legId);
+
       const cfg = isEvmChainId(l.chain) ? EVM_CHAINS[l.chain] : undefined;
+      const nonEvmExplorer = Object.hasOwn(NON_EVM_EXPLORERS, l.chain)
+        ? NON_EVM_EXPLORERS[l.chain]
+        : undefined;
+
       return {
+        legId,
+        sourceWallet: legWallet,
         chain: l.chain,
         chainName: l.chainName || cfg?.name || l.chain,
-        explorerUrl: cfg?.explorerUrl || NON_EVM_EXPLORERS[l.chain] || 'https://etherscan.io',
+        explorerUrl: cfg?.explorerUrl || nonEvmExplorer || 'https://etherscan.io',
         assetCount: l.assetCount,
         estimatedNetUsd: Number(l.estimatedNetUsd.toFixed(2)),
-        estimatedFeeUsd: Number((l.estimatedFeeUsd ?? 0).toFixed(2)),
+        estimatedFeeUsd: Number(feeUsd.toFixed(2)),
         status: 'queued',
         statusText: 'Queued in background agent',
         updatedAt: now,
@@ -118,18 +275,26 @@ export class BackgroundJobStore {
       status: legs.length ? 'active' : 'completed',
       totalNetUsd: Number(legs.reduce((s, l) => s + l.estimatedNetUsd, 0).toFixed(2)),
       settledNetUsd: 0,
+      attestedNetUsd: 0,
       legs,
     };
 
     this.jobs.set(jobId, job);
-    if (this.jobs.size > 30) {
-      const oldest = this.jobs.keys().next().value;
-      if (oldest) {
-        this.clearPollersForJob(oldest);
-        this.jobs.delete(oldest);
+    this.pruneInactiveJobs(jobId);
+    return job;
+  }
+
+  private pruneInactiveJobs(protectedJobId?: string): void {
+    if (this.jobs.size <= this.maxJobs) return;
+    // Evict oldest terminal (non-active) jobs first; NEVER evict active in-progress jobs
+    for (const [candidateId, candidate] of this.jobs.entries()) {
+      if (candidateId === protectedJobId) continue;
+      if (candidate.status !== 'active') {
+        this.clearPollersForJob(candidateId);
+        this.jobs.delete(candidateId);
+        if (this.jobs.size <= this.maxJobs) break;
       }
     }
-    return job;
   }
 
   listJobs(): BackgroundJob[] {
@@ -140,84 +305,167 @@ export class BackgroundJobStore {
     return this.jobs.get(jobId) ?? null;
   }
 
+  private findLeg(
+    job: BackgroundJob,
+    target: JobLegTarget,
+    opts?: { legId?: string; sourceWallet?: string; walletAddress?: string }
+  ): BackgroundJobLeg | undefined {
+    const explicitLegId =
+      opts?.legId || (typeof target === 'object' && target !== null ? target.legId : undefined);
+    if (explicitLegId) {
+      return job.legs.find((l) => l.legId === explicitLegId);
+    }
+
+    if (typeof target === 'string') {
+      // Exact legId match first (supports passing leg.legId directly)
+      const byLegId = job.legs.find((l) => l.legId === target);
+      if (byLegId) return byLegId;
+    }
+
+    const chain = typeof target === 'string' ? target : target?.chain;
+    const wallet = (
+      opts?.sourceWallet ||
+      opts?.walletAddress ||
+      (typeof target === 'object' && target !== null
+        ? target.sourceWallet || target.walletAddress
+        : undefined) ||
+      ''
+    ).trim();
+
+    if (wallet && chain) {
+      // Exact wallet match first (preserves case sensitivity for Base58/TON), then case-insensitive fallback (EVM)
+      const exact = job.legs.find((l) => l.chain === chain && l.sourceWallet === wallet);
+      if (exact) return exact;
+      const lower = wallet.toLowerCase();
+      return job.legs.find((l) => l.chain === chain && l.sourceWallet.toLowerCase() === lower);
+    }
+
+    if (chain) {
+      return job.legs.find((l) => l.chain === chain);
+    }
+
+    return undefined;
+  }
+
   updateLeg(
     jobId: string,
-    chain: AnyChainId,
-    patch: Partial<Omit<BackgroundJobLeg, 'chain' | 'chainName' | 'explorerUrl'>>
+    target: JobLegTarget,
+    patch: BackgroundJobLegPatch,
+    opts?: { legId?: string; sourceWallet?: string; walletAddress?: string }
   ): BackgroundJob | null {
     const job = this.jobs.get(jobId);
     if (!job) return null;
-    const leg = job.legs.find((l) => l.chain === chain);
+    const leg = this.findLeg(job, target, opts);
     if (!leg) return null;
 
-    Object.assign(leg, patch, { updatedAt: new Date().toISOString() });
+    const cleanPatch = sanitizeLegPatch(patch);
+    Object.assign(leg, cleanPatch, { updatedAt: new Date().toISOString() });
     this.recomputeJobSummary(job);
+
+    const pollerKey = `${jobId}:${leg.legId}`;
 
     // Start autonomous server-side background settlement watcher once an EVM tx or Relay intent exists
     if (
-      isEvmChainId(chain) &&
+      isEvmChainId(leg.chain) &&
       (leg.status === 'confirming' || leg.status === 'relaying') &&
       (leg.evmTxHash || leg.requestId)
     ) {
-      this.ensureBackgroundPoller(jobId, chain);
-    } else if (leg.status === 'landed' || leg.status === 'failed' || leg.status === 'skipped') {
-      this.clearPoller(`${jobId}:${chain}`);
+      this.ensureBackgroundPoller(jobId, leg.legId, leg.chain);
+    } else if (POLLER_EXIT_STATUSES.has(leg.status)) {
+      this.clearPoller(pollerKey);
     }
 
     return job;
   }
 
   private recomputeJobSummary(job: BackgroundJob): void {
+    // Only actually landed legs count toward settledNetUsd; unclaimed 'attested' CCTP legs are tracked separately
     const settled = job.legs
-      .filter((l) => l.status === 'landed' || l.status === 'attested')
+      .filter((l) => l.status === 'landed')
+      .reduce((s, l) => s + l.estimatedNetUsd, 0);
+    const attested = job.legs
+      .filter((l) => l.status === 'attested')
       .reduce((s, l) => s + l.estimatedNetUsd, 0);
     job.settledNetUsd = Number(settled.toFixed(2));
+    job.attestedNetUsd = Number(attested.toFixed(2));
     job.updatedAt = new Date().toISOString();
 
-    const terminal = new Set<JobLegStatus>(['landed', 'attested', 'failed', 'skipped']);
-    const allDone = job.legs.every((l) => terminal.has(l.status));
-    if (!allDone) {
+    if (job.legs.length === 0) {
+      job.status = 'completed';
+      this.pruneInactiveJobs(job.jobId);
+      return;
+    }
+
+    // Jobs with queued/in-flight OR unclaimed 'attested' legs remain active until settled/failed/skipped
+    const allTerminal = job.legs.every((l) => TERMINAL_JOB_LEG_STATUSES.has(l.status));
+    if (!allTerminal) {
       job.status = 'active';
       return;
     }
-    const anyLanded = job.legs.some((l) => l.status === 'landed' || l.status === 'attested');
+
+    const allSkipped = job.legs.every((l) => l.status === 'skipped');
+    const anyLanded = job.legs.some((l) => l.status === 'landed');
     const anyFailed = job.legs.some((l) => l.status === 'failed');
-    if (anyLanded && !anyFailed) job.status = 'completed';
+
+    if (allSkipped) job.status = 'skipped';
+    else if (anyLanded && !anyFailed) job.status = 'completed';
     else if (anyLanded && anyFailed) job.status = 'partial';
     else job.status = 'failed';
+
+    this.pruneInactiveJobs(job.jobId);
   }
 
-  private ensureBackgroundPoller(jobId: string, chain: EvmChainId): void {
-    const key = `${jobId}:${chain}`;
+  private ensureBackgroundPoller(jobId: string, legId: string, chain: EvmChainId): void {
+    const key = `${jobId}:${legId}`;
     if (this.pollTimers.has(key)) return;
 
+    const initialJob = this.jobs.get(jobId);
+    const initialLeg = initialJob?.legs.find((l) => l.legId === legId);
+    if (!initialJob || !initialLeg) return;
+
     let attempts = 0;
-    const maxAttempts = 40; // ~2.5 minutes background tracking
+    const maxAttempts = computePollerMaxAttempts(chain, initialLeg, this.pollIntervalMs);
 
     const timer = setInterval(async () => {
-      attempts += 1;
-      const job = this.jobs.get(jobId);
-      const leg = job?.legs.find((l) => l.chain === chain);
-      if (!job || !leg || attempts > maxAttempts) {
-        this.clearPoller(key);
-        return;
-      }
-      if (leg.status === 'landed' || leg.status === 'failed' || leg.status === 'skipped') {
-        this.clearPoller(key);
-        return;
-      }
+      // Prevent overlapping async ticks on slow RPCs / Relay fetches
+      if (this.pollInFlight.has(key)) return;
+      this.pollInFlight.add(key);
 
       try {
-        const st = await checkLiveExecutionStatus({
+        attempts += 1;
+        const job = this.jobs.get(jobId);
+        const leg = job?.legs.find((l) => l.legId === legId);
+        if (!job || !leg) {
+          this.clearPoller(key);
+          return;
+        }
+        if (POLLER_EXIT_STATUSES.has(leg.status)) {
+          this.clearPoller(key);
+          return;
+        }
+        if (attempts > maxAttempts) {
+          leg.statusText = 'Background polling window elapsed — check explorer or refresh status';
+          leg.updatedAt = new Date().toISOString();
+          this.clearPoller(key);
+          return;
+        }
+
+        const st = await this.statusChecker({
           chain,
           txHash: leg.evmTxHash,
           requestId: leg.requestId,
           provider: leg.provider,
         });
 
+        // Re-check terminal status & timer ownership after await to prevent out-of-order state regression
+        if (this.pollTimers.get(key) !== timer || POLLER_EXIT_STATUSES.has(leg.status)) {
+          return;
+        }
+
         if (st.evmFailed) {
           leg.status = 'failed';
           leg.statusText = 'EVM transaction reverted onchain';
+          leg.updatedAt = new Date().toISOString();
           this.recomputeJobSummary(job);
           this.clearPoller(key);
           return;
@@ -228,34 +476,44 @@ export class BackgroundJobStore {
         if (st.bridgeStatus === 'success') {
           leg.status = 'landed';
           leg.statusText = `Landed on Solana (${job.outputAsset})`;
+          leg.updatedAt = new Date().toISOString();
           this.recomputeJobSummary(job);
           this.clearPoller(key);
           return;
         }
 
         if (st.evmConfirmed && leg.requiresSolanaClaim && leg.evmTxHash) {
-          const att = await fetchCctpAttestationForTx({
+          const att = await this.attestationFetcher({
             chain,
             txHash: leg.evmTxHash,
             solanaDestination: job.solanaDestination,
           });
+          if (this.pollTimers.get(key) !== timer || POLLER_EXIT_STATUSES.has(leg.status)) {
+            return;
+          }
           leg.attestationStatus = att.attestationStatus;
           if (att.attestationStatus === 'complete') {
             leg.status = 'attested';
             leg.statusText = 'Circle CCTP attested · ready to claim on Solana';
+            leg.updatedAt = new Date().toISOString();
             this.recomputeJobSummary(job);
             this.clearPoller(key);
             return;
           }
           leg.status = 'relaying';
           leg.statusText = 'EVM confirmed · waiting for Circle Iris attestation';
+          leg.updatedAt = new Date().toISOString();
           this.recomputeJobSummary(job);
           return;
         }
 
-        if (st.evmConfirmed && !leg.requestId) {
+        // Only mark direct onchain (non-bridge / non-Relay / non-LI.FI) txs as landed on EVM confirmation
+        const isAsyncBridgeProvider =
+          leg.provider === 'relay' || leg.provider === 'lifi' || leg.provider === 'circle_cctp';
+        if (st.evmConfirmed && !leg.requestId && !leg.requiresSolanaClaim && !isAsyncBridgeProvider) {
           leg.status = 'landed';
           leg.statusText = 'Confirmed onchain';
+          leg.updatedAt = new Date().toISOString();
           this.recomputeJobSummary(job);
           this.clearPoller(key);
           return;
@@ -264,12 +522,15 @@ export class BackgroundJobStore {
         if (st.evmConfirmed) {
           leg.status = 'relaying';
           leg.statusText = `Relaying to Solana (${st.bridgeStatus})…`;
+          leg.updatedAt = new Date().toISOString();
           this.recomputeJobSummary(job);
         }
       } catch {
         // Retry silently on transient RPC hiccups
+      } finally {
+        this.pollInFlight.delete(key);
       }
-    }, 3500);
+    }, this.pollIntervalMs);
 
     // Don't block Node process exit
     timer.unref?.();
@@ -282,6 +543,7 @@ export class BackgroundJobStore {
       clearInterval(timer);
       this.pollTimers.delete(key);
     }
+    this.pollInFlight.delete(key);
   }
 
   private clearPollersForJob(jobId: string): void {
@@ -293,5 +555,6 @@ export class BackgroundJobStore {
   dispose(): void {
     for (const timer of this.pollTimers.values()) clearInterval(timer);
     this.pollTimers.clear();
+    this.pollInFlight.clear();
   }
 }
