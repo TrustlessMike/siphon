@@ -1,6 +1,8 @@
 import { encodeCctpDepositForBurn, solanaAddressToBytes32 } from '../bridge/cctp.js';
 import {
   AAVE_V2_LENDING_POOLS,
+  checkCompoundAccountSafety,
+  type CompoundAccountSafety,
   computeAaveSafePartialWithdrawal,
   identifyProtocolExtractorId,
   isKnownCooldownVault,
@@ -8,6 +10,7 @@ import {
   MIN_SAFE_HEALTH_FACTOR,
   PROTOCOL_EXTRACTOR_REGISTRY,
   resolveDefiExitPlan,
+  validateTrustedProtocolTarget,
 } from '../defi/extractors.js';
 import {
   DEAD_BURN_ADDRESS,
@@ -17,6 +20,7 @@ import {
   SOLANA_CCTP_DOMAIN,
 } from '../scanner/chains.js';
 import {
+  type AaveAccountSafety,
   checkAaveV3AccountSafety,
   checkErc20Allowance,
   isEip2612Token,
@@ -309,12 +313,43 @@ async function buildDefiWithdrawExecution(params: {
   bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp';
   feeConfig: ProtocolFeeConfig;
   followUpQuoteFn?: FollowUpQuoteFn;
+  aaveSafetyCheckFn?: AaveSafetyCheckFn;
+  compoundSafetyCheckFn?: CompoundSafetyCheckFn;
 }): Promise<PreparedExecution> {
-  const { asset, userAddress, solanaDestination, outputAsset, bridgePreference, feeConfig, followUpQuoteFn } = params;
+  const {
+    asset,
+    userAddress,
+    solanaDestination,
+    outputAsset,
+    bridgePreference,
+    feeConfig,
+    followUpQuoteFn,
+    aaveSafetyCheckFn = checkAaveV3AccountSafety,
+    compoundSafetyCheckFn = checkCompoundAccountSafety,
+  } = params;
   const evmChain = asEvmChain(asset.chain);
   const cfg = EVM_CHAINS[evmChain];
   const protocolId = identifyProtocolExtractorId(asset);
   const quoteDirectBridge = followUpQuoteFn ?? buildBridgeExecution;
+
+  // 0. Security guard: verify protocolAddress against canonical trusted contracts before building calldata
+  if (!isLiquidReceiptToken(asset.symbol, asset.address) && asset.protocolAddress) {
+    const targetToVerify =
+      protocolId === 'uniswap_v2_lp'
+        ? asset.lpRouterAddress || asset.protocolAddress
+        : protocolId === 'uniswap_v3_nft'
+        ? asset.nftManagerAddress || asset.protocolAddress
+        : asset.protocolAddress;
+    const trust = validateTrustedProtocolTarget({
+      chain: evmChain,
+      protocolId,
+      assetAddress: asset.address,
+      protocolAddress: targetToVerify,
+    });
+    if (!trust.trusted) {
+      throw new Error(trust.reason || `Blocked untrusted protocol target for ${asset.symbol}.`);
+    }
+  }
 
   // 1. Cooldown-locked vaults (like Ethena sUSDe) MUST bypass redeem() via Direct Swap when liquid!
   const cooldownVault =
@@ -360,7 +395,7 @@ async function buildDefiWithdrawExecution(params: {
     }
   }
 
-  // 2. Aave v3 & Aave v2 live debt guard + Safe Partial Exit calculator (HF >= 1.6)
+  // 2. Aave v3 & Aave v2 live FAIL-CLOSED debt guard + Safe Partial Exit calculator (HF >= 1.6)
   let resolvedExitPlan = asset.defiExitPlan;
   if (protocolId === 'aave_v3' || protocolId === 'aave_v2') {
     const poolTarget =
@@ -372,8 +407,13 @@ async function buildDefiWithdrawExecution(params: {
     let ltBps = asset.aaveLiquidationThresholdBps;
 
     if (debtUsd <= 0 && poolTarget) {
-      const safety = await checkAaveV3AccountSafety(evmChain, userAddress, poolTarget);
-      if (safety.checked && safety.hasActiveDebt) {
+      const safety = await aaveSafetyCheckFn(evmChain, userAddress, poolTarget);
+      if (!safety.checked) {
+        throw new Error(
+          `Aave v3 safety guard: could not verify onchain debt status (${safety.reason}). Blocking MAX withdrawal to protect against liquidation — please retry once RPC is reachable.`
+        );
+      }
+      if (safety.hasActiveDebt) {
         debtUsd = safety.totalDebtUsd;
         healthFactor = safety.healthFactor;
         totalCollateralUsd = safety.totalCollateralUsd;
@@ -410,6 +450,38 @@ async function buildDefiWithdrawExecution(params: {
         },
         outputAsset,
       });
+    }
+  }
+
+  // 2b. Compound v3 & Compound v2 / Venus / Benqi FAIL-CLOSED active borrow guard
+  if (protocolId === 'compound_v3' || protocolId === 'compound_v2') {
+    if (
+      (asset.compoundDebtUsd && asset.compoundDebtUsd > 0) ||
+      (asset.compoundShortfallUsd && asset.compoundShortfallUsd > 0)
+    ) {
+      throw new Error(
+        `Compound safety guard: wallet has active borrow/shortfall on ${asset.protocol || 'Compound'}. Repay borrow before withdrawing collateral to prevent revert or liquidation.`
+      );
+    }
+    const targetAddr =
+      asset.protocolAddress ||
+      asset.address ||
+      (protocolId === 'compound_v3' ? cfg.compoundV3Comet : undefined);
+    if (targetAddr) {
+      const compSafety = await compoundSafetyCheckFn({
+        chain: evmChain,
+        userAddress,
+        protocolId,
+        targetAddress: targetAddr,
+      });
+      if (!compSafety.checked) {
+        throw new Error(
+          `Compound safety guard: could not verify onchain borrow status (${compSafety.reason}). Blocking withdrawal to protect against liquidation.`
+        );
+      }
+      if (compSafety.hasActiveBorrow) {
+        throw new Error(`Compound safety guard: ${compSafety.reason}`);
+      }
     }
   }
 
@@ -1028,6 +1100,19 @@ export type FollowUpQuoteFn = (
   feeConfig: ProtocolFeeConfig
 ) => Promise<PreparedExecution>;
 
+export type AaveSafetyCheckFn = (
+  chain: EvmChainId,
+  userAddress: string,
+  poolAddressOverride?: string
+) => Promise<AaveAccountSafety>;
+
+export type CompoundSafetyCheckFn = (params: {
+  chain: EvmChainId;
+  userAddress: string;
+  protocolId: 'compound_v3' | 'compound_v2';
+  targetAddress: string;
+}) => Promise<CompoundAccountSafety>;
+
 /**
  * Prepares REAL executable mainnet transaction(s) for any scanned asset:
  *   - DeFi Position -> Aave v2/v3 (full or safe partial exit) / Compound v2/v3 / ERC-4626 / Uni v2/v3 LP / Direct Swap liquid receipt
@@ -1043,6 +1128,8 @@ export async function prepareRealExecution(params: {
   protocolFeeBps?: number;
   feeRecipientEvm?: string | null;
   followUpQuoteFn?: FollowUpQuoteFn;
+  aaveSafetyCheckFn?: AaveSafetyCheckFn;
+  compoundSafetyCheckFn?: CompoundSafetyCheckFn;
 }): Promise<PreparedExecution> {
   const {
     asset,
@@ -1053,6 +1140,8 @@ export async function prepareRealExecution(params: {
     protocolFeeBps,
     feeRecipientEvm,
     followUpQuoteFn,
+    aaveSafetyCheckFn,
+    compoundSafetyCheckFn,
   } = params;
   const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
 
@@ -1116,6 +1205,8 @@ export async function prepareRealExecution(params: {
       bridgePreference,
       feeConfig,
       followUpQuoteFn,
+      aaveSafetyCheckFn,
+      compoundSafetyCheckFn,
     });
   }
 
@@ -1162,6 +1253,8 @@ export async function prepareChainBatchExecution(params: {
   feeRecipientEvm?: string | null;
   allowHighCost?: boolean;
   followUpQuoteFn?: FollowUpQuoteFn;
+  aaveSafetyCheckFn?: AaveSafetyCheckFn;
+  compoundSafetyCheckFn?: CompoundSafetyCheckFn;
 }): Promise<PreparedChainBatch> {
   const {
     chain,
@@ -1175,6 +1268,8 @@ export async function prepareChainBatchExecution(params: {
     feeRecipientEvm,
     allowHighCost = false,
     followUpQuoteFn,
+    aaveSafetyCheckFn,
+    compoundSafetyCheckFn,
   } = params;
   const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
 
@@ -1227,6 +1322,8 @@ export async function prepareChainBatchExecution(params: {
       protocolFeeBps: feeConfig.feeBps,
       feeRecipientEvm: feeConfig.feeRecipientEvm,
       followUpQuoteFn,
+      aaveSafetyCheckFn,
+      compoundSafetyCheckFn,
     })
   );
 
@@ -1429,17 +1526,22 @@ export async function prepareChainBatchExecution(params: {
               feeConfig
             );
 
-            const gateOk =
+            const gateResult =
               typeof followUpPrep.quotedOutUsd === 'number'
                 ? evaluateLiveQuoteHaircut({
                     grossUsd: unlocked.estimatedUsd,
                     quoteOutUsd: followUpPrep.quotedOutUsd,
                     actualGasUsd: followUpPrep.estimatedGasUsd ?? asset.batchedGasUsd ?? 0,
                     allowHighCost,
-                  }).passed
-                : true;
+                  })
+                : { passed: true, reason: '' };
 
-            if (gateOk && followUpPrep.transactions.length > 0) {
+            if (!gateResult.passed) {
+              notes.push(`${unlocked.symbol} (post-${asset.symbol} unwind): ${gateResult.reason}`);
+              continue;
+            }
+
+            if (followUpPrep.transactions.length > 0) {
               for (const ftx of followUpPrep.transactions) {
                 const taggedStepId = ftx.stepId.includes('after_defi')
                   ? ftx.stepId

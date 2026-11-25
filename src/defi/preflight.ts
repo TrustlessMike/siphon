@@ -10,12 +10,15 @@ import type {
 import {
   AAVE_V2_LENDING_POOLS,
   type BuiltDefiExtractionTx,
+  checkCompoundAccountSafety,
+  type CompoundAccountSafety,
   type Erc4626VaultState,
   identifyProtocolExtractorId,
   isLiquidReceiptToken,
   probeErc4626VaultStates,
   PROTOCOL_EXTRACTOR_REGISTRY,
   resolveDefiExitPlan,
+  validateTrustedProtocolTarget,
 } from './extractors.js';
 
 export interface PreflightSimulatedCall {
@@ -208,8 +211,26 @@ export async function preflightDefiAsset(params: {
   walletAddress: string;
   outputAsset?: 'USDC' | 'SOL';
   skipRpc?: boolean;
+  aaveSafetyCheckFn?: (
+    chain: EvmChainId,
+    userAddress: string,
+    poolAddress?: string
+  ) => Promise<AaveAccountSafety>;
+  compoundSafetyCheckFn?: (params: {
+    chain: EvmChainId;
+    userAddress: string;
+    protocolId: 'compound_v3' | 'compound_v2';
+    targetAddress: string;
+  }) => Promise<CompoundAccountSafety>;
 }): Promise<DefiPreflightResult> {
-  const { asset, walletAddress, outputAsset = 'USDC', skipRpc = false } = params;
+  const {
+    asset,
+    walletAddress,
+    outputAsset = 'USDC',
+    skipRpc = false,
+    aaveSafetyCheckFn = checkAaveV3AccountSafety,
+    compoundSafetyCheckFn = checkCompoundAccountSafety,
+  } = params;
   const chain = asset.chain as EvmChainId;
   const cfg = EVM_CHAINS[chain];
   if (!cfg) {
@@ -220,28 +241,76 @@ export async function preflightDefiAsset(params: {
   const protocolName = asset.protocol || PROTOCOL_EXTRACTOR_REGISTRY[protocolId].name;
   const rawBal = BigInt(asset.rawBalance || '0');
 
+  // Security check: block spoofed/untrusted protocolAddress BEFORE running any RPC or calldata build
+  if (!isLiquidReceiptToken(asset.symbol, asset.address) && asset.protocolAddress) {
+    const targetToCheck =
+      protocolId === 'uniswap_v2_lp'
+        ? asset.lpRouterAddress || asset.protocolAddress
+        : protocolId === 'uniswap_v3_nft'
+        ? asset.nftManagerAddress || asset.protocolAddress
+        : asset.protocolAddress;
+    const trust = validateTrustedProtocolTarget({
+      chain,
+      protocolId,
+      assetAddress: asset.address,
+      protocolAddress: targetToCheck,
+    });
+    if (!trust.trusted) {
+      const blockedPlan = resolveDefiExitPlan({ asset, outputAsset });
+      return {
+        assetId: asset.id,
+        chain,
+        symbol: asset.symbol,
+        protocol: protocolName,
+        defiExitPlan: blockedPlan,
+        simulatedCalls: [],
+        canExecute1Click: false,
+        blockNumber: 0,
+      };
+    }
+  }
+
   let vaultState: Erc4626VaultState | undefined;
   let aaveSafety: AaveAccountSafety | undefined;
+  let compoundSafety: CompoundAccountSafety | undefined;
   let blockNumber = 0;
 
   if (!skipRpc) {
-    const [blockRes, vMap, aaveRes] = await Promise.all([
+    const [blockRes, vMap, aaveRes, compRes] = await Promise.all([
       evmJsonRpcCall<string>(cfg.rpcUrls, 'eth_blockNumber', [], 3000).catch(() => ({ result: '0x0' })),
       protocolId === 'erc4626'
         ? probeErc4626VaultStates({
             chain,
             owner: walletAddress,
-            vaults: [{ address: asset.protocolAddress || asset.address, rawBalance: rawBal, decimals: asset.decimals }],
+            vaults: [
+              {
+                address: asset.protocolAddress || asset.address,
+                rawBalance: rawBal,
+                decimals: asset.decimals,
+                underlyingDecimals:
+                  asset.underlyingAddress?.toLowerCase() === cfg.usdcAddress.toLowerCase()
+                    ? 6
+                    : asset.decimals,
+              },
+            ],
           })
         : Promise.resolve(new Map<string, Erc4626VaultState>()),
       protocolId === 'aave_v3' || protocolId === 'aave_v2'
-        ? checkAaveV3AccountSafety(
+        ? aaveSafetyCheckFn(
             chain,
             walletAddress,
             protocolId === 'aave_v2'
               ? asset.protocolAddress || AAVE_V2_LENDING_POOLS[chain]
               : asset.protocolAddress || cfg.aaveV3Pool
           )
+        : Promise.resolve(undefined),
+      protocolId === 'compound_v3' || protocolId === 'compound_v2'
+        ? compoundSafetyCheckFn({
+            chain,
+            userAddress: walletAddress,
+            protocolId,
+            targetAddress: asset.protocolAddress || asset.address,
+          })
         : Promise.resolve(undefined),
     ]);
 
@@ -254,6 +323,7 @@ export async function preflightDefiAsset(params: {
     }
     vaultState = vMap.get((asset.protocolAddress || asset.address).toLowerCase());
     aaveSafety = aaveRes;
+    compoundSafety = compRes;
   }
 
   // Compute initial exit plan from protocol state + Smart Exit Router
@@ -262,6 +332,7 @@ export async function preflightDefiAsset(params: {
     outputAsset,
     vaultState,
     aaveSafety,
+    compoundSafety,
     simulatedLive: !skipRpc,
     simulatedAtBlock: blockNumber || undefined,
   });

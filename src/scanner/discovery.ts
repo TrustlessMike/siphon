@@ -170,8 +170,8 @@ export function decodeAaveAccountData(hexResult: string): AaveAccountSafety {
       totalDebtUsd: 0,
       currentLiquidationThresholdBps: 8000,
       healthFactor: Number.POSITIVE_INFINITY,
-      safeForMaxWithdraw: true,
-      reason: 'Empty Aave account data response.',
+      safeForMaxWithdraw: false,
+      reason: 'Empty Aave account data response (fail-closed safety pause).',
     };
   }
   const word = (i: number) => BigInt('0x' + clean.slice(i * 64, (i + 1) * 64));
@@ -221,7 +221,7 @@ export async function checkAaveV3AccountSafety(
       totalDebtUsd: 0,
       currentLiquidationThresholdBps: 8000,
       healthFactor: 999,
-      safeForMaxWithdraw: true,
+      safeForMaxWithdraw: false,
       reason: 'Aave Pool not configured on this chain.',
     };
   }
@@ -243,8 +243,8 @@ export async function checkAaveV3AccountSafety(
         totalDebtUsd: 0,
         currentLiquidationThresholdBps: 8000,
         healthFactor: 999,
-        safeForMaxWithdraw: true,
-        reason: 'Could not read Aave account data.',
+        safeForMaxWithdraw: false,
+        reason: 'Could not read Aave account data from RPC.',
       };
     }
     return decodeAaveAccountData(json.result);
@@ -256,8 +256,8 @@ export async function checkAaveV3AccountSafety(
       totalDebtUsd: 0,
       currentLiquidationThresholdBps: 8000,
       healthFactor: 999,
-      safeForMaxWithdraw: true,
-      reason: 'Aave account check timed out.',
+      safeForMaxWithdraw: false,
+      reason: 'Aave account debt check timed out on RPC.',
     };
   }
 }

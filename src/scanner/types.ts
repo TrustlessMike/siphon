@@ -225,6 +225,8 @@ export interface ScannedAsset {
   aaveHealthFactor?: number;
   aaveTotalCollateralUsd?: number;
   aaveLiquidationThresholdBps?: number;
+  compoundDebtUsd?: number;
+  compoundShortfallUsd?: number;
   dexLiquidityVerified?: boolean;
   stakedExitMode?: 'instant_liquid_stake' | 'scheduled_authz_autosweep' | 'native_unstake';
   calldataPreview?: string;

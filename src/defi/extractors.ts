@@ -49,12 +49,16 @@ export const DEFI_SELECTORS = {
   // Compound v3 (Comet)
   compoundV3Withdraw: '0xf3fef3a3', // withdraw(address,uint256)
   compoundV3BaseToken: '0xc55dae63', // baseToken()
+  compoundV3BorrowBalanceOf: '0x374c49b4', // borrowBalanceOf(address)
+  compoundV3IsBorrowCollateralized: '0x38aa813f', // isBorrowCollateralized(address)
 
   // Compound v2 / Venus / Benqi / Moonwell
   compoundV2Underlying: '0x6f307dc3', // underlying()
   compoundV2ExchangeRateStored: '0x182df0f5', // exchangeRateStored()
   compoundV2Comptroller: '0x5fe3b567', // comptroller()
   compoundV2Redeem: '0xdb006a75', // redeem(uint256)
+  compoundV2BorrowBalanceStored: '0x95dd9193', // borrowBalanceStored(address)
+  compoundV2GetAccountLiquidity: '0x5ec88c79', // getAccountLiquidity(address)
 
   // Uniswap v2 / Sushi / Aerodrome v2 LP
   token0: '0x0dfe1681',
@@ -79,6 +83,133 @@ export const AAVE_V2_LENDING_POOLS: Partial<Record<EvmChainId, string>> = {
   polygon: '0x8dFf5E27EA6b7AC08EbFdf9eB090F32ee9a30fcf',
   avalanche: '0x4F01AeD16D97E3aB5ab2B501154DC9bb0F1A5A2C',
 };
+
+export const COMPOUND_V3_COMETS: Partial<Record<EvmChainId, string[]>> = {
+  ethereum: [
+    '0xc3d688B66703497DAA19211EEdff47f25384cdc3', // cUSDCv3
+    '0xA17581A9E3356d9A858b789D68B4d866e593aE94', // cWETHv3
+    '0x3Afdc9BCA9213A35503b077a6072F3D0d5AB0840', // cUSDTv3
+  ],
+  base: [
+    '0xb125E6687d4313864e53df431d5425969c15Eb2F', // cUSDCv3
+    '0x46e6b214b524310239732D51387075E0e70970bf', // cWETHv3
+    '0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf', // cUSDbCv3
+    '0x784efeB622244d2348d4F2522f8860B96fbEcE89', // cAEROv3
+  ],
+  arbitrum: [
+    '0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf', // cUSDCv3
+    '0xA5EDBDD9646f8dFF606d7448e414884C7d905dCA', // cUSDC.ev3
+    '0x6f7D514bbD4aFf3BcD1140B7344b32f063dEe486', // cWETHv3
+    '0xd98Be00b5D27fc98112BdE293e487f8D4cA57d07', // cUSDTv3
+  ],
+  optimism: [
+    '0x2e44e174f7D53F0212823acC11C01A11d58c5bCB', // cUSDCv3
+    '0x995E394b8B2437aC8Ce61Ee0bC610D617962B2Ac', // cUSDTv3
+  ],
+  polygon: [
+    '0xF25212E676D1F7F89Cd72fFEe66158f541246445', // cUSDCv3
+  ],
+};
+
+export const COMPOUND_V2_COMPTROLLERS: Partial<Record<EvmChainId, string[]>> = {
+  ethereum: ['0x3d9819210A31b4961b30EF54bE2aeD79B9c9Cd3B'], // Compound v2 Comptroller
+  bnb: ['0xfD36E2c2a6789Db23113685031d7F16329158384'], // Venus Unitroller
+  avalanche: ['0x486Af39519B4Dc9a7fCcd318217352830E8AD9b4'], // Benqi Comptroller
+  base: ['0xfBb21d0380beE3312B33c4353c8936a0F13EF26C'], // Moonwell Comptroller
+};
+
+/**
+ * Security guard against spoofed/malicious receipt tokens or tampered API payloads
+ * injecting arbitrary `protocolAddress` calldata targets.
+ */
+export function validateTrustedProtocolTarget(params: {
+  chain: EvmChainId;
+  protocolId: DefiProtocolExtractorId;
+  assetAddress: string;
+  protocolAddress?: string;
+}): { trusted: boolean; reason?: string } {
+  const { chain, protocolId, assetAddress, protocolAddress } = params;
+  const cfg = EVM_CHAINS[chain];
+  if (!cfg) return { trusted: false, reason: `Unsupported chain ${chain}.` };
+  if (!protocolAddress || !/^0x[0-9a-fA-F]{40}$/.test(protocolAddress)) {
+    return { trusted: false, reason: `Missing or malformed protocol contract address.` };
+  }
+  const targetLower = protocolAddress.toLowerCase();
+  const assetLower = assetAddress.toLowerCase();
+
+  if (protocolId === 'aave_v3') {
+    const expected = cfg.aaveV3Pool?.toLowerCase();
+    if (!expected || targetLower !== expected) {
+      return {
+        trusted: false,
+        reason: `Blocked untrusted Aave v3 Pool address — does not match the verified Aave v3 Pool on ${cfg.name}.`,
+      };
+    }
+    return { trusted: true };
+  }
+
+  if (protocolId === 'aave_v2') {
+    const expected = AAVE_V2_LENDING_POOLS[chain]?.toLowerCase();
+    if (!expected || targetLower !== expected) {
+      return {
+        trusted: false,
+        reason: `Blocked untrusted Aave v2 LendingPool address — does not match the verified Aave v2 pool on ${cfg.name}.`,
+      };
+    }
+    return { trusted: true };
+  }
+
+  if (protocolId === 'compound_v3') {
+    const allowed = new Set<string>(
+      [...(COMPOUND_V3_COMETS[chain] ?? []), cfg.compoundV3Comet]
+        .filter((a): a is string => Boolean(a))
+        .map((a) => a.toLowerCase())
+    );
+    if (!allowed.has(targetLower)) {
+      return {
+        trusted: false,
+        reason: `Blocked untrusted Compound v3 market address — does not match a verified Comet market on ${cfg.name}.`,
+      };
+    }
+    return { trusted: true };
+  }
+
+  if (protocolId === 'uniswap_v2_lp') {
+    const allowed = new Set((V2_DEX_ROUTERS[chain] ?? []).map((r) => r.router.toLowerCase()));
+    if (!allowed.has(targetLower)) {
+      return {
+        trusted: false,
+        reason: `Blocked untrusted DEX router address — does not match a verified v2 router on ${cfg.name}.`,
+      };
+    }
+    return { trusted: true };
+  }
+
+  if (protocolId === 'uniswap_v3_nft') {
+    const allowed = new Set((UNISWAP_V3_NFT_MANAGERS[chain] ?? []).map((m) => m.address.toLowerCase()));
+    if (!allowed.has(targetLower)) {
+      return {
+        trusted: false,
+        reason: `Blocked untrusted NFT Position Manager address — does not match a verified Uniswap v3 / Aerodrome CL manager on ${cfg.name}.`,
+      };
+    }
+    return { trusted: true };
+  }
+
+  // ERC-4626 vaults and Compound v2 cTokens must ALWAYS call redeem() on the receipt token itself —
+  // never allow a spoofed receipt token to redirect calldata to an unrelated third-party target!
+  if (protocolId === 'erc4626' || protocolId === 'compound_v2') {
+    if (targetLower !== assetLower) {
+      return {
+        trusted: false,
+        reason: `Blocked spoofed protocol target — vault/cToken redemption must target the receipt contract itself, not an external address.`,
+      };
+    }
+    return { trusted: true };
+  }
+
+  return { trusted: true };
+}
 
 export interface V2DexRouterConfig {
   name: string;
@@ -566,6 +697,31 @@ export function encodeMulticallBytes(innerCalls: string[]): string {
   return DEFI_SELECTORS.multicall + header + offsets.join('') + encodedItems.join('');
 }
 
+/**
+ * Decodes `multicall(bytes[] data)` (`0xac9650d8`) back into its ordered inner calldata items
+ * for verification, pre-sign proofs, and backtesting.
+ */
+export function decodeMulticallBytes(calldata: string): string[] {
+  const clean = strip0x(calldata).toLowerCase();
+  if (!clean.startsWith(strip0x(DEFI_SELECTORS.multicall)) || clean.length < 8 + 128) return [];
+  const body = clean.slice(8);
+  const arrayOffset = Number(BigInt('0x' + body.slice(0, 64))) * 2;
+  if (body.length < arrayOffset + 64) return [];
+  const count = Number(BigInt('0x' + body.slice(arrayOffset, arrayOffset + 64)));
+  const tableStart = arrayOffset + 64;
+  const out: string[] = [];
+
+  for (let i = 0; i < count; i++) {
+    const relOffset = Number(BigInt('0x' + body.slice(tableStart + i * 64, tableStart + (i + 1) * 64))) * 2;
+    const itemStart = tableStart + relOffset;
+    if (body.length < itemStart + 64) break;
+    const byteLen = Number(BigInt('0x' + body.slice(itemStart, itemStart + 64)));
+    const itemHex = body.slice(itemStart + 64, itemStart + 64 + byteLen * 2);
+    out.push('0x' + itemHex);
+  }
+  return out;
+}
+
 export function buildUniswapV3NftExitCalldata(params: {
   tokenId: bigint;
   liquidity: bigint;
@@ -745,12 +901,209 @@ export function computeAaveSafePartialWithdrawal(params: {
   };
 }
 
+export interface CompoundAccountSafety {
+  checked: boolean;
+  protocolId: 'compound_v3' | 'compound_v2';
+  hasActiveBorrow: boolean;
+  borrowBalanceRaw: bigint;
+  isCollateralized: boolean;
+  accountLiquidityUsd?: number;
+  shortfallUsd?: number;
+  safeForWithdraw: boolean;
+  reason: string;
+}
+
+/**
+ * Fail-closed live borrow safety check for Compound v3 (Comet `borrowBalanceOf` + `isBorrowCollateralized`)
+ * and Compound v2 / Venus / Benqi (`cToken.borrowBalanceStored` + `Comptroller.getAccountLiquidity`).
+ */
+export async function checkCompoundAccountSafety(params: {
+  chain: EvmChainId;
+  userAddress: string;
+  protocolId: 'compound_v3' | 'compound_v2';
+  targetAddress: string;
+}): Promise<CompoundAccountSafety> {
+  const { chain, userAddress, protocolId, targetAddress } = params;
+  const cfg = EVM_CHAINS[chain];
+  if (!cfg || !/^0x[0-9a-fA-F]{40}$/.test(userAddress) || !/^0x[0-9a-fA-F]{40}$/.test(targetAddress)) {
+    return {
+      checked: false,
+      protocolId,
+      hasActiveBorrow: false,
+      borrowBalanceRaw: 0n,
+      isCollateralized: false,
+      safeForWithdraw: false,
+      reason: 'Could not verify Compound borrow status (invalid chain or contract address).',
+    };
+  }
+
+  const userPad = pad32Hex(userAddress);
+
+  if (protocolId === 'compound_v3') {
+    try {
+      const mc = encodeMulticall3Aggregate3([
+        { target: targetAddress, allowFailure: true, callData: `${DEFI_SELECTORS.compoundV3BorrowBalanceOf}${userPad}` },
+        {
+          target: targetAddress,
+          allowFailure: true,
+          callData: `${DEFI_SELECTORS.compoundV3IsBorrowCollateralized}${userPad}`,
+        },
+      ]);
+      const res = await evmJsonRpcCall<string>(
+        cfg.rpcUrls,
+        'eth_call',
+        [{ to: cfg.multicall3, data: mc }, 'latest'],
+        3500
+      );
+      if (!res.result || res.result === '0x') {
+        return {
+          checked: false,
+          protocolId,
+          hasActiveBorrow: false,
+          borrowBalanceRaw: 0n,
+          isCollateralized: false,
+          safeForWithdraw: false,
+          reason: 'Compound v3 borrow safety check returned empty data — pausing withdrawal for safety.',
+        };
+      }
+      const dec = decodeMulticall3Aggregate3(res.result);
+      const borrowRaw = dec[0]?.success ? decodeAbiUint256Word(dec[0].returnData) : null;
+      const collat = dec[1]?.success ? decodeAbiBoolWord(dec[1].returnData) : null;
+      if (borrowRaw === null) {
+        return {
+          checked: false,
+          protocolId,
+          hasActiveBorrow: false,
+          borrowBalanceRaw: 0n,
+          isCollateralized: false,
+          safeForWithdraw: false,
+          reason: 'Compound v3 borrowBalanceOf check failed — pausing withdrawal to prevent liquidation.',
+        };
+      }
+      const hasActiveBorrow = borrowRaw > 0n;
+      return {
+        checked: true,
+        protocolId,
+        hasActiveBorrow,
+        borrowBalanceRaw: borrowRaw,
+        isCollateralized: collat !== false,
+        safeForWithdraw: !hasActiveBorrow,
+        reason: hasActiveBorrow
+          ? 'Active Compound v3 borrow detected on this market. Repay your borrow before withdrawing collateral to avoid revert or liquidation.'
+          : 'Verified onchain: zero active Compound v3 borrow on this market.',
+      };
+    } catch {
+      return {
+        checked: false,
+        protocolId,
+        hasActiveBorrow: false,
+        borrowBalanceRaw: 0n,
+        isCollateralized: false,
+        safeForWithdraw: false,
+        reason: 'Compound v3 borrow check timed out on RPC — pausing withdrawal for safety.',
+      };
+    }
+  }
+
+  // Compound v2 / Venus / Benqi
+  try {
+    const mc = encodeMulticall3Aggregate3([
+      {
+        target: targetAddress,
+        allowFailure: true,
+        callData: `${DEFI_SELECTORS.compoundV2BorrowBalanceStored}${userPad}`,
+      },
+      { target: targetAddress, allowFailure: true, callData: DEFI_SELECTORS.compoundV2Comptroller },
+    ]);
+    const res = await evmJsonRpcCall<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [{ to: cfg.multicall3, data: mc }, 'latest'],
+      3500
+    );
+    if (!res.result || res.result === '0x') {
+      return {
+        checked: false,
+        protocolId,
+        hasActiveBorrow: false,
+        borrowBalanceRaw: 0n,
+        isCollateralized: false,
+        safeForWithdraw: false,
+        reason: 'Compound v2 borrow check returned empty data — pausing withdrawal for safety.',
+      };
+    }
+    const dec = decodeMulticall3Aggregate3(res.result);
+    const borrowRaw = dec[0]?.success ? decodeAbiUint256Word(dec[0].returnData) : null;
+    const comptroller = dec[1]?.success ? decodeAbiAddressWord(dec[1].returnData) : null;
+    if (borrowRaw === null) {
+      return {
+        checked: false,
+        protocolId,
+        hasActiveBorrow: false,
+        borrowBalanceRaw: 0n,
+        isCollateralized: false,
+        safeForWithdraw: false,
+        reason: 'Could not read Compound v2 borrow balance — pausing withdrawal for safety.',
+      };
+    }
+
+    let accountLiquidityUsd: number | undefined;
+    let shortfallUsd: number | undefined;
+    if (comptroller) {
+      const liqRes = await evmJsonRpcCall<string>(
+        cfg.rpcUrls,
+        'eth_call',
+        [{ to: comptroller, data: `${DEFI_SELECTORS.compoundV2GetAccountLiquidity}${userPad}` }, 'latest'],
+        3500
+      ).catch(() => ({ result: undefined }));
+      if (liqRes.result && liqRes.result !== '0x') {
+        const errCode = decodeAbiUint256Word(liqRes.result, 0);
+        const liqRaw = decodeAbiUint256Word(liqRes.result, 1);
+        const shortRaw = decodeAbiUint256Word(liqRes.result, 2);
+        if (errCode === 0n && liqRaw !== null && shortRaw !== null) {
+          accountLiquidityUsd = Number(formatUnits(liqRaw, 18).toFixed(2));
+          shortfallUsd = Number(formatUnits(shortRaw, 18).toFixed(2));
+        }
+      }
+    }
+
+    const hasShortfall = (shortfallUsd ?? 0) > 0;
+    const hasActiveBorrow = borrowRaw > 0n || hasShortfall;
+    return {
+      checked: true,
+      protocolId,
+      hasActiveBorrow,
+      borrowBalanceRaw: borrowRaw,
+      isCollateralized: !hasShortfall,
+      accountLiquidityUsd,
+      shortfallUsd,
+      safeForWithdraw: !hasActiveBorrow,
+      reason: hasShortfall
+        ? `Account has a $${shortfallUsd?.toFixed(2)} collateral shortfall — repay borrow before redeeming.`
+        : hasActiveBorrow
+        ? 'Active borrow detected on this Compound v2 / fork market. Repay your borrow before redeeming collateral.'
+        : 'Verified onchain: zero active borrow and healthy collateral on Compound v2 market.',
+    };
+  } catch {
+    return {
+      checked: false,
+      protocolId,
+      hasActiveBorrow: false,
+      borrowBalanceRaw: 0n,
+      isCollateralized: false,
+      safeForWithdraw: false,
+      reason: 'Compound v2 borrow safety check timed out on RPC — pausing withdrawal for safety.',
+    };
+  }
+}
+
 // ========================== LIVE MULTICALL3 PROBERS ==========================
 
 export interface Erc4626VaultState {
   vaultAddress: string;
   underlyingAddress: string | null;
   sharesRaw: bigint;
+  onchainBalanceRaw?: bigint | null;
   convertToAssetsRaw: bigint | null;
   previewRedeemRaw: bigint | null;
   expectedUnderlyingRaw: bigint;
@@ -767,6 +1120,7 @@ export interface Erc4626VaultState {
  *   - previewRedeem(shares)
  *   - maxRedeem(owner)
  *   - cooldownDuration() (Ethena sUSDe and cooldown-enabled ERC-4626 vaults)
+ *   - balanceOf(owner) (distinguishes real pause/cooldown from zero onchain wallet balance!)
  */
 export async function probeErc4626VaultStates(params: {
   chain: EvmChainId;
@@ -782,6 +1136,7 @@ export async function probeErc4626VaultStates(params: {
   const cfg = EVM_CHAINS[params.chain];
   if (!cfg || !params.vaults.length) return out;
 
+  const ownerBalData = `${DEFI_SELECTORS.balanceOf}${pad32Hex(params.owner)}`;
   const calls = params.vaults.flatMap((v) => {
     const shares = v.rawBalance > 0n ? v.rawBalance : 10n ** BigInt(v.decimals);
     return [
@@ -790,6 +1145,7 @@ export async function probeErc4626VaultStates(params: {
       { target: v.address, allowFailure: true, callData: encodeErc4626PreviewRedeem(shares) },
       { target: v.address, allowFailure: true, callData: encodeErc4626MaxRedeem(params.owner) },
       { target: v.address, allowFailure: true, callData: DEFI_SELECTORS.cooldownDuration },
+      { target: v.address, allowFailure: true, callData: ownerBalData },
     ];
   });
 
@@ -806,30 +1162,34 @@ export async function probeErc4626VaultStates(params: {
 
     for (let i = 0; i < params.vaults.length; i++) {
       const v = params.vaults[i];
-      const base = i * 5;
+      const base = i * 6;
       const rAsset = decoded[base];
       const rConvert = decoded[base + 1];
       const rPreview = decoded[base + 2];
       const rMax = decoded[base + 3];
       const rCooldown = decoded[base + 4];
+      const rBalance = decoded[base + 5];
 
       const underlyingAddress = rAsset?.success ? decodeAbiAddressWord(rAsset.returnData) : null;
       const convertToAssetsRaw = rConvert?.success ? decodeAbiUint256Word(rConvert.returnData) : null;
       const previewRedeemRaw = rPreview?.success ? decodeAbiUint256Word(rPreview.returnData) : null;
       const maxRedeemRaw = rMax?.success ? decodeAbiUint256Word(rMax.returnData) : null;
       const cooldownBig = rCooldown?.success ? decodeAbiUint256Word(rCooldown.returnData) : null;
+      const onchainBalanceRaw = rBalance?.success ? decodeAbiUint256Word(rBalance.returnData) : null;
       const cooldownDurationSec = cooldownBig !== null ? Number(cooldownBig) : null;
 
       const shares = v.rawBalance > 0n ? v.rawBalance : 10n ** BigInt(v.decimals);
       const expectedUnderlyingRaw = previewRedeemRaw ?? convertToAssetsRaw ?? shares;
 
-      // Cooldown detection:
-      // 1) Explicit cooldownDuration() > 0 (e.g. Ethena sUSDe = 604800s)
-      // 2) maxRedeem(owner) == 0 while user holds non-zero shares
-      // 3) previewRedeem(shares) reverted while convertToAssets(shares) succeeded (Ethena sUSDe behavior)
+      // Cooldown / pause detection:
+      // 1) Explicit cooldownDuration() > 0 (e.g. Ethena sUSDe = 86400s / 604800s)
+      // 2) maxRedeem(owner) == 0 ONLY when user actually holds onchain balanceOf(owner) > 0
+      // 3) previewRedeem(shares) reverted while convertToAssets(shares) succeeded (paused/locked ERC-4626)
+      // 4) Known cooldown vault address (Ethena sUSDe)
+      const userHoldsOnchainShares = onchainBalanceRaw !== null ? onchainBalanceRaw > 0n : v.rawBalance > 0n;
       const cooldownDetected = Boolean(
         (cooldownDurationSec !== null && cooldownDurationSec > 0) ||
-          (v.rawBalance > 0n && maxRedeemRaw !== null && maxRedeemRaw === 0n) ||
+          (userHoldsOnchainShares && maxRedeemRaw !== null && maxRedeemRaw === 0n) ||
           (convertToAssetsRaw !== null && !rPreview?.success) ||
           KNOWN_COOLDOWN_VAULT_ADDRESSES.has(v.address.toLowerCase())
       );
@@ -843,6 +1203,7 @@ export async function probeErc4626VaultStates(params: {
         vaultAddress: v.address,
         underlyingAddress,
         sharesRaw: v.rawBalance,
+        onchainBalanceRaw,
         convertToAssetsRaw,
         previewRedeemRaw,
         expectedUnderlyingRaw,
@@ -940,22 +1301,38 @@ export async function probeExpandedDefiContracts(params: {
       const aaveV2Pool = results[base + 2]?.success ? decodeAbiAddressWord(results[base + 2].returnData) : null;
 
       if (aaveUnderlying && aaveV3Pool) {
-        detected.set(addr, {
+        const check = validateTrustedProtocolTarget({
+          chain: params.chain,
           protocolId: 'aave_v3',
-          protocol: 'Aave v3',
+          assetAddress: addr,
           protocolAddress: aaveV3Pool,
-          underlyingAddress: aaveUnderlying,
         });
+        if (check.trusted) {
+          detected.set(addr, {
+            protocolId: 'aave_v3',
+            protocol: 'Aave v3',
+            protocolAddress: aaveV3Pool,
+            underlyingAddress: aaveUnderlying,
+          });
+        }
         continue;
       }
 
       if (aaveUnderlying && aaveV2Pool) {
-        detected.set(addr, {
+        const check = validateTrustedProtocolTarget({
+          chain: params.chain,
           protocolId: 'aave_v2',
-          protocol: 'Aave v2',
+          assetAddress: addr,
           protocolAddress: aaveV2Pool,
-          underlyingAddress: aaveUnderlying,
         });
+        if (check.trusted) {
+          detected.set(addr, {
+            protocolId: 'aave_v2',
+            protocol: 'Aave v2',
+            protocolAddress: aaveV2Pool,
+            underlyingAddress: aaveUnderlying,
+          });
+        }
         continue;
       }
 
@@ -973,7 +1350,16 @@ export async function probeExpandedDefiContracts(params: {
       const cUnderlying = results[base + 4]?.success ? decodeAbiAddressWord(results[base + 4].returnData) : null;
       const cRate = results[base + 5]?.success ? decodeAbiUint256Word(results[base + 5].returnData) : null;
       const cComptroller = results[base + 6]?.success ? decodeAbiAddressWord(results[base + 6].returnData) : null;
-      if (cUnderlying && cComptroller && cRate !== null && cRate > 0n) {
+      const trustedComptrollers = new Set(
+        (COMPOUND_V2_COMPTROLLERS[params.chain] ?? []).map((c) => c.toLowerCase())
+      );
+      if (
+        cUnderlying &&
+        cComptroller &&
+        trustedComptrollers.has(cComptroller.toLowerCase()) &&
+        cRate !== null &&
+        cRate > 0n
+      ) {
         const protocolLabel =
           params.chain === 'bnb'
             ? 'Venus (Compound v2)'
@@ -998,11 +1384,13 @@ export async function probeExpandedDefiContracts(params: {
       const factoryAddr = results[base + 11]?.success ? decodeAbiAddressWord(results[base + 11].returnData) : null;
       const stableFlag = results[base + 12]?.success ? decodeAbiBoolWord(results[base + 12].returnData) : null;
 
-      if (token0 && token1 && reserves && totalSupply && totalSupply > 0n) {
-        const matchedRouter =
-          chainRouters.find((r) => factoryAddr && r.factory.toLowerCase() === factoryAddr.toLowerCase()) ??
-          (stableFlag !== null ? chainRouters.find((r) => r.isAerodromeStyle) : undefined) ??
-          chainRouters[0];
+      if (token0 && token1 && reserves && totalSupply && totalSupply > 0n && factoryAddr) {
+        const matchedRouter = chainRouters.find(
+          (r) => r.factory.toLowerCase() === factoryAddr.toLowerCase()
+        );
+        if (!matchedRouter) {
+          continue;
+        }
         const amounts =
           lpBal > 0n
             ? computeUniswapV2UnderlyingAmounts({
@@ -1014,12 +1402,12 @@ export async function probeExpandedDefiContracts(params: {
             : null;
         detected.set(addr, {
           protocolId: 'uniswap_v2_lp',
-          protocol: matchedRouter ? `${matchedRouter.name} LP` : 'Uniswap v2 LP',
-          protocolAddress: matchedRouter?.router ?? addr,
+          protocol: `${matchedRouter.name} LP`,
+          protocolAddress: matchedRouter.router,
           underlyingAddress: token0,
           secondaryUnderlyingAddress: token1,
-          lpRouterAddress: matchedRouter?.router,
-          lpStable: matchedRouter?.isAerodromeStyle ? Boolean(stableFlag) : undefined,
+          lpRouterAddress: matchedRouter.router,
+          lpStable: matchedRouter.isAerodromeStyle ? Boolean(stableFlag) : undefined,
           reserve0: reserves.reserve0,
           reserve1: reserves.reserve1,
           totalSupply,
@@ -1219,6 +1607,8 @@ export interface ResolveDefiExitPlanInput {
     | 'aaveHealthFactor'
     | 'aaveTotalCollateralUsd'
     | 'aaveLiquidationThresholdBps'
+    | 'compoundDebtUsd'
+    | 'compoundShortfallUsd'
     | 'lpToken0Address'
     | 'lpToken0Symbol'
     | 'lpToken0Decimals'
@@ -1227,11 +1617,13 @@ export interface ResolveDefiExitPlanInput {
     | 'lpToken1Decimals'
     | 'lpRouterAddress'
     | 'nftTokenId'
+    | 'nftLiquidity'
     | 'nftManagerAddress'
   >;
   outputAsset?: 'USDC' | 'SOL';
   vaultState?: Erc4626VaultState;
   aaveSafety?: AaveAccountSafety;
+  compoundSafety?: CompoundAccountSafety;
   expectedSecondaryRaw?: bigint;
   expectedSecondaryUi?: number;
   preflightStatus?: DefiPreflightStatus;
@@ -1242,21 +1634,61 @@ export interface ResolveDefiExitPlanInput {
 
 /**
  * Smart Exit Router: computes the optimal, plain-English `DefiExitPlan` for any DeFi asset:
+ *  - Security check: blocks any spoofed/untrusted `protocolAddress` before building calldata
  *  - Liquid receipt tokens with deep DEX liquidity (wstETH, rETH, cbETH, weETH, ezETH, sUSDe, sDAI, sUSDS, stETH)
  *    -> `direct_swap` / `direct_swap_bypass_cooldown` (1 tx, instant, skips cooldowns & unwrap gas!)
  *  - Cooldown-locked vaults WITHOUT deep DEX liquidity -> `unbonding_required` / `cooldown_blocked`
  *  - Aave v3/v2 with active debt -> `partial_unwind` / `safe_partial_debt_exit` (keeping HF >= 1.6) or `blocked`
+ *  - Compound v3/v2 with active borrow or RPC check failure -> `blocked` (fail-closed)
  *  - Illiquid protocol receipts (Aave, Compound v2/v3, Morpho/Yearn/Fluid/Euler ERC-4626, Uni v2/v3 LP)
  *    -> `protocol_unwind` / `instant_1click_unwind`
  */
 export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPlan {
-  const { asset, outputAsset = 'USDC', vaultState, aaveSafety } = input;
+  const { asset, outputAsset = 'USDC', vaultState, aaveSafety, compoundSafety } = input;
   const protocolId = identifyProtocolExtractorId(asset);
   const protocolName = asset.protocol || 'DeFi Protocol';
   const rawBal = BigInt(asset.rawBalance || '0');
   const liquidReceipt = getLiquidReceiptInfo(asset.symbol, asset.address);
   const hasDeepDexLiquidity =
     Boolean(liquidReceipt) && (asset.liquidityUsd >= 50_000 || asset.liquidityUsd === 0);
+
+  // 0. Security check against spoofed/untrusted protocolAddress injection (skip for direct DEX liquid receipts)
+  if (
+    !(liquidReceipt && hasDeepDexLiquidity) &&
+    asset.protocolAddress &&
+    asset.chain in EVM_CHAINS
+  ) {
+    const targetAddr =
+      protocolId === 'uniswap_v2_lp'
+        ? asset.lpRouterAddress || asset.protocolAddress
+        : protocolId === 'uniswap_v3_nft'
+        ? asset.nftManagerAddress || asset.protocolAddress
+        : asset.protocolAddress;
+    const trust = validateTrustedProtocolTarget({
+      chain: asset.chain as EvmChainId,
+      protocolId,
+      assetAddress: asset.address,
+      protocolAddress: targetAddr,
+    });
+    if (!trust.trusted) {
+      return {
+        protocolId,
+        protocolName,
+        routeKind: 'unbonding_required',
+        exitStrategy: 'cooldown_blocked',
+        preflightStatus: 'blocked',
+        preflightReason:
+          trust.reason ||
+          `Blocked untrusted contract target for ${asset.symbol}. Only verified protocol contracts are allowed.`,
+        plainEnglishSteps: [
+          `Blocked for your safety: ${asset.symbol} pointed to an unverified contract address.`,
+        ],
+        supportsAtomicBatch: false,
+        simulatedLive: input.simulatedLive,
+        simulatedAtBlock: input.simulatedAtBlock,
+      };
+    }
+  }
 
   // 1. Smart Exit Router: Liquid receipt tokens with deep DEX liquidity -> Direct Swap & Bridge!
   if (liquidReceipt && hasDeepDexLiquidity) {
@@ -1323,8 +1755,27 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
     };
   }
 
-  // 3. Aave v3 & Aave v2 (with Safe Partial Exit calculator when active debt exists)
+  // 3. Aave v3 & Aave v2 (fail-closed on RPC error + Safe Partial Exit calculator when active debt exists)
   if (protocolId === 'aave_v3' || protocolId === 'aave_v2') {
+    if (aaveSafety && !aaveSafety.checked) {
+      return {
+        protocolId,
+        protocolName,
+        routeKind: 'partial_unwind',
+        exitStrategy: 'cooldown_blocked',
+        preflightStatus: 'blocked',
+        preflightReason: `Paused for your safety: could not verify your ${protocolName} borrow status onchain (${aaveSafety.reason}). Retry once RPC is reachable.`,
+        plainEnglishSteps: [
+          `Wait a moment and re-run preflight to verify your ${protocolName} debt status before withdrawing`,
+        ],
+        underlyingSymbol: asset.underlyingSymbol,
+        underlyingAddress: asset.underlyingAddress,
+        underlyingDecimals: asset.decimals,
+        supportsAtomicBatch: false,
+        simulatedLive: input.simulatedLive,
+        simulatedAtBlock: input.simulatedAtBlock,
+      };
+    }
     const debtUsd = aaveSafety?.checked ? aaveSafety.totalDebtUsd : asset.aaveDebtUsd ?? 0;
     const hf = aaveSafety?.checked ? aaveSafety.healthFactor : asset.aaveHealthFactor;
     const totalCollateralUsd = aaveSafety?.checked
@@ -1428,9 +1879,57 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
     };
   }
 
-  // 4. Compound v3 & Compound v2 / Venus / Benqi
+  // 4. Compound v3 & Compound v2 / Venus / Benqi (with fail-closed active borrow guard)
   if (protocolId === 'compound_v3' || protocolId === 'compound_v2') {
     const uSym = asset.underlyingSymbol ?? 'USDC';
+    if (compoundSafety && !compoundSafety.checked) {
+      return {
+        protocolId,
+        protocolName,
+        routeKind: 'partial_unwind',
+        exitStrategy: 'cooldown_blocked',
+        preflightStatus: 'blocked',
+        preflightReason: `Paused for your safety: ${compoundSafety.reason}`,
+        plainEnglishSteps: [
+          `Retry preflight once RPC responds to confirm you have no active ${protocolName} borrow`,
+        ],
+        underlyingSymbol: uSym,
+        underlyingAddress: asset.underlyingAddress,
+        underlyingDecimals: asset.decimals,
+        supportsAtomicBatch: false,
+        simulatedLive: input.simulatedLive,
+        simulatedAtBlock: input.simulatedAtBlock,
+      };
+    }
+
+    const hasBorrow = Boolean(
+      compoundSafety?.hasActiveBorrow ||
+        (asset.compoundDebtUsd && asset.compoundDebtUsd > 0) ||
+        (asset.compoundShortfallUsd && asset.compoundShortfallUsd > 0)
+    );
+    if (hasBorrow) {
+      return {
+        protocolId,
+        protocolName,
+        routeKind: 'partial_unwind',
+        exitStrategy: 'cooldown_blocked',
+        preflightStatus: 'blocked',
+        preflightReason:
+          compoundSafety?.reason ||
+          `Active borrow detected on ${protocolName}${asset.compoundDebtUsd ? ` ($${asset.compoundDebtUsd.toFixed(2)})` : ''}. Repay your borrow before withdrawing collateral to avoid revert or liquidation.`,
+        plainEnglishSteps: [
+          `Repay your active borrow on ${protocolName}`,
+          `Return to withdraw ${asset.uiBalance} ${uSym} and bridge to Solana ${outputAsset}`,
+        ],
+        underlyingSymbol: uSym,
+        underlyingAddress: asset.underlyingAddress,
+        underlyingDecimals: asset.decimals,
+        supportsAtomicBatch: false,
+        simulatedLive: input.simulatedLive,
+        simulatedAtBlock: input.simulatedAtBlock,
+      };
+    }
+
     const expectedUi = vaultState
       ? Number(formatUnits(vaultState.expectedUnderlyingRaw, asset.decimals).toFixed(6))
       : asset.uiBalance;
@@ -1442,7 +1941,7 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
       preflightStatus: input.preflightStatus ?? 'verified',
       preflightReason:
         input.preflightReason ||
-        `${protocolName} position ready for instant withdrawal and automated Solana bridging.`,
+        `${protocolName} position has zero active borrow — ready for 1-click withdrawal and Solana bridging.`,
       plainEnglishSteps: [
         protocolId === 'compound_v2'
           ? `Redeem ${asset.uiBalance} ${asset.symbol} from ${protocolName} into ${uSym}`
@@ -1499,19 +1998,26 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
   if (protocolId === 'uniswap_v3_nft') {
     const sym0 = asset.lpToken0Symbol ?? asset.underlyingSymbol ?? 'Token A';
     const sym1 = asset.lpToken1Symbol ?? 'Token B';
+    const isZeroLiquidity = (asset.nftLiquidity ?? asset.rawBalance ?? '0') === '0';
     return {
       protocolId: 'uniswap_v3_nft',
       protocolName,
       routeKind: 'protocol_unwind',
       exitStrategy: 'instant_1click_unwind',
-      preflightStatus: input.preflightStatus ?? 'verified',
+      preflightStatus: input.preflightStatus ?? (isZeroLiquidity && asset.grossUsd <= 0 ? 'warning' : 'verified'),
       preflightReason:
         input.preflightReason ||
-        `${protocolName} NFT #${asset.nftTokenId ?? '—'} can decrease liquidity, collect fees, and burn in 1 atomic multicall.`,
-      plainEnglishSteps: [
-        `Close ${protocolName} position #${asset.nftTokenId ?? '—'} (decrease liquidity, collect fees & burn NFT in 1 call)`,
-        `Swap & bridge unlocked ${sym0} + ${sym1} to Solana ${outputAsset}`,
-      ],
+        (isZeroLiquidity
+          ? `${protocolName} NFT #${asset.nftTokenId ?? '—'} has zero active liquidity — collects any uncollected fees and burns the empty NFT in 1 call.`
+          : `${protocolName} NFT #${asset.nftTokenId ?? '—'} can decrease liquidity, collect fees, and burn in 1 atomic multicall.`),
+      plainEnglishSteps: isZeroLiquidity
+        ? [
+            `Collect any remaining fees from empty ${protocolName} position #${asset.nftTokenId ?? '—'} and burn the NFT in 1 call`,
+          ]
+        : [
+            `Close ${protocolName} position #${asset.nftTokenId ?? '—'} (decrease liquidity, collect fees & burn NFT in 1 call)`,
+            `Swap & bridge unlocked ${sym0} + ${sym1} to Solana ${outputAsset}`,
+          ],
       underlyingSymbol: sym0,
       underlyingAddress: asset.lpToken0Address ?? asset.underlyingAddress,
       underlyingDecimals: asset.lpToken0Decimals ?? 18,
@@ -1648,8 +2154,14 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
     buildExtraction: ({ asset, userAddress, chain, exitPlan }) => {
       const cfg = EVM_CHAINS[chain];
       const poolTarget = asset.protocolAddress || cfg.aaveV3Pool;
-      if (!poolTarget) {
-        throw new Error(`Missing Aave v3 Pool address on ${cfg.name}.`);
+      const trust = validateTrustedProtocolTarget({
+        chain,
+        protocolId: 'aave_v3',
+        assetAddress: asset.address,
+        protocolAddress: poolTarget,
+      });
+      if (!trust.trusted || !poolTarget) {
+        throw new Error(trust.reason || `Missing Aave v3 Pool address on ${cfg.name}.`);
       }
       const underlying =
         asset.underlyingAddress ||
@@ -1715,8 +2227,14 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
     buildExtraction: ({ asset, userAddress, chain, exitPlan }) => {
       const cfg = EVM_CHAINS[chain];
       const poolTarget = asset.protocolAddress || AAVE_V2_LENDING_POOLS[chain];
-      if (!poolTarget) {
-        throw new Error(`Missing Aave v2 LendingPool address on ${cfg.name}.`);
+      const trust = validateTrustedProtocolTarget({
+        chain,
+        protocolId: 'aave_v2',
+        assetAddress: asset.address,
+        protocolAddress: poolTarget,
+      });
+      if (!trust.trusted || !poolTarget) {
+        throw new Error(trust.reason || `Missing Aave v2 LendingPool address on ${cfg.name}.`);
       }
       const underlying =
         asset.underlyingAddress ||
@@ -1776,8 +2294,14 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
     buildExtraction: ({ asset, chain }) => {
       const cfg = EVM_CHAINS[chain];
       const cometTarget = asset.protocolAddress || asset.address || cfg.compoundV3Comet;
-      if (!cometTarget) {
-        throw new Error(`Missing Compound v3 Comet address on ${cfg.name}.`);
+      const trust = validateTrustedProtocolTarget({
+        chain,
+        protocolId: 'compound_v3',
+        assetAddress: asset.address,
+        protocolAddress: cometTarget,
+      });
+      if (!trust.trusted || !cometTarget) {
+        throw new Error(trust.reason || `Missing Compound v3 Comet address on ${cfg.name}.`);
       }
       const rawBal = BigInt(asset.rawBalance);
       const underlying = asset.underlyingAddress || cfg.usdcAddress;
@@ -1825,6 +2349,15 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
     buildExtraction: ({ asset, chain, exitPlan }) => {
       const cfg = EVM_CHAINS[chain];
       const cTokenTarget = asset.protocolAddress || asset.address;
+      const trust = validateTrustedProtocolTarget({
+        chain,
+        protocolId: 'compound_v2',
+        assetAddress: asset.address,
+        protocolAddress: cTokenTarget,
+      });
+      if (!trust.trusted) {
+        throw new Error(trust.reason || `Untrusted Compound v2 cToken address.`);
+      }
       const rawBal = BigInt(asset.rawBalance);
       const underlying = asset.underlyingAddress || exitPlan?.underlyingAddress || cfg.usdcAddress;
       const uSym = asset.underlyingSymbol ?? 'USDC';
@@ -1867,8 +2400,17 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
     id: 'erc4626',
     name: 'ERC-4626 Vault',
     matches: (asset) => identifyProtocolExtractorId(asset) === 'erc4626',
-    buildExtraction: ({ asset, userAddress, exitPlan }) => {
+    buildExtraction: ({ asset, userAddress, chain, exitPlan }) => {
       const vaultTarget = asset.protocolAddress || asset.address;
+      const trust = validateTrustedProtocolTarget({
+        chain,
+        protocolId: 'erc4626',
+        assetAddress: asset.address,
+        protocolAddress: vaultTarget,
+      });
+      if (!trust.trusted) {
+        throw new Error(trust.reason || `Untrusted ERC-4626 vault target.`);
+      }
       const rawBal = BigInt(asset.rawBalance);
       const uSym = asset.underlyingSymbol ?? exitPlan?.underlyingSymbol ?? 'underlying';
       const uAddr = asset.underlyingAddress ?? exitPlan?.underlyingAddress ?? '';
@@ -1917,8 +2459,14 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
       const cfg = EVM_CHAINS[chain];
       const routers = V2_DEX_ROUTERS[chain] ?? [];
       const routerAddr = asset.lpRouterAddress || asset.protocolAddress || routers[0]?.router;
-      if (!routerAddr) {
-        throw new Error(`No Uniswap v2 / Aerodrome v2 router configured on ${cfg.name}.`);
+      const trust = validateTrustedProtocolTarget({
+        chain,
+        protocolId: 'uniswap_v2_lp',
+        assetAddress: asset.address,
+        protocolAddress: routerAddr,
+      });
+      if (!trust.trusted || !routerAddr) {
+        throw new Error(trust.reason || `No Uniswap v2 / Aerodrome v2 router configured on ${cfg.name}.`);
       }
       const tokenA = asset.lpToken0Address || asset.underlyingAddress || exitPlan?.underlyingAddress;
       const tokenB = asset.lpToken1Address || exitPlan?.secondaryUnderlyingAddress;
@@ -2013,8 +2561,14 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
       const managers = UNISWAP_V3_NFT_MANAGERS[chain] ?? [];
       const managerAddr =
         asset.nftManagerAddress || asset.protocolAddress || exitPlan?.nftManagerAddress || managers[0]?.address;
-      if (!managerAddr) {
-        throw new Error(`No Uniswap v3 / Aerodrome CL Position Manager configured on ${cfg.name}.`);
+      const trust = validateTrustedProtocolTarget({
+        chain,
+        protocolId: 'uniswap_v3_nft',
+        assetAddress: asset.address,
+        protocolAddress: managerAddr,
+      });
+      if (!trust.trusted || !managerAddr) {
+        throw new Error(trust.reason || `No Uniswap v3 / Aerodrome CL Position Manager configured on ${cfg.name}.`);
       }
       const tokenIdStr = asset.nftTokenId || exitPlan?.nftTokenId;
       if (!tokenIdStr) {
