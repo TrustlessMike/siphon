@@ -179,6 +179,8 @@ export interface MigrationPlan {
   usePermit2Batch: boolean;
   includeBurns: boolean;
   outputAsset: 'USDC' | 'SOL';
+  bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+  activeBridgeLabel?: string;
   legs: CctpBridgeLeg[];
   totals: {
     selectedAssets: number;

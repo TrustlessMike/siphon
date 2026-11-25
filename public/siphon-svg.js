@@ -55,7 +55,7 @@ export function renderConvergenceSvg(plan, scan) {
     },
     {
       id: 'swap',
-      title: 'Batch Swap → USDC',
+      title: `Swap & Route → ${plan.outputAsset || 'USDC'}`,
       sub: `${plan.totals.tokensSoldCount} liquid asset(s)`,
       y: height * 0.5 - 26,
       bar: '#0A0A0A',
@@ -183,6 +183,24 @@ export function renderConvergenceSvg(plan, scan) {
       ? `${plan.totals.netSolanaSol.toFixed(2)} SOL`
       : `$${plan.totals.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })} USDC`;
 
+  const pref = plan.bridgePreference || 'auto';
+  const bridgeNodeTitle =
+    pref === 'cctp'
+      ? 'Circle CCTP 1:1'
+      : pref === 'relay'
+      ? 'Relay Bridge'
+      : pref === 'lifi'
+      ? 'LI.FI Router'
+      : 'Relay / LI.FI';
+  const bridgeNodeSub =
+    pref === 'cctp'
+      ? `Domain 5 · ${activeLegs.length} leg(s)`
+      : pref === 'relay'
+      ? `~2s fill · ${activeLegs.length} leg(s)`
+      : pref === 'lifi'
+      ? `Aggregator · ${activeLegs.length} leg(s)`
+      : `Auto-fill · ${activeLegs.length} leg(s)`;
+
   return `
     <svg id="siphonFlowSvg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" style="width:100%; height:auto; display:block;">
       <defs>
@@ -206,11 +224,11 @@ export function renderConvergenceSvg(plan, scan) {
       ${chainNodes}
       ${laneNodes}
 
-      <!-- Stage 3: Circle CCTP Bridge -->
+      <!-- Stage 3: Active Bridge Provider -->
       <g transform="translate(${col3X}, ${cctpY})">
         <rect width="${col3W}" height="58" rx="8" fill="#FFFFFF" stroke="#0A0A0A" stroke-width="1.35" />
-        <text x="14" y="23" font-family="Inter, sans-serif" font-size="12.5" font-weight="700" fill="#0A0A0A">Circle CCTP 1:1</text>
-        <text x="14" y="42" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#52525B">Domain 5 · ${activeLegs.length} leg(s)</text>
+        <text x="14" y="23" font-family="Inter, sans-serif" font-size="12.5" font-weight="700" fill="#0A0A0A">${escapeXml(bridgeNodeTitle)}</text>
+        <text x="14" y="42" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#52525B">${escapeXml(bridgeNodeSub)}</text>
       </g>
 
       <!-- Burn Sink Receipt -->

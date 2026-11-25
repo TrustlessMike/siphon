@@ -211,6 +211,45 @@ export interface BuildPlanInput {
   usePermit2Batch?: boolean;
   includeBurns?: boolean;
   outputAsset?: 'USDC' | 'SOL';
+  bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+}
+
+function getBridgeProviderMeta(
+  pref: 'auto' | 'relay' | 'lifi' | 'cctp',
+  outputAsset: 'USDC' | 'SOL',
+  cctpSec: number
+): { label: string; shortLabel: string; etaText: string; stepTitle: string } {
+  const effectivePref = outputAsset === 'SOL' && pref === 'cctp' ? 'auto' : pref;
+  if (effectivePref === 'relay') {
+    return {
+      label: 'Relay Instant Bridge (~2s auto-fill)',
+      shortLabel: 'Relay Bridge',
+      etaText: '~2–10s auto-fill',
+      stepTitle: `Relay Bridge → Solana ${outputAsset}`,
+    };
+  }
+  if (effectivePref === 'lifi') {
+    return {
+      label: 'LI.FI Aggregator (Mayan / deBridge / Relay)',
+      shortLabel: 'LI.FI Router',
+      etaText: '~15–30s auto-fill',
+      stepTitle: `LI.FI Route → Solana ${outputAsset}`,
+    };
+  }
+  if (effectivePref === 'cctp') {
+    return {
+      label: 'Circle CCTP 1:1 (Domain 5 · Solana Claim)',
+      shortLabel: 'Circle CCTP 1:1',
+      etaText: `~${cctpSec}s finality`,
+      stepTitle: 'Circle CCTP 1:1 Burn',
+    };
+  }
+  return {
+    label: 'Auto (Relay → LI.FI → Circle CCTP)',
+    shortLabel: 'Relay / LI.FI',
+    etaText: '~2–15s auto-fill',
+    stepTitle: `Relay / LI.FI → Solana ${outputAsset}`,
+  };
 }
 
 export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
@@ -222,6 +261,9 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     includeBurns = true,
     outputAsset = 'USDC',
   } = input;
+  const rawPref = input.bridgePreference ?? 'auto';
+  const bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp' =
+    outputAsset === 'SOL' && rawPref === 'cctp' ? 'auto' : rawPref;
 
   const solanaMintRecipientBytes32 = solanaAddressToBytes32(solanaDestination);
   const selectedSet = Array.isArray(selectedAssetIds)
@@ -300,12 +342,13 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
       usdcAddress: cfg.usdcAddress,
     });
 
+    const providerMeta = getBridgeProviderMeta(bridgePreference, outputAsset, cfg.cctpAttestationSec);
     const steps: CctpBridgeLeg['steps'] = [];
     if (usePermit2Batch) {
       steps.push({
-        step: 'Permit2 Signature',
-        detail: `Single EIP-712 batch approval for ${chainAssets.length} token(s) on ${cfg.name}`,
-        target: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
+        step: 'EIP-5792 Atomic Batch',
+        detail: `Bundles ${chainAssets.length} asset(s) + deduplicated exact approvals into 1 confirmation on ${cfg.name}`,
+        target: 'wallet_sendCalls',
       });
     }
     for (const d of defiItems) {
@@ -317,8 +360,8 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     }
     if (swapItems.length > 0) {
       steps.push({
-        step: 'Batch Swap → USDC',
-        detail: `Sell ${swapItems.map((s) => s.symbol).join(', ')} into native ${cfg.name} USDC`,
+        step: `Swap & Bridge → Solana ${outputAsset}`,
+        detail: `Route ${swapItems.map((s) => s.symbol).join(', ')} via ${providerMeta.shortLabel} (${providerMeta.etaText})`,
         target: cfg.usdcAddress,
       });
     }
@@ -336,15 +379,18 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     if (burnItems.length > 0) {
       steps.push({
         step: 'Isolated Safe Burn',
-        detail: `Burn ${burnItems.length} zero-liquidity token(s) to 0x…dEaD via try/catch`,
+        detail: `Burn ${burnItems.length} zero-liquidity token(s) to 0x…dEaD (eth_call verified)`,
         target: DEAD_BURN_ADDRESS,
       });
     }
-    if (bridgedUsdc > 0) {
+    if (bridgedUsdc > 0 && (bridgePreference === 'cctp' || directUsdcItems.length > 0 || swapItems.length === 0)) {
       steps.push({
-        step: 'Circle CCTP Bridge',
-        detail: `depositForBurn(${bridgedUsdc.toFixed(2)} USDC, domain=5 → Solana)`,
-        target: cfg.cctpTokenMessenger,
+        step: providerMeta.stepTitle,
+        detail:
+          bridgePreference === 'cctp'
+            ? `depositForBurn(${bridgedUsdc.toFixed(2)} USDC, Domain ${cfg.cctpDomain} → 5 Solana)`
+            : `Settles ~$${bridgedUsdc.toFixed(2)} as native Solana ${outputAsset} (${providerMeta.etaText})`,
+        target: bridgePreference === 'cctp' ? cfg.cctpTokenMessenger : providerMeta.shortLabel,
       });
     }
 
@@ -382,6 +428,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
 
   const times = legs.filter((l) => l.bridgedUsdc > 0).map((l) => l.estimatedSeconds);
   const solPrice = scan.totals.solPriceUsd || 70;
+  const activeBridgeMeta = getBridgeProviderMeta(bridgePreference, outputAsset, 20);
 
   return {
     planId: `plan_${crypto.randomBytes(5).toString('hex')}`,
@@ -392,6 +439,8 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     usePermit2Batch,
     includeBurns,
     outputAsset,
+    bridgePreference,
+    activeBridgeLabel: activeBridgeMeta.label,
     legs,
     totals: {
       selectedAssets: chosen.length,

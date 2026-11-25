@@ -20,6 +20,7 @@ import {
   refreshInstalledWallets,
   sendEip5792Batch,
   sendRealEvmTransaction,
+  subscribeWalletDiscovery,
   waitForEip5792Batch,
 } from './wallets.js';
 
@@ -162,23 +163,28 @@ function updateWalletButtons() {
   const queueBtn = document.getElementById('runLiveQueueBtn');
 
   if (evmBtn) {
-    evmBtn.textContent = evmAddr ? `EVM: ${shortAddr(evmAddr)}` : 'Connect EVM';
+    const shortName = walletName ? walletName.split(' ')[0] : 'EVM';
+    evmBtn.textContent = evmAddr ? `${shortName}: ${shortAddr(evmAddr)}` : 'Connect EVM';
     evmBtn.classList.toggle('connected', Boolean(evmAddr));
   }
   if (solBtn) {
-    solBtn.textContent = solAddr ? `SOL: ${shortAddr(solAddr)}` : 'Connect Solana';
+    const solName = getConnectedSolanaWalletName()?.split(' ')[0] || 'SOL';
+    solBtn.textContent = solAddr ? `${solName}: ${shortAddr(solAddr)}` : 'Connect Solana';
     solBtn.classList.toggle('connected', Boolean(solAddr));
   }
   if (siteBtn) {
+    const shortName = walletName ? walletName.split(' ')[0] : null;
     siteBtn.textContent = evmAddr
-      ? `${shortAddr(evmAddr)}`
+      ? `${shortName ? `${shortName} · ` : ''}${shortAddr(evmAddr)}`
       : solAddr
-      ? `SOL: ${shortAddr(solAddr)}`
+      ? `SOL · ${shortAddr(solAddr)}`
       : 'Connect Wallet';
     siteBtn.classList.toggle('connected', Boolean(evmAddr || solAddr));
   }
   if (heroBtn) {
-    heroBtn.textContent = evmAddr ? `Connected: ${shortAddr(evmAddr)}` : 'Connect Wallet';
+    heroBtn.textContent = evmAddr
+      ? `${walletName || 'Wallet'} · ${shortAddr(evmAddr)}`
+      : 'Connect Wallet';
   }
   if (execEvm) {
     execEvm.textContent = evmAddr
@@ -262,11 +268,28 @@ async function runScan({ address = null, presetId = null, autoOpen = false } = {
   }
 }
 
+function getActiveBridgePreference() {
+  const select = document.getElementById('bridgePrefSelect');
+  const cctpOpt = select?.querySelector('option[value="cctp"]');
+  if (cctpOpt) {
+    cctpOpt.disabled = outputAsset === 'SOL';
+    cctpOpt.textContent =
+      outputAsset === 'SOL'
+        ? 'Direct Circle CCTP (USDC only)'
+        : 'Direct Circle CCTP (USDC)';
+  }
+  if (select && outputAsset === 'SOL' && select.value === 'cctp') {
+    select.value = 'auto';
+  }
+  return select?.value || 'auto';
+}
+
 async function recomputePlan() {
   if (!currentScan) return;
   const solDest = document.getElementById('solanaDestInput').value.trim();
   const usePermit2Batch = document.getElementById('permit2Toggle').checked;
   const includeBurns = document.getElementById('burnToggle').checked;
+  const bridgePreference = getActiveBridgePreference();
 
   try {
     currentPlan = await api('/api/plan', {
@@ -278,6 +301,7 @@ async function recomputePlan() {
         usePermit2Batch,
         includeBurns,
         outputAsset,
+        bridgePreference,
       }),
     });
     renderAll();
@@ -290,6 +314,15 @@ function renderAll() {
   if (!currentScan || !currentPlan) return;
   updateWalletButtons();
   const t = currentPlan.totals;
+  const pref = currentPlan.bridgePreference || getActiveBridgePreference();
+  const shortProvider =
+    pref === 'cctp'
+      ? 'Circle CCTP 1:1'
+      : pref === 'relay'
+      ? 'Relay (~2s fill)'
+      : pref === 'lifi'
+      ? 'LI.FI aggregator'
+      : 'Relay / LI.FI auto-fill';
 
   document.getElementById('kpiNetUsdc').textContent =
     outputAsset === 'SOL'
@@ -299,8 +332,8 @@ function renderAll() {
     outputAsset === 'SOL' ? 'Net Solana SOL' : 'Net Solana USDC';
   document.getElementById('kpiNetSub').textContent =
     outputAsset === 'SOL'
-      ? `$${t.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })} USDC eq`
-      : `${t.netSolanaSol.toFixed(2)} SOL eq · live Relay/CCTP`;
+      ? `$${t.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })} eq · ${shortProvider}`
+      : `${t.netSolanaSol.toFixed(2)} SOL eq · ${shortProvider}`;
 
   const selectedAssets = currentScan.assets.filter((a) => selectedAssetIds.has(a.id));
   const defiUsd = selectedAssets
@@ -866,6 +899,11 @@ async function executeSelectedLiveQueue() {
 function renderPipelineView() {
   document.getElementById('planSolAddr').textContent = currentPlan.solanaDestination;
   document.getElementById('planSolBytes32').textContent = currentPlan.solanaMintRecipientBytes32;
+  const pref = currentPlan.bridgePreference || getActiveBridgePreference();
+  const activeProvEl = document.getElementById('execActiveProvider');
+  if (activeProvEl) {
+    activeProvEl.textContent = currentPlan.activeBridgeLabel || 'Auto (Relay → LI.FI → Circle CCTP)';
+  }
 
   const grid = document.getElementById('cctpLegsGrid');
   if (!currentPlan.legs.length) {
@@ -882,13 +920,34 @@ function renderPipelineView() {
       const saved = Math.max(0, estCalls - 1);
       const chainCfg = currentScan.chains.find((c) => c.chain === leg.chain);
       const cap = chainCfg ? isChainBatchSupported(chainCfg.chainId) : { supported: false };
+      const routeMeta =
+        pref === 'cctp'
+          ? `Circle CCTP Domain ${leg.sourceDomain} → 5 · ~${leg.estimatedSeconds}s finality`
+          : pref === 'lifi'
+          ? `LI.FI Multi-Bridge → Solana ${currentPlan.outputAsset} · ~15–30s`
+          : pref === 'relay'
+          ? `Relay Instant Fill → Solana ${currentPlan.outputAsset} · ~2–10s`
+          : `Relay → LI.FI Auto-Fill → Solana ${currentPlan.outputAsset} · ~2–15s`;
+
+      const routeBoxHtml =
+        pref === 'cctp'
+          ? `
+          <div class="calldata-box mono">
+            <div style="color:var(--ink-0); font-weight:600; margin-bottom:3px;">Circle CCTP depositForBurn (${shortAddr(leg.tokenMessenger)})</div>
+            ${escapeHtml(leg.cctpCalldata.slice(0, 88))}…
+          </div>`
+          : `
+          <div class="calldata-box mono">
+            <div style="color:var(--ink-0); font-weight:600; margin-bottom:3px;">Live ${pref === 'lifi' ? 'LI.FI /v1/quote' : 'Relay /quote'} Route (${leg.chainName} #${chainCfg?.chainId ?? ''} → Solana ${currentPlan.outputAsset})</div>
+            Exact calldata fetched fresh on click · Zero manual Solana claim · Exact ERC-20 approvals only
+          </div>`;
 
       return `
         <div class="card leg-card">
           <div class="leg-head">
             <div>
-              <strong>${escapeHtml(leg.chainName)} → Solana (Domain ${leg.sourceDomain} → 5)</strong>
-              <div class="mono muted-xs">Est. Gas $${leg.gasUsd.toFixed(2)} · Relay ~10s / CCTP ~${leg.estimatedSeconds}s</div>
+              <strong>${escapeHtml(leg.chainName)} → Solana ${escapeHtml(currentPlan.outputAsset)}</strong>
+              <div class="mono muted-xs">Est. Gas $${leg.gasUsd.toFixed(2)} · ${escapeHtml(routeMeta)}</div>
             </div>
             <strong class="mono" style="font-size:16px;">$${leg.bridgedUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })}</strong>
           </div>
@@ -906,10 +965,7 @@ function renderPipelineView() {
               .join('')}
           </div>
 
-          <div class="calldata-box mono">
-            <div style="color:var(--ink-0); font-weight:600; margin-bottom:3px;">Direct CCTP depositForBurn (${shortAddr(leg.tokenMessenger)})</div>
-            ${escapeHtml(leg.cctpCalldata.slice(0, 88))}…
-          </div>
+          ${routeBoxHtml}
 
           <div class="leg-batch-footer">
             <div class="leg-batch-meta mono">
@@ -1040,6 +1096,27 @@ async function handleEvmConnected({ address, walletName, capabilities }) {
   await runScan({ address, autoOpen: true });
 }
 
+function getWalletBrandBadge(name, iconUrl) {
+  if (iconUrl) {
+    return `<img src="${escapeHtml(iconUrl)}" alt="" class="wallet-option-icon" />`;
+  }
+  const n = String(name || '').toLowerCase();
+  let bg = '#0A0A0A';
+  let fg = '#FFFFFF';
+  let glyph = String(name || 'W').slice(0, 2).toUpperCase();
+  if (n.includes('metamask')) { bg = '#F6851B'; glyph = 'MM'; }
+  else if (n.includes('rabby')) { bg = '#7084FF'; glyph = 'RB'; }
+  else if (n.includes('phantom')) { bg = '#AB9FF2'; fg = '#1C1433'; glyph = 'PH'; }
+  else if (n.includes('coinbase')) { bg = '#0052FF'; glyph = 'CB'; }
+  else if (n.includes('walletconnect')) { bg = '#3B99FC'; glyph = 'WC'; }
+  else if (n.includes('backpack')) { bg = '#E33E3F'; glyph = 'BP'; }
+  else if (n.includes('solflare')) { bg = '#FC7227'; glyph = 'SF'; }
+  else if (n.includes('brave')) { bg = '#FB542B'; glyph = 'BR'; }
+  else if (n.includes('trust')) { bg = '#0500FF'; glyph = 'TW'; }
+  else if (n.includes('okx')) { bg = '#0A0A0A'; glyph = 'OK'; }
+  return `<span class="wallet-option-monogram" style="background:${bg};color:${fg};">${escapeHtml(glyph)}</span>`;
+}
+
 function renderWalletModalContent() {
   const titleEl = document.getElementById('walletModalTitle');
   const subEl = document.getElementById('walletModalSub');
@@ -1072,30 +1149,30 @@ function renderWalletModalContent() {
 
   if (isEvm) {
     const detected = listAvailableEvmWallets();
-    for (const w of detected) {
-      const iconHtml = w.icon
-        ? `<img src="${escapeHtml(w.icon)}" alt="" class="wallet-option-icon" />`
-        : `<span class="wallet-option-monogram">${escapeHtml(w.name.slice(0, 2).toUpperCase())}</span>`;
-      rows.push(`
-        <button type="button" class="wallet-option-row" data-pick-evm="${escapeHtml(w.id)}">
-          <div class="wallet-option-left">
-            ${iconHtml}
-            <div>
-              <div class="wallet-option-name">${escapeHtml(w.name)}</div>
-              <div class="wallet-option-meta mono">Detected · ${escapeHtml(w.standard)}</div>
+    if (detected.length) {
+      rows.push(`<div class="wallet-section-label">Installed in browser</div>`);
+      for (const w of detected) {
+        rows.push(`
+          <button type="button" class="wallet-option-row" data-pick-evm="${escapeHtml(w.id)}">
+            <div class="wallet-option-left">
+              ${getWalletBrandBadge(w.name, w.icon)}
+              <div>
+                <div class="wallet-option-name">${escapeHtml(w.name)}</div>
+                <div class="wallet-option-meta mono">Detected · ${escapeHtml(w.standard)}</div>
+              </div>
             </div>
-          </div>
-          <span class="mono wallet-option-action">${activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
-        </button>
-      `);
+            <span class="mono wallet-option-action">${activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
+          </button>
+        `);
+      }
     }
 
-    // Coinbase Smart Wallet works in any browser with zero extension installed (Passkey / popup + native EIP-5792)
+    rows.push(`<div class="wallet-section-label">Universal &amp; Mobile</div>`);
     if (cfg.coinbaseSmartWalletEnabled) {
       rows.push(`
         <button type="button" class="wallet-option-row" data-pick-coinbase="true">
           <div class="wallet-option-left">
-            <span class="wallet-option-monogram">CB</span>
+            ${getWalletBrandBadge('Coinbase Smart Wallet', null)}
             <div>
               <div class="wallet-option-name">Coinbase Smart Wallet</div>
               <div class="wallet-option-meta mono">Passkey / Popup · No extension needed</div>
@@ -1106,11 +1183,10 @@ function renderWalletModalContent() {
       `);
     }
 
-    // WalletConnect v2 QR for mobile & hardware wallets
     rows.push(`
       <button type="button" class="wallet-option-row" data-pick-wc="true">
         <div class="wallet-option-left">
-          <span class="wallet-option-monogram">WC</span>
+          ${getWalletBrandBadge('WalletConnect', null)}
           <div>
             <div class="wallet-option-name">WalletConnect (Mobile QR)</div>
             <div class="wallet-option-meta mono">${
@@ -1123,36 +1199,49 @@ function renderWalletModalContent() {
         <span class="mono wallet-option-action">QR →</span>
       </button>
     `);
-  } else {
-    const solWallets = listAvailableSolanaWallets();
-    for (const w of solWallets) {
-      const iconHtml = w.icon
-        ? `<img src="${escapeHtml(w.icon)}" alt="" class="wallet-option-icon" />`
-        : `<span class="wallet-option-monogram">${escapeHtml(w.name.slice(0, 2).toUpperCase())}</span>`;
+
+    if (!detected.length) {
       rows.push(`
-        <button type="button" class="wallet-option-row" data-pick-sol="${escapeHtml(w.id)}">
-          <div class="wallet-option-left">
-            ${iconHtml}
-            <div>
-              <div class="wallet-option-name">${escapeHtml(w.name)}</div>
-              <div class="wallet-option-meta mono">Detected · ${escapeHtml(w.standard)}</div>
-            </div>
-          </div>
-          <span class="mono wallet-option-action">${activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
-        </button>
+        <div class="wallet-section-label">Browser extensions</div>
+        <div class="wallet-install-strip">
+          <a class="wallet-install-chip" href="https://rabby.io" target="_blank" rel="noreferrer">Rabby ↗</a>
+          <a class="wallet-install-chip" href="https://metamask.io" target="_blank" rel="noreferrer">MetaMask ↗</a>
+          <a class="wallet-install-chip" href="https://phantom.app" target="_blank" rel="noreferrer">Phantom ↗</a>
+        </div>
       `);
     }
-
-    if (!solWallets.length) {
+  } else {
+    const solWallets = listAvailableSolanaWallets();
+    if (solWallets.length) {
+      rows.push(`<div class="wallet-section-label">Installed in browser</div>`);
+      for (const w of solWallets) {
+        rows.push(`
+          <button type="button" class="wallet-option-row" data-pick-sol="${escapeHtml(w.id)}">
+            <div class="wallet-option-left">
+              ${getWalletBrandBadge(w.name, w.icon)}
+              <div>
+                <div class="wallet-option-name">${escapeHtml(w.name)}</div>
+                <div class="wallet-option-meta mono">Detected · ${escapeHtml(w.standard)}</div>
+              </div>
+            </div>
+            <span class="mono wallet-option-action">${activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
+          </button>
+        `);
+      }
+    } else {
       rows.push(`
-        <div class="wallet-modal-empty">
-          No Solana extension detected in this browser. Install Phantom, Backpack, or Solflare, or set your destination address below.
+        <div class="wallet-section-label">Browser extensions</div>
+        <div class="wallet-install-strip">
+          <a class="wallet-install-chip" href="https://phantom.app" target="_blank" rel="noreferrer">Phantom ↗</a>
+          <a class="wallet-install-chip" href="https://backpack.app" target="_blank" rel="noreferrer">Backpack ↗</a>
+          <a class="wallet-install-chip" href="https://solflare.com" target="_blank" rel="noreferrer">Solflare ↗</a>
         </div>
       `);
     }
 
     const currentDest = document.getElementById('solanaDestInput')?.value.trim() || '';
     rows.push(`
+      <div class="wallet-section-label">Or paste Solana destination</div>
       <form class="wallet-manual-form" id="modalSolanaManualForm">
         <input type="text" id="modalSolanaInput" class="field-input mono" value="${escapeHtml(currentDest)}" placeholder="Paste any Solana address" aria-label="Solana destination address" />
         <button type="submit" class="btn-outline-dark">Use</button>
@@ -1312,6 +1401,14 @@ function wireEvents() {
   });
   document.getElementById('permit2Toggle').addEventListener('change', recomputePlan);
   document.getElementById('burnToggle').addEventListener('change', recomputePlan);
+  document.getElementById('bridgePrefSelect')?.addEventListener('change', recomputePlan);
+
+  subscribeWalletDiscovery(() => {
+    const modal = document.getElementById('walletModalBackdrop');
+    if (modal && !modal.classList.contains('hidden')) {
+      renderWalletModalContent();
+    }
+  });
 
   document.querySelectorAll('.seg-opt').forEach((btn) => {
     btn.addEventListener('click', () => {

@@ -192,8 +192,8 @@ function classifyAndBuildReport(params: {
       } else {
         actionReason =
           item.underlyingSymbol === 'USDC'
-            ? `Withdraw from ${item.protocol} directly as native USDC → Circle CCTP to Solana.`
-            : `Withdraw ${item.underlyingSymbol ?? item.symbol} from ${item.protocol}, batch-swap to USDC → CCTP.`;
+            ? `Withdraw from ${item.protocol} directly as native USDC → Solana (Relay / CCTP).`
+            : `Withdraw ${item.underlyingSymbol ?? item.symbol} from ${item.protocol} → Solana via Relay / LI.FI.`;
         selectedByDefault = netUsdcBatched > 0.25;
       }
       calldataPreview = encodeAaveWithdrawPreview(
@@ -203,7 +203,7 @@ function classifyAndBuildReport(params: {
       );
     } else if (isDirectUsdc) {
       action = 'BRIDGE_DIRECT_USDC';
-      actionReason = 'Already native CCTP USDC — zero swap slippage, direct 1:1 burn-and-mint to Solana.';
+      actionReason = 'Native USDC — direct route to Solana via Relay (~2s), LI.FI, or Circle CCTP.';
       selectedByDefault = grossUsd > 0.25;
     } else if (netUsdcBatched <= 0.1) {
       action = 'SKIP_GAS_NEGATIVE';
@@ -211,7 +211,7 @@ function classifyAndBuildReport(params: {
       selectedByDefault = false;
     } else {
       action = 'SELL_AND_BRIDGE';
-      actionReason = `Batch-swap ${item.symbol} → native USDC via SiphonRouter → Circle CCTP to Solana.`;
+      actionReason = `Swap & bridge ${item.symbol} → native Solana USDC/SOL via Relay or LI.FI.`;
       selectedByDefault = true;
     }
 

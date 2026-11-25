@@ -53,7 +53,24 @@ const SUPPORTED_CHAIN_IDS = [1, 8453, 42161, 10, 137, 43114];
 
 const discoveredEvmProviders = [];
 const discoveredSolanaStandardWallets = [];
+const discoveryListeners = new Set();
 let activeEvmProvider = null;
+
+function notifyWalletDiscovery() {
+  for (const fn of discoveryListeners) {
+    try {
+      fn();
+    } catch {
+      // ignore listener errors
+    }
+  }
+}
+
+export function subscribeWalletDiscovery(listener) {
+  if (typeof listener !== 'function') return () => {};
+  discoveryListeners.add(listener);
+  return () => discoveryListeners.delete(listener);
+}
 let connectedEvmAddress = null;
 let connectedWalletName = null;
 let connectedSolanaAddress = null;
@@ -109,6 +126,7 @@ function registerStandardWallet(wallet) {
       standard: true,
       wallet,
     });
+    notifyWalletDiscovery();
   }
 }
 
@@ -118,6 +136,7 @@ if (typeof window !== 'undefined') {
     const detail = event.detail;
     if (detail?.provider && !discoveredEvmProviders.some((p) => p.info?.uuid === detail.info?.uuid)) {
       discoveredEvmProviders.push(detail);
+      notifyWalletDiscovery();
     }
   });
   try {
@@ -436,14 +455,15 @@ export async function connectWalletConnect(callbacks = {}) {
   const cfg = walletSdkConfig.walletConnectProjectId
     ? walletSdkConfig
     : await loadWalletConnectorConfig();
-  if (!cfg.walletConnectProjectId) {
+  const projectId = callbacks.projectId?.trim() || cfg.walletConnectProjectId;
+  if (!projectId) {
     throw new Error(
-      'WalletConnect QR requires WALLETCONNECT_PROJECT_ID in your server environment (free at cloud.reown.com).'
+      'WalletConnect QR requires WALLETCONNECT_PROJECT_ID on the server (free at cloud.reown.com).'
     );
   }
   const { EthereumProvider } = await loadWalletSdkBundle();
   const provider = await EthereumProvider.init({
-    projectId: cfg.walletConnectProjectId,
+    projectId,
     chains: [1],
     optionalChains: [8453, 42161, 10, 137, 43114],
     showQrModal: true,

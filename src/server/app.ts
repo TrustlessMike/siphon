@@ -235,6 +235,7 @@ export function createSiphonServer() {
           usePermit2Batch?: boolean;
           includeBurns?: boolean;
           outputAsset?: 'USDC' | 'SOL';
+          bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
         }>(req);
 
         const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
@@ -260,6 +261,7 @@ export function createSiphonServer() {
           usePermit2Batch: body.usePermit2Batch ?? true,
           includeBurns: body.includeBurns ?? true,
           outputAsset: body.outputAsset ?? 'USDC',
+          bridgePreference: body.bridgePreference ?? 'auto',
         });
 
         return sendJson(res, 200, plan);

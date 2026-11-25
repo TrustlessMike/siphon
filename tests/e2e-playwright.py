@@ -171,9 +171,25 @@ def main():
             pgD.click("#walletTabEvm")
             pgD.click("[data-pick-evm='rabby-1']")
             pgD.wait_for_selector("#appShell:not(.hidden)", timeout=15000)
-            pgD.wait_for_function("() => document.querySelector('#connectEvmBtn')?.textContent?.includes('0xd8dA')", timeout=15000)
+            pgD.wait_for_function("() => document.querySelector('#connectEvmBtn')?.textContent?.includes('Rabby')", timeout=15000)
+            pgD.wait_for_function("() => document.querySelector('#connectSolBtn')?.textContent?.includes('Phantom')", timeout=15000)
             pgD.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=15000)
             pgD.wait_for_timeout(400)
+
+            # Verify SVG & Batch Execution leg cards match selected bridge provider dynamically!
+            svgTextAuto = pgD.locator("#convergenceSvgHost").inner_text()
+            assert "Relay / LI.FI" in svgTextAuto, svgTextAuto
+            pgD.click(".app-tab[data-view='pipeline']")
+            pgD.select_option("#bridgePrefSelect", "lifi")
+            pgD.wait_for_function("() => (document.querySelector('#execActiveProvider')?.innerText || '').includes('LI.FI')", timeout=5000)
+            assert "LI.FI /v1/quote" in pgD.locator("#cctpLegsGrid").inner_text()
+            pgD.select_option("#bridgePrefSelect", "cctp")
+            pgD.wait_for_function("() => (document.querySelector('#execActiveProvider')?.innerText || '').includes('Circle CCTP')", timeout=5000)
+            assert "Circle CCTP depositForBurn" in pgD.locator("#cctpLegsGrid").inner_text()
+            pgD.select_option("#bridgePrefSelect", "auto")
+            pgD.wait_for_function("() => (document.querySelector('#execActiveProvider')?.innerText || '').includes('Auto')", timeout=5000)
+            pgD.click(".app-tab[data-view='scanner']")
+            pgD.wait_for_timeout(200)
 
             # Check live vitalik.eth headline USD isn't inflated by fake-price spam tokens!
             netUsdcText = pgD.locator("#kpiNetUsdc").inner_text()
