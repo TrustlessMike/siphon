@@ -1,4 +1,4 @@
-import { EVM_CHAINS } from '../scanner/chains.js';
+import { EVM_CHAINS, TOKEN_REGISTRY } from '../scanner/chains.js';
 import {
   decodeMulticall3Aggregate3,
   encodeMulticall3Aggregate3,
@@ -33,6 +33,7 @@ export const DEFI_SELECTORS = {
 
   // ERC-4626 (Morpho, Yearn v3, Spark, Sky, Ethena, Fluid, Euler)
   asset: '0x38d52e0f',
+  erc4626TotalAssets: '0x01e1d114', // totalAssets()
   convertToAssets: '0x07a2d13a',
   previewRedeem: '0x4cdad506',
   maxRedeem: '0xd905777e',
@@ -47,6 +48,7 @@ export const DEFI_SELECTORS = {
   // Aave v3 & Aave v2
   aaveWithdraw: '0x69328dec', // withdraw(address,uint256,address)
   aaveGetUserAccountData: '0xbf92857c', // getUserAccountData(address)
+  aaveGetReserveData: '0x35ea6a75', // getReserveData(address)
   aaveUnderlyingAsset: '0xb16a19de', // UNDERLYING_ASSET_ADDRESS()
   aaveV3Pool: '0x7535d246', // POOL()
   aaveV2LendingPool: '0xb4dcfc77', // LENDING_POOL()
@@ -88,6 +90,46 @@ export const AAVE_V2_LENDING_POOLS: Partial<Record<EvmChainId, string>> = {
   polygon: '0x8dFf5E27EA6b7AC08EbFdf9eB090F32ee9a30fcf',
   avalanche: '0x4F01AeD16D97E3aB5ab2B501154DC9bb0F1A5A2C',
 };
+
+/**
+ * Audited per-chain Aave v3 Pool allowlist (always includes `EVM_CHAINS[chain].aaveV3Pool`).
+ */
+export const AUDITED_AAVE_V3_POOLS: Partial<Record<EvmChainId, string[]>> = {
+  ethereum: [
+    '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2', // Aave v3 Ethereum Core
+    '0x4e033931ad43597d96D6bcc25c280717730B58B1', // Aave v3 Ethereum Prime (Lido)
+  ],
+};
+
+export function getAllowedAaveV3Pools(chain: EvmChainId): Set<string> {
+  const allowed = new Set<string>();
+  const primary = EVM_CHAINS[chain]?.aaveV3Pool;
+  if (primary) allowed.add(primary.toLowerCase());
+  for (const p of AUDITED_AAVE_V3_POOLS[chain] ?? []) {
+    allowed.add(p.toLowerCase());
+  }
+  return allowed;
+}
+
+export function isAllowedAaveV3Pool(chain: EvmChainId, poolAddress?: string | null): boolean {
+  if (!poolAddress || !/^0x[0-9a-fA-F]{40}$/.test(poolAddress)) return false;
+  return getAllowedAaveV3Pools(chain).has(poolAddress.toLowerCase());
+}
+
+const CURATED_DEFI_VAULT_KEYS = new Set<string>(
+  TOKEN_REGISTRY.filter((t) => t.kind === 'defi_position').map(
+    (t) => `${t.chain}:${t.address.toLowerCase()}`
+  )
+);
+
+/**
+ * Returns true if the given (chain, address) is an audited DeFi vault/receipt contract
+ * explicitly curated in `TOKEN_REGISTRY`.
+ */
+export function isCuratedDefiVault(chain: EvmChainId, address?: string | null): boolean {
+  if (!address) return false;
+  return CURATED_DEFI_VAULT_KEYS.has(`${chain}:${address.toLowerCase()}`);
+}
 
 export const COMPOUND_V3_COMETS: Partial<Record<EvmChainId, string[]>> = {
   ethereum: [
@@ -143,8 +185,7 @@ export function validateTrustedProtocolTarget(params: {
   const assetLower = assetAddress.toLowerCase();
 
   if (protocolId === 'aave_v3') {
-    const expected = cfg.aaveV3Pool?.toLowerCase();
-    if (!expected || targetLower !== expected) {
+    if (!isAllowedAaveV3Pool(chain, protocolAddress)) {
       return {
         trusted: false,
         reason: `Blocked untrusted Aave v3 Pool address — does not match the verified Aave v3 Pool on ${cfg.name}.`,
@@ -501,6 +542,128 @@ export function encodeErc4626Redeem(shares: bigint, receiver: string, owner: str
 // Aave v3 & Aave v2 withdraw(address asset, uint256 amount, address to)
 export function encodeAaveWithdraw(underlyingAsset: string, amount: bigint, to: string): string {
   return `${DEFI_SELECTORS.aaveWithdraw}${pad32Hex(underlyingAsset)}${padUint256(amount)}${pad32Hex(to)}`;
+}
+
+// Aave v3 & Aave v2 Pool.getReserveData(address asset) (`0x35ea6a75`)
+export function encodeAaveGetReserveData(underlyingAsset: string): string {
+  return `${DEFI_SELECTORS.aaveGetReserveData}${pad32Hex(underlyingAsset)}`;
+}
+
+export interface AaveReserveTokenAddresses {
+  aTokenAddress: string | null;
+  stableDebtTokenAddress: string | null;
+  variableDebtTokenAddress: string | null;
+}
+
+/**
+ * Decodes Aave v3 `IPool.getReserveData(address)` struct return (15 words):
+ *   word 8: aTokenAddress
+ *   word 9: stableDebtTokenAddress
+ *   word 10: variableDebtTokenAddress
+ */
+export function decodeAaveV3ReserveData(hex: string): AaveReserveTokenAddresses | null {
+  const clean = strip0x(hex);
+  if (clean.length < 64 * 11) return null;
+  return {
+    aTokenAddress: decodeAbiAddressWord('0x' + clean.slice(8 * 64, 9 * 64)),
+    stableDebtTokenAddress: decodeAbiAddressWord('0x' + clean.slice(9 * 64, 10 * 64)),
+    variableDebtTokenAddress: decodeAbiAddressWord('0x' + clean.slice(10 * 64, 11 * 64)),
+  };
+}
+
+/**
+ * Decodes Aave v2 `ILendingPool.getReserveData(address)` struct return (12 words):
+ *   word 7: aTokenAddress
+ *   word 8: stableDebtTokenAddress
+ *   word 9: variableDebtTokenAddress
+ */
+export function decodeAaveV2ReserveData(hex: string): AaveReserveTokenAddresses | null {
+  const clean = strip0x(hex);
+  if (clean.length < 64 * 10) return null;
+  return {
+    aTokenAddress: decodeAbiAddressWord('0x' + clean.slice(7 * 64, 8 * 64)),
+    stableDebtTokenAddress: decodeAbiAddressWord('0x' + clean.slice(8 * 64, 9 * 64)),
+    variableDebtTokenAddress: decodeAbiAddressWord('0x' + clean.slice(9 * 64, 10 * 64)),
+  };
+}
+
+/**
+ * Verifies in a SINGLE Multicall3 batch that candidate Aave v3/v2 receipt tokens are genuine
+ * collateral `aTokenAddress` contracts by calling `POOL.getReserveData(underlying)` (`0x35ea6a75`)
+ * on an allowlisted pool. Explicitly rejects `variableDebtTokenAddress`, `stableDebtTokenAddress`,
+ * and any spoofed airdrop contract. Fails closed on RPC error.
+ */
+export async function verifyAaveReserveATokens(params: {
+  chain: EvmChainId;
+  candidates: Array<{
+    tokenAddress: string;
+    poolAddress: string;
+    underlyingAddress: string;
+    version: 'v3' | 'v2';
+  }>;
+}): Promise<Set<string>> {
+  const verified = new Set<string>();
+  const cfg = EVM_CHAINS[params.chain];
+  if (!cfg || !params.candidates.length) return verified;
+
+  const allowedCandidates = params.candidates.filter((c) => {
+    const check = validateTrustedProtocolTarget({
+      chain: params.chain,
+      protocolId: c.version === 'v3' ? 'aave_v3' : 'aave_v2',
+      assetAddress: c.tokenAddress,
+      protocolAddress: c.poolAddress,
+    });
+    return check.trusted;
+  });
+  if (!allowedCandidates.length) return verified;
+
+  try {
+    const mcData = encodeMulticall3Aggregate3(
+      allowedCandidates.map((c) => ({
+        target: c.poolAddress,
+        allowFailure: true,
+        callData: encodeAaveGetReserveData(c.underlyingAddress),
+      }))
+    );
+    const json = await evmJsonRpcCall<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [{ to: cfg.multicall3, data: mcData }, 'latest'],
+      4000
+    );
+    if (!json.result || json.result === '0x') return verified;
+    const results = decodeMulticall3Aggregate3(json.result);
+    for (let i = 0; i < allowedCandidates.length; i++) {
+      const c = allowedCandidates[i];
+      const r = results[i];
+      if (!r?.success) continue;
+      const decoded =
+        c.version === 'v3'
+          ? decodeAaveV3ReserveData(r.returnData)
+          : decodeAaveV2ReserveData(r.returnData);
+      if (!decoded?.aTokenAddress) continue;
+      const tokenLower = c.tokenAddress.toLowerCase();
+      if (
+        decoded.variableDebtTokenAddress &&
+        decoded.variableDebtTokenAddress.toLowerCase() === tokenLower
+      ) {
+        continue;
+      }
+      if (
+        decoded.stableDebtTokenAddress &&
+        decoded.stableDebtTokenAddress.toLowerCase() === tokenLower
+      ) {
+        continue;
+      }
+      if (decoded.aTokenAddress.toLowerCase() === tokenLower) {
+        verified.add(tokenLower);
+      }
+    }
+  } catch {
+    // Fail closed: never trust unverified Aave receipt tokens when getReserveData fails
+  }
+
+  return verified;
 }
 
 // Compound v3 Comet.withdraw(address asset, uint256 amount)
@@ -1134,6 +1297,7 @@ export interface Erc4626VaultState {
   convertToAssetsRaw: bigint | null;
   previewRedeemRaw: bigint | null;
   expectedUnderlyingRaw: bigint;
+  verifiedUnderlyingOutput?: boolean;
   maxRedeemRaw: bigint | null;
   cooldownDurationSec: number | null;
   cooldownDetected: boolean;
@@ -1206,7 +1370,8 @@ export async function probeErc4626VaultStates(params: {
       const cooldownDurationSec = cooldownBig !== null ? Number(cooldownBig) : null;
 
       const shares = v.rawBalance > 0n ? v.rawBalance : 10n ** BigInt(v.decimals);
-      const expectedUnderlyingRaw = previewRedeemRaw ?? convertToAssetsRaw ?? shares;
+      const verifiedUnderlyingOutput = previewRedeemRaw !== null || convertToAssetsRaw !== null;
+      const expectedUnderlyingRaw = previewRedeemRaw ?? convertToAssetsRaw ?? 0n;
 
       // Cooldown / pause detection:
       // 1) Explicit cooldownDuration() > 0 (e.g. Ethena sUSDe = 86400s / 604800s)
@@ -1234,6 +1399,7 @@ export async function probeErc4626VaultStates(params: {
         convertToAssetsRaw,
         previewRedeemRaw,
         expectedUnderlyingRaw,
+        verifiedUnderlyingOutput,
         maxRedeemRaw,
         cooldownDurationSec,
         cooldownDetected,
@@ -1320,6 +1486,18 @@ export async function probeExpandedDefiContracts(params: {
     const results = decodeMulticall3Aggregate3(json.result);
     const chainRouters = V2_DEX_ROUTERS[params.chain] ?? [];
 
+    const aaveCandidates: Array<{
+      tokenAddress: string;
+      poolAddress: string;
+      underlyingAddress: string;
+      version: 'v3' | 'v2';
+    }> = [];
+    const erc4626Candidates: Array<{
+      vaultAddress: string;
+      underlyingAddress: string;
+      userShares: bigint;
+    }> = [];
+
     for (let i = 0; i < unique.length; i++) {
       const addr = unique[i];
       const base = i * PROBES_PER_TOKEN;
@@ -1337,11 +1515,11 @@ export async function probeExpandedDefiContracts(params: {
           protocolAddress: aaveV3Pool,
         });
         if (check.trusted) {
-          detected.set(addr, {
-            protocolId: 'aave_v3',
-            protocol: 'Aave v3',
-            protocolAddress: aaveV3Pool,
+          aaveCandidates.push({
+            tokenAddress: addr,
+            poolAddress: aaveV3Pool,
             underlyingAddress: aaveUnderlying,
+            version: 'v3',
           });
         }
         continue;
@@ -1355,24 +1533,32 @@ export async function probeExpandedDefiContracts(params: {
           protocolAddress: aaveV2Pool,
         });
         if (check.trusted) {
-          detected.set(addr, {
-            protocolId: 'aave_v2',
-            protocol: 'Aave v2',
-            protocolAddress: aaveV2Pool,
+          aaveCandidates.push({
+            tokenAddress: addr,
+            poolAddress: aaveV2Pool,
             underlyingAddress: aaveUnderlying,
+            version: 'v2',
           });
         }
         continue;
       }
 
       const erc4626Asset = results[base + 3]?.success ? decodeAbiAddressWord(results[base + 3].returnData) : null;
-      if (erc4626Asset) {
-        detected.set(addr, {
-          protocolId: 'erc4626',
-          protocol: 'ERC-4626 Vault',
-          protocolAddress: addr,
-          underlyingAddress: erc4626Asset,
-        });
+      if (erc4626Asset && erc4626Asset.toLowerCase() !== addr.toLowerCase()) {
+        if (isCuratedDefiVault(params.chain, addr)) {
+          detected.set(addr, {
+            protocolId: 'erc4626',
+            protocol: 'ERC-4626 Vault',
+            protocolAddress: addr,
+            underlyingAddress: erc4626Asset,
+          });
+        } else {
+          erc4626Candidates.push({
+            vaultAddress: addr,
+            underlyingAddress: erc4626Asset,
+            userShares: lpBal,
+          });
+        }
         continue;
       }
 
@@ -1448,7 +1634,7 @@ export async function probeExpandedDefiContracts(params: {
 
       const yearnToken = results[base + 13]?.success ? decodeAbiAddressWord(results[base + 13].returnData) : null;
       const yearnPps = results[base + 14]?.success ? decodeAbiUint256Word(results[base + 14].returnData) : null;
-      if (yearnToken && yearnPps !== null && yearnPps > 0n) {
+      if (yearnToken && yearnToken.toLowerCase() !== addr.toLowerCase() && yearnPps !== null && yearnPps > 0n) {
         detected.set(addr, {
           protocolId: 'yearn_v2',
           protocol: 'Yearn v2',
@@ -1456,6 +1642,108 @@ export async function probeExpandedDefiContracts(params: {
           underlyingAddress: yearnToken,
           exchangeRateStored: yearnPps,
         });
+      }
+    }
+
+    // Pass 2 (CRIT-02 authentication):
+    //  - Verify Aave v3/v2 candidates via POOL.getReserveData(underlying) (`0x35ea6a75`) so
+    //    variableDebt* / stableDebt* tokens and spoofed contracts are NEVER classified as collateral!
+    //  - Verify non-curated ERC-4626 candidates prove real totalAssets(), convertToAssets(),
+    //    and real underlying token backing (`underlying.balanceOf(vault)`) before accepting.
+    if (aaveCandidates.length > 0 || erc4626Candidates.length > 0) {
+      const verifyCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
+      for (const c of aaveCandidates) {
+        verifyCalls.push({
+          target: c.poolAddress,
+          allowFailure: true,
+          callData: encodeAaveGetReserveData(c.underlyingAddress),
+        });
+      }
+      for (const v of erc4626Candidates) {
+        const probeShares = v.userShares > 0n ? v.userShares : 1n;
+        verifyCalls.push(
+          { target: v.vaultAddress, allowFailure: true, callData: DEFI_SELECTORS.erc4626TotalAssets },
+          { target: v.vaultAddress, allowFailure: true, callData: encodeErc4626ConvertToAssets(probeShares) },
+          {
+            target: v.underlyingAddress,
+            allowFailure: true,
+            callData: `${DEFI_SELECTORS.balanceOf}${pad32Hex(v.vaultAddress)}`,
+          }
+        );
+      }
+
+      const verifyMc = encodeMulticall3Aggregate3(verifyCalls);
+      const verifyJson = await evmJsonRpcCall<string>(
+        cfg.rpcUrls,
+        'eth_call',
+        [{ to: cfg.multicall3, data: verifyMc }, 'latest'],
+        4000
+      );
+      if (verifyJson.result && verifyJson.result !== '0x') {
+        const verifyDecoded = decodeMulticall3Aggregate3(verifyJson.result);
+
+        for (let i = 0; i < aaveCandidates.length; i++) {
+          const c = aaveCandidates[i];
+          const r = verifyDecoded[i];
+          if (!r?.success) continue;
+          const decoded =
+            c.version === 'v3'
+              ? decodeAaveV3ReserveData(r.returnData)
+              : decodeAaveV2ReserveData(r.returnData);
+          if (!decoded?.aTokenAddress) continue;
+          const tokenLower = c.tokenAddress.toLowerCase();
+          if (
+            decoded.variableDebtTokenAddress?.toLowerCase() === tokenLower ||
+            decoded.stableDebtTokenAddress?.toLowerCase() === tokenLower
+          ) {
+            continue;
+          }
+          if (decoded.aTokenAddress.toLowerCase() === tokenLower) {
+            detected.set(tokenLower, {
+              protocolId: c.version === 'v3' ? 'aave_v3' : 'aave_v2',
+              protocol: c.version === 'v3' ? 'Aave v3' : 'Aave v2',
+              protocolAddress: c.poolAddress,
+              underlyingAddress: c.underlyingAddress,
+            });
+          }
+        }
+
+        const ercOffset = aaveCandidates.length;
+        for (let i = 0; i < erc4626Candidates.length; i++) {
+          const v = erc4626Candidates[i];
+          const baseIdx = ercOffset + i * 3;
+          const rTotalAssets = verifyDecoded[baseIdx];
+          const rConvert = verifyDecoded[baseIdx + 1];
+          const rUnderlyingBal = verifyDecoded[baseIdx + 2];
+
+          const totalAssets = rTotalAssets?.success ? decodeAbiUint256Word(rTotalAssets.returnData) : null;
+          const convertAssets = rConvert?.success ? decodeAbiUint256Word(rConvert.returnData) : null;
+          const underlyingBal = rUnderlyingBal?.success
+            ? decodeAbiUint256Word(rUnderlyingBal.returnData)
+            : null;
+
+          if (
+            totalAssets === null ||
+            totalAssets <= 0n ||
+            convertAssets === null ||
+            convertAssets <= 0n ||
+            underlyingBal === null ||
+            underlyingBal <= 0n
+          ) {
+            continue;
+          }
+          // Reject spoofed vaults claiming more redeemable underlying than they actually hold
+          if (v.userShares > 0n && underlyingBal < convertAssets) {
+            continue;
+          }
+          detected.set(v.vaultAddress.toLowerCase(), {
+            protocolId: 'erc4626',
+            protocol: 'ERC-4626 Vault',
+            protocolAddress: v.vaultAddress,
+            underlyingAddress: v.underlyingAddress,
+            expectedUnderlyingRaw: v.userShares > 0n ? convertAssets : undefined,
+          });
+        }
       }
     }
   } catch {
@@ -1842,41 +2130,44 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
     };
   }
 
-  // 0b. Security check against spoofed/untrusted protocolAddress injection (skip for direct DEX liquid receipts)
-  if (
-    !(liquidReceipt && hasDeepDexLiquidity) &&
-    asset.protocolAddress &&
-    asset.chain in EVM_CHAINS
-  ) {
-    const targetAddr =
-      protocolId === 'uniswap_v2_lp'
-        ? asset.lpRouterAddress || asset.protocolAddress
-        : protocolId === 'uniswap_v3_nft'
-        ? asset.nftManagerAddress || asset.protocolAddress
-        : asset.protocolAddress;
-    const trust = validateTrustedProtocolTarget({
-      chain: asset.chain as EvmChainId,
-      protocolId,
-      assetAddress: asset.address,
-      protocolAddress: targetAddr,
-    });
-    if (!trust.trusted) {
-      return {
-        protocolId,
-        protocolName,
-        routeKind: 'unbonding_required',
-        exitStrategy: 'cooldown_blocked',
-        preflightStatus: 'blocked',
-        preflightReason:
-          trust.reason ||
-          `Blocked untrusted contract target for ${asset.symbol}. Only verified protocol contracts are allowed.`,
-        plainEnglishSteps: [
-          `Blocked for your safety: ${asset.symbol} pointed to an unverified contract address.`,
-        ],
-        supportsAtomicBatch: false,
-        simulatedLive: input.simulatedLive,
-        simulatedAtBlock: input.simulatedAtBlock,
-      };
+  // 0b. Security check against spoofed/untrusted protocolAddress injection.
+  // Never bypass validation when a spoofed asset redirects protocolAddress away from its canonical target!
+  if (asset.protocolAddress && asset.chain in EVM_CHAINS) {
+    const isDirectLiquidOnly =
+      protocolId === 'liquid_receipt' &&
+      Boolean(liquidReceipt && hasDeepDexLiquidity) &&
+      asset.protocolAddress.toLowerCase() === asset.address.toLowerCase();
+    if (!isDirectLiquidOnly) {
+      const targetAddr =
+        protocolId === 'uniswap_v2_lp'
+          ? asset.lpRouterAddress || asset.protocolAddress
+          : protocolId === 'uniswap_v3_nft'
+          ? asset.nftManagerAddress || asset.protocolAddress
+          : asset.protocolAddress;
+      const trust = validateTrustedProtocolTarget({
+        chain: asset.chain as EvmChainId,
+        protocolId: protocolId === 'liquid_receipt' ? 'erc4626' : protocolId,
+        assetAddress: asset.address,
+        protocolAddress: targetAddr,
+      });
+      if (!trust.trusted) {
+        return {
+          protocolId,
+          protocolName,
+          routeKind: 'unbonding_required',
+          exitStrategy: 'cooldown_blocked',
+          preflightStatus: 'blocked',
+          preflightReason:
+            trust.reason ||
+            `Blocked untrusted contract target for ${asset.symbol}. Only verified protocol contracts are allowed.`,
+          plainEnglishSteps: [
+            `Blocked for your safety: ${asset.symbol} pointed to an unverified contract address.`,
+          ],
+          supportsAtomicBatch: false,
+          simulatedLive: input.simulatedLive,
+          simulatedAtBlock: input.simulatedAtBlock,
+        };
+      }
     }
   }
 
@@ -2263,11 +2554,44 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
 
   // 7. Standard ERC-4626 Vault (Morpho, Yearn v3, Fluid, Euler, etc.)
   const uSym = asset.underlyingSymbol ?? 'underlying';
-  const uDec = asset.decimals;
-  const expectedRaw = vaultState?.expectedUnderlyingRaw ?? rawBal;
-  const expectedUi = vaultState
-    ? Number(formatUnits(expectedRaw, uDec).toFixed(6))
-    : asset.uiBalance;
+  const uDec =
+    asset.chain in EVM_CHAINS &&
+    asset.underlyingAddress?.toLowerCase() === EVM_CHAINS[asset.chain as EvmChainId].usdcAddress.toLowerCase()
+      ? 6
+      : asset.decimals;
+
+  if (vaultState && (vaultState.verifiedUnderlyingOutput === false || vaultState.expectedUnderlyingRaw <= 0n)) {
+    return {
+      protocolId: 'erc4626',
+      protocolName,
+      routeKind: 'unbonding_required',
+      exitStrategy: 'cooldown_blocked',
+      preflightStatus: 'blocked',
+      preflightReason:
+        input.preflightReason ||
+        `${protocolName} (${asset.symbol}) failed ERC-4626 previewRedeem / convertToAssets verification — blocked to prevent unverified vault execution.`,
+      plainEnglishSteps: [
+        `Blocked for your safety: ${asset.symbol} did not return a verifiable redeemable underlying balance.`,
+      ],
+      cooldownDetected: false,
+      underlyingSymbol: uSym,
+      underlyingAddress: asset.underlyingAddress ?? vaultState.underlyingAddress ?? undefined,
+      underlyingDecimals: uDec,
+      supportsAtomicBatch: false,
+      simulatedLive: input.simulatedLive,
+      simulatedAtBlock: input.simulatedAtBlock,
+    };
+  }
+
+  const verifiedExpectedRaw =
+    vaultState?.expectedUnderlyingRaw ??
+    (input.expectedUnderlyingRaw !== undefined && input.expectedUnderlyingRaw > 0n
+      ? input.expectedUnderlyingRaw
+      : undefined);
+  const expectedUi =
+    verifiedExpectedRaw !== undefined
+      ? Number(formatUnits(verifiedExpectedRaw, uDec).toFixed(6))
+      : input.expectedUnderlyingUi ?? asset.uiBalance;
 
   return {
     protocolId: 'erc4626',
@@ -2287,14 +2611,14 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
         : `Swap & bridge ${uSym} to Solana ${outputAsset}`,
     ],
     cooldownDetected: false,
-    expectedUnderlyingRaw: expectedRaw.toString(),
+    expectedUnderlyingRaw: verifiedExpectedRaw?.toString(),
     expectedUnderlyingUi: expectedUi,
     underlyingSymbol: uSym,
     underlyingAddress: asset.underlyingAddress ?? vaultState?.underlyingAddress ?? undefined,
     underlyingDecimals: uDec,
     shareExchangeRate: vaultState?.shareExchangeRate ?? 1,
     maxRedeemRaw: vaultState?.maxRedeemRaw?.toString() ?? rawBal.toString(),
-    supportsAtomicBatch: true,
+    supportsAtomicBatch: Boolean(verifiedExpectedRaw !== undefined),
     simulatedLive: input.simulatedLive,
     simulatedAtBlock: input.simulatedAtBlock,
   };
@@ -2645,9 +2969,14 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
       const uSym = asset.underlyingSymbol ?? exitPlan?.underlyingSymbol ?? 'underlying';
       const uAddr = asset.underlyingAddress ?? exitPlan?.underlyingAddress ?? '';
       const uDec = exitPlan?.underlyingDecimals ?? asset.decimals;
-      const expectedRaw = exitPlan?.expectedUnderlyingRaw ? BigInt(exitPlan.expectedUnderlyingRaw) : rawBal;
+      const hasVerifiedExpected =
+        Boolean(exitPlan?.expectedUnderlyingRaw) &&
+        BigInt(exitPlan!.expectedUnderlyingRaw!) > 0n &&
+        exitPlan?.preflightStatus !== 'blocked';
+      const expectedRaw = hasVerifiedExpected ? BigInt(exitPlan!.expectedUnderlyingRaw!) : 0n;
       const expectedUi =
-        exitPlan?.expectedUnderlyingUi ?? Number(formatUnits(expectedRaw, uDec).toFixed(6));
+        exitPlan?.expectedUnderlyingUi ??
+        (hasVerifiedExpected ? Number(formatUnits(expectedRaw, uDec).toFixed(6)) : asset.uiBalance);
 
       return {
         protocolId: 'erc4626',
@@ -2662,18 +2991,20 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
             value: '0x0',
           },
         ],
-        unlockedAssets: uAddr
-          ? [
-              {
-                address: uAddr,
-                symbol: uSym,
-                decimals: uDec,
-                expectedRawAmount: expectedRaw,
-                expectedUiAmount: expectedUi,
-                estimatedUsd: asset.grossUsd,
-              },
-            ]
-          : [],
+        // Never size follow-up CCTP / bridge transfers from unverified raw share balances!
+        unlockedAssets:
+          uAddr && hasVerifiedExpected
+            ? [
+                {
+                  address: uAddr,
+                  symbol: uSym,
+                  decimals: uDec,
+                  expectedRawAmount: expectedRaw,
+                  expectedUiAmount: expectedUi,
+                  estimatedUsd: asset.grossUsd,
+                },
+              ]
+            : [],
         estimatedOutput: `${expectedUi} ${uSym} redeemed from ${asset.symbol}`,
         estimatedSeconds: 15,
         notes: ['Underlying tokens return to your wallet for direct Solana bridging.'],

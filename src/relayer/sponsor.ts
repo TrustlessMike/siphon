@@ -398,7 +398,8 @@ export function buildGaslessSweepIntent(params: {
       a.chain === params.chain &&
       a.action !== 'SKIP_HONEYPOT' &&
       a.action !== 'SKIP_GAS_NEGATIVE' &&
-      a.action !== 'SKIP_NEGATIVE_ROI'
+      a.action !== 'SKIP_NEGATIVE_ROI' &&
+      a.action !== 'SKIP_UNPRICED'
   );
   // MED-05: Permit2 batch strictly covers liquid swappable/bridgeable ERC-20s (never dead burns or DeFi receipts)
   const allLiquidErc20Assets = chainAssets.filter(

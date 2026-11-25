@@ -583,9 +583,13 @@ export function evaluateAssetRoi(
   const totalCostUsd = isBatched ? batchedTotalCostUsd : soloTotalCostUsd;
   const effectiveCostPct = grossUsd > 0 ? r2((totalCostUsd / grossUsd) * 100) : 100;
 
-  // Respect explicit chain-floor / BTC sub-fee dust SKIP flags so pre-skipped dust is never resurrected
+  // Respect explicit chain-floor / BTC sub-fee dust / unpriced SKIP flags so pre-skipped assets are never resurrected
   let roiVerdict = classifyRoiVerdict(netRoiUsd, effectiveCostPct);
-  if (asset.action === 'SKIP_GAS_NEGATIVE' || asset.action === 'SKIP_NEGATIVE_ROI') {
+  if (
+    asset.action === 'SKIP_GAS_NEGATIVE' ||
+    asset.action === 'SKIP_NEGATIVE_ROI' ||
+    asset.action === 'SKIP_UNPRICED'
+  ) {
     roiVerdict = 'negative_roi';
   }
 
@@ -1258,8 +1262,12 @@ export function applyTwoLevelRoiToReport(
           a.selectedByDefault = false;
           continue;
         }
-        // Never resurrect pre-skipped dust (Cosmos/Tron/TON/BTC floor skips) as selectedByDefault: true
-        if (a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_NEGATIVE_ROI') {
+        // Never resurrect pre-skipped dust (Cosmos/Tron/TON/BTC floor skips) or unpriced tokens as selectedByDefault: true
+        if (
+          a.action === 'SKIP_GAS_NEGATIVE' ||
+          a.action === 'SKIP_NEGATIVE_ROI' ||
+          a.action === 'SKIP_UNPRICED'
+        ) {
           a.selectedByDefault = false;
           continue;
         }
@@ -1306,7 +1314,8 @@ export function applyTwoLevelRoiToReport(
       (a) =>
         a.action === 'SKIP_HONEYPOT' ||
         a.action === 'SKIP_GAS_NEGATIVE' ||
-        a.action === 'SKIP_NEGATIVE_ROI'
+        a.action === 'SKIP_NEGATIVE_ROI' ||
+        a.action === 'SKIP_UNPRICED'
     ).length;
     chainSummary.grossUsd = chainGrossUsd;
     chainSummary.totalGasUsd = r2(chainBatchedGas);
@@ -1385,7 +1394,10 @@ export function applyTwoLevelRoiToReport(
   report.totals.burnCandidateCount = report.assets.filter((a) => a.action === 'BURN_ZERO_LIQUIDITY').length;
   report.totals.honeypotSkippedCount = report.assets.filter((a) => a.action === 'SKIP_HONEYPOT').length;
   report.totals.gasNegativeCount = report.assets.filter(
-    (a) => a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_NEGATIVE_ROI'
+    (a) =>
+      a.action === 'SKIP_GAS_NEGATIVE' ||
+      a.action === 'SKIP_NEGATIVE_ROI' ||
+      a.action === 'SKIP_UNPRICED'
   ).length;
 
   return report;

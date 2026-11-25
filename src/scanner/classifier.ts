@@ -3,10 +3,11 @@ import {
   CHAIN_LIST,
   DEAD_BURN_ADDRESS,
   EVM_CHAINS,
+  isCuratedRegistryToken,
   PROTOCOL_FEE_BPS,
   TOKEN_REGISTRY,
 } from './chains.js';
-import { fetchLiveUsdPrices } from './prices.js';
+import { fetchLiveUsdPrices, fetchLiveUsdPricesWithStatus } from './prices.js';
 import {
   AAVE_V2_LENDING_POOLS,
   computeYearnV2UnderlyingRaw,
@@ -25,6 +26,7 @@ import {
   discoverChainTokens,
   discoverDefiProtocolPositions,
   fetchDexLiquidityBatch,
+  fetchDexLiquidityBatchWithStatus,
   isEip2612Token,
   MIN_VERIFIED_DEX_LIQUIDITY_USD,
   simulateBurnTransferOnchain,
@@ -136,6 +138,9 @@ interface RawAssetSeed {
   defiUnlockAt?: number;
   defiNetUsd?: number;
   defiDebtSummary?: string;
+  isRegistryToken?: boolean;
+  pricingUnavailable?: boolean;
+  dexLookupFailed?: boolean;
 }
 
 function classifyAndBuildReport(params: {
@@ -218,12 +223,32 @@ function classifyAndBuildReport(params: {
 
     let defiExitPlan: ScannedAsset['defiExitPlan'];
 
+    const curatedRegistryToken = Boolean(
+      item.isRegistryToken || isCuratedRegistryToken(item.chain, item.address)
+    );
+
     if (item.honeypot) {
       action = 'SKIP_HONEYPOT';
       actionReason = 'eth_call transfer simulation reverted (honeypot / transfer-lock). Safely skipped.';
       selectedByDefault = false;
       honeypotSafe = false;
-    } else if (item.kind === 'dead_token' || item.liquidityUsd === 0 || item.priceUsd === 0) {
+    } else if (
+      item.pricingUnavailable ||
+      item.dexLookupFailed ||
+      (curatedRegistryToken && item.priceUsd <= 0)
+    ) {
+      action = 'SKIP_UNPRICED';
+      actionReason = item.dexLookupFailed
+        ? 'DEX liquidity verification failed or timed out — safely skipped (never burned during API outages).'
+        : curatedRegistryToken
+        ? 'Live price feed unavailable for curated registry token — safely skipped (curated blue-chip tokens are never burned).'
+        : 'Price lookup failed or unavailable — safely skipped instead of burning.';
+      selectedByDefault = false;
+      calldataPreview = undefined;
+    } else if (
+      !curatedRegistryToken &&
+      (item.kind === 'dead_token' || item.liquidityUsd === 0 || item.priceUsd === 0)
+    ) {
       action = 'BURN_ZERO_LIQUIDITY';
       actionReason = 'Zero verified DEX liquidity ($0.00). Opt-in burn to 0x…dEaD (unchecked by default to save gas & popups).';
       selectedByDefault = false;
@@ -423,7 +448,11 @@ function classifyAndBuildReport(params: {
       ).length,
       burnCount: chainAssets.filter((a) => a.action === 'BURN_ZERO_LIQUIDITY').length,
       skippedCount: chainAssets.filter(
-        (a) => a.action === 'SKIP_HONEYPOT' || a.action === 'SKIP_GAS_NEGATIVE'
+        (a) =>
+          a.action === 'SKIP_HONEYPOT' ||
+          a.action === 'SKIP_GAS_NEGATIVE' ||
+          a.action === 'SKIP_NEGATIVE_ROI' ||
+          a.action === 'SKIP_UNPRICED'
       ).length,
       grossUsd,
       netUsdcBridged,
@@ -515,8 +544,8 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     ...TOKEN_REGISTRY.map((t) => t.llamaKey).filter((k): k is string => Boolean(k)),
   ];
 
-  const [prices, discoveredByChainArr, discoveredProtocolPositions, ...chainOutputs] = await Promise.all([
-    fetchLiveUsdPrices(llamaKeys),
+  const [priceStatus, discoveredByChainArr, discoveredProtocolPositions, ...chainOutputs] = await Promise.all([
+    fetchLiveUsdPricesWithStatus(llamaKeys),
     Promise.all(
       CHAIN_LIST.map(async (c) => [c.id, await discoverChainTokens(c.id, cleanAddr, 24)] as const)
     ),
@@ -529,6 +558,12 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
       )
     ),
   ]);
+  const prices = priceStatus.prices;
+  if (priceStatus.hadError) {
+    warnings.push(
+      'DeFiLlama live price feed partially failed or timed out — using verified fallback prices and skipping unpriced assets safely.'
+    );
+  }
   const discoveredByChain = new Map(discoveredByChainArr);
 
   const solPriceUsd = prices.get('coingecko:solana') ?? 70;
@@ -590,6 +625,7 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
       if (!rawBal || rawBal === 0n) continue;
       seenAddrs.add(tok.address.toLowerCase());
       const priceUsd = (tok.llamaKey ? prices.get(tok.llamaKey) : undefined) ?? 0;
+      const pricingUnavailable = priceUsd <= 0;
       rawAssets.push({
         chain: c.id,
         address: tok.address,
@@ -604,6 +640,8 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
         rawBalance: rawBal,
         priceUsd,
         liquidityUsd: priceUsd > 0 ? 5_000_000 : 0,
+        isRegistryToken: true,
+        pricingUnavailable,
       });
     }
 
@@ -613,8 +651,8 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     if (discoveredChainTokens.length > 0) {
       const novelTokens = discoveredChainTokens.filter((dt) => !seenAddrs.has(dt.address.toLowerCase()));
       const novelBalancesMap = new Map(novelTokens.map((dt) => [dt.address.toLowerCase(), dt.rawBalance]));
-      const [dexLiquidityMap, defiReceiptMap] = await Promise.all([
-        fetchDexLiquidityBatch(
+      const [dexLiquidityResult, defiReceiptMap] = await Promise.all([
+        fetchDexLiquidityBatchWithStatus(
           c.id,
           novelTokens.map((dt) => dt.address)
         ),
@@ -624,6 +662,12 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
           rawBalances: novelBalancesMap,
         }),
       ]);
+      const dexLiquidityMap = dexLiquidityResult.liquidity;
+      if (!dexLiquidityResult.ok && novelTokens.length > 0) {
+        warnings.push(
+          `${c.name} DexScreener liquidity lookup failed (${dexLiquidityResult.error ?? 'unavailable'}) — unverified tokens safely skipped instead of burned.`
+        );
+      }
 
       // Fetch prices for any auto-detected DeFi underlying assets (ERC-4626 / Yearn v2 / Aave / Compound v2 / LP token0+token1)
       const defiUnderlyings = Array.from(defiReceiptMap.values()).flatMap((d) =>
@@ -751,9 +795,13 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
           }
         }
 
-        const dex = dexLiquidityMap.get(dt.address.toLowerCase());
+        const addrLower = dt.address.toLowerCase();
+        const dex = dexLiquidityMap.get(addrLower);
         const verifiedLiq = dex?.liquidityUsd ?? 0;
         const verifiedPrice = dex && dex.priceUsd > 0 ? dex.priceUsd : 0;
+        const isRegistry = isCuratedRegistryToken(c.id, dt.address);
+        const dexCheckedCleanly =
+          dexLiquidityResult.ok && dexLiquidityResult.queriedAddresses.has(addrLower);
 
         // Require verified DEX liquidity >= $2,500 before counting a discovered long-tail token as sellable USD
         if (verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD && verifiedPrice > 0) {
@@ -768,6 +816,25 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
             priceUsd: verifiedPrice,
             liquidityUsd: Math.round(verifiedLiq),
             dexLiquidityVerified: true,
+            isRegistryToken: isRegistry,
+          });
+        } else if (!dexCheckedCleanly || isRegistry) {
+          // CRIT-08: When DexScreener lookup fails/times out or token is in curated TOKEN_REGISTRY,
+          // NEVER classify as BURN_ZERO_LIQUIDITY — fail closed to SKIP_UNPRICED.
+          rawAssets.push({
+            chain: c.id,
+            address: dt.address,
+            symbol: dt.symbol,
+            name: dt.name,
+            decimals: dt.decimals,
+            kind: 'erc20',
+            rawBalance: dt.rawBalance,
+            priceUsd: 0,
+            liquidityUsd: 0,
+            dexLiquidityVerified: false,
+            isRegistryToken: isRegistry,
+            dexLookupFailed: !dexCheckedCleanly,
+            pricingUnavailable: isRegistry,
           });
         } else if (extraDead.length < 6) {
           extraDead.push(dt);

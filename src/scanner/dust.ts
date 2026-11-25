@@ -90,6 +90,7 @@ export function planDustConversion(params: {
       a.grossUsd > 0 &&
       a.grossUsd <= maxDustThresholdUsd &&
       a.action !== 'SKIP_HONEYPOT' &&
+      a.action !== 'SKIP_UNPRICED' &&
       a.action !== 'BURN_ZERO_LIQUIDITY' &&
       a.kind !== 'defi_position'
   );

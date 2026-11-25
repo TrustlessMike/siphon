@@ -53,6 +53,7 @@ export type AssetAction =
   | 'BURN_ZERO_LIQUIDITY'
   | 'SKIP_GAS_NEGATIVE'
   | 'SKIP_NEGATIVE_ROI'
+  | 'SKIP_UNPRICED'
   | 'SKIP_HONEYPOT';
 
 export interface RoiCostBreakdown {

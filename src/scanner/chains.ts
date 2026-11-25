@@ -1287,3 +1287,16 @@ export const TOKEN_REGISTRY: TokenDescriptor[] = [
     llamaKey: 'coingecko:worldcoin-wld',
   },
 ];
+
+const CURATED_REGISTRY_KEY_SET = new Set<string>(
+  TOKEN_REGISTRY.map((t) => `${t.chain}:${t.address.toLowerCase()}`)
+);
+
+/**
+ * Returns true if the given (chain, address) pair is a curated blue-chip or DeFi receipt token
+ * in `TOKEN_REGISTRY`. Curated registry tokens must NEVER be classified as `BURN_ZERO_LIQUIDITY`.
+ */
+export function isCuratedRegistryToken(chain: string, address: string): boolean {
+  if (!chain || !address) return false;
+  return CURATED_REGISTRY_KEY_SET.has(`${chain.toLowerCase()}:${address.toLowerCase()}`);
+}

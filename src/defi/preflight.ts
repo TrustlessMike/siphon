@@ -242,31 +242,37 @@ export async function preflightDefiAsset(params: {
   const rawBal = BigInt(asset.rawBalance || '0');
 
   // Security check: block spoofed/untrusted protocolAddress BEFORE running any RPC or calldata build
-  if (!isLiquidReceiptToken(asset.symbol, asset.address) && asset.protocolAddress) {
-    const targetToCheck =
-      protocolId === 'uniswap_v2_lp'
-        ? asset.lpRouterAddress || asset.protocolAddress
-        : protocolId === 'uniswap_v3_nft'
-        ? asset.nftManagerAddress || asset.protocolAddress
-        : asset.protocolAddress;
-    const trust = validateTrustedProtocolTarget({
-      chain,
-      protocolId,
-      assetAddress: asset.address,
-      protocolAddress: targetToCheck,
-    });
-    if (!trust.trusted) {
-      const blockedPlan = resolveDefiExitPlan({ asset, outputAsset });
-      return {
-        assetId: asset.id,
+  if (asset.protocolAddress) {
+    const isDirectLiquidOnly =
+      protocolId === 'liquid_receipt' &&
+      isLiquidReceiptToken(asset.symbol, asset.address) &&
+      asset.protocolAddress.toLowerCase() === asset.address.toLowerCase();
+    if (!isDirectLiquidOnly) {
+      const targetToCheck =
+        protocolId === 'uniswap_v2_lp'
+          ? asset.lpRouterAddress || asset.protocolAddress
+          : protocolId === 'uniswap_v3_nft'
+          ? asset.nftManagerAddress || asset.protocolAddress
+          : asset.protocolAddress;
+      const trust = validateTrustedProtocolTarget({
         chain,
-        symbol: asset.symbol,
-        protocol: protocolName,
-        defiExitPlan: blockedPlan,
-        simulatedCalls: [],
-        canExecute1Click: false,
-        blockNumber: 0,
-      };
+        protocolId: protocolId === 'liquid_receipt' ? 'erc4626' : protocolId,
+        assetAddress: asset.address,
+        protocolAddress: targetToCheck,
+      });
+      if (!trust.trusted) {
+        const blockedPlan = resolveDefiExitPlan({ asset, outputAsset });
+        return {
+          assetId: asset.id,
+          chain,
+          symbol: asset.symbol,
+          protocol: protocolName,
+          defiExitPlan: blockedPlan,
+          simulatedCalls: [],
+          canExecute1Click: false,
+          blockNumber: 0,
+        };
+      }
     }
   }
 

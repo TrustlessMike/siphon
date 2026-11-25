@@ -1,4 +1,14 @@
 import { PublicKey } from '@solana/web3.js';
+import {
+  decodeAaveV3ReserveData,
+  decodeAbiUint256Word,
+  DEFI_SELECTORS,
+  encodeAaveGetReserveData,
+  encodeErc4626ConvertToAssets,
+  isAllowedAaveV3Pool,
+  isCuratedDefiVault,
+  pad32Hex,
+} from '../defi/extractors.js';
 import { DEAD_BURN_ADDRESS, EVM_CHAINS } from './chains.js';
 import { decodeMulticall3Aggregate3, encodeMulticall3Aggregate3, evmJsonRpcCall } from './rpc.js';
 import { sanitizeTokenName, sanitizeTokenSymbol } from './sanitize.js';
@@ -80,13 +90,17 @@ function decodeAbiAddressWord(hex: string): string | null {
 }
 
 /**
- * Probes arbitrary discovered ERC-20 contracts in ONE Multicall3 batch to automatically detect:
- *  - ANY Aave v3 aToken via `UNDERLYING_ASSET_ADDRESS()` (0xb16a19de) + `POOL()` (0x7535d246)
- *  - ANY ERC-4626 Vault (Morpho, Yearn v3, Spark, Sky, Ethena, Fluid, Euler) via `asset()` (0x38d52e0f)
+ * Probes arbitrary discovered ERC-20 contracts in Multicall3 batches to automatically detect:
+ *  - Verified Aave v3 aTokens via `UNDERLYING_ASSET_ADDRESS()` (0xb16a19de) + `POOL()` (0x7535d246),
+ *    checked against the per-chain Aave v3 Pool allowlist AND authenticated via
+ *    `POOL.getReserveData(underlying)` (`0x35ea6a75`) confirming `aTokenAddress === tokenAddr`
+ *    (explicitly rejecting `variableDebt*`, `stableDebt*`, and spoofed airdrop contracts).
+ *  - Verified ERC-4626 Vaults via `asset()` (0x38d52e0f) + onchain backing checks for non-curated vaults.
  */
 export async function probeDefiReceiptContracts(
   chain: EvmChainId,
-  tokenAddresses: string[]
+  tokenAddresses: string[],
+  rawBalances?: Map<string, bigint>
 ): Promise<Map<string, DetectedDefiReceipt>> {
   const detected = new Map<string, DetectedDefiReceipt>();
   const cfg = EVM_CHAINS[chain];
@@ -95,11 +109,11 @@ export async function probeDefiReceiptContracts(
   ).slice(0, 20);
   if (!cfg || !unique.length) return detected;
 
-  // 3 probes per token: [0] UNDERLYING_ASSET_ADDRESS(), [1] POOL(), [2] asset()
+  // Pass 1 — 3 probes per token: [0] UNDERLYING_ASSET_ADDRESS(), [1] POOL(), [2] asset()
   const calls = unique.flatMap((target) => [
-    { target, allowFailure: true, callData: '0xb16a19de' },
-    { target, allowFailure: true, callData: '0x7535d246' },
-    { target, allowFailure: true, callData: '0x38d52e0f' },
+    { target, allowFailure: true, callData: DEFI_SELECTORS.aaveUnderlyingAsset },
+    { target, allowFailure: true, callData: DEFI_SELECTORS.aaveV3Pool },
+    { target, allowFailure: true, callData: DEFI_SELECTORS.asset },
   ]);
 
   try {
@@ -112,6 +126,18 @@ export async function probeDefiReceiptContracts(
     );
     if (!json.result || json.result === '0x') return detected;
     const results = decodeMulticall3Aggregate3(json.result);
+
+    const aaveCandidates: Array<{
+      tokenAddress: string;
+      poolAddress: string;
+      underlyingAddress: string;
+    }> = [];
+    const erc4626Candidates: Array<{
+      vaultAddress: string;
+      underlyingAddress: string;
+      userShares: bigint;
+    }> = [];
+
     for (let i = 0; i < unique.length; i++) {
       const addr = unique[i];
       const rUnderlying = results[i * 3];
@@ -121,27 +147,130 @@ export async function probeDefiReceiptContracts(
       const aaveUnderlying = rUnderlying?.success ? decodeAbiAddressWord(rUnderlying.returnData) : null;
       const aavePool = rPool?.success ? decodeAbiAddressWord(rPool.returnData) : null;
       if (aaveUnderlying && aavePool) {
-        detected.set(addr, {
-          kind: 'aave_v3',
-          protocol: 'Aave v3',
-          protocolAddress: aavePool,
-          underlyingAddress: aaveUnderlying,
-        });
+        if (isAllowedAaveV3Pool(chain, aavePool)) {
+          aaveCandidates.push({
+            tokenAddress: addr,
+            poolAddress: aavePool,
+            underlyingAddress: aaveUnderlying,
+          });
+        }
+        // Never fall through to ERC-4626 on Aave-shaped contracts (including debt tokens or spoofed pools)
         continue;
       }
 
       const erc4626Asset = rAsset?.success ? decodeAbiAddressWord(rAsset.returnData) : null;
-      if (erc4626Asset) {
-        detected.set(addr, {
-          kind: 'erc4626',
-          protocol: 'ERC-4626 Vault',
-          protocolAddress: addr,
-          underlyingAddress: erc4626Asset,
+      if (erc4626Asset && erc4626Asset.toLowerCase() !== addr.toLowerCase()) {
+        if (isCuratedDefiVault(chain, addr)) {
+          detected.set(addr, {
+            kind: 'erc4626',
+            protocol: 'ERC-4626 Vault',
+            protocolAddress: addr,
+            underlyingAddress: erc4626Asset,
+          });
+        } else {
+          erc4626Candidates.push({
+            vaultAddress: addr,
+            underlyingAddress: erc4626Asset,
+            userShares: rawBalances?.get(addr) ?? 0n,
+          });
+        }
+      }
+    }
+
+    // Pass 2 — Authenticate Aave v3 candidates via POOL.getReserveData(underlying) (`0x35ea6a75`)
+    // and verify non-curated ERC-4626 vaults hold real redeemable underlying tokens.
+    if (aaveCandidates.length > 0 || erc4626Candidates.length > 0) {
+      const verifyCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
+      for (const c of aaveCandidates) {
+        verifyCalls.push({
+          target: c.poolAddress,
+          allowFailure: true,
+          callData: encodeAaveGetReserveData(c.underlyingAddress),
         });
+      }
+      for (const v of erc4626Candidates) {
+        const probeShares = v.userShares > 0n ? v.userShares : 1n;
+        verifyCalls.push(
+          { target: v.vaultAddress, allowFailure: true, callData: DEFI_SELECTORS.erc4626TotalAssets },
+          { target: v.vaultAddress, allowFailure: true, callData: encodeErc4626ConvertToAssets(probeShares) },
+          {
+            target: v.underlyingAddress,
+            allowFailure: true,
+            callData: `${DEFI_SELECTORS.balanceOf}${pad32Hex(v.vaultAddress)}`,
+          }
+        );
+      }
+
+      const verifyMc = encodeMulticall3Aggregate3(verifyCalls);
+      const verifyJson = await evmJsonRpcCall<string>(
+        cfg.rpcUrls,
+        'eth_call',
+        [{ to: cfg.multicall3, data: verifyMc }, 'latest'],
+        3500
+      );
+      if (verifyJson.result && verifyJson.result !== '0x') {
+        const verifyDecoded = decodeMulticall3Aggregate3(verifyJson.result);
+        for (let i = 0; i < aaveCandidates.length; i++) {
+          const c = aaveCandidates[i];
+          const r = verifyDecoded[i];
+          if (!r?.success) continue;
+          const reserve = decodeAaveV3ReserveData(r.returnData);
+          if (!reserve?.aTokenAddress) continue;
+          const tokenLower = c.tokenAddress.toLowerCase();
+          if (
+            reserve.variableDebtTokenAddress?.toLowerCase() === tokenLower ||
+            reserve.stableDebtTokenAddress?.toLowerCase() === tokenLower
+          ) {
+            continue;
+          }
+          if (reserve.aTokenAddress.toLowerCase() === tokenLower) {
+            detected.set(tokenLower, {
+              kind: 'aave_v3',
+              protocol: 'Aave v3',
+              protocolAddress: c.poolAddress,
+              underlyingAddress: c.underlyingAddress,
+            });
+          }
+        }
+
+        const ercOffset = aaveCandidates.length;
+        for (let i = 0; i < erc4626Candidates.length; i++) {
+          const v = erc4626Candidates[i];
+          const baseIdx = ercOffset + i * 3;
+          const rTotalAssets = verifyDecoded[baseIdx];
+          const rConvert = verifyDecoded[baseIdx + 1];
+          const rUnderlyingBal = verifyDecoded[baseIdx + 2];
+
+          const totalAssets = rTotalAssets?.success ? decodeAbiUint256Word(rTotalAssets.returnData) : null;
+          const convertAssets = rConvert?.success ? decodeAbiUint256Word(rConvert.returnData) : null;
+          const underlyingBal = rUnderlyingBal?.success
+            ? decodeAbiUint256Word(rUnderlyingBal.returnData)
+            : null;
+
+          if (
+            totalAssets === null ||
+            totalAssets <= 0n ||
+            convertAssets === null ||
+            convertAssets <= 0n ||
+            underlyingBal === null ||
+            underlyingBal <= 0n
+          ) {
+            continue;
+          }
+          if (v.userShares > 0n && underlyingBal < convertAssets) {
+            continue;
+          }
+          detected.set(v.vaultAddress.toLowerCase(), {
+            kind: 'erc4626',
+            protocol: 'ERC-4626 Vault',
+            protocolAddress: v.vaultAddress,
+            underlyingAddress: v.underlyingAddress,
+          });
+        }
       }
     }
   } catch {
-    // non-fatal probe
+    // non-fatal probe (fails closed)
   }
   return detected;
 }
@@ -282,14 +411,22 @@ export interface DexLiquidityInfo {
   dexId?: string;
 }
 
+export interface DexLiquidityBatchResult {
+  liquidity: Map<string, DexLiquidityInfo>;
+  ok: boolean;
+  queriedAddresses: Set<string>;
+  error?: string;
+}
+
 /**
  * Batch-verifies real DEX liquidity & spot price for up to 30 token addresses on a chain
- * using DexScreener's free public API so fake-price spam tokens never inflate portfolio totals.
+ * using DexScreener's free public API, explicitly distinguishing a genuine 0-pair response
+ * (`ok: true`) from an HTTP error / timeout / network failure (`ok: false`).
  */
-export async function fetchDexLiquidityBatch(
+export async function fetchDexLiquidityBatchWithStatus(
   chain: EvmChainId,
   tokenAddresses: string[]
-): Promise<Map<string, DexLiquidityInfo>> {
+): Promise<DexLiquidityBatchResult> {
   const out = new Map<string, DexLiquidityInfo>();
   const slug = DEXSCREENER_CHAIN_SLUGS[chain];
   const unique = Array.from(
@@ -299,8 +436,14 @@ export async function fetchDexLiquidityBatch(
         .map((a) => a.toLowerCase())
     )
   ).slice(0, 30);
+  const queriedAddresses = new Set<string>(unique);
 
-  if (!slug || !unique.length) return out;
+  if (!slug) {
+    return { liquidity: out, ok: false, queriedAddresses: new Set(), error: `Unsupported DexScreener chain ${chain}` };
+  }
+  if (!unique.length) {
+    return { liquidity: out, ok: true, queriedAddresses };
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3500);
@@ -308,7 +451,14 @@ export async function fetchDexLiquidityBatch(
     const url = `https://api.dexscreener.com/tokens/v1/${slug}/${unique.join(',')}`;
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timer);
-    if (!res.ok) return out;
+    if (!res.ok) {
+      return {
+        liquidity: out,
+        ok: false,
+        queriedAddresses,
+        error: `DexScreener HTTP ${res.status}`,
+      };
+    }
 
     const pairs = (await res.json()) as Array<{
       dexId?: string;
@@ -318,7 +468,14 @@ export async function fetchDexLiquidityBatch(
       volume?: { h24?: number };
     }>;
 
-    if (!Array.isArray(pairs)) return out;
+    if (!Array.isArray(pairs)) {
+      return {
+        liquidity: out,
+        ok: false,
+        queriedAddresses,
+        error: 'Malformed DexScreener response',
+      };
+    }
     for (const pair of pairs) {
       const addr = pair.baseToken?.address?.toLowerCase();
       if (!addr) continue;
@@ -335,10 +492,28 @@ export async function fetchDexLiquidityBatch(
         });
       }
     }
-  } catch {
+    return { liquidity: out, ok: true, queriedAddresses };
+  } catch (err) {
     clearTimeout(timer);
+    return {
+      liquidity: out,
+      ok: false,
+      queriedAddresses,
+      error: err instanceof Error ? err.message : 'DexScreener lookup failed',
+    };
   }
-  return out;
+}
+
+/**
+ * Batch-verifies real DEX liquidity & spot price for up to 30 token addresses on a chain
+ * using DexScreener's free public API so fake-price spam tokens never inflate portfolio totals.
+ */
+export async function fetchDexLiquidityBatch(
+  chain: EvmChainId,
+  tokenAddresses: string[]
+): Promise<Map<string, DexLiquidityInfo>> {
+  const res = await fetchDexLiquidityBatchWithStatus(chain, tokenAddresses);
+  return res.liquidity;
 }
 
 const KNOWN_EIP2612_SYMBOLS = new Set([
@@ -597,7 +772,7 @@ async function discoverBlockscoutTokens(
  * Zero-key Routescan public ERC-20 holdings fallback for chains without Blockscout v2
  * (Avalanche, BNB Chain, Mantle, Blast, Linea, Sonic).
  */
-async function discoverRoutescanTokens(
+export async function discoverRoutescanTokens(
   chain: EvmChainId,
   walletAddress: string,
   maxTokens = 24
@@ -607,7 +782,7 @@ async function discoverRoutescanTokens(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3800);
   try {
-    const url = `https://cdn.routescan.io/api/evm/${cfg.chainId}/address/${encodeURIComponent(walletAddress)}/erc20-holdings?limit=${maxTokens}`;
+    const url = `https://api.routescan.io/v2/network/mainnet/evm/${cfg.chainId}/address/${encodeURIComponent(walletAddress)}/erc20-holdings?limit=${maxTokens}`;
     const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: controller.signal });
     clearTimeout(timer);
     if (!res.ok) return [];
@@ -621,6 +796,7 @@ async function discoverRoutescanTokens(
         tokenPrice?: number | string;
         holderBalance?: string;
         token?: {
+          address?: string;
           symbol?: string;
           name?: string;
           decimals?: number | string;
@@ -630,8 +806,9 @@ async function discoverRoutescanTokens(
     };
     const out: DiscoveredEthToken[] = [];
     for (const item of json.items ?? []) {
+      const tokenAddress = item.tokenAddress ?? item.token?.address;
       const qty = item.holderBalance ?? item.tokenQuantity;
-      if (!item.tokenAddress || !/^0x[0-9a-fA-F]{40}$/.test(item.tokenAddress) || !qty) continue;
+      if (!tokenAddress || !/^0x[0-9a-fA-F]{40}$/.test(tokenAddress) || !qty) continue;
       try {
         const rawBalance = BigInt(qty);
         if (rawBalance <= 0n) continue;
@@ -643,7 +820,7 @@ async function discoverRoutescanTokens(
         const rawSym = item.token?.symbol ?? item.tokenSymbol;
         const rawName = item.token?.name ?? item.tokenName ?? rawSym;
         out.push({
-          address: item.tokenAddress,
+          address: tokenAddress,
           symbol: sanitizeTokenSymbol(rawSym, 'UNKNOWN'),
           name: sanitizeTokenName(rawName, 'ERC-20 Token'),
           decimals,

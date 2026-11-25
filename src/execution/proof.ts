@@ -574,7 +574,12 @@ export async function buildPreSignSimulationProof(params: {
 
   const grossUsd = Number(
     assets
-      .filter((a) => a.action !== 'BURN_ZERO_LIQUIDITY' && a.action !== 'SKIP_HONEYPOT')
+      .filter(
+        (a) =>
+          a.action !== 'BURN_ZERO_LIQUIDITY' &&
+          a.action !== 'SKIP_HONEYPOT' &&
+          a.action !== 'SKIP_UNPRICED'
+      )
       .reduce((s, a) => s + a.grossUsd, 0)
       .toFixed(2)
   );
@@ -586,7 +591,12 @@ export async function buildPreSignSimulationProof(params: {
     (
       estimateBridgeFixedFeeUsd(batch.chain) +
       assets
-        .filter((a) => a.action !== 'BURN_ZERO_LIQUIDITY' && a.action !== 'SKIP_HONEYPOT')
+        .filter(
+          (a) =>
+            a.action !== 'BURN_ZERO_LIQUIDITY' &&
+            a.action !== 'SKIP_HONEYPOT' &&
+            a.action !== 'SKIP_UNPRICED'
+        )
         .reduce((s, a) => s + (a.estimatedSlippageUsd || 0), 0)
     ).toFixed(2)
   );
@@ -700,7 +710,7 @@ export async function buildPreSignSimulationProof(params: {
       ? 'eip5792_batch'
       : 'sequential',
     outflows: assets
-      .filter((a) => a.action !== 'SKIP_HONEYPOT')
+      .filter((a) => a.action !== 'SKIP_HONEYPOT' && a.action !== 'SKIP_UNPRICED')
       .map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
