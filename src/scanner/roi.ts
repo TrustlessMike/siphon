@@ -1,12 +1,33 @@
 import { getProtocolFeeConfig } from './chains.js';
 import type {
   AnyChainId,
+  ChainFamily,
   ChainRouteStrategy,
   RoiCostBreakdown,
   RoiVerdict,
   ScannedAsset,
   ScanReport,
 } from './types.js';
+
+/**
+ * Case-aware wallet key normalization for `(sourceWallet, chain)` batch grouping.
+ * Only lowercases case-insensitive hex (`0x...`, `.eth`) and Bech32 (`cosmos1...`, `bc1...`)
+ * addresses while preserving exact case for Base58 (Tron, BTC legacy, Solana) and Base64url (TON).
+ */
+export function normalizeBatchWalletKey(rawWallet?: string | null, family?: ChainFamily): string {
+  const clean = (rawWallet || '').trim();
+  if (!clean) return 'default';
+  if (
+    family === 'evm' ||
+    family === 'cosmos' ||
+    /^0x[0-9a-fA-F]+$/.test(clean) ||
+    clean.toLowerCase().endsWith('.eth') ||
+    /^(bc1|tb1)[0-9a-zA-Z]+$/i.test(clean)
+  ) {
+    return clean.toLowerCase();
+  }
+  return clean;
+}
 
 export const SOLANA_USDC_ATA_RENT_SOL = 0.00203928;
 export const WORTH_IT_MIN_NET_USD = 0.25;
@@ -93,6 +114,8 @@ export interface RouteComparison {
 export interface ChainBatchRoiReport {
   chain: AnyChainId;
   chainName: string;
+  sourceWallet?: string;
+  sourceWalletLabel?: string;
   assetCount: number;
   keptCount: number;
   lowEfficiencyCount: number;
@@ -646,6 +669,8 @@ export function compareChainRouteStrategies(params: {
 export function evaluateChainBatchRoi(params: {
   chain: AnyChainId;
   chainName?: string;
+  sourceWallet?: string;
+  sourceWalletLabel?: string;
   assets: ScannedAsset[];
   protocolFeeBps?: number;
   gasSponsored?: boolean;
@@ -776,6 +801,8 @@ export function evaluateChainBatchRoi(params: {
   return {
     chain: params.chain,
     chainName: params.chainName || params.assets[0]?.chainName || params.chain,
+    sourceWallet: params.sourceWallet ?? params.assets[0]?.sourceWallet,
+    sourceWalletLabel: params.sourceWalletLabel ?? params.assets[0]?.sourceWalletLabel,
     assetCount: params.assets.length,
     keptCount: buckets.kept.length,
     lowEfficiencyCount: buckets.lowEfficiency.length,
@@ -837,65 +864,109 @@ export function applyTwoLevelRoiToReport(
     const chainAssets = byChain.get(chainSummary.chain) ?? [];
     if (!chainAssets.length) continue;
 
-    // Count Solana ATA rent ONCE across the entire multi-chain sweep (on first profitable chain)
-    const chainHasAtaRent = !ataApplied && ataRentTotal > 0;
-    const chainRoi = evaluateChainBatchRoi({
-      chain: chainSummary.chain,
-      chainName: chainSummary.chainName,
-      assets: chainAssets,
-      protocolFeeBps: feeBps,
-      gasSponsored: chainSummary.needsGasSponsorship,
-      hasSolanaUsdcAta: chainHasAtaRent ? false : true,
-      solPriceUsd,
-      gasPriceGwei: chainSummary.gasPriceGwei,
-    });
-    if (chainHasAtaRent && !chainRoi.skipChainNegativeRoi) {
-      ataApplied = true;
-    }
-
-    const evalMap = new Map(chainRoi.evaluations.map((e) => [e.assetId, e]));
+    // Sub-group by sourceWallet so distinct EOAs on the same chain are NEVER merged into 1 atomic batch!
+    const byWallet = new Map<string, { sourceWallet?: string; sourceWalletLabel?: string; assets: ScannedAsset[] }>();
     for (const a of chainAssets) {
-      const ev = evalMap.get(a.id);
-      if (!ev) continue;
-      a.netRoiUsd = ev.netRoiUsd;
-      a.effectiveCostPct = ev.effectiveCostPct;
-      a.roiVerdict = ev.roiVerdict;
-      a.roiCostBreakdown = ev.costBreakdown;
-      a.netUsdcSingle = ev.signedSoloNetUsd;
-      a.netUsdcBatched = ev.signedBatchedNetUsd;
-
-      if (a.action === 'SKIP_HONEYPOT' || a.action === 'BURN_ZERO_LIQUIDITY') {
-        a.selectedByDefault = false;
-        continue;
-      }
-      if (a.aaveDebtUsd && a.aaveDebtUsd > 0) {
-        a.selectedByDefault = false;
-        continue;
-      }
-
-      if (ev.roiVerdict === 'negative_roi') {
-        a.action = 'SKIP_GAS_NEGATIVE';
-        a.selectedByDefault = false;
-        if (!a.actionReason.toLowerCase().includes('skipped')) {
-          a.actionReason = ev.reason;
-        }
-      } else if (ev.roiVerdict === 'low_efficiency') {
-        // Low efficiency (35%-65% fees): keep sweepable action so user can opt in, unchecked by default!
-        a.selectedByDefault = false;
-        a.actionReason = `${ev.reason} (${a.actionReason})`;
+      const rawWallet = a.sourceWallet || report.walletAddress;
+      const wKey = normalizeBatchWalletKey(rawWallet, a.family);
+      const group = byWallet.get(wKey);
+      if (group) {
+        group.assets.push(a);
       } else {
-        // Worth it: selected by default unless the entire chain leg is negative ROI
-        a.selectedByDefault = !chainRoi.skipChainNegativeRoi;
+        byWallet.set(wKey, {
+          sourceWallet: a.sourceWallet || (report.walletAddress && !report.walletAddress.includes(',') ? report.walletAddress : undefined),
+          sourceWalletLabel: a.sourceWalletLabel || report.walletLabel,
+          assets: [a],
+        });
       }
     }
 
-    chainSummary.chainLegNetUsd = chainRoi.chainLegNetUsd;
-    chainSummary.chainLegCostPct = chainRoi.chainLegCostPct;
-    chainSummary.roiVerdict = chainRoi.roiVerdict;
-    chainSummary.skipChainNegativeRoi = chainRoi.skipChainNegativeRoi;
-    chainSummary.routeStrategy = chainRoi.routeComparison.recommendedStrategy;
-    chainSummary.breakEvenHint = chainRoi.breakEvenHint;
-    chainSummary.solanaAtaRentUsd = chainRoi.solanaAtaRentUsd;
+    const walletBatchReports: ChainBatchRoiReport[] = [];
+
+    for (const wGroup of byWallet.values()) {
+      // Count Solana ATA rent ONCE across the entire multi-chain/multi-wallet sweep (on first profitable batch)
+      const batchHasAtaRent = !ataApplied && ataRentTotal > 0;
+      const batchRoi = evaluateChainBatchRoi({
+        chain: chainSummary.chain,
+        chainName: chainSummary.chainName,
+        sourceWallet: wGroup.sourceWallet,
+        sourceWalletLabel: wGroup.sourceWalletLabel,
+        assets: wGroup.assets,
+        protocolFeeBps: feeBps,
+        gasSponsored: chainSummary.needsGasSponsorship,
+        hasSolanaUsdcAta: batchHasAtaRent ? false : true,
+        solPriceUsd,
+        gasPriceGwei: chainSummary.gasPriceGwei,
+      });
+      if (batchHasAtaRent && !batchRoi.skipChainNegativeRoi) {
+        ataApplied = true;
+      }
+      walletBatchReports.push(batchRoi);
+
+      const evalMap = new Map(batchRoi.evaluations.map((e) => [e.assetId, e]));
+      for (const a of wGroup.assets) {
+        const ev = evalMap.get(a.id);
+        if (!ev) continue;
+        a.netRoiUsd = ev.netRoiUsd;
+        a.effectiveCostPct = ev.effectiveCostPct;
+        a.roiVerdict = ev.roiVerdict;
+        a.roiCostBreakdown = ev.costBreakdown;
+        a.netUsdcSingle = ev.signedSoloNetUsd;
+        a.netUsdcBatched = ev.signedBatchedNetUsd;
+
+        if (a.action === 'SKIP_HONEYPOT' || a.action === 'BURN_ZERO_LIQUIDITY') {
+          a.selectedByDefault = false;
+          continue;
+        }
+        if (a.aaveDebtUsd && a.aaveDebtUsd > 0) {
+          a.selectedByDefault = false;
+          continue;
+        }
+
+        if (ev.roiVerdict === 'negative_roi') {
+          a.action = 'SKIP_GAS_NEGATIVE';
+          a.selectedByDefault = false;
+          if (!a.actionReason.toLowerCase().includes('skipped')) {
+            a.actionReason = ev.reason;
+          }
+        } else if (ev.roiVerdict === 'low_efficiency') {
+          // Low efficiency (35%-65% fees): keep sweepable action so user can opt in, unchecked by default!
+          a.selectedByDefault = false;
+          a.actionReason = `${ev.reason} (${a.actionReason})`;
+        } else {
+          // Worth it: selected by default unless THIS wallet's chain batch is negative ROI
+          a.selectedByDefault = !batchRoi.skipChainNegativeRoi;
+        }
+      }
+    }
+
+    if (walletBatchReports.length === 1) {
+      const chainRoi = walletBatchReports[0];
+      chainSummary.chainLegNetUsd = chainRoi.chainLegNetUsd;
+      chainSummary.chainLegCostPct = chainRoi.chainLegCostPct;
+      chainSummary.roiVerdict = chainRoi.roiVerdict;
+      chainSummary.skipChainNegativeRoi = chainRoi.skipChainNegativeRoi;
+      chainSummary.routeStrategy = chainRoi.routeComparison.recommendedStrategy;
+      chainSummary.breakEvenHint = chainRoi.breakEvenHint;
+      chainSummary.solanaAtaRentUsd = chainRoi.solanaAtaRentUsd;
+    } else {
+      const sumNetUsd = r2(walletBatchReports.reduce((s, r) => s + r.chainLegNetUsd, 0));
+      const sumKeptGross = r2(walletBatchReports.reduce((s, r) => s + r.keptGrossUsd, 0));
+      const aggCostPct = sumKeptGross > 0 ? r2(((sumKeptGross - sumNetUsd) / sumKeptGross) * 100) : 100;
+      const allSkipped = walletBatchReports.every((r) => r.skipChainNegativeRoi);
+      chainSummary.chainLegNetUsd = sumNetUsd;
+      chainSummary.chainLegCostPct = aggCostPct;
+      chainSummary.roiVerdict = allSkipped ? 'negative_roi' : classifyRoiVerdict(sumNetUsd, aggCostPct);
+      chainSummary.skipChainNegativeRoi = allSkipped;
+      chainSummary.routeStrategy = walletBatchReports.some(
+        (r) => r.routeComparison.recommendedStrategy === 'local_batch_single_bridge'
+      )
+        ? 'local_batch_single_bridge'
+        : 'direct_per_token_bridge';
+      chainSummary.breakEvenHint = walletBatchReports.find((r) => r.breakEvenHint)?.breakEvenHint;
+      chainSummary.solanaAtaRentUsd = r2(walletBatchReports.reduce((s, r) => s + r.solanaAtaRentUsd, 0));
+    }
+
     chainSummary.skippedCount = chainAssets.filter(
       (a) =>
         a.action === 'SKIP_HONEYPOT' ||
@@ -912,7 +983,7 @@ export function applyTwoLevelRoiToReport(
 }
 
 /**
- * Portfolio-Level Rollup across all chains in a ScanReport.
+ * Portfolio-Level Rollup across all `(sourceWallet, chain)` batches in a ScanReport.
  */
 export function evaluatePortfolioRoi(
   report: ScanReport,
@@ -930,22 +1001,39 @@ export function evaluatePortfolioRoi(
     solPriceUsd,
   });
 
-  const byChain = new Map<AnyChainId, ScannedAsset[]>();
+  // Group strictly by (sourceWallet, chain) so distinct EOAs on the same chain are modeled separately
+  const byWalletAndChain = new Map<
+    string,
+    { chain: AnyChainId; sourceWallet?: string; sourceWalletLabel?: string; assets: ScannedAsset[] }
+  >();
   for (const a of report.assets) {
-    const arr = byChain.get(a.chain) ?? [];
-    arr.push(a);
-    byChain.set(a.chain, arr);
+    const rawWallet = a.sourceWallet || report.walletAddress;
+    const wKey = normalizeBatchWalletKey(rawWallet, a.family);
+    const key = `${wKey}::${a.chain}`;
+    const existing = byWalletAndChain.get(key);
+    if (existing) {
+      existing.assets.push(a);
+    } else {
+      byWalletAndChain.set(key, {
+        chain: a.chain,
+        sourceWallet: a.sourceWallet || (report.walletAddress && !report.walletAddress.includes(',') ? report.walletAddress : undefined),
+        sourceWalletLabel: a.sourceWalletLabel || report.walletLabel,
+        assets: [a],
+      });
+    }
   }
 
   const chains: ChainBatchRoiReport[] = [];
   let ataAssigned = false;
-  for (const [chain, chainAssets] of byChain.entries()) {
-    const meta = report.chains.find((c) => c.chain === chain);
+  for (const group of byWalletAndChain.values()) {
+    const meta = report.chains.find((c) => c.chain === group.chain);
     const applyAtaHere = !ataAssigned && solanaAtaRentUsd > 0;
     const chainRoi = evaluateChainBatchRoi({
-      chain,
-      chainName: meta?.chainName || chainAssets[0]?.chainName || chain,
-      assets: chainAssets,
+      chain: group.chain,
+      chainName: meta?.chainName || group.assets[0]?.chainName || group.chain,
+      sourceWallet: group.sourceWallet,
+      sourceWalletLabel: group.sourceWalletLabel,
+      assets: group.assets,
       protocolFeeBps: feeCfg.feeBps,
       gasSponsored: opts.gasSponsored ?? true,
       fixedRelayerOverheadUsd: opts.fixedRelayerOverheadUsd,

@@ -69,9 +69,39 @@ export interface BackgroundJob {
   legs: BackgroundJobLeg[];
 }
 
+export interface BackgroundJobStoreOptions {
+  maxJobs?: number;
+  ttlMs?: number;
+  nowMs?: () => number;
+}
+
+const DEFAULT_MAX_JOBS = 30;
+const DEFAULT_JOB_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
 export class BackgroundJobStore {
-  private jobs = new Map<string, BackgroundJob>();
+  private jobs = new Map<string, { job: BackgroundJob; expiresAt: number }>();
   private pollTimers = new Map<string, NodeJS.Timeout>();
+  private readonly maxJobs: number;
+  private readonly ttlMs: number;
+  private readonly nowMs: () => number;
+
+  constructor(opts: BackgroundJobStoreOptions = {}) {
+    this.maxJobs = Math.max(1, Math.floor(opts.maxJobs ?? DEFAULT_MAX_JOBS));
+    this.ttlMs = Math.max(1, Math.floor(opts.ttlMs ?? DEFAULT_JOB_TTL_MS));
+    this.nowMs = opts.nowMs ?? (() => Date.now());
+  }
+
+  pruneExpired(now = this.nowMs()): number {
+    let removed = 0;
+    for (const [jobId, entry] of this.jobs.entries()) {
+      if (now >= entry.expiresAt) {
+        this.clearPollersForJob(jobId);
+        this.jobs.delete(jobId);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
 
   createJob(input: {
     sourceWallet: string;
@@ -88,7 +118,9 @@ export class BackgroundJobStore {
       estimatedFeeUsd?: number;
     }>;
   }): BackgroundJob {
-    const now = new Date().toISOString();
+    const nowMs = this.nowMs();
+    this.pruneExpired(nowMs);
+    const now = new Date(nowMs).toISOString();
     const jobId = `job_${crypto.randomBytes(5).toString('hex')}`;
     const legs: BackgroundJobLeg[] = input.legs.map((l) => {
       const cfg = isEvmChainId(l.chain) ? EVM_CHAINS[l.chain] : undefined;
@@ -121,23 +153,35 @@ export class BackgroundJobStore {
       legs,
     };
 
-    this.jobs.set(jobId, job);
-    if (this.jobs.size > 30) {
+    this.jobs.set(jobId, { job, expiresAt: nowMs + this.ttlMs });
+    while (this.jobs.size > this.maxJobs) {
       const oldest = this.jobs.keys().next().value;
-      if (oldest) {
-        this.clearPollersForJob(oldest);
-        this.jobs.delete(oldest);
-      }
+      if (!oldest) break;
+      this.clearPollersForJob(oldest);
+      this.jobs.delete(oldest);
     }
     return job;
   }
 
   listJobs(): BackgroundJob[] {
-    return Array.from(this.jobs.values()).reverse();
+    this.pruneExpired();
+    return Array.from(this.jobs.values())
+      .map((entry) => entry.job)
+      .reverse();
   }
 
   getJob(jobId: string): BackgroundJob | null {
-    return this.jobs.get(jobId) ?? null;
+    const entry = this.jobs.get(jobId);
+    if (!entry) return null;
+    if (this.nowMs() >= entry.expiresAt) {
+      this.clearPollersForJob(jobId);
+      this.jobs.delete(jobId);
+      return null;
+    }
+    // Refresh LRU order on read
+    this.jobs.delete(jobId);
+    this.jobs.set(jobId, entry);
+    return entry.job;
   }
 
   updateLeg(
@@ -145,13 +189,23 @@ export class BackgroundJobStore {
     chain: AnyChainId,
     patch: Partial<Omit<BackgroundJobLeg, 'chain' | 'chainName' | 'explorerUrl'>>
   ): BackgroundJob | null {
-    const job = this.jobs.get(jobId);
-    if (!job) return null;
+    const entry = this.jobs.get(jobId);
+    if (!entry) return null;
+    const nowMs = this.nowMs();
+    if (nowMs >= entry.expiresAt) {
+      this.clearPollersForJob(jobId);
+      this.jobs.delete(jobId);
+      return null;
+    }
+    const job = entry.job;
     const leg = job.legs.find((l) => l.chain === chain);
     if (!leg) return null;
 
-    Object.assign(leg, patch, { updatedAt: new Date().toISOString() });
+    Object.assign(leg, patch, { updatedAt: new Date(nowMs).toISOString() });
     this.recomputeJobSummary(job);
+    // Refresh LRU position and extend TTL on active update
+    this.jobs.delete(jobId);
+    this.jobs.set(jobId, { job, expiresAt: nowMs + this.ttlMs });
 
     // Start autonomous server-side background settlement watcher once an EVM tx or Relay intent exists
     if (
@@ -196,7 +250,8 @@ export class BackgroundJobStore {
 
     const timer = setInterval(async () => {
       attempts += 1;
-      const job = this.jobs.get(jobId);
+      const entry = this.jobs.get(jobId);
+      const job = entry && this.nowMs() < entry.expiresAt ? entry.job : undefined;
       const leg = job?.legs.find((l) => l.chain === chain);
       if (!job || !leg || attempts > maxAttempts) {
         this.clearPoller(key);

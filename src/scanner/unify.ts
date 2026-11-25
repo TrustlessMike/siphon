@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { detectAddressFamily, getAdapterForFamily } from '../adapters/registry.js';
+import { detectAddressFamily, getAdapterForFamily, getFamilyForChain } from '../adapters/registry.js';
 import { PROTOCOL_FEE_BPS } from './chains.js';
 import { scanLiveWallet, scanPresetWallet } from './classifier.js';
 import { applyTwoLevelRoiToReport } from './roi.js';
@@ -32,9 +32,67 @@ function shortAddr(addr: string): string {
 }
 
 /**
+ * Normalizes a wallet address for deduplication / batch grouping while preserving case
+ * for case-sensitive encodings (Base58Check BTC legacy / Tron / Solana, Base64url TON).
+ * Only EVM (`0x...` / `.eth`), Hex Move (`sui`/`aptos`), and Bech32 (`cosmos` / `bc1...`)
+ * addresses are lowercased.
+ */
+export function normalizeWalletAddressForKey(
+  rawAddress: string,
+  family?: ChainFamily | null
+): string {
+  const clean = (rawAddress || '').trim();
+  if (!clean) return '';
+
+  const resolvedFamily = family ?? detectAddressFamily(clean);
+
+  // EVM hex & ENS are case-insensitive
+  if (resolvedFamily === 'evm' || /^0x[0-9a-fA-F]{40}$/.test(clean) || clean.toLowerCase().endsWith('.eth')) {
+    return clean.toLowerCase();
+  }
+
+  // Sui / Aptos 0x hex addresses are case-insensitive
+  if ((resolvedFamily === 'sui' || resolvedFamily === 'aptos') && /^0x[0-9a-fA-F]{1,64}$/.test(clean)) {
+    return clean.toLowerCase();
+  }
+
+  // Cosmos Bech32 addresses are case-insensitive (BIP-173)
+  if (resolvedFamily === 'cosmos') {
+    return clean.toLowerCase();
+  }
+
+  // Bitcoin Bech32/Bech32m (bc1.../tb1...) is case-insensitive, while Base58Check (1.../3...) is case-sensitive!
+  if (resolvedFamily === 'btc' || /^(bc1|tb1)[0-9a-zA-Z]+$/i.test(clean)) {
+    if (/^(bc1|tb1)[0-9a-zA-Z]+$/i.test(clean)) {
+      return clean.toLowerCase();
+    }
+    return clean;
+  }
+
+  // Case-sensitive ecosystems: Tron (Base58 T...), TON (Base64url EQ.../UQ...), Solana (Base58), etc.
+  return clean;
+}
+
+/**
+ * Computes a collision-free deduplication key for a unified wallet input.
+ */
+export function normalizeWalletDedupKey(w: UnifiedWalletInput): string {
+  if (w.presetId?.trim()) {
+    return `preset:${w.presetId.trim()}`;
+  }
+  const clean = (w.address || '').trim();
+  if (!clean) return '';
+  const detected = detectAddressFamily(clean, w.family);
+  const norm = normalizeWalletAddressForKey(clean, detected ?? w.family ?? null);
+  const prefix = detected ?? w.family ?? 'raw';
+  return `${prefix}:${norm}`;
+}
+
+/**
  * Scans multiple source wallets across ANY combination of ecosystems (multiple EVMs,
  * Cosmos, Sui, Aptos, TON, Tron, Bitcoin) in parallel and unifies them into one
- * sweepable ScanReport with per-wallet provenance (`sourceWallet`, `sourceWalletLabel`).
+ * sweepable ScanReport with per-wallet provenance (`sourceWallet`, `sourceWalletLabel`)
+ * and per-asset `family` preserved cleanly.
  */
 export async function scanUnifiedWallets(params: {
   wallets: UnifiedWalletInput[];
@@ -45,7 +103,7 @@ export async function scanUnifiedWallets(params: {
   const seenKeys = new Set<string>();
 
   for (const w of params.wallets) {
-    const key = (w.presetId ? `preset:${w.presetId}` : (w.address || '').trim().toLowerCase());
+    const key = normalizeWalletDedupKey(w);
     if (!key || seenKeys.has(key)) continue;
     seenKeys.add(key);
     deduped.push(w);
@@ -88,11 +146,13 @@ export async function scanUnifiedWallets(params: {
           durationMs: Math.max(1, Math.round(performance.now() - t0)),
         };
       } catch (err) {
+        const inferredFamily =
+          w.family || detectAddressFamily((w.address || '').trim()) || 'evm';
         return {
           ok: false as const,
           idx,
-          family: w.family || 'evm',
-          address: w.address || w.presetId || 'unknown',
+          family: inferredFamily,
+          address: (w.address || w.presetId || 'unknown').trim(),
           label: fallbackLabel,
           error: err instanceof Error ? err.message : String(err),
           durationMs: Math.max(1, Math.round(performance.now() - t0)),
@@ -143,7 +203,7 @@ export async function scanUnifiedWallets(params: {
       mergedAssets.push({
         ...a,
         id: `w${res.idx}_${a.id}`,
-        family: a.family || res.family,
+        family: a.family || res.family || getFamilyForChain(a.chain),
         sourceWallet: a.sourceWallet || r.walletAddress,
         sourceWalletLabel: a.sourceWalletLabel || res.label,
       });
@@ -152,7 +212,7 @@ export async function scanUnifiedWallets(params: {
     for (const c of r.chains) {
       const existing = chainMap.get(c.chain);
       if (!existing) {
-        chainMap.set(c.chain, { ...c, family: c.family || res.family });
+        chainMap.set(c.chain, { ...c, family: c.family || res.family || getFamilyForChain(c.chain) });
       } else {
         existing.assetCount += c.assetCount;
         existing.defiCount += c.defiCount;
@@ -196,11 +256,18 @@ export async function scanUnifiedWallets(params: {
 
   const primaryWallet = unifiedWallets.find((w) => !w.error) || unifiedWallets[0];
   const combinedAddresses = unifiedWallets.map((w) => w.address).join(',');
-  const familiesPresent = Array.from(new Set(unifiedWallets.map((w) => w.family)));
+  const successfulFamilies = Array.from(
+    new Set(perWalletResults.filter((r) => r.ok).map((r) => r.family))
+  );
+  const familiesPresent =
+    successfulFamilies.length > 0
+      ? successfulFamilies
+      : Array.from(new Set(unifiedWallets.map((w) => w.family)));
 
   const report: ScanReport = {
     scanId: `scan_unified_${crypto.randomBytes(5).toString('hex')}`,
-    family: familiesPresent.length === 1 ? familiesPresent[0] : 'evm',
+    family: familiesPresent.length === 1 ? familiesPresent[0] : 'mixed',
+    families: familiesPresent,
     unifiedWallets,
     mode: primaryMode,
     walletAddress: unifiedWallets.length === 1 ? primaryWallet.address : combinedAddresses,

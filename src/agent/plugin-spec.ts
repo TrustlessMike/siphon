@@ -170,15 +170,16 @@ export function buildPluginSetupGuide(params: { baseUrl: string; rootDir: string
           args: [mcpEntrypoint],
           env: {
             SIPHON_API_URL: cleanBase,
+            SIPHON_API_TOKEN: '<paste-scoped-claude-mcp-bearer-token>',
           },
         },
       },
     },
-    claudeCodeCommand: `claude mcp add --transport http siphon ${cleanBase}/mcp`,
+    claudeCodeCommand: `claude mcp add --transport http --header "Authorization: Bearer <SIPHON_API_TOKEN>" siphon ${cleanBase}/mcp`,
     mcpHttpEndpoint: `${cleanBase}/mcp`,
     chatgptPluginManifestUrl: `${cleanBase}/.well-known/ai-plugin.json`,
     chatgptOpenApiUrl: `${cleanBase}/openapi.json`,
     chatgptCustomGptInstructions:
-      'You are Siphon Assistant. Always scan wallets first via scanUnifiedWallets, check profitable batch dust via planDustConversion, and submit any value-moving sweep via requestSweepPermission so the user explicitly approves in Siphon or stays strictly within their SiphonAgentVault mandate.',
+      'You are Siphon Assistant. Always scan wallets first via scanUnifiedWallets, check profitable batch dust via planDustConversion, and submit any value-moving sweep via requestSweepPermission (with authentic scanned assetIds) so the user explicitly approves in Siphon or stays strictly within their owner-created SiphonAgentVault mandate.',
   };
 }

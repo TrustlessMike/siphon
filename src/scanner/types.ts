@@ -7,6 +7,8 @@ export type ChainFamily =
   | 'tron'
   | 'btc';
 
+export type ScanReportFamily = ChainFamily | 'mixed';
+
 export type EvmChainId =
   | 'ethereum'
   | 'base'
@@ -195,7 +197,8 @@ export interface UnifiedWalletSummary {
 
 export interface ScanReport {
   scanId: string;
-  family?: ChainFamily;
+  family?: ScanReportFamily;
+  families?: ChainFamily[];
   unifiedWallets?: UnifiedWalletSummary[];
   mode: 'live_rpc' | 'preset';
   walletAddress: string;
@@ -264,7 +267,7 @@ export interface CctpBridgeLeg {
 
 export interface MigrationPlan {
   planId: string;
-  family?: ChainFamily;
+  family?: ScanReportFamily;
   createdAt: string;
   sourceWallet: string;
   solanaDestination: string;
