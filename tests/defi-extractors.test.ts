@@ -652,9 +652,9 @@ test('1-Click Withdraw -> Swap -> Bridge chaining bundles non-USDC Aave, ERC-462
     bridgePreference: 'cctp',
     bundleDefiCctp: true,
   });
-  assert.equal(morphoBatch.calls.length, 3); // ERC-4626 redeem + USDC approve + CCTP depositForBurn
+  assert.equal(morphoBatch.calls.length, 3); // ERC-4626 redeem + USDC approve + CCTP V2 depositForBurn
   assert.ok(morphoBatch.calls[0].data.startsWith('0xba087652'));
-  assert.ok(morphoBatch.calls[2].data.startsWith('0x6fd3504e'));
+  assert.ok(morphoBatch.calls[2].data.startsWith('0x8e0250ee'));
   const cctpAmount = BigInt('0x' + morphoBatch.calls[2].data.slice(10, 74));
   assert.equal(cctpAmount, 1_150_000_000n, 'CCTP must bridge exact previewRedeem 6-decimal USDC output');
   assert.equal(morphoBatch.chainedFollowUpPlans?.[0].bundledInCurrentBatch, true);

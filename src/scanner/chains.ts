@@ -4,9 +4,108 @@ export const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 export const DEAD_BURN_ADDRESS = '0x000000000000000000000000000000000000dEaD';
 export const SOLANA_CCTP_DOMAIN = 5;
 
-export const MIN_PROTOCOL_FEE_BPS = 500; // 5.0%
+// Circle CCTP V2 canonical CREATE2 addresses uniform across EVM mainnets
+export const CCTP_V2_TOKEN_MESSENGER = '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d';
+export const CCTP_V2_MESSAGE_TRANSMITTER = '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64';
+
+export const MIN_PROTOCOL_FEE_BPS = 500; // 5.0% (legacy flat floor, kept for backwards compatibility)
 export const MAX_PROTOCOL_FEE_BPS = 1000; // 10.0%
 export const DEFAULT_PROTOCOL_FEE_BPS = 700; // 7.0%
+
+// Preservation-first progressive protocol fee schedule constants
+export const MIN_PRESERVATION_FEE_BPS = 0; // 0.0% (self-custody / partner-subsidized mode)
+export const DEFAULT_PRESERVATION_FEE_CAP_USD = 50; // $50 hard ceiling on principal migrations
+
+export type PreservationFeeMode = 'tiered' | 'self_custody' | 'partner_subsidized' | 'legacy_flat';
+
+export type PreservationFeeTierId =
+  | 'zero'
+  | 'dust'
+  | 'small'
+  | 'growth'
+  | 'principal'
+  | 'self_custody_zero'
+  | 'partner_subsidized_zero'
+  | 'legacy_flat';
+
+export interface PreservationFeeTier {
+  id: 'dust' | 'small' | 'growth' | 'principal';
+  label: string;
+  minGrossUsd: number;
+  maxGrossUsd: number | null;
+  feeBps: number;
+  maxFeeUsdCap: number | null;
+}
+
+export const PRESERVATION_FEE_TIERS: readonly PreservationFeeTier[] = [
+  {
+    id: 'dust',
+    label: 'Micro-Dust Rescue (<$50)',
+    minGrossUsd: 0,
+    maxGrossUsd: 50,
+    feeBps: 500, // 5.00%
+    maxFeeUsdCap: null,
+  },
+  {
+    id: 'small',
+    label: 'Small Sweep ($50–$500)',
+    minGrossUsd: 50,
+    maxGrossUsd: 500,
+    feeBps: 100, // 1.00%
+    maxFeeUsdCap: null,
+  },
+  {
+    id: 'growth',
+    label: 'Mid Migration ($500–$5,000)',
+    minGrossUsd: 500,
+    maxGrossUsd: 5_000,
+    feeBps: 25, // 0.25%
+    maxFeeUsdCap: null,
+  },
+  {
+    id: 'principal',
+    label: 'Principal Preservation ($5,000+)',
+    minGrossUsd: 5_000,
+    maxGrossUsd: null,
+    feeBps: 10, // 0.10%
+    maxFeeUsdCap: DEFAULT_PRESERVATION_FEE_CAP_USD, // hard $50 ceiling (configurable $25–$50)
+  },
+] as const;
+
+export interface PreservationFeeOptions {
+  mode?: PreservationFeeMode;
+  /** Optional hard USD fee ceiling (overrides tier default cap when provided) */
+  maxFeeUsdCap?: number | null;
+  /** Optional explicit bps override in [0, 1000] */
+  overrideFeeBps?: number;
+  /** Optional custom progressive tier table */
+  tiers?: readonly PreservationFeeTier[];
+  /** Baseline flat fee bps used to compute capital savings (default 700 bps = 7%) */
+  baselineFlatFeeBps?: number;
+}
+
+export interface PreservationFeeResult {
+  grossUsd: number;
+  mode: PreservationFeeMode;
+  tierId: PreservationFeeTierId;
+  tierLabel: string;
+  nominalFeeBps: number;
+  effectiveFeeBps: number;
+  effectiveFeePercent: number;
+  feeUsd: number;
+  feeCapUsd: number | null;
+  capApplied: boolean;
+  netAfterFeeUsd: number;
+  capitalPreservedPct: number;
+  baselineFlatFeeUsd: number;
+  savingsVsFlat7PctUsd: number;
+  savingsVsFlat7PctBps: number;
+}
+
+function round2(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  return Number(n.toFixed(2));
+}
 
 export function resolveProtocolFeeBps(raw?: number | string | null): number {
   if (raw === undefined || raw === null || raw === '') return DEFAULT_PROTOCOL_FEE_BPS;
@@ -14,6 +113,153 @@ export function resolveProtocolFeeBps(raw?: number | string | null): number {
   if (!Number.isFinite(parsed)) return DEFAULT_PROTOCOL_FEE_BPS;
   const rounded = Math.round(parsed);
   return Math.min(MAX_PROTOCOL_FEE_BPS, Math.max(MIN_PROTOCOL_FEE_BPS, rounded));
+}
+
+/**
+ * Resolves a preservation-mode fee rate in basis points across the full [0, 1000] bps range
+ * (allowing 0 bps for self-custody / partner-subsidized migrations while preserving the 10% cap).
+ */
+export function resolvePreservationFeeBps(raw?: number | string | null): number {
+  if (raw === undefined || raw === null || raw === '') return 0;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return 0;
+  const rounded = Math.round(parsed);
+  return Math.min(MAX_PROTOCOL_FEE_BPS, Math.max(MIN_PRESERVATION_FEE_BPS, rounded));
+}
+
+/**
+ * Preservation-First Tiered Protocol Fee Engine:
+ *   - Dust (<$50):              500 bps (5.00%) — sustains micro-dust gasless relayer economics
+ *   - Small ($50–$500):         100 bps (1.00%)
+ *   - Mid ($500–$5,000):         25 bps (0.25%)
+ *   - Principal ($5,000+):       10 bps (0.10%) capped at $50 hard ceiling (configurable via maxFeeUsdCap)
+ *   - Self-custody / subsidized:  0 bps (0.00%)
+ */
+export function computePreservationFee(
+  grossUsdInput: number,
+  opts: PreservationFeeOptions = {}
+): PreservationFeeResult {
+  const mode: PreservationFeeMode = opts.mode ?? 'tiered';
+  const baselineBps =
+    opts.baselineFlatFeeBps !== undefined && Number.isFinite(opts.baselineFlatFeeBps)
+      ? Math.max(0, Math.min(MAX_PROTOCOL_FEE_BPS, Math.round(opts.baselineFlatFeeBps)))
+      : DEFAULT_PROTOCOL_FEE_BPS;
+
+  if (!Number.isFinite(grossUsdInput) || grossUsdInput <= 0) {
+    return {
+      grossUsd: 0,
+      mode,
+      tierId: 'zero',
+      tierLabel: 'Zero Gross Value',
+      nominalFeeBps: 0,
+      effectiveFeeBps: 0,
+      effectiveFeePercent: 0,
+      feeUsd: 0,
+      feeCapUsd: null,
+      capApplied: false,
+      netAfterFeeUsd: 0,
+      capitalPreservedPct: 100,
+      baselineFlatFeeUsd: 0,
+      savingsVsFlat7PctUsd: 0,
+      savingsVsFlat7PctBps: 0,
+    };
+  }
+
+  const grossUsd = round2(grossUsdInput);
+  const baselineFlatFeeUsd = round2((grossUsd * baselineBps) / 10_000);
+
+  if (mode === 'self_custody' || mode === 'partner_subsidized') {
+    return {
+      grossUsd,
+      mode,
+      tierId: mode === 'self_custody' ? 'self_custody_zero' : 'partner_subsidized_zero',
+      tierLabel: mode === 'self_custody' ? 'Self-Custody Zero Fee (0 bps)' : 'Partner-Subsidized Zero Fee (0 bps)',
+      nominalFeeBps: 0,
+      effectiveFeeBps: 0,
+      effectiveFeePercent: 0,
+      feeUsd: 0,
+      feeCapUsd: 0,
+      capApplied: false,
+      netAfterFeeUsd: grossUsd,
+      capitalPreservedPct: 100,
+      baselineFlatFeeUsd,
+      savingsVsFlat7PctUsd: baselineFlatFeeUsd,
+      savingsVsFlat7PctBps: baselineBps,
+    };
+  }
+
+  if (mode === 'legacy_flat') {
+    const flatBps =
+      opts.overrideFeeBps !== undefined
+        ? resolveProtocolFeeBps(opts.overrideFeeBps)
+        : DEFAULT_PROTOCOL_FEE_BPS;
+    const feeUsd = round2((grossUsd * flatBps) / 10_000);
+    const netAfterFeeUsd = round2(Math.max(0, grossUsd - feeUsd));
+    const effectiveFeeBps = grossUsd > 0 ? Number(((feeUsd / grossUsd) * 10_000).toFixed(2)) : 0;
+    return {
+      grossUsd,
+      mode,
+      tierId: 'legacy_flat',
+      tierLabel: `Legacy Flat (${(flatBps / 100).toFixed(2)}%)`,
+      nominalFeeBps: flatBps,
+      effectiveFeeBps,
+      effectiveFeePercent: Number((effectiveFeeBps / 100).toFixed(4)),
+      feeUsd,
+      feeCapUsd: null,
+      capApplied: false,
+      netAfterFeeUsd,
+      capitalPreservedPct: Number(((netAfterFeeUsd / grossUsd) * 100).toFixed(4)),
+      baselineFlatFeeUsd,
+      savingsVsFlat7PctUsd: round2(baselineFlatFeeUsd - feeUsd),
+      savingsVsFlat7PctBps: Number((baselineBps - effectiveFeeBps).toFixed(2)),
+    };
+  }
+
+  const tiers = opts.tiers && opts.tiers.length > 0 ? opts.tiers : PRESERVATION_FEE_TIERS;
+  const matchedTier =
+    tiers.find(
+      (t) => grossUsd >= t.minGrossUsd && (t.maxGrossUsd === null || grossUsd < t.maxGrossUsd)
+    ) ?? tiers[tiers.length - 1];
+
+  const nominalFeeBps =
+    opts.overrideFeeBps !== undefined
+      ? resolvePreservationFeeBps(opts.overrideFeeBps)
+      : resolvePreservationFeeBps(matchedTier.feeBps);
+
+  const resolvedCapUsd =
+    opts.maxFeeUsdCap !== undefined
+      ? opts.maxFeeUsdCap !== null && Number.isFinite(opts.maxFeeUsdCap) && opts.maxFeeUsdCap >= 0
+        ? round2(opts.maxFeeUsdCap)
+        : null
+      : matchedTier.maxFeeUsdCap;
+
+  const uncappedFeeUsd = round2((grossUsd * nominalFeeBps) / 10_000);
+  const capApplied = resolvedCapUsd !== null && uncappedFeeUsd > resolvedCapUsd;
+  const feeUsd = capApplied ? resolvedCapUsd : uncappedFeeUsd;
+  const netAfterFeeUsd = round2(Math.max(0, grossUsd - feeUsd));
+  const effectiveFeeBps = grossUsd > 0 ? Number(((feeUsd / grossUsd) * 10_000).toFixed(2)) : 0;
+  const effectiveFeePercent = Number((effectiveFeeBps / 100).toFixed(4));
+  const capitalPreservedPct = Number(((netAfterFeeUsd / grossUsd) * 100).toFixed(4));
+  const savingsVsFlat7PctUsd = round2(baselineFlatFeeUsd - feeUsd);
+  const savingsVsFlat7PctBps = Number((baselineBps - effectiveFeeBps).toFixed(2));
+
+  return {
+    grossUsd,
+    mode,
+    tierId: matchedTier.id,
+    tierLabel: matchedTier.label,
+    nominalFeeBps,
+    effectiveFeeBps,
+    effectiveFeePercent,
+    feeUsd,
+    feeCapUsd: resolvedCapUsd,
+    capApplied,
+    netAfterFeeUsd,
+    capitalPreservedPct,
+    baselineFlatFeeUsd,
+    savingsVsFlat7PctUsd,
+    savingsVsFlat7PctBps,
+  };
 }
 
 export function isValidFeeRecipientEvm(addr?: string | null): addr is string {
@@ -88,10 +334,10 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
     cctpDomain: 0,
-    cctpVersion: 1,
-    cctpTokenMessenger: '0xBd3fa81B58Ba92a82136038B25aDec7066af3155',
-    cctpMessageTransmitter: '0x0a992d191DEeC32aFe36203Ad87D7d289a738F81',
-    cctpAttestationSec: 780,
+    cctpVersion: 2,
+    cctpTokenMessenger: CCTP_V2_TOKEN_MESSENGER,
+    cctpMessageTransmitter: CCTP_V2_MESSAGE_TRANSMITTER,
+    cctpAttestationSec: 15,
     swapGasUnits: 155_000,
     defiWithdrawGasUnits: 190_000,
     burnGasUnits: 48_000,
@@ -116,10 +362,10 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
     cctpDomain: 6,
-    cctpVersion: 1,
-    cctpTokenMessenger: '0x1682Ae6375C4E4A97e4B583BC394c861A46D8962',
-    cctpMessageTransmitter: '0xAD09780d193884d503182aD4588450C416D6F9D4',
-    cctpAttestationSec: 18,
+    cctpVersion: 2,
+    cctpTokenMessenger: CCTP_V2_TOKEN_MESSENGER,
+    cctpMessageTransmitter: CCTP_V2_MESSAGE_TRANSMITTER,
+    cctpAttestationSec: 12,
     swapGasUnits: 150_000,
     defiWithdrawGasUnits: 185_000,
     burnGasUnits: 45_000,
@@ -144,10 +390,10 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
     cctpDomain: 3,
-    cctpVersion: 1,
-    cctpTokenMessenger: '0x19330d10D9Cc8751218eaf51E8885D058642E08A',
-    cctpMessageTransmitter: '0xC30362313FBBA5cf9163F0bb16a0e01f01A896ca',
-    cctpAttestationSec: 16,
+    cctpVersion: 2,
+    cctpTokenMessenger: CCTP_V2_TOKEN_MESSENGER,
+    cctpMessageTransmitter: CCTP_V2_MESSAGE_TRANSMITTER,
+    cctpAttestationSec: 12,
     swapGasUnits: 180_000,
     defiWithdrawGasUnits: 210_000,
     burnGasUnits: 52_000,
@@ -172,10 +418,10 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',
     cctpDomain: 2,
-    cctpVersion: 1,
-    cctpTokenMessenger: '0x2B4069517957735bE00ceE0fadAE88a26365528f',
-    cctpMessageTransmitter: '0x4D41f22c5a0e5c74090899E5a8Fb597a8842b3e8',
-    cctpAttestationSec: 20,
+    cctpVersion: 2,
+    cctpTokenMessenger: CCTP_V2_TOKEN_MESSENGER,
+    cctpMessageTransmitter: CCTP_V2_MESSAGE_TRANSMITTER,
+    cctpAttestationSec: 14,
     swapGasUnits: 150_000,
     defiWithdrawGasUnits: 185_000,
     burnGasUnits: 45_000,
@@ -201,10 +447,10 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
     cctpDomain: 7,
-    cctpVersion: 1,
-    cctpTokenMessenger: '0x9daF8c91AEFAE50b9c0E69629D3F6Ca40cA3B3FE',
-    cctpMessageTransmitter: '0xF3be9355363857F3e001be68856A2f96b4C39Ba9',
-    cctpAttestationSec: 24,
+    cctpVersion: 2,
+    cctpTokenMessenger: CCTP_V2_TOKEN_MESSENGER,
+    cctpMessageTransmitter: CCTP_V2_MESSAGE_TRANSMITTER,
+    cctpAttestationSec: 15,
     swapGasUnits: 160_000,
     defiWithdrawGasUnits: 195_000,
     burnGasUnits: 48_000,
@@ -229,10 +475,10 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E',
     cctpDomain: 1,
-    cctpVersion: 1,
-    cctpTokenMessenger: '0x6B25532e1060CE10cc3B0A99e5683b91BFDe6982',
-    cctpMessageTransmitter: '0x8186359aF5F57FbB40c6b14A588d2A59C0C29880',
-    cctpAttestationSec: 15,
+    cctpVersion: 2,
+    cctpTokenMessenger: CCTP_V2_TOKEN_MESSENGER,
+    cctpMessageTransmitter: CCTP_V2_MESSAGE_TRANSMITTER,
+    cctpAttestationSec: 10,
     swapGasUnits: 155_000,
     defiWithdrawGasUnits: 190_000,
     burnGasUnits: 48_000,
