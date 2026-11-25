@@ -649,32 +649,68 @@ export const tronAdapter: ChainFamilyAdapter = {
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
     const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
-    const expectedBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const cleanAddr = params.userAddress.trim();
+    const userAddressValid = tronAdapter.matchesAddress(cleanAddr);
+    let expectedBytes32 = '0x' + '00'.repeat(32);
+    let solanaRecipientValid = false;
+    try {
+      expectedBytes32 = solanaAddressToBytes32(params.solanaDestination);
+      solanaRecipientValid = true;
+    } catch {
+      solanaRecipientValid = false;
+    }
+
     const sweepable = filterChainSweepableAssets('tron', params.assets);
+    const outputAsset = params.outputAsset ?? 'USDC';
 
     const [acctRes, nowBlock, resources, solSnap, priceMap] = await Promise.all([
-      tronFetch<{ data?: Array<{ balance?: number }> }>(`/v1/accounts/${encodeURIComponent(params.userAddress)}`),
+      userAddressValid
+        ? tronFetch<{
+            data?: Array<{
+              balance?: number;
+              trc20?: Array<Record<string, string>>;
+            }>;
+          }>(`/v1/accounts/${encodeURIComponent(cleanAddr)}`)
+        : Promise.resolve(null),
       tronFetch<{ block_header?: { raw_data?: { number?: number } } }>('/wallet/getnowblock', {
         method: 'POST',
         body: '{}',
       }),
-      tronFetch<{
-        freeNetLimit?: number;
-        freeNetUsed?: number;
-        NetLimit?: number;
-        NetUsed?: number;
-        EnergyLimit?: number;
-        EnergyUsed?: number;
-      }>('/wallet/getaccountresource', {
-        method: 'POST',
-        body: JSON.stringify({ address: params.userAddress, visible: true }),
-      }),
-      fetchSolanaWalletBalances(params.solanaDestination).catch(() => null),
+      userAddressValid
+        ? tronFetch<{
+            freeNetLimit?: number;
+            freeNetUsed?: number;
+            NetLimit?: number;
+            NetUsed?: number;
+            EnergyLimit?: number;
+            EnergyUsed?: number;
+          }>('/wallet/getaccountresource', {
+            method: 'POST',
+            body: JSON.stringify({ address: cleanAddr, visible: true }),
+          })
+        : Promise.resolve(null),
+      solanaRecipientValid
+        ? fetchSolanaWalletBalances(params.solanaDestination).catch(() => null)
+        : Promise.resolve(null),
       fetchLiveUsdPrices(['coingecko:tron']),
     ]);
 
     const blockNumber = nowBlock?.block_header?.raw_data?.number ?? 0;
-    const nativeBalanceUi = Number(unitsToUi(String(acctRes?.data?.[0]?.balance ?? 0), 6).toFixed(4));
+    const acct = acctRes?.data?.[0];
+    const acctKnown = Boolean(acctRes && Array.isArray(acctRes.data));
+    const liveTrxSun = BigInt(Math.max(0, Math.trunc(acct?.balance ?? 0)));
+    const liveTrc20Balances = new Map<string, bigint>();
+    for (const entry of acct?.trc20 ?? []) {
+      for (const [contract, rawBal] of Object.entries(entry)) {
+        try {
+          liveTrc20Balances.set(contract, BigInt(rawBal || '0'));
+        } catch {
+          // ignore
+        }
+      }
+    }
+
+    const nativeBalanceUi = Number(unitsToUi(liveTrxSun.toString(), 6).toFixed(4));
     const nativePriceUsd = params.nativePriceUsd ?? priceMap.get('coingecko:tron') ?? 0.24;
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
     const availEnergy = Math.max(0, Number(resources?.EnergyLimit ?? 0) - Number(resources?.EnergyUsed ?? 0));
@@ -687,7 +723,161 @@ export const tronAdapter: ChainFamilyAdapter = {
     const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.98).toFixed(2));
-    const tronVerified = blockNumber > 0;
+    const tronReachable = blockNumber > 0;
+
+    // Fail-closed live TRX & TRC-20 balance check
+    let insufficientBalanceDetail: string | null = null;
+    if (acctKnown) {
+      for (const a of sweepable) {
+        if (a.address === 'stake_v2:trx') continue;
+        let reqRaw = 0n;
+        try {
+          reqRaw = BigInt(a.rawBalance || '0');
+        } catch {
+          reqRaw = 0n;
+        }
+        if (a.address === 'native') {
+          if (reqRaw > liveTrxSun) {
+            insufficientBalanceDetail = `Insufficient live TRX balance (${liveTrxSun.toString()} sun available < ${reqRaw.toString()} requested).`;
+            break;
+          }
+        } else {
+          const availRaw = liveTrc20Balances.get(a.address) ?? 0n;
+          if (reqRaw > availRaw) {
+            insufficientBalanceDetail = `Insufficient live TRC-20 balance for ${a.symbol} (${availRaw.toString()} available < ${reqRaw.toString()} requested).`;
+            break;
+          }
+        }
+      }
+    }
+
+    const ataMissing = outputAsset === 'USDC' && solSnap !== null && !solSnap.hasUsdcAta;
+
+    // Real live POST /wallet/triggerconstantcontract ONLY when a TVM constant-call payload is provided
+    let triggerPayload: Record<string, unknown> | null = params.simulationPayload ?? null;
+    if (!triggerPayload && params.rawTxBytes?.trim().startsWith('{')) {
+      try {
+        const parsed = JSON.parse(params.rawTxBytes);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          triggerPayload = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // invalid JSON handled below
+      }
+    }
+    const rawPayloadMalformed = Boolean(params.rawTxBytes && !triggerPayload);
+
+    let liveSimSucceeded = false;
+    let liveSimError: string | null = rawPayloadMalformed
+      ? 'Tron /wallet/triggerconstantcontract requires a JSON contract call payload.'
+      : null;
+    let liveSimEnergyUsed: number | null = null;
+    let liveSimUnreachable = false;
+
+    if (triggerPayload && userAddressValid && solanaRecipientValid && !insufficientBalanceDetail) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 4200);
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        };
+        if (process.env.TRONGRID_API_KEY?.trim()) {
+          headers['TRON-PRO-API-KEY'] = process.env.TRONGRID_API_KEY.trim();
+        }
+        const res = await fetch(`${TRONGRID_BASE}/wallet/triggerconstantcontract`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            owner_address: cleanAddr,
+            visible: true,
+            ...triggerPayload,
+          }),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        const json = (await res.json().catch(() => ({}))) as {
+          result?: { result?: boolean; code?: string; message?: string };
+          energy_used?: number;
+          transaction?: { ret?: Array<{ contractRet?: string }> };
+          Error?: string;
+        };
+        const contractRet = json.transaction?.ret?.[0]?.contractRet;
+        if (res.ok && json.result?.result === true && contractRet !== 'REVERT' && !json.Error) {
+          liveSimSucceeded = true;
+          liveSimEnergyUsed = Number(json.energy_used ?? 0);
+        } else {
+          liveSimError =
+            json.Error ||
+            (contractRet === 'REVERT' ? 'TVM execution REVERTED' : null) ||
+            json.result?.message ||
+            json.result?.code ||
+            `TronGrid /wallet/triggerconstantcontract failed (HTTP ${res.status})`;
+        }
+      } catch {
+        liveSimUnreachable = true;
+      }
+    }
+
+    const warnings: string[] = [];
+    if (!userAddressValid) {
+      warnings.push(`Invalid Tron address format: ${cleanAddr || '(empty)'}.`);
+    }
+    if (!solanaRecipientValid) {
+      warnings.push('Invalid Solana destination address (expected valid non-zero base58 pubkey).');
+    }
+    if (ataMissing) {
+      warnings.push('Destination Solana wallet has no canonical USDC ATA yet; create ATA before settling USDC.');
+    }
+    if (sweepable.length === 0) {
+      warnings.push('No sweepable Tron assets selected.');
+    }
+    if (insufficientBalanceDetail) {
+      warnings.push(insufficientBalanceDetail);
+    }
+    if (!hasEnoughNativeGas) {
+      warnings.push(
+        `Low TRX/Resources (${nativeBalanceUi} TRX · ${availEnergy.toLocaleString()} Energy · ${availBandwidth} Bandwidth). Dual Energy+Bandwidth delegation or ~15 TRX needed.`
+      );
+    }
+    if (!tronReachable) {
+      warnings.push('TronGrid block height could not be reached for live verification.');
+    }
+    if (liveSimError) {
+      warnings.push(`Tron /wallet/triggerconstantcontract reverted: ${liveSimError}`);
+    }
+
+    const failClosedTx =
+      !userAddressValid ||
+      sweepable.length === 0 ||
+      Boolean(insufficientBalanceDetail) ||
+      Boolean(liveSimError);
+    const failClosedRecipient = !solanaRecipientValid || ataMissing;
+
+    const simulatedLive = Boolean(triggerPayload && liveSimSucceeded && !failClosedTx && !failClosedRecipient);
+    const allChecksSafe = Boolean(simulatedLive && !failClosedTx && !failClosedRecipient);
+
+    const tvmCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedTx
+      ? 'reverted'
+      : liveSimUnreachable || (!triggerPayload && !tronReachable)
+      ? 'rpc_skipped'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const recipientCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedRecipient
+      ? 'reverted'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const simulationNote = simulatedLive
+      ? `Live Tron /wallet/triggerconstantcontract passed (energy_used=${liveSimEnergyUsed ?? 0}) at block #${blockNumber.toLocaleString()}.`
+      : failClosedTx || failClosedRecipient
+      ? `Pre-flight check failed closed: ${warnings[0] ?? 'validation rejected.'}`
+      : liveSimUnreachable || !tronReachable
+      ? 'TronGrid /wallet/triggerconstantcontract unreachable; TVM call was not simulated.'
+      : 'High-level Tron intent pre-flight only: /wallet/triggerconstantcontract requires target contract_address, function_selector, and parameter.';
 
     const proofDigestSha256 =
       '0x' +
@@ -697,23 +887,14 @@ export const tronAdapter: ChainFamilyAdapter = {
           JSON.stringify({
             family: 'tron',
             blockNumber,
-            userAddress: params.userAddress,
+            userAddress: cleanAddr,
             expectedBytes32,
+            simulatedLive,
             outflows: sweepable.map((a) => ({ id: a.id, raw: a.rawBalance })),
             guaranteedMinNetUsd,
           })
         )
         .digest('hex');
-
-    const warnings: string[] = [];
-    if (!hasEnoughNativeGas) {
-      warnings.push(
-        `Low TRX/Resources (${nativeBalanceUi} TRX · ${availEnergy.toLocaleString()} Energy · ${availBandwidth} Bandwidth). Dual Energy+Bandwidth delegation or ~15 TRX needed.`
-      );
-    }
-    if (!tronVerified) {
-      warnings.push('TronGrid block height could not be reached for live verification.');
-    }
 
     return {
       proofId: `prf_tron_${crypto.randomBytes(4).toString('hex')}`,
@@ -724,10 +905,10 @@ export const tronAdapter: ChainFamilyAdapter = {
       chainId: '0x2b6653dc',
       chainName: 'Tron',
       blockNumber,
-      userAddress: params.userAddress,
+      userAddress: cleanAddr,
       solanaDestination: params.solanaDestination,
       solanaMintRecipientBytes32: expectedBytes32,
-      mintRecipientVerified: true,
+      mintRecipientVerified: solanaRecipientValid,
       hasEnoughNativeGas,
       nativeBalanceUi,
       nativeSymbol: 'TRX',
@@ -735,6 +916,8 @@ export const tronAdapter: ChainFamilyAdapter = {
       estimatedGasUsd,
       recommendedMode: hasEnoughNativeGas ? 'sequential' : 'sponsored_gasless',
       simulationEndpoint: '/wallet/getaccountresource + /wallet/triggerconstantcontract',
+      simulatedLive,
+      simulationNote,
       outflows: sweepable.map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
@@ -750,7 +933,7 @@ export const tronAdapter: ChainFamilyAdapter = {
       },
       guaranteedMinNetUsd,
       estimatedNetUsd,
-      outputAsset: params.outputAsset ?? 'USDC',
+      outputAsset,
       preSolanaSnapshot: solSnap
         ? {
             usdcBalance: solSnap.usdcBalance,
@@ -764,26 +947,48 @@ export const tronAdapter: ChainFamilyAdapter = {
           stepId: 'tron_triggerconstantcontract',
           assetSymbol: 'USDT',
           actionType: 'tron_constant_call',
-          target: 'api.trongrid.io/wallet/getaccountresource',
-          summary: tronVerified
-            ? `Tron block #${blockNumber.toLocaleString()} · ${availEnergy.toLocaleString()} Energy / ${availBandwidth} Bandwidth`
-            : 'TronGrid unreachable',
-          preflightStatus: tronVerified ? 'verified' : 'rpc_skipped',
-          preflightDetail: tronVerified
-            ? `Live TronGrid state verified (${nativeBalanceUi} TRX · ${availEnergy.toLocaleString()} Energy · ${availBandwidth} BW)`
-            : 'TronGrid rate-limited',
+          target: 'api.trongrid.io/wallet/triggerconstantcontract',
+          summary:
+            tvmCheckStatus === 'verified'
+              ? `Live Tron /wallet/triggerconstantcontract passed (energy ${liveSimEnergyUsed ?? 0})`
+              : tvmCheckStatus === 'reverted'
+              ? liveSimError
+                ? `TVM simulation reverted: ${liveSimError.slice(0, 120)}`
+                : insufficientBalanceDetail || warnings[0] || 'Tron pre-flight rejected'
+              : tvmCheckStatus === 'rpc_skipped'
+              ? 'TronGrid unreachable'
+              : `Pre-flight Tron state checked at #${blockNumber.toLocaleString()} (no TVM call simulated)`,
+          preflightStatus: tvmCheckStatus,
+          preflightDetail:
+            tvmCheckStatus === 'verified'
+              ? `Block #${blockNumber.toLocaleString()} · triggerconstantcontract passed (energy_used=${liveSimEnergyUsed ?? 0})`
+              : tvmCheckStatus === 'reverted'
+              ? liveSimError || insufficientBalanceDetail || warnings[0] || 'Tron pre-flight check failed closed'
+              : tvmCheckStatus === 'rpc_skipped'
+              ? 'TronGrid rate-limited'
+              : `Block #${blockNumber.toLocaleString()} · ${nativeBalanceUi} TRX · ${availEnergy.toLocaleString()} Energy · ${availBandwidth} BW (TVM call payload not supplied)`,
         },
         {
           stepId: 'tron_mayan_allbridge',
-          assetSymbol: 'USDT',
+          assetSymbol: outputAsset,
           actionType: 'bridge_or_swap',
           target: 'Relay / LI.FI / Allbridge → Solana',
-          summary: `Solana recipient ${params.solanaDestination.slice(0, 6)}… verified`,
-          preflightStatus: 'verified',
-          preflightDetail: 'Solana base58 & bytes32 recipient verified',
+          summary: !solanaRecipientValid
+            ? 'Invalid Solana destination address'
+            : ataMissing
+            ? 'Solana destination USDC ATA missing'
+            : `Solana recipient ${params.solanaDestination.slice(0, 6)}… checked (${simulatedLive ? 'verified' : 'unsimulated'})`,
+          preflightStatus: recipientCheckStatus,
+          preflightDetail: !solanaRecipientValid
+            ? 'Solana destination failed base58 / non-zero public key validation'
+            : ataMissing
+            ? 'Solana wallet has no canonical USDC ATA yet'
+            : simulatedLive
+            ? 'Solana base58 & bytes32 recipient verified alongside live TVM simulation'
+            : 'Solana base58 & bytes32 recipient validated (tx execution not simulated live)',
         },
       ],
-      allChecksSafe: tronVerified,
+      allChecksSafe,
       warnings,
     };
   },

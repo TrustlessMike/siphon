@@ -636,19 +636,41 @@ export const tonAdapter: ChainFamilyAdapter = {
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
     const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
-    const expectedBytes32 = solanaAddressToBytes32(params.solanaDestination);
-    const sweepable = filterChainSweepableAssets('ton', params.assets);
+    const cleanAddr = params.userAddress.trim();
+    const userAddressValid = tonAdapter.matchesAddress(cleanAddr);
+    let expectedBytes32 = '0x' + '00'.repeat(32);
+    let solanaRecipientValid = false;
+    try {
+      expectedBytes32 = solanaAddressToBytes32(params.solanaDestination);
+      solanaRecipientValid = true;
+    } catch {
+      solanaRecipientValid = false;
+    }
 
-    const [account, head, solSnap, priceMap] = await Promise.all([
-      fetchJson<{ balance?: number; interfaces?: string[] }>(
-        `${TONAPI_BASE}/accounts/${encodeURIComponent(params.userAddress)}`
-      ),
+    const sweepable = filterChainSweepableAssets('ton', params.assets);
+    const outputAsset = params.outputAsset ?? 'USDC';
+    const hasJettonsToSweep = sweepable.some((a) => a.address !== 'native');
+
+    const [account, jettons, head, solSnap, priceMap] = await Promise.all([
+      userAddressValid
+        ? fetchJson<{ balance?: number; interfaces?: string[] }>(
+            `${TONAPI_BASE}/accounts/${encodeURIComponent(cleanAddr)}`
+          )
+        : Promise.resolve(null),
+      userAddressValid && hasJettonsToSweep
+        ? fetchJson<{
+            balances?: Array<{ balance: string; jetton?: { address?: string } }>;
+          }>(`${TONAPI_BASE}/accounts/${encodeURIComponent(cleanAddr)}/jettons`)
+        : Promise.resolve(null),
       fetchJson<{ seqno?: number }>(`${TONAPI_BASE}/blockchain/masterchain-head`),
-      fetchSolanaWalletBalances(params.solanaDestination).catch(() => null),
+      solanaRecipientValid
+        ? fetchSolanaWalletBalances(params.solanaDestination).catch(() => null)
+        : Promise.resolve(null),
       fetchLiveUsdPrices(['coingecko:the-open-network']),
     ]);
 
     const seqno = Number(head?.seqno ?? 0);
+    const liveTonNano = account?.balance !== undefined ? BigInt(Math.max(0, Math.trunc(account.balance))) : null;
     const nativeBalanceUi = Number(unitsToUi(String(account?.balance ?? 0), 9).toFixed(5));
     const nativePriceUsd = params.nativePriceUsd ?? priceMap.get('coingecko:the-open-network') ?? 3.8;
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
@@ -658,7 +680,148 @@ export const tonAdapter: ChainFamilyAdapter = {
     const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.98).toFixed(2));
-    const tonVerified = Boolean(account && seqno > 0);
+    const tonReachable = Boolean(account && seqno > 0);
+
+    // Fail-closed live TON & Jetton balance check
+    let insufficientBalanceDetail: string | null = null;
+    const liveJettonBalances = new Map<string, bigint>();
+    for (const j of jettons?.balances ?? []) {
+      const k = (j.jetton?.address || '').trim().toLowerCase();
+      if (!k) continue;
+      try {
+        liveJettonBalances.set(k, BigInt(j.balance || '0'));
+      } catch {
+        // ignore
+      }
+    }
+    for (const a of sweepable) {
+      let reqRaw = 0n;
+      try {
+        reqRaw = BigInt(a.rawBalance || '0');
+      } catch {
+        reqRaw = 0n;
+      }
+      if (a.address === 'native' && liveTonNano !== null) {
+        if (reqRaw > liveTonNano) {
+          insufficientBalanceDetail = `Insufficient live TON balance (${liveTonNano.toString()} nanotons available < ${reqRaw.toString()} requested).`;
+          break;
+        }
+      } else if (a.address !== 'native' && jettons && Array.isArray(jettons.balances)) {
+        const availRaw = liveJettonBalances.get(a.address.trim().toLowerCase()) ?? 0n;
+        if (reqRaw > availRaw) {
+          insufficientBalanceDetail = `Insufficient live TON Jetton balance for ${a.symbol} (${availRaw.toString()} available < ${reqRaw.toString()} requested).`;
+          break;
+        }
+      }
+    }
+
+    const ataMissing = outputAsset === 'USDC' && solSnap !== null && !solSnap.hasUsdcAta;
+
+    // Real live POST /v2/traces/emulate ONLY when BOC payload is provided
+    const boc = (
+      params.rawTxBytes ??
+      (typeof params.simulationPayload?.boc === 'string' ? params.simulationPayload.boc : undefined)
+    )?.trim();
+
+    let liveSimSucceeded = false;
+    let liveSimError: string | null = null;
+    let liveSimDetail: string | null = null;
+    let liveSimUnreachable = false;
+
+    if (boc && userAddressValid && solanaRecipientValid && !insufficientBalanceDetail) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 4200);
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        };
+        if (process.env.TONAPI_KEY?.trim()) {
+          headers.Authorization = `Bearer ${process.env.TONAPI_KEY.trim()}`;
+        }
+        const res = await fetch(`${TONAPI_BASE}/traces/emulate`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ boc }),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        const json = (await res.json().catch(() => ({}))) as {
+          error?: string;
+          transaction?: { success?: boolean; aborted?: boolean; total_fees?: number };
+        };
+        if (res.ok && !json.error && json.transaction?.success === true && json.transaction?.aborted !== true) {
+          liveSimSucceeded = true;
+          liveSimDetail = `emulated_fees=${json.transaction.total_fees ?? 0} nanotons`;
+        } else {
+          liveSimError =
+            json.error ||
+            (json.transaction?.aborted
+              ? 'TonAPI /v2/traces/emulate reported aborted transaction'
+              : `TonAPI /v2/traces/emulate failed (HTTP ${res.status})`);
+        }
+      } catch {
+        liveSimUnreachable = true;
+      }
+    }
+
+    const warnings: string[] = [];
+    if (!userAddressValid) {
+      warnings.push(`Invalid TON address format: ${cleanAddr || '(empty)'}.`);
+    }
+    if (!solanaRecipientValid) {
+      warnings.push('Invalid Solana destination address (expected valid non-zero base58 pubkey).');
+    }
+    if (ataMissing) {
+      warnings.push('Destination Solana wallet has no canonical USDC ATA yet; create ATA before settling USDC.');
+    }
+    if (sweepable.length === 0) {
+      warnings.push('No sweepable TON assets selected.');
+    }
+    if (insufficientBalanceDetail) {
+      warnings.push(insufficientBalanceDetail);
+    }
+    if (!hasEnoughNativeGas) {
+      warnings.push(`Low TON balance (${nativeBalanceUi} TON). Wallet W5 Gasless reimburses relayer in Jettons ($0 user TON).`);
+    }
+    if (!tonReachable) {
+      warnings.push('TonAPI account/masterchain state could not be reached for live verification.');
+    }
+    if (liveSimError) {
+      warnings.push(`TonAPI /v2/traces/emulate reverted: ${liveSimError}`);
+    }
+
+    const failClosedTx =
+      !userAddressValid ||
+      sweepable.length === 0 ||
+      Boolean(insufficientBalanceDetail) ||
+      Boolean(liveSimError);
+    const failClosedRecipient = !solanaRecipientValid || ataMissing;
+
+    const simulatedLive = Boolean(boc && liveSimSucceeded && !failClosedTx && !failClosedRecipient);
+    const allChecksSafe = Boolean(simulatedLive && !failClosedTx && !failClosedRecipient);
+
+    const emulateCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedTx
+      ? 'reverted'
+      : liveSimUnreachable || (!boc && !tonReachable)
+      ? 'rpc_skipped'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const recipientCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedRecipient
+      ? 'reverted'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const simulationNote = simulatedLive
+      ? `Live TonAPI /v2/traces/emulate succeeded (${liveSimDetail ?? 'ok'}) at masterchain seqno #${seqno.toLocaleString()}.`
+      : failClosedTx || failClosedRecipient
+      ? `Pre-flight check failed closed: ${warnings[0] ?? 'validation rejected.'}`
+      : liveSimUnreachable || !tonReachable
+      ? 'TonAPI /v2/traces/emulate or account endpoint unreachable; transaction was not emulated.'
+      : 'High-level TON intent pre-flight only: /v2/traces/emulate requires a serialized BOC payload from TonConnect/Wallet W5.';
 
     const proofDigestSha256 =
       '0x' +
@@ -668,21 +831,14 @@ export const tonAdapter: ChainFamilyAdapter = {
           JSON.stringify({
             family: 'ton',
             seqno,
-            userAddress: params.userAddress,
+            userAddress: cleanAddr,
             solanaDestination: params.solanaDestination,
+            simulatedLive,
             outflows: sweepable.map((a) => ({ id: a.id, raw: a.rawBalance })),
             guaranteedMinNetUsd,
           })
         )
         .digest('hex');
-
-    const warnings: string[] = [];
-    if (!hasEnoughNativeGas) {
-      warnings.push(`Low TON balance (${nativeBalanceUi} TON). Wallet W5 Gasless reimburses relayer in Jettons ($0 user TON).`);
-    }
-    if (!tonVerified) {
-      warnings.push('TonAPI account/masterchain state could not be reached for live verification.');
-    }
 
     return {
       proofId: `prf_ton_${crypto.randomBytes(4).toString('hex')}`,
@@ -693,10 +849,10 @@ export const tonAdapter: ChainFamilyAdapter = {
       chainId: '-239',
       chainName: 'TON',
       blockNumber: seqno,
-      userAddress: params.userAddress,
+      userAddress: cleanAddr,
       solanaDestination: params.solanaDestination,
       solanaMintRecipientBytes32: expectedBytes32,
-      mintRecipientVerified: true,
+      mintRecipientVerified: solanaRecipientValid,
       hasEnoughNativeGas,
       nativeBalanceUi,
       nativeSymbol: 'TON',
@@ -704,6 +860,8 @@ export const tonAdapter: ChainFamilyAdapter = {
       estimatedGasUsd,
       recommendedMode: hasEnoughNativeGas ? 'eip5792_batch' : 'sponsored_gasless',
       simulationEndpoint: '/v2/traces/emulate',
+      simulatedLive,
+      simulationNote,
       outflows: sweepable.map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
@@ -719,7 +877,7 @@ export const tonAdapter: ChainFamilyAdapter = {
       },
       guaranteedMinNetUsd,
       estimatedNetUsd,
-      outputAsset: params.outputAsset ?? 'USDC',
+      outputAsset,
       preSolanaSnapshot: solSnap
         ? {
             usdcBalance: solSnap.usdcBalance,
@@ -734,25 +892,47 @@ export const tonAdapter: ChainFamilyAdapter = {
           assetSymbol: 'TON',
           actionType: 'ton_w5_emulate',
           target: 'tonapi.io/v2/traces/emulate',
-          summary: tonVerified
-            ? `TON Masterchain seqno #${seqno.toLocaleString()} & account state verified (${sweepable.length} asset(s))`
-            : 'TonAPI state unreachable',
-          preflightStatus: tonVerified ? 'verified' : 'rpc_skipped',
-          preflightDetail: tonVerified
-            ? `Live TonAPI state verified (${nativeBalanceUi} TON · seqno #${seqno.toLocaleString()})`
-            : 'TonAPI rate-limited or unreachable',
+          summary:
+            emulateCheckStatus === 'verified'
+              ? `Live TonAPI /v2/traces/emulate passed (${liveSimDetail ?? 'ok'})`
+              : emulateCheckStatus === 'reverted'
+              ? liveSimError
+                ? `TON trace emulation reverted: ${liveSimError.slice(0, 120)}`
+                : insufficientBalanceDetail || warnings[0] || 'TON pre-flight rejected'
+              : emulateCheckStatus === 'rpc_skipped'
+              ? 'TonAPI endpoint unreachable'
+              : `Pre-flight TON state checked at seqno #${seqno.toLocaleString()} (no BOC emulated)`,
+          preflightStatus: emulateCheckStatus,
+          preflightDetail:
+            emulateCheckStatus === 'verified'
+              ? `Seqno #${seqno.toLocaleString()} · /v2/traces/emulate passed (${liveSimDetail ?? 'ok'})`
+              : emulateCheckStatus === 'reverted'
+              ? liveSimError || insufficientBalanceDetail || warnings[0] || 'TON pre-flight check failed closed'
+              : emulateCheckStatus === 'rpc_skipped'
+              ? 'TonAPI rate-limited or unreachable'
+              : `Seqno #${seqno.toLocaleString()} (${nativeBalanceUi} TON) · BOC not supplied for live emulation`,
         },
         {
           stepId: 'ton_bridge_solana',
-          assetSymbol: 'USDT',
+          assetSymbol: outputAsset,
           actionType: 'bridge_or_swap',
           target: 'Relay / deBridge → Solana',
-          summary: `Solana recipient ${params.solanaDestination.slice(0, 6)}… verified`,
-          preflightStatus: 'verified',
-          preflightDetail: 'Solana base58 & bytes32 recipient verified',
+          summary: !solanaRecipientValid
+            ? 'Invalid Solana destination address'
+            : ataMissing
+            ? 'Solana destination USDC ATA missing'
+            : `Solana recipient ${params.solanaDestination.slice(0, 6)}… checked (${simulatedLive ? 'verified' : 'unsimulated'})`,
+          preflightStatus: recipientCheckStatus,
+          preflightDetail: !solanaRecipientValid
+            ? 'Solana destination failed base58 / non-zero public key validation'
+            : ataMissing
+            ? 'Solana wallet has no canonical USDC ATA yet'
+            : simulatedLive
+            ? 'Solana base58 & bytes32 recipient verified alongside live trace emulation'
+            : 'Solana base58 & bytes32 recipient validated (tx execution not emulated live)',
         },
       ],
-      allChecksSafe: tonVerified,
+      allChecksSafe,
       warnings,
     };
   },

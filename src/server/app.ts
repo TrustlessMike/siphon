@@ -14,6 +14,10 @@ import {
   fetchCctpAttestationForTx,
   solanaAddressToBytes32,
 } from '../bridge/cctp.js';
+import {
+  buildSolanaCctpClaimInstructionPlan,
+  fetchLatestSolanaBlockhash,
+} from '../bridge/solana-claim.js';
 import { runDefiPreflightBatch } from '../defi/preflight.js';
 import { buildPreSignSimulationProof, verifyOnchainExecutionProof } from '../execution/proof.js';
 import {
@@ -1405,6 +1409,78 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         }
       }
 
+      if (method === 'POST' && pathname === '/api/cctp/solana-claim-tx') {
+        const body = await readJsonBody<{
+          messageBytesHex?: string;
+          attestation?: string;
+          attestationHex?: string;
+          solanaDestination?: string;
+          payer?: string;
+          chain?: EvmChainId;
+          txHash?: string;
+          includeCreateAta?: boolean;
+          recentBlockhash?: string;
+          skipBlockhashFetch?: boolean;
+        }>(req);
+
+        const solanaDestination = body.solanaDestination?.trim();
+        if (!solanaDestination) {
+          return reply(400, { error: 'solanaDestination is required.' });
+        }
+
+        try {
+          let messageBytesHex = body.messageBytesHex?.trim();
+          let attestationHex = (body.attestationHex ?? body.attestation)?.trim();
+
+          if ((!messageBytesHex || !attestationHex) && body.chain && body.txHash) {
+            if (!/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim())) {
+              return reply(400, { error: 'Valid 32-byte 0x txHash is required when resolving attestation.' });
+            }
+            const att = await fetchCctpAttestationForTx({
+              chain: body.chain,
+              txHash: body.txHash.trim(),
+              solanaDestination,
+            });
+            if (!att.found || !att.messageBytesHex) {
+              return reply(404, { error: att.nextStep || 'CCTP MessageSent event not found for transaction.' });
+            }
+            if (att.attestationStatus !== 'complete' || !att.attestation) {
+              return reply(409, {
+                attestationStatus: att.attestationStatus,
+                messageHash: att.messageHash,
+                error: att.nextStep || 'Circle Iris attestation is not complete yet.',
+              });
+            }
+            messageBytesHex = att.messageBytesHex;
+            attestationHex = att.attestation;
+          }
+
+          if (!messageBytesHex || !attestationHex) {
+            return reply(400, {
+              error: 'Provide messageBytesHex + attestation (or chain + txHash) to build a Solana CCTP claim transaction plan.',
+            });
+          }
+
+          const recentBlockhash =
+            body.recentBlockhash?.trim() ||
+            (body.skipBlockhashFetch ? null : await fetchLatestSolanaBlockhash());
+
+          const claimPlan = buildSolanaCctpClaimInstructionPlan({
+            messageBytesHex,
+            attestationHex,
+            solanaDestination,
+            payer: body.payer?.trim() || solanaDestination,
+            includeCreateAta: body.includeCreateAta,
+            recentBlockhash,
+          });
+          return reply(200, claimPlan);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Could not build Solana CCTP claim plan.',
+          });
+        }
+      }
+
       if (method === 'POST' && pathname === '/api/tx/simulate-proof') {
         const body = await readJsonBody<{
           chain?: AnyChainId;
@@ -1417,6 +1493,8 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           feeRecipientEvm?: string | null;
           bundleDefiCctp?: boolean;
           nativePriceUsd?: number;
+          rawTxBytes?: string;
+          simulationPayload?: Record<string, unknown>;
         }>(req);
 
         if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
@@ -1462,6 +1540,8 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
             protocolFeeBps: body.protocolFeeBps,
             feeRecipient: undefined,
             nativePriceUsd: body.nativePriceUsd,
+            rawTxBytes: body.rawTxBytes,
+            simulationPayload: body.simulationPayload,
           });
           return reply(200, { proof, batch: null });
         } catch (err) {

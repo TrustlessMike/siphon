@@ -1003,27 +1003,48 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     const chainIdKey = (params.chain in COSMOS_CHAINS ? params.chain : 'cosmoshub') as CosmosChainId;
     const cfg = COSMOS_CHAINS[chainIdKey];
     const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
-    const expectedBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+    const cleanAddr = params.userAddress.trim();
+    const userAddressValid = cosmosAdapter.matchesAddress(cleanAddr);
+    const hrpMatches = cleanAddr.toLowerCase().startsWith(`${cfg.prefix}1`);
+    let expectedBytes32 = '0x' + '00'.repeat(32);
+    let solanaRecipientValid = false;
+    try {
+      expectedBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+      solanaRecipientValid = true;
+    } catch {
+      solanaRecipientValid = false;
+    }
+
     const sweepable = filterChainSweepableAssets(cfg.id, params.assets);
-    const hrpMatches = params.userAddress.toLowerCase().startsWith(`${cfg.prefix}1`);
+    const outputAsset = params.outputAsset ?? 'USDC';
 
     const [blockRes, balRes, solSnap, priceMap] = await Promise.all([
       cosmosLcdGet<{ block?: { header?: { height?: string } } }>(
         cfg.lcdUrls,
         '/cosmos/base/tendermint/v1beta1/blocks/latest'
       ),
-      hrpMatches
+      userAddressValid && hrpMatches
         ? cosmosLcdGet<{ balances?: Array<{ denom: string; amount: string }> }>(
             cfg.lcdUrls,
-            `/cosmos/bank/v1beta1/spendable_balances/${encodeURIComponent(params.userAddress)}`
+            `/cosmos/bank/v1beta1/spendable_balances/${encodeURIComponent(cleanAddr)}`
           )
         : Promise.resolve(null),
-      fetchSolanaWalletBalances(params.solanaDestination).catch(() => null),
+      solanaRecipientValid
+        ? fetchSolanaWalletBalances(params.solanaDestination).catch(() => null)
+        : Promise.resolve(null),
       fetchLiveUsdPrices([cfg.coingeckoKey]),
     ]);
 
     const blockNumber = Number(blockRes?.block?.header?.height || 0);
-    const nativeRaw = balRes?.balances?.find((b) => b.denom === cfg.baseDenom)?.amount || '0';
+    const liveDenomBalances = new Map<string, bigint>();
+    for (const b of balRes?.balances ?? []) {
+      try {
+        liveDenomBalances.set(b.denom, BigInt(b.amount || '0'));
+      } catch {
+        // ignore malformed balance
+      }
+    }
+    const nativeRaw = (liveDenomBalances.get(cfg.baseDenom) ?? 0n).toString();
     const nativeBalanceUi = Number(rawToUi(nativeRaw, cfg.decimals).toFixed(5));
     const nativePriceUsd = params.nativePriceUsd ?? priceMap.get(cfg.coingeckoKey) ?? 1;
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
@@ -1035,45 +1056,190 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
 
-    const lcdVerified = blockNumber > 0 && hrpMatches;
-    const checks: UniversalPreSignProof['checks'] = [
-      {
-        stepId: 'cosmos_tx_simulate',
-        assetSymbol: cfg.symbol,
-        actionType: 'cosmos_simulate',
-        target: `${cfg.lcdUrls[0]}/cosmos/tx/v1beta1/simulate`,
-        summary: lcdVerified
-          ? `Live ${cfg.name} LCD state verified at height #${blockNumber.toLocaleString()}`
-          : !hrpMatches
-          ? `Address prefix mismatch: expected ${cfg.prefix}1… for ${cfg.name}`
-          : `${cfg.name} LCD unreachable`,
-        preflightStatus: lcdVerified ? 'verified' : !hrpMatches ? 'reverted' : 'rpc_skipped',
-        preflightDetail: lcdVerified
-          ? `CometBFT height #${blockNumber.toLocaleString()} · spendable ${nativeBalanceUi} ${cfg.symbol}`
-          : !hrpMatches
-          ? `Connected address (${params.userAddress.slice(0, 12)}…) does not match ${cfg.prefix}1…`
-          : 'LCD endpoint busy',
-      },
-      {
-        stepId: 'noble_cctp_domain4',
-        assetSymbol: 'USDC',
-        actionType: 'cctp_deposit_for_burn',
-        target: 'noble-1::circle.cctp.v1.MsgDepositForBurn',
-        summary: `Noble Circle CCTP Domain 4 → Solana USDC ATA PDA (${expectedBytes32.slice(0, 10)}…)`,
-        preflightStatus: 'verified',
-        preflightDetail: 'Canonical Solana USDC ATA PDA bytes32 verified bit-for-bit',
-      },
-    ];
+    // Fail-closed live spendable balance check when LCD returned spendable_balances
+    let insufficientBalanceDetail: string | null = null;
+    if (balRes && Array.isArray(balRes.balances)) {
+      for (const a of sweepable) {
+        if (a.address.startsWith('rewards:') || a.address.startsWith('staking:')) continue;
+        let reqRaw = 0n;
+        try {
+          reqRaw = BigInt(a.rawBalance || '0');
+        } catch {
+          reqRaw = 0n;
+        }
+        const availRaw = liveDenomBalances.get(a.address) ?? 0n;
+        if (reqRaw > availRaw) {
+          insufficientBalanceDetail = `Insufficient live ${cfg.name} spendable balance for ${a.symbol} (${availRaw.toString()} available < ${reqRaw.toString()} requested).`;
+          break;
+        }
+      }
+    }
+
+    const ataMissing = outputAsset === 'USDC' && solSnap !== null && !solSnap.hasUsdcAta;
+    const lcdReachable = blockNumber > 0;
+
+    // Real live /cosmos/tx/v1beta1/simulate call ONLY when serialized tx_bytes or tx payload is supplied
+    const rawTxBytes = (
+      params.rawTxBytes ??
+      (typeof params.simulationPayload?.tx_bytes === 'string' ? params.simulationPayload.tx_bytes : undefined)
+    )?.trim();
+    const simBody = rawTxBytes
+      ? { tx_bytes: rawTxBytes }
+      : params.simulationPayload && typeof params.simulationPayload.tx === 'object'
+      ? params.simulationPayload
+      : null;
+
+    let liveSimSucceeded = false;
+    let liveSimError: string | null = null;
+    let liveSimGasUsed: string | null = null;
+    let liveSimUnreachable = false;
+
+    if (simBody && userAddressValid && hrpMatches && solanaRecipientValid && !insufficientBalanceDetail) {
+      let responded = false;
+      for (const base of cfg.lcdUrls) {
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 4200);
+          const res = await fetch(`${base.replace(/\/$/, '')}/cosmos/tx/v1beta1/simulate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify(simBody),
+            signal: controller.signal,
+          });
+          clearTimeout(timer);
+          responded = true;
+          const json = (await res.json().catch(() => ({}))) as {
+            gas_info?: { gas_used?: string; gas_wanted?: string };
+            code?: number;
+            message?: string;
+          };
+          if (res.ok && json.gas_info && !json.code) {
+            liveSimSucceeded = true;
+            liveSimGasUsed = String(json.gas_info.gas_used ?? json.gas_info.gas_wanted ?? '0');
+          } else {
+            liveSimError = json.message || `Cosmos /cosmos/tx/v1beta1/simulate returned HTTP ${res.status}`;
+          }
+          break;
+        } catch {
+          // try next LCD endpoint
+        }
+      }
+      if (!responded) {
+        liveSimUnreachable = true;
+      }
+    }
 
     const warnings: string[] = [];
-    if (!hrpMatches) {
+    if (!userAddressValid) {
+      warnings.push(`Invalid Cosmos address format: ${cleanAddr || '(empty)'}.`);
+    } else if (!hrpMatches) {
       warnings.push(`Address prefix mismatch for ${cfg.name}: expected "${cfg.prefix}1…" address.`);
+    }
+    if (!solanaRecipientValid) {
+      warnings.push('Invalid Solana destination address (expected valid non-zero base58 pubkey).');
+    }
+    if (ataMissing) {
+      warnings.push('Destination Solana wallet has no canonical USDC ATA yet; create ATA before claiming CCTP USDC.');
+    }
+    if (sweepable.length === 0) {
+      warnings.push(`No sweepable assets selected on ${cfg.name}.`);
+    }
+    if (insufficientBalanceDetail) {
+      warnings.push(insufficientBalanceDetail);
     }
     if (!hasEnoughNativeGas) {
       warnings.push(
         `Low ${cfg.symbol} gas on ${cfg.name} (${nativeBalanceUi} ${cfg.symbol}). ${cfg.supportsTxFees ? 'Osmosis x/txfees or ' : ''}x/feegrant sponsorship required.`
       );
     }
+    if (!lcdReachable) {
+      warnings.push(`${cfg.name} LCD endpoint unreachable for live block height verification.`);
+    }
+    if (liveSimError) {
+      warnings.push(`Live Cosmos simulate reverted: ${liveSimError}`);
+    }
+
+    const failClosedTx =
+      !userAddressValid ||
+      !hrpMatches ||
+      sweepable.length === 0 ||
+      Boolean(insufficientBalanceDetail) ||
+      Boolean(liveSimError);
+    const failClosedRecipient = !solanaRecipientValid || ataMissing;
+
+    const simulatedLive = Boolean(simBody && liveSimSucceeded && !failClosedTx && !failClosedRecipient);
+    const allChecksSafe = Boolean(simulatedLive && !failClosedTx && !failClosedRecipient);
+
+    const txCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedTx
+      ? 'reverted'
+      : liveSimUnreachable || (!simBody && !lcdReachable)
+      ? 'rpc_skipped'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const recipientCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedRecipient
+      ? 'reverted'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const simulationNote = simulatedLive
+      ? `Live /cosmos/tx/v1beta1/simulate passed on ${cfg.name} (gas_used=${liveSimGasUsed ?? 'ok'}) at height #${blockNumber.toLocaleString()}.`
+      : failClosedTx || failClosedRecipient
+      ? `Pre-flight check failed closed: ${warnings[0] ?? 'validation rejected.'}`
+      : liveSimUnreachable || !lcdReachable
+      ? `${cfg.name} LCD /cosmos/tx/v1beta1/simulate unreachable; transaction was not simulated.`
+      : `High-level Cosmos intent pre-flight only: /cosmos/tx/v1beta1/simulate requires serialized protobuf tx_bytes from Keplr/Leap.`;
+
+    const checks: UniversalPreSignProof['checks'] = [
+      {
+        stepId: 'cosmos_tx_simulate',
+        assetSymbol: cfg.symbol,
+        actionType: 'cosmos_simulate',
+        target: `${cfg.lcdUrls[0]}/cosmos/tx/v1beta1/simulate`,
+        summary:
+          txCheckStatus === 'verified'
+            ? `Live /cosmos/tx/v1beta1/simulate passed on ${cfg.name} (gas ${liveSimGasUsed ?? 'ok'})`
+            : txCheckStatus === 'reverted'
+            ? liveSimError
+              ? `Cosmos simulation reverted: ${liveSimError.slice(0, 120)}`
+              : !userAddressValid || !hrpMatches
+              ? `Address prefix mismatch: expected ${cfg.prefix}1… for ${cfg.name}`
+              : insufficientBalanceDetail || `Cosmos pre-flight rejected on ${cfg.name}`
+            : txCheckStatus === 'rpc_skipped'
+            ? `${cfg.name} LCD unreachable`
+            : `Pre-flight LCD state checked at #${blockNumber.toLocaleString()} (no tx_bytes simulated)`,
+        preflightStatus: txCheckStatus,
+        preflightDetail:
+          txCheckStatus === 'verified'
+            ? `CometBFT #${blockNumber.toLocaleString()} · /cosmos/tx/v1beta1/simulate gas_used=${liveSimGasUsed ?? 'ok'}`
+            : txCheckStatus === 'reverted'
+            ? liveSimError || insufficientBalanceDetail || warnings[0] || 'Cosmos pre-flight check failed closed'
+            : txCheckStatus === 'rpc_skipped'
+            ? 'LCD endpoint unavailable'
+            : `CometBFT #${blockNumber.toLocaleString()} · spendable ${nativeBalanceUi} ${cfg.symbol} · tx_bytes not supplied for live dry-run`,
+      },
+      {
+        stepId: 'noble_cctp_domain4',
+        assetSymbol: 'USDC',
+        actionType: 'cctp_deposit_for_burn',
+        target: 'noble-1::circle.cctp.v1.MsgDepositForBurn',
+        summary: !solanaRecipientValid
+          ? 'Invalid Solana destination address'
+          : ataMissing
+          ? 'Solana destination USDC ATA missing'
+          : `Noble CCTP Domain 4 → Solana USDC ATA PDA (${expectedBytes32.slice(0, 10)}…${simulatedLive ? '' : ', unsimulated'})`,
+        preflightStatus: recipientCheckStatus,
+        preflightDetail: !solanaRecipientValid
+          ? 'Solana destination failed base58 / non-zero public key validation'
+          : ataMissing
+          ? 'Solana wallet has no canonical USDC ATA yet'
+          : simulatedLive
+          ? 'Canonical Solana USDC ATA PDA bytes32 verified alongside live tx simulation'
+          : 'Canonical Solana USDC ATA PDA bytes32 derived (tx execution not simulated live)',
+      },
+    ];
 
     const proofDigestSha256 =
       '0x' +
@@ -1084,9 +1250,10 @@ export const cosmosAdapter: ChainFamilyAdapter = {
             family: 'cosmos',
             chainId: cfg.chainId,
             blockNumber,
-            userAddress: params.userAddress,
+            userAddress: cleanAddr,
             solanaDestination: params.solanaDestination,
             expectedBytes32,
+            simulatedLive,
             outflows: sweepable.map((a) => ({ id: a.id, raw: a.rawBalance })),
             guaranteedMinNetUsd,
           })
@@ -1102,10 +1269,10 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       chainId: cfg.chainId,
       chainName: cfg.name,
       blockNumber,
-      userAddress: params.userAddress,
+      userAddress: cleanAddr,
       solanaDestination: params.solanaDestination,
       solanaMintRecipientBytes32: expectedBytes32,
-      mintRecipientVerified: true,
+      mintRecipientVerified: solanaRecipientValid,
       hasEnoughNativeGas,
       nativeBalanceUi,
       nativeSymbol: cfg.symbol,
@@ -1113,6 +1280,8 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       estimatedGasUsd,
       recommendedMode: hasEnoughNativeGas ? 'eip5792_batch' : 'sponsored_gasless',
       simulationEndpoint: '/cosmos/tx/v1beta1/simulate',
+      simulatedLive,
+      simulationNote,
       outflows: sweepable.map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
@@ -1128,7 +1297,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       },
       guaranteedMinNetUsd,
       estimatedNetUsd,
-      outputAsset: params.outputAsset ?? 'USDC',
+      outputAsset,
       preSolanaSnapshot: solSnap
         ? {
             usdcBalance: solSnap.usdcBalance,
@@ -1138,7 +1307,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
           }
         : undefined,
       checks,
-      allChecksSafe: lcdVerified,
+      allChecksSafe,
       warnings,
     };
   },

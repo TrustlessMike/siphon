@@ -153,6 +153,10 @@ export interface UniversalPreSignProof {
   estimatedGasUsd: number;
   recommendedMode: 'sponsored_gasless' | 'eip5792_batch' | 'sequential';
   simulationEndpoint: string;
+  /** True ONLY when a real chain dry-run / emulation endpoint executed and succeeded on actual tx bytes/payload */
+  simulatedLive?: boolean;
+  /** Explicit explanation of whether live tx emulation ran or only pre-flight state/recipient/balance checks ran */
+  simulationNote?: string;
   outflows: Array<{ symbol: string; amount: number; usd: number; action: string }>;
   protocolFee: {
     feeBps: number;
@@ -188,7 +192,7 @@ export interface UniversalPreSignProof {
     actionType: string;
     target: string;
     summary: string;
-    preflightStatus: 'verified' | 'dependent_ok' | 'reverted' | 'rpc_skipped';
+    preflightStatus: 'verified' | 'dependent_ok' | 'reverted' | 'rpc_skipped' | 'unsimulated';
     preflightDetail: string;
   }>;
   allChecksSafe: boolean;
@@ -277,6 +281,10 @@ export interface ChainFamilyAdapter {
     protocolFeeBps?: number;
     feeRecipient?: string | null;
     nativePriceUsd?: number;
+    /** Optional serialized transaction bytes (e.g. Sui BCS base64, Cosmos tx_bytes base64, TON BOC, BTC PSBT hex) for real chain dry-run */
+    rawTxBytes?: string;
+    /** Optional structured simulation payload (e.g. Aptos UserTransaction, Tron triggerconstantcontract params) for real chain dry-run */
+    simulationPayload?: Record<string, unknown>;
   }): Promise<UniversalPreSignProof>;
   relayAndProve(params: {
     chain: AnyChainId;

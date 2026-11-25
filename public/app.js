@@ -1,6 +1,7 @@
 import { mountSiphonFunnelScene } from './siphon-3d.js?v=7';
 import { renderConvergenceSvg } from './siphon-svg.js?v=7';
 import {
+  claimCctpOnSolana,
   connectCoinbaseSmartWallet,
   connectEvmWallet,
   connectFamilyWallet,
@@ -2091,11 +2092,18 @@ function renderPreSignProofCard(proof) {
   const feeEstStr = safeNum(proof.protocolFee?.estimatedFeeUsd).toFixed(2);
   const haircutCount = safeInt(proof.haircutDroppedAssets?.length);
 
+  const headerLabel = proof.allChecksSafe
+    ? '✓ Real-Time Pre-Sign Proof'
+    : proof.simulatedLive === false
+    ? '! Pre-Flight Only (Not Live-Simulated)'
+    : '! Simulation Warning';
+
   card.innerHTML = `
     <div class="proof-head">
-      <span>${proof.allChecksSafe ? '✓ Real-Time Pre-Sign Proof' : '! Simulation Warning'} (${escapeHtml(proof.chainName)} #${escapeHtml(blockStr)})</span>
+      <span>${headerLabel} (${escapeHtml(proof.chainName)} #${escapeHtml(blockStr)})</span>
       <span class="mono muted-xs">${escapeHtml(shortAddr(proof.proofDigestSha256))}</span>
     </div>
+    ${proof.simulationNote ? `<div class="breakeven-banner mono">${escapeHtml(proof.simulationNote)}</div>` : ''}
     <div class="proof-kv"><span>Wallet Proven</span><strong class="mono">${escapeHtml(shortAddr(proof.userAddress))}</strong></div>
     <div class="proof-kv"><span>Gas Check</span><span class="mono">${escapeHtml(gasLabel)}</span></div>
     <div class="proof-kv"><span>Solana Recipient bytes32</span><span class="mono">${proof.mintRecipientVerified ? '✓ Matched bit-for-bit' : '✕ Mismatch'}</span></div>
@@ -2296,6 +2304,22 @@ function renderBackgroundAgentUI() {
           });
           linkEls.push(proveBtn);
         }
+        if (
+          (leg.status === 'attested' || leg.attestationStatus === 'complete') &&
+          !leg.solanaTxHash &&
+          safeTxHash(leg.evmTxHash)
+        ) {
+          const claimBtn = document.createElement('button');
+          claimBtn.type = 'button';
+          claimBtn.className = 'text-action';
+          claimBtn.dataset.claimCctpJob = String(activeJob.jobId || '');
+          claimBtn.dataset.claimCctpChain = String(leg.chain || '');
+          claimBtn.textContent = 'Claim USDC on Solana';
+          claimBtn.addEventListener('click', () => {
+            claimCctpLegOnSolana(activeJob, leg, claimBtn);
+          });
+          linkEls.push(claimBtn);
+        }
         if (linkEls.length) {
           statusLine.append(document.createTextNode(' · '));
           linkEls.forEach((el, idx) => {
@@ -2426,6 +2450,25 @@ function renderBackgroundAgentUI() {
           tdLinks.append(document.createTextNode(' · '), cctpBtn);
           hasAny = true;
         }
+        if (
+          (leg.status === 'attested' ||
+            leg.attestationStatus === 'complete' ||
+            leg.requiresSolanaClaim) &&
+          !leg.solanaTxHash &&
+          safeTxHash(leg.evmTxHash)
+        ) {
+          const claimBtn = document.createElement('button');
+          claimBtn.type = 'button';
+          claimBtn.className = 'text-action';
+          claimBtn.dataset.claimCctpJob = String(job.jobId || '');
+          claimBtn.dataset.claimCctpChain = String(leg.chain || '');
+          claimBtn.textContent = 'Claim USDC on Solana';
+          claimBtn.addEventListener('click', () => {
+            claimCctpLegOnSolana(job, leg, claimBtn);
+          });
+          tdLinks.append(document.createTextNode(' · '), claimBtn);
+          hasAny = true;
+        }
         void hasAny;
 
         tr.append(tdChain, tdProv, tdOut, tdStat, tdLinks);
@@ -2551,6 +2594,71 @@ async function proveLegOnchain(jobId, chain, btnEl = null) {
     showToast(err.message);
   } finally {
     if (btnEl) btnEl.textContent = 'Prove ✓';
+  }
+}
+
+async function claimCctpLegOnSolana(job, leg, btnEl = null) {
+  if (!job || !leg?.evmTxHash) return;
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = 'Preparing Claim…';
+  }
+  try {
+    let solPayer = getConnectedSolanaAddress();
+    if (!solPayer) {
+      const avail = listAvailableSolanaWallets();
+      if (avail.length) {
+        const conn = await connectSolanaWallet();
+        solPayer = conn?.address || getConnectedSolanaAddress();
+        updateWalletButtons();
+      }
+    }
+
+    const claimPlan = await api('/api/cctp/solana-claim-tx', {
+      method: 'POST',
+      body: JSON.stringify({
+        chain: leg.chain,
+        txHash: leg.evmTxHash,
+        solanaDestination: job.solanaDestination,
+        payer: solPayer || job.solanaDestination,
+      }),
+    });
+
+    if (btnEl) btnEl.textContent = 'Sign in Solana Wallet…';
+    const result = await claimCctpOnSolana(claimPlan, {
+      expectedSolanaDestination: job.solanaDestination,
+      autoConnect: true,
+    });
+
+    await patchJobLeg(job.jobId, leg.chain, {
+      status: 'landed',
+      solanaTxHash: result.signature,
+      attestationStatus: 'claimed',
+      statusText: `Claimed ${safeNum(claimPlan.amountUsdc).toFixed(2)} USDC on Solana (${result.walletName})`,
+    });
+    await syncBackgroundJobs();
+    refreshSolanaBalance();
+    showToast(
+      `Claimed ${safeNum(claimPlan.amountUsdc).toFixed(2)} USDC on Solana (${shortAddr(result.signature)}).`
+    );
+  } catch (err) {
+    if (isUserRejectedError(err)) {
+      showToast('Solana CCTP claim signature cancelled in wallet.');
+    } else if (Array.isArray(err?.fallbackInstructions) && err.fallbackInstructions.length) {
+      const fallbackNote = `${err.message} ${err.fallbackInstructions[0]}`;
+      await patchJobLeg(job.jobId, leg.chain, {
+        status: leg.status === 'attested' ? 'attested' : 'relaying',
+        statusText: fallbackNote,
+      });
+      showToast(fallbackNote);
+    } else {
+      showToast(err?.message || 'Could not claim CCTP USDC on Solana.');
+    }
+  } finally {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = 'Claim USDC on Solana';
+    }
   }
 }
 
