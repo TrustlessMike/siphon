@@ -33,11 +33,13 @@ function buildStudioEnvironment(renderer) {
   envScene.background = new THREE.Color(0xf8fafc);
 
   const plane = new THREE.PlaneGeometry(1, 1);
+  const envMats = [];
   const addPanel = (hex, intensity, pos, scale, rot) => {
     const mat = new THREE.MeshBasicMaterial({
       color: new THREE.Color(hex).multiplyScalar(intensity),
       side: THREE.DoubleSide,
     });
+    envMats.push(mat);
     const m = new THREE.Mesh(plane, mat);
     m.position.set(...pos);
     m.scale.set(...scale);
@@ -54,6 +56,8 @@ function buildStudioEnvironment(renderer) {
 
   const rt = pmrem.fromScene(envScene, 0.035);
   pmrem.dispose();
+  plane.dispose();
+  for (const m of envMats) m.dispose();
   return rt;
 }
 
@@ -82,13 +86,13 @@ function createSoftShadowTexture() {
  * (6 EVM chains), and a central frosted Kamino ice-cyan (#C6F4FF) glass triangular prism core.
  */
 export function mountSiphonFunnelScene(canvas) {
-  if (!canvas) return { setActive() {}, destroy() {} };
+  if (!canvas) return { setActive() {}, setPaused() {}, isRunning() { return false; }, destroy() {} };
 
   const rect = canvas.getBoundingClientRect();
   const w = Math.max(280, Math.round(rect.width || 560));
   const h = Math.max(240, Math.round(rect.height || 430));
   const renderer = createRenderer(canvas, w, h);
-  if (!renderer) return { setActive() {}, destroy() {} };
+  if (!renderer) return { setActive() {}, setPaused() {}, isRunning() { return false; }, destroy() {} };
 
   const scene = new THREE.Scene();
   const envRT = buildStudioEnvironment(renderer);
@@ -244,9 +248,45 @@ export function mountSiphonFunnelScene(canvas) {
   let targetRotY = 0;
   let targetRotX = 0;
   let visible = true;
+  let paused = false;
+  let contextLost = false;
+  let destroyed = false;
   let rafId = 0;
   let last = performance.now();
   let elapsed = 0;
+
+  const isShellHidden = () => {
+    const shell = document.getElementById('siteShell');
+    if (shell && (shell.classList.contains('hidden') || shell.hidden)) return true;
+    return Boolean(canvas.closest('.hidden'));
+  };
+
+  const shouldRun = () =>
+    !destroyed &&
+    !paused &&
+    !contextLost &&
+    visible &&
+    !document.hidden &&
+    !isShellHidden() &&
+    !prefersReducedMotion();
+
+  const stopLoop = () => {
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+  };
+
+  const startLoop = () => {
+    if (!shouldRun() || rafId) return;
+    last = performance.now();
+    rafId = requestAnimationFrame(tick);
+  };
+
+  const syncLoopState = () => {
+    if (shouldRun()) startLoop();
+    else stopLoop();
+  };
 
   const onPointerMove = (e) => {
     const r = canvas.getBoundingClientRect();
@@ -258,68 +298,120 @@ export function mountSiphonFunnelScene(canvas) {
   };
   canvas.addEventListener('pointermove', onPointerMove, { passive: true });
 
+  const onContextLost = (e) => {
+    e.preventDefault();
+    contextLost = true;
+    stopLoop();
+  };
+  const onContextRestored = () => {
+    contextLost = false;
+    renderer.render(scene, camera);
+    syncLoopState();
+  };
+  canvas.addEventListener('webglcontextlost', onContextLost);
+  canvas.addEventListener('webglcontextrestored', onContextRestored);
+
+  const onVisibilityChange = () => syncLoopState();
+  document.addEventListener('visibilitychange', onVisibilityChange);
+
   const ro = new ResizeObserver(() => {
     const r = canvas.getBoundingClientRect();
     if (r.width > 40 && r.height > 40) {
       fitCamera(r.width, r.height);
       renderer.setSize(Math.round(r.width), Math.round(r.height), false);
-      renderer.render(scene, camera);
+      if (!contextLost && !isShellHidden()) {
+        renderer.render(scene, camera);
+      }
     }
+    syncLoopState();
   });
   ro.observe(canvas);
 
   const io = new IntersectionObserver((entries) => {
     visible = entries[0]?.isIntersecting ?? true;
+    syncLoopState();
   });
   io.observe(canvas);
 
+  const siteShellEl = document.getElementById('siteShell');
+  const mo =
+    siteShellEl && typeof MutationObserver !== 'undefined'
+      ? new MutationObserver(() => syncLoopState())
+      : null;
+  if (mo && siteShellEl) {
+    mo.observe(siteShellEl, { attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
+  }
+
   const tick = (now) => {
-    const dt = Math.min(0.05, (now - last) / 1000);
+    rafId = 0;
+    if (!shouldRun()) return;
+
+    const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
     last = now;
 
-    if (visible && !document.hidden) {
-      const speed = activeBoost ? 1.85 : 0.75;
-      elapsed += dt * speed;
+    const speed = activeBoost ? 1.85 : 0.75;
+    elapsed += dt * speed;
 
-      root.position.y = 0.05 + Math.sin(elapsed * 1.1) * 0.045;
-      prism.rotation.y += dt * 0.35 * speed;
-      ribsGroup.rotation.y -= dt * 0.1 * speed;
+    root.position.y = 0.05 + Math.sin(elapsed * 1.1) * 0.045;
+    prism.rotation.y += dt * 0.35 * speed;
+    ribsGroup.rotation.y -= dt * 0.1 * speed;
 
-      motes.forEach((m) => {
-        const t = (m.userData.phase + elapsed * 0.22) % 1;
-        const angle = m.userData.angle + t * 1.15;
-        const radius = 1.42 * (1 - t) + 0.32 * t;
-        const y = 0.72 * (1 - t) + -1.25 * t;
-        m.position.set(Math.cos(angle) * radius, y, Math.sin(angle) * radius);
-        const s = Math.sin(t * Math.PI);
-        m.scale.setScalar(0.35 + s * 0.75);
-      });
+    motes.forEach((m) => {
+      const t = (m.userData.phase + elapsed * 0.22) % 1;
+      const angle = m.userData.angle + t * 1.15;
+      const radius = 1.42 * (1 - t) + 0.32 * t;
+      const y = 0.72 * (1 - t) + -1.25 * t;
+      m.position.set(Math.cos(angle) * radius, y, Math.sin(angle) * radius);
+      const s = Math.sin(t * Math.PI);
+      m.scale.setScalar(0.35 + s * 0.75);
+    });
 
-      root.rotation.y += (targetRotY + Math.sin(elapsed * 0.35) * 0.07 - root.rotation.y) * 0.05;
-      root.rotation.x += (targetRotX - root.rotation.x) * 0.05;
+    root.rotation.y += (targetRotY + Math.sin(elapsed * 0.35) * 0.07 - root.rotation.y) * 0.05;
+    root.rotation.x += (targetRotX - root.rotation.x) * 0.05;
 
-      renderer.render(scene, camera);
-    }
+    renderer.render(scene, camera);
 
-    if (!prefersReducedMotion()) {
+    if (shouldRun()) {
       rafId = requestAnimationFrame(tick);
     }
   };
 
-  renderer.render(scene, camera);
-  if (!prefersReducedMotion()) {
-    rafId = requestAnimationFrame(tick);
+  if (!isShellHidden()) {
+    renderer.render(scene, camera);
   }
+  syncLoopState();
 
   return {
     setActive(isActive) {
       activeBoost = Boolean(isActive);
     },
+    setPaused(isPaused) {
+      paused = Boolean(isPaused);
+      syncLoopState();
+    },
+    isRunning() {
+      return rafId !== 0;
+    },
     destroy() {
-      cancelAnimationFrame(rafId);
+      destroyed = true;
+      stopLoop();
       canvas.removeEventListener('pointermove', onPointerMove);
+      canvas.removeEventListener('webglcontextlost', onContextLost);
+      canvas.removeEventListener('webglcontextrestored', onContextRestored);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       ro.disconnect();
       io.disconnect();
+      mo?.disconnect();
+      scene.traverse((obj) => {
+        if (obj.geometry) obj.geometry.dispose?.();
+        if (obj.material) {
+          const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+          for (const mat of mats) {
+            mat.map?.dispose?.();
+            mat.dispose?.();
+          }
+        }
+      });
       envRT.dispose();
       renderer.dispose();
     },

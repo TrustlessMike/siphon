@@ -109,6 +109,146 @@ const SUPPORTED_CHAIN_IDS = [
   1, 8453, 42161, 10, 137, 43114, 56, 146, 130, 59144, 534352, 5000, 81457, 480,
 ];
 
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const BASE58_MAP = new Map(Array.from(BASE58_ALPHABET).map((ch, i) => [ch, BigInt(i)]));
+const EVM_ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+const ZERO_EVM_ADDR = '0x0000000000000000000000000000000000000000';
+const ZERO_BYTES32 = '0x' + '00'.repeat(32);
+
+export function solanaBase58ToBytes32Hex(addr) {
+  const s = String(addr || '').trim();
+  if (!s || s.length < 32 || s.length > 44) {
+    throw new Error('Invalid Solana base58 destination address.');
+  }
+  let value = 0n;
+  for (let i = 0; i < s.length; i++) {
+    const digit = BASE58_MAP.get(s[i]);
+    if (digit === undefined) {
+      throw new Error('Invalid Solana base58 character in destination address.');
+    }
+    value = value * 58n + digit;
+  }
+  const bytes = [];
+  while (value > 0n) {
+    bytes.push(Number(value & 0xffn));
+    value >>= 8n;
+  }
+  bytes.reverse();
+  let leadingZeros = 0;
+  while (leadingZeros < s.length && s[leadingZeros] === '1') leadingZeros++;
+  const full = new Uint8Array(leadingZeros + bytes.length);
+  full.set(bytes, leadingZeros);
+  if (full.length !== 32) {
+    throw new Error('Invalid Solana public key length (expected 32 bytes).');
+  }
+  const hex =
+    '0x' +
+    Array.from(full)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  return hex;
+}
+
+export function isValidSolanaBase58(addr) {
+  try {
+    const hex = solanaBase58ToBytes32Hex(addr);
+    return hex !== ZERO_BYTES32;
+  } catch {
+    return false;
+  }
+}
+
+export function isUserRejectedError(err) {
+  const code = err?.code ?? err?.cause?.code ?? err?.data?.originalError?.code;
+  if (code === 4001 || code === 'ACTION_REJECTED') return true;
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    msg.includes('user rejected') ||
+    msg.includes('user denied') ||
+    msg.includes('rejected the request') ||
+    msg.includes('action_rejected')
+  );
+}
+
+function withTimeout(promise, ms, timeoutMessage = 'RPC request timed out') {
+  let timer = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function assertValidEvmAddress(addr, label = 'address') {
+  const s = String(addr || '').trim();
+  if (!EVM_ADDR_RE.test(s) || s.toLowerCase() === ZERO_EVM_ADDR) {
+    throw new Error(`Pre-sign check failed: invalid ${label} (${s || 'empty'}).`);
+  }
+  return s;
+}
+
+function assertFromMatchesConnected(expectedFrom) {
+  if (!connectedEvmAddress) {
+    throw new Error('Connect your EVM wallet before signing.');
+  }
+  if (expectedFrom && String(expectedFrom).toLowerCase() !== connectedEvmAddress.toLowerCase()) {
+    throw new Error(
+      `Pre-sign check failed: signer mismatch (${expectedFrom} !== connected ${connectedEvmAddress}).`
+    );
+  }
+}
+
+function assertValidCallForSign(call, expectedSolanaDestination) {
+  assertValidEvmAddress(call?.to, 'target contract');
+  if (call?.data !== undefined && call?.data !== null && call?.data !== '') {
+    if (typeof call.data !== 'string' || !/^0x([0-9a-fA-F]{2})*$/.test(call.data)) {
+      throw new Error('Pre-sign check failed: malformed transaction calldata.');
+    }
+  }
+  if (
+    expectedSolanaDestination &&
+    call?.solanaDestination &&
+    String(call.solanaDestination).trim() !== String(expectedSolanaDestination).trim()
+  ) {
+    throw new Error('Pre-sign check failed: call Solana destination does not match UI destination.');
+  }
+  if (
+    expectedSolanaDestination &&
+    typeof call?.data === 'string' &&
+    call.data.toLowerCase().startsWith('0x6fd3504e') &&
+    call.data.length >= 10 + 256
+  ) {
+    const expectedBytes32 = solanaBase58ToBytes32Hex(expectedSolanaDestination).toLowerCase();
+    const encodedRecipient = '0x' + call.data.slice(10 + 128, 10 + 192).toLowerCase();
+    if (encodedRecipient !== expectedBytes32) {
+      throw new Error(
+        'Pre-sign check failed: CCTP depositForBurn mintRecipient does not match your Solana destination.'
+      );
+    }
+  }
+}
+
+function assertSolanaRecipientMatch(recipientValue, expectedSolanaDestination) {
+  if (!expectedSolanaDestination || recipientValue === undefined || recipientValue === null) return;
+  const expectedTrim = String(expectedSolanaDestination).trim();
+  const expectedBytes32 = solanaBase58ToBytes32Hex(expectedTrim).toLowerCase();
+  const raw = String(recipientValue).trim();
+  if (/^0x[0-9a-fA-F]{64}$/.test(raw)) {
+    if (raw.toLowerCase() !== expectedBytes32) {
+      throw new Error(
+        'Pre-sign check failed: typed-data solanaRecipient bytes32 does not match your Solana destination.'
+      );
+    }
+    return;
+  }
+  if (raw !== expectedTrim) {
+    throw new Error(
+      'Pre-sign check failed: typed-data solanaRecipient does not match your Solana destination.'
+    );
+  }
+}
+
 const discoveredEvmProviders = [];
 const discoveredSolanaStandardWallets = [];
 const discoveredSuiStandardWallets = [];
@@ -160,6 +300,7 @@ let cachedSdkModule = null;
 let sdkPreloadPromise = null;
 let cachedCoinbaseProvider = null;
 let activeEvmListeners = null;
+let activeSolanaSession = null;
 
 const WC_STORAGE_KEY = 'siphon_wc_project_id';
 
@@ -185,25 +326,27 @@ export function getEffectiveWalletConnectProjectId() {
   return walletSdkConfig.walletConnectProjectId || getSavedWalletConnectProjectId();
 }
 
-async function loadWalletSdkBundle() {
-  if (cachedSdkModule) return cachedSdkModule;
+async function loadWalletSdkBundle({ initCoinbase = false } = {}) {
+  if (cachedSdkModule) {
+    if (initCoinbase && !cachedCoinbaseProvider && typeof cachedSdkModule.createCoinbaseWalletSDK === 'function') {
+      try {
+        const sdk = cachedSdkModule.createCoinbaseWalletSDK({
+          appName: 'Siphon',
+          appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
+          appChainIds: SUPPORTED_CHAIN_IDS,
+          preference: { options: 'all' },
+        });
+        cachedCoinbaseProvider = sdk.getProvider();
+      } catch {
+        // instantiate on demand
+      }
+    }
+    return cachedSdkModule;
+  }
   if (!sdkPreloadPromise) {
     sdkPreloadPromise = import('/vendor/wallet-sdks.js')
       .then((mod) => {
         cachedSdkModule = mod;
-        if (!cachedCoinbaseProvider && typeof mod.createCoinbaseWalletSDK === 'function') {
-          try {
-            const sdk = mod.createCoinbaseWalletSDK({
-              appName: 'Siphon',
-              appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
-              appChainIds: SUPPORTED_CHAIN_IDS,
-              preference: { options: 'all' },
-            });
-            cachedCoinbaseProvider = sdk.getProvider();
-          } catch {
-            // instantiate on demand
-          }
-        }
         return mod;
       })
       .catch((err) => {
@@ -211,19 +354,43 @@ async function loadWalletSdkBundle() {
         throw err;
       });
   }
-  return sdkPreloadPromise;
+  const mod = await sdkPreloadPromise;
+  if (initCoinbase && !cachedCoinbaseProvider && typeof mod.createCoinbaseWalletSDK === 'function') {
+    try {
+      const sdk = mod.createCoinbaseWalletSDK({
+        appName: 'Siphon',
+        appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
+        appChainIds: SUPPORTED_CHAIN_IDS,
+        preference: { options: 'all' },
+      });
+      cachedCoinbaseProvider = sdk.getProvider();
+    } catch {
+      // instantiate on demand
+    }
+  }
+  return mod;
 }
 
 export function preloadWalletSdks() {
   if (typeof window === 'undefined') return;
-  loadWalletSdkBundle().catch(() => {});
+  loadWalletSdkBundle({ initCoinbase: false }).catch(() => {});
 }
 
 export async function loadWalletConnectorConfig() {
   try {
     const res = await fetch('/api/config');
     if (res.ok) {
-      walletSdkConfig = await res.json();
+      const data = await res.json();
+      if (data && typeof data === 'object') {
+        walletSdkConfig = {
+          ...walletSdkConfig,
+          ...data,
+          protocolFee: {
+            ...walletSdkConfig.protocolFee,
+            ...(data.protocolFee && typeof data.protocolFee === 'object' ? data.protocolFee : {}),
+          },
+        };
+      }
     }
   } catch {
     // keep defaults
@@ -340,7 +507,13 @@ function detachEvmListeners() {
 function attachEvmListeners(provider, callbacks = {}) {
   detachEvmListeners();
   const onAccounts = async (nextAccounts) => {
-    connectedEvmAddress = nextAccounts?.[0] ?? null;
+    const next = nextAccounts?.[0] ?? null;
+    if (!next) {
+      disconnectEvmWallet();
+      callbacks.onAccountsChanged?.(null);
+      return;
+    }
+    connectedEvmAddress = next;
     await detectWalletBatchCapabilities(connectedEvmAddress);
     callbacks.onAccountsChanged?.(connectedEvmAddress);
   };
@@ -350,19 +523,19 @@ function attachEvmListeners(provider, callbacks = {}) {
       callbacks.onChainChanged?.();
     }
   };
-  const onDisconnect = callbacks.onDisconnect
-    ? () => {
-        disconnectEvmWallet();
-        callbacks.onDisconnect?.();
-      }
-    : null;
+  const onDisconnect = () => {
+    disconnectEvmWallet();
+    callbacks.onDisconnect?.();
+    callbacks.onAccountsChanged?.(null);
+  };
   provider.on?.('accountsChanged', onAccounts);
   provider.on?.('chainChanged', onChain);
-  if (onDisconnect) provider.on?.('disconnect', onDisconnect);
+  provider.on?.('disconnect', onDisconnect);
   activeEvmListeners = { provider, onAccounts, onChain, onDisconnect };
 }
 
 export function disconnectEvmWallet() {
+  const prevProvider = activeEvmProvider;
   detachEvmListeners();
   activeEvmProvider = null;
   connectedEvmAddress = null;
@@ -375,11 +548,43 @@ export function disconnectEvmWallet() {
     details: {},
     modeLabel: 'EIP-5792 Ready (connect MetaMask, Rabby, Coinbase, or Phantom)',
   };
+  if (typeof prevProvider?.disconnect === 'function') {
+    try {
+      Promise.resolve(prevProvider.disconnect()).catch(() => {});
+    } catch {
+      // ignore provider disconnect errors
+    }
+  }
+}
+
+function detachSolanaListeners() {
+  if (!activeSolanaSession) return;
+  try {
+    activeSolanaSession.cleanup?.();
+  } catch {
+    // ignore cleanup errors
+  }
+  activeSolanaSession = null;
 }
 
 export function disconnectSolanaWallet() {
+  const prev = activeSolanaSession;
+  detachSolanaListeners();
   connectedSolanaAddress = null;
   connectedSolanaWalletName = null;
+  if (prev?.kind === 'standard' && typeof prev.wallet?.features?.['standard:disconnect']?.disconnect === 'function') {
+    try {
+      Promise.resolve(prev.wallet.features['standard:disconnect'].disconnect()).catch(() => {});
+    } catch {
+      // ignore
+    }
+  } else if (prev?.kind === 'legacy' && typeof prev.provider?.disconnect === 'function') {
+    try {
+      Promise.resolve(prev.provider.disconnect()).catch(() => {});
+    } catch {
+      // ignore
+    }
+  }
 }
 
 export function getWalletBatchCapabilities() {
@@ -449,19 +654,27 @@ export async function detectWalletBatchCapabilities(address = connectedEvmAddres
 
   const hexChainIds = chainIds.map((id) => '0x' + Number(id).toString(16));
   try {
-    const raw = await activeEvmProvider.request({
-      method: 'wallet_getCapabilities',
-      params: [address, hexChainIds],
-    });
+    const raw = await withTimeout(
+      activeEvmProvider.request({
+        method: 'wallet_getCapabilities',
+        params: [address, hexChainIds],
+      }),
+      2500,
+      'wallet_getCapabilities timed out'
+    );
     cachedBatchCapabilities = parseCapabilitiesResponse(raw, chainIds);
     return cachedBatchCapabilities;
   } catch {
     // Fallback to EIP-5792 v1 1-arg form: wallet_getCapabilities([address])
     try {
-      const rawV1 = await activeEvmProvider.request({
-        method: 'wallet_getCapabilities',
-        params: [address],
-      });
+      const rawV1 = await withTimeout(
+        activeEvmProvider.request({
+          method: 'wallet_getCapabilities',
+          params: [address],
+        }),
+        2500,
+        'wallet_getCapabilities v1 timed out'
+      );
       cachedBatchCapabilities = parseCapabilitiesResponse(rawV1, chainIds);
       return cachedBatchCapabilities;
     } catch {
@@ -585,8 +798,14 @@ export async function connectEvmWallet(optionsOrCallback) {
       'No EVM browser wallet detected. Install MetaMask, Rabby, Coinbase Wallet, or Phantom (EVM) to sign live batches.'
     );
   }
-  const chosen =
-    (opts.walletId ? wallets.find((w) => w.id === opts.walletId) : null) || wallets[0];
+  let chosen = wallets[0];
+  if (opts.walletId) {
+    const match = wallets.find((w) => w.id === opts.walletId);
+    if (!match) {
+      throw new Error('Selected EVM wallet is no longer available. Please refresh or choose another wallet.');
+    }
+    chosen = match;
+  }
   const provider = chosen.provider;
   const accounts = await provider.request({ method: 'eth_requestAccounts' });
   if (!accounts || !accounts[0]) {
@@ -611,15 +830,19 @@ export async function connectEvmWallet(optionsOrCallback) {
 export async function connectCoinbaseSmartWallet(callbacks = {}) {
   let provider = cachedCoinbaseProvider;
   if (!provider) {
-    const { createCoinbaseWalletSDK } = await loadWalletSdkBundle();
-    const sdk = createCoinbaseWalletSDK({
-      appName: 'Siphon',
-      appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
-      appChainIds: SUPPORTED_CHAIN_IDS,
-      preference: { options: 'all' },
-    });
-    provider = sdk.getProvider();
-    cachedCoinbaseProvider = provider;
+    const { createCoinbaseWalletSDK } = await loadWalletSdkBundle({ initCoinbase: true });
+    if (cachedCoinbaseProvider) {
+      provider = cachedCoinbaseProvider;
+    } else {
+      const sdk = createCoinbaseWalletSDK({
+        appName: 'Siphon',
+        appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
+        appChainIds: SUPPORTED_CHAIN_IDS,
+        preference: { options: 'all' },
+      });
+      provider = sdk.getProvider();
+      cachedCoinbaseProvider = provider;
+    }
   }
   const accounts = await provider.request({ method: 'eth_requestAccounts' });
   if (!accounts || !accounts[0]) {
@@ -652,8 +875,7 @@ export async function connectWalletConnect(callbacks = {}) {
   const { EthereumProvider } = await loadWalletSdkBundle();
   const provider = await EthereumProvider.init({
     projectId,
-    chains: [1],
-    optionalChains: [8453, 42161, 10, 137, 43114],
+    optionalChains: SUPPORTED_CHAIN_IDS,
     showQrModal: true,
     metadata: {
       name: 'Siphon',
@@ -663,7 +885,10 @@ export async function connectWalletConnect(callbacks = {}) {
     },
   });
   await provider.connect();
-  const accounts = await provider.request({ method: 'eth_requestAccounts' });
+  const accounts =
+    Array.isArray(provider.accounts) && provider.accounts.length
+      ? provider.accounts
+      : await provider.request({ method: 'eth_requestAccounts' });
   if (!accounts || !accounts[0]) {
     throw new Error('WalletConnect session cancelled.');
   }
@@ -683,7 +908,11 @@ export async function ensureEvmChain(chainId) {
   if (!activeEvmProvider) {
     throw new Error('Connect an EVM wallet first.');
   }
-  const hexChainId = '0x' + Number(chainId).toString(16);
+  const numericChainId = Number(chainId);
+  if (!Number.isInteger(numericChainId) || numericChainId <= 0) {
+    throw new Error(`Invalid target EVM chainId: ${chainId}`);
+  }
+  const hexChainId = '0x' + numericChainId.toString(16);
   const currentHex = await activeEvmProvider.request({ method: 'eth_chainId' });
   if (String(currentHex).toLowerCase() === hexChainId.toLowerCase()) return;
 
@@ -693,21 +922,39 @@ export async function ensureEvmChain(chainId) {
       params: [{ chainId: hexChainId }],
     });
   } catch (err) {
-    if (err?.code === 4902 && CHAIN_ADD_PARAMS[chainId]) {
+    const nestedCode = err?.code ?? err?.data?.originalError?.code ?? err?.cause?.code;
+    if (nestedCode === 4902 && CHAIN_ADD_PARAMS[numericChainId]) {
       await activeEvmProvider.request({
         method: 'wallet_addEthereumChain',
-        params: [CHAIN_ADD_PARAMS[chainId]],
+        params: [CHAIN_ADD_PARAMS[numericChainId]],
       });
+      // EIP-3085 does not guarantee an automatic switch on all wallets
+      const afterAddHex = await activeEvmProvider.request({ method: 'eth_chainId' });
+      if (String(afterAddHex).toLowerCase() !== hexChainId.toLowerCase()) {
+        await activeEvmProvider.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: hexChainId }],
+        });
+      }
     } else {
       throw err;
     }
   }
+
+  const verifiedHex = await activeEvmProvider.request({ method: 'eth_chainId' });
+  if (String(verifiedHex).toLowerCase() !== hexChainId.toLowerCase()) {
+    throw new Error(
+      `Wallet failed to switch to target chain ${hexChainId} (still on ${verifiedHex || 'unknown'}). Transaction aborted to prevent wrong-chain broadcast.`
+    );
+  }
 }
 
-export async function sendRealEvmTransaction(tx) {
+export async function sendRealEvmTransaction(tx, opts = {}) {
   if (!activeEvmProvider || !connectedEvmAddress) {
     throw new Error('Connect your EVM wallet before signing live transactions.');
   }
+  assertFromMatchesConnected(tx?.from || opts?.expectedFrom);
+  assertValidCallForSign(tx, opts?.expectedSolanaDestination);
   await ensureEvmChain(tx.chainId);
 
   const txParams = {
@@ -729,13 +976,38 @@ export async function sendRealEvmTransaction(tx) {
  * Signs a gasless off-chain EIP-712 typed-data payload (Permit2 PermitBatchTransferFrom or
  * EIP-7702 SweepIntent) with ZERO native ETH/POL/AVAX gas required in the user's wallet.
  */
-export async function signGaslessTypedData(typedData, chainId) {
+export async function signGaslessTypedData(typedData, chainId, opts = {}) {
   if (!activeEvmProvider || !connectedEvmAddress) {
     throw new Error('Connect your EVM wallet to sign the gasless sweep intent.');
   }
-  if (chainId) {
-    await ensureEvmChain(chainId);
+  assertFromMatchesConnected(opts?.expectedFrom);
+
+  const parsed = typeof typedData === 'string' ? JSON.parse(typedData) : typedData;
+  const domainChainId = parsed?.domain?.chainId;
+  if (chainId !== undefined && chainId !== null) {
+    const targetId = Number(chainId);
+    if (!Number.isInteger(targetId) || targetId <= 0) {
+      throw new Error(`Pre-sign check failed: invalid target chainId (${chainId}).`);
+    }
+    if (domainChainId !== undefined && domainChainId !== null && Number(domainChainId) !== targetId) {
+      throw new Error(
+        `Pre-sign check failed: EIP-712 domain.chainId (${domainChainId}) !== target chainId (${targetId}).`
+      );
+    }
+    await ensureEvmChain(targetId);
   }
+
+  const witnessRecipient =
+    parsed?.message?.witness?.solanaRecipient ?? parsed?.message?.solanaRecipient;
+  if (opts?.expectedSolanaDestination) {
+    if (witnessRecipient === undefined || witnessRecipient === null) {
+      throw new Error(
+        'Pre-sign check failed: gasless typed-data payload is missing solanaRecipient commitment.'
+      );
+    }
+    assertSolanaRecipientMatch(witnessRecipient, opts.expectedSolanaDestination);
+  }
+
   const payload = typeof typedData === 'string' ? typedData : JSON.stringify(typedData);
   const signature = await activeEvmProvider.request({
     method: 'eth_signTypedData_v4',
@@ -749,19 +1021,36 @@ export async function signGaslessTypedData(typedData, chainId) {
 
 /**
  * Submits ALL calls on a single EVM chain in ONE wallet confirmation popup via EIP-5792 `wallet_sendCalls`.
- * Supports both EIP-5792 v2 (`version: "2.0.0"`, `atomicRequired: false`) and v1 (`version: "1.0"`).
+ * Enforces `atomicRequired: true` whenever the batch includes protocol fee steps so a failed swap/bridge
+ * cannot leave a standalone fee transfer executed onchain.
  * Throws an Error with `err.unsupportedEip5792 = true` if the wallet lacks EIP-5792 so callers can fall back seamlessly.
  */
-export async function sendEip5792Batch({ chainId, calls }) {
+export async function sendEip5792Batch({
+  chainId,
+  calls,
+  atomicRequired,
+  expectedFrom,
+  expectedSolanaDestination,
+}) {
   if (!activeEvmProvider || !connectedEvmAddress) {
     throw new Error('Connect your EVM wallet before signing live batches.');
   }
   if (!Array.isArray(calls) || !calls.length) {
     throw new Error('No calls prepared for this chain batch.');
   }
+  assertFromMatchesConnected(expectedFrom);
+  for (const c of calls) {
+    assertValidCallForSign(c, expectedSolanaDestination);
+  }
 
   await ensureEvmChain(chainId);
   const hexChainId = '0x' + Number(chainId).toString(16);
+  const hasProtocolFeeStep = calls.some(
+    (c) =>
+      c?.isProtocolFee === true ||
+      String(c?.stepId || '').toLowerCase().startsWith('protocol_fee')
+  );
+  const mustBeAtomic = Boolean(atomicRequired ?? hasProtocolFeeStep);
   const formattedCalls = calls.map((c) => ({
     to: c.to,
     data: c.data,
@@ -769,7 +1058,7 @@ export async function sendEip5792Batch({ chainId, calls }) {
   }));
 
   const isUnsupportedErr = (err) => {
-    const code = err?.code;
+    const code = err?.code ?? err?.cause?.code;
     const msg = String(err?.message || '').toLowerCase();
     return (
       code === -32601 ||
@@ -777,7 +1066,7 @@ export async function sendEip5792Batch({ chainId, calls }) {
       msg.includes('method not found') ||
       msg.includes('does not exist') ||
       msg.includes('unsupported method') ||
-      msg.includes('wallet_sendcalls')
+      msg.includes('not supported')
     );
   };
 
@@ -789,20 +1078,25 @@ export async function sendEip5792Batch({ chainId, calls }) {
           version: '2.0.0',
           chainId: hexChainId,
           from: connectedEvmAddress,
-          atomicRequired: false,
+          atomicRequired: mustBeAtomic,
           calls: formattedCalls,
         },
       ],
     });
     const batchId = typeof res === 'string' ? res : res?.id;
     if (!batchId) throw new Error('Wallet returned empty EIP-5792 batch ID.');
-    return { mode: 'eip5792', batchId, version: '2.0.0' };
+    return { mode: 'eip5792', batchId, version: '2.0.0', atomicRequired: mustBeAtomic };
   } catch (err) {
-    if (err?.code === 4001) throw err; // User rejected
+    if (isUserRejectedError(err)) throw err;
     if (isUnsupportedErr(err)) {
       const wrapped = new Error('Connected wallet does not support EIP-5792 wallet_sendCalls.');
       wrapped.unsupportedEip5792 = true;
       throw wrapped;
+    }
+
+    // Do NOT silently downgrade fee-bundled batches to non-atomic EIP-5792 v1
+    if (mustBeAtomic) {
+      throw err;
     }
 
     // Retry once with EIP-5792 v1 schema (`version: '1.0'`, no `atomicRequired`)
@@ -820,9 +1114,9 @@ export async function sendEip5792Batch({ chainId, calls }) {
       });
       const batchId = typeof resV1 === 'string' ? resV1 : resV1?.id;
       if (!batchId) throw new Error('Wallet returned empty EIP-5792 batch ID.');
-      return { mode: 'eip5792', batchId, version: '1.0' };
+      return { mode: 'eip5792', batchId, version: '1.0', atomicRequired: false };
     } catch (errV1) {
-      if (errV1?.code === 4001) throw errV1;
+      if (isUserRejectedError(errV1)) throw errV1;
       if (isUnsupportedErr(errV1)) {
         const wrapped = new Error('Connected wallet does not support EIP-5792 wallet_sendCalls.');
         wrapped.unsupportedEip5792 = true;
@@ -839,9 +1133,13 @@ export async function sendEip5792Batch({ chainId, calls }) {
  */
 export async function waitForEip5792Batch(batchId, onUpdate) {
   if (!activeEvmProvider) throw new Error('Wallet disconnected.');
+  let lastObservedTxHashes = [];
 
   for (let i = 0; i < 45; i++) {
     await new Promise((r) => setTimeout(r, 2000));
+    if (!activeEvmProvider) {
+      return { confirmed: false, failed: true, status: 'DISCONNECTED', txHashes: lastObservedTxHashes };
+    }
     try {
       const res = await activeEvmProvider.request({
         method: 'wallet_getCallsStatus',
@@ -852,8 +1150,9 @@ export async function waitForEip5792Batch(batchId, onUpdate) {
       const txHashes = Array.from(
         new Set(receipts.map((r) => r?.transactionHash).filter(Boolean))
       );
+      if (txHashes.length) lastObservedTxHashes = txHashes;
 
-      onUpdate?.({ status, txHashes, raw: res });
+      onUpdate?.({ status, txHashes: lastObservedTxHashes, raw: res });
 
       // EIP-5792 v2 numeric codes (200 = confirmed, >= 400 = failed) + v1 strings
       const isConfirmed = status === 200 || status === 'CONFIRMED';
@@ -863,17 +1162,26 @@ export async function waitForEip5792Batch(batchId, onUpdate) {
         status === 'REVERTED';
 
       if (isConfirmed) {
-        return { confirmed: true, failed: false, status, txHashes, raw: res };
+        const anySubRevert = receipts.some(
+          (r) => r?.status === '0x0' || r?.status === 0 || r?.status === '0' || r?.status === false
+        );
+        if (anySubRevert) {
+          return { confirmed: false, failed: true, status: 'REVERTED', txHashes: lastObservedTxHashes, raw: res };
+        }
+        return { confirmed: true, failed: false, status, txHashes: lastObservedTxHashes, raw: res };
       }
       if (isFailed) {
-        return { confirmed: false, failed: true, status, txHashes, raw: res };
+        return { confirmed: false, failed: true, status, txHashes: lastObservedTxHashes, raw: res };
       }
-    } catch {
+    } catch (err) {
+      if (err?.code === -32601 || err?.code === -32602) {
+        return { confirmed: false, failed: true, status: 'UNSUPPORTED', txHashes: lastObservedTxHashes };
+      }
       // Keep polling briefly while wallet indexes bundle
     }
   }
 
-  return { confirmed: false, failed: false, status: 'TIMEOUT', txHashes: [] };
+  return { confirmed: false, failed: false, status: 'TIMEOUT', txHashes: lastObservedTxHashes };
 }
 
 export function listAvailableSolanaWallets() {
@@ -940,8 +1248,16 @@ export async function connectSolanaWallet(options = {}) {
     );
   }
 
-  const chosen =
-    (options.walletId ? wallets.find((w) => w.id === options.walletId) : null) || wallets[0];
+  let chosen = wallets[0];
+  if (options.walletId) {
+    const match = wallets.find((w) => w.id === options.walletId);
+    if (!match) {
+      throw new Error('Selected Solana wallet is not available. Please choose another wallet.');
+    }
+    chosen = match;
+  }
+
+  detachSolanaListeners();
 
   let pubkey = null;
   if (chosen.kind === 'standard') {
@@ -957,22 +1273,52 @@ export async function connectSolanaWallet(options = {}) {
   connectedSolanaAddress = pubkey;
   connectedSolanaWalletName = chosen.name;
 
-  if (chosen.kind === 'legacy' && chosen.provider?.on) {
+  let cleanup = null;
+  if (chosen.kind === 'standard' && typeof chosen.wallet.features?.['standard:events']?.on === 'function') {
     try {
-      chosen.provider.on('accountChanged', (nextPubkey) => {
-        const nextStr = nextPubkey?.toString?.() || null;
+      const off = chosen.wallet.features['standard:events'].on('change', ({ accounts }) => {
+        if (!Array.isArray(accounts)) return;
+        const nextStr = accounts[0]?.address || null;
         connectedSolanaAddress = nextStr;
+        if (!nextStr) connectedSolanaWalletName = null;
         options.onAccountChanged?.(nextStr);
       });
-      chosen.provider.on('disconnect', () => {
+      if (typeof off === 'function') cleanup = off;
+    } catch {
+      // ignore optional event errors
+    }
+  } else if (chosen.kind === 'legacy' && chosen.provider?.on) {
+    try {
+      const onAccountChanged = (nextPubkey) => {
+        const nextStr = nextPubkey?.toString?.() || null;
+        connectedSolanaAddress = nextStr;
+        if (!nextStr) connectedSolanaWalletName = null;
+        options.onAccountChanged?.(nextStr);
+      };
+      const onDisconnect = () => {
+        detachSolanaListeners();
         connectedSolanaAddress = null;
         connectedSolanaWalletName = null;
         options.onAccountChanged?.(null);
-      });
+      };
+      chosen.provider.on('accountChanged', onAccountChanged);
+      chosen.provider.on('disconnect', onDisconnect);
+      cleanup = () => {
+        chosen.provider.removeListener?.('accountChanged', onAccountChanged);
+        chosen.provider.off?.('accountChanged', onAccountChanged);
+        chosen.provider.removeListener?.('disconnect', onDisconnect);
+        chosen.provider.off?.('disconnect', onDisconnect);
+      };
     } catch {
       // ignore optional listener errors
     }
   }
+  activeSolanaSession = {
+    kind: chosen.kind,
+    wallet: chosen.wallet || null,
+    provider: chosen.provider || null,
+    cleanup,
+  };
 
   return { address: pubkey, walletName: chosen.name };
 }
@@ -1245,7 +1591,10 @@ export async function connectFamilyWallet(family, opts = {}) {
     } else if (typeof chosen.provider.request === 'function') {
       const res = await chosen.provider.request('getAccounts', { purposes: ['payment', 'ordinals'] });
       const accs = res?.result || res || [];
-      address = accs?.[0]?.address || null;
+      const payment = Array.isArray(accs)
+        ? accs.find((a) => a?.purpose === 'payment') || accs[0]
+        : null;
+      address = payment?.address || null;
     }
   }
 
@@ -1266,20 +1615,29 @@ export async function connectFamilyWallet(family, opts = {}) {
   return session;
 }
 
-export async function signFamilyGaslessIntent(family, intent) {
+export async function signFamilyGaslessIntent(family, intent, opts = {}) {
   if (family === 'evm') {
-    return signGaslessTypedData(intent.typedData || intent.signPayload, intent.chainId);
+    return signGaslessTypedData(intent.typedData || intent.signPayload, intent.chainId, opts);
   }
   const session = familyWalletSessions[family];
   if (!session) {
     throw new Error(`Connect your ${family.toUpperCase()} wallet first to sign the 1-sig gasless sweep.`);
   }
+  if (
+    opts?.expectedSolanaDestination &&
+    intent?.solanaDestination &&
+    String(intent.solanaDestination).trim() !== String(opts.expectedSolanaDestination).trim()
+  ) {
+    throw new Error('Pre-sign check failed: intent Solana destination does not match your UI destination.');
+  }
   const msgText = JSON.stringify(intent.signPayload || intent);
 
   if (family === 'cosmos') {
     const chainId = String(intent.chainId || 'cosmoshub-4');
+    const chainKey = String(intent.chain || '').toLowerCase();
+    const signerAddr = session.addressesByChain?.[chainKey] || session.address;
     if (typeof session.provider.signArbitrary === 'function') {
-      const sig = await session.provider.signArbitrary(chainId, session.address, msgText);
+      const sig = await session.provider.signArbitrary(chainId, signerAddr, msgText);
       return sig?.signature || JSON.stringify(sig);
     }
     throw new Error('Connected Cosmos wallet does not expose signArbitrary.');
@@ -1287,9 +1645,12 @@ export async function signFamilyGaslessIntent(family, intent) {
   if (family === 'sui') {
     const bytes = new TextEncoder().encode(msgText);
     if (session.kind === 'standard' && session.provider.features?.['sui:signPersonalMessage']) {
+      const matchingAccount =
+        session.provider.accounts?.find((a) => a.address === session.address) ||
+        session.provider.accounts?.[0];
       const res = await session.provider.features['sui:signPersonalMessage'].signPersonalMessage({
         message: bytes,
-        account: session.provider.accounts?.[0],
+        account: matchingAccount,
       });
       return res?.signature || JSON.stringify(res);
     }
@@ -1304,11 +1665,9 @@ export async function signFamilyGaslessIntent(family, intent) {
     return res?.signature || JSON.stringify(res);
   }
   if (family === 'ton') {
-    if (typeof session.provider.send === 'function') {
-      const res = await session.provider.send('ton_rawSign', [{ data: intent.intentDigestSha256 }]);
-      return typeof res === 'string' ? res : JSON.stringify(res);
-    }
-    throw new Error('Tonkeeper extension signing unavailable — approve via TonConnect.');
+    throw new Error(
+      'Blind TON raw digest signing (ton_rawSign) is disabled for wallet safety. Use a structured TonConnect 2 sendTransaction wallet flow to review exact transfer messages before approving.'
+    );
   }
   if (family === 'tron') {
     const tw = window.tronWeb || window.tronLink?.tronWeb;
@@ -1320,6 +1679,10 @@ export async function signFamilyGaslessIntent(family, intent) {
   if (family === 'btc') {
     if (session.walletId === 'unisat' && typeof session.provider.signMessage === 'function') {
       return await session.provider.signMessage(msgText);
+    }
+    if (session.walletId === 'phantom-btc' && typeof session.provider.signMessage === 'function') {
+      const res = await session.provider.signMessage(session.address, new TextEncoder().encode(msgText));
+      return typeof res === 'string' ? res : res?.signature || JSON.stringify(res);
     }
     if (typeof session.provider.signMessage === 'function') {
       const res = await session.provider.signMessage(session.address, msgText);
