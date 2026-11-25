@@ -1,5 +1,5 @@
-import { mountSiphonFunnelScene } from './siphon-3d.js?v=3';
-import { renderConvergenceSvg } from './siphon-svg.js?v=3';
+import { mountSiphonFunnelScene } from './siphon-3d.js?v=4';
+import { renderConvergenceSvg } from './siphon-svg.js?v=4';
 import {
   connectCoinbaseSmartWallet,
   connectEvmWallet,
@@ -31,7 +31,7 @@ import {
   signGaslessTypedData,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
-} from './wallets.js?v=3';
+} from './wallets.js?v=4';
 
 let currentScan = null;
 let currentPlan = null;
@@ -1392,9 +1392,21 @@ async function executeChainBatchLive(chain, existingJobId = null) {
       return;
     }
 
-    if (executionMode === 'gasless') {
+    const hasDefiContractExits = chainAssets.some(
+      (a) =>
+        a.action === 'WITHDRAW_AND_BRIDGE' &&
+        a.protocol &&
+        !a.protocol.toLowerCase().includes('lido')
+    );
+
+    if (executionMode === 'gasless' && !hasDefiContractExits) {
       await executeGaslessIntentChain(chain, jobId, chainAssets, connectedEvm, solDest);
       return;
+    }
+    if (executionMode === 'gasless' && hasDefiContractExits) {
+      showToast(
+        `${batch.chainName}: executing smart-contract DeFi withdrawal directly via wallet batch (Permit2 cannot call Pool.withdraw/ERC-4626 redeem directly).`
+      );
     }
 
     const chainCap = isChainBatchSupported(batch.chainId);
@@ -1481,6 +1493,14 @@ async function executeChainBatchLive(chain, existingJobId = null) {
       }
     }
 
+    const hasDefiExitCall = batch.calls.some(
+      (c) =>
+        c.stepId === 'aave_withdraw' ||
+        c.stepId === 'compound_withdraw' ||
+        c.stepId === 'erc4626_redeem'
+    );
+    const hasCctpAfterDefi = batch.calls.some((c) => c.stepId === 'cctp_deposit_for_burn_after_defi');
+
     // Hand off to Siphon's server-side background settlement watcher!
     await patchJobLeg(jobId, chain, {
       status: batch.bridgeTrackers.length ? 'relaying' : 'landed',
@@ -1490,13 +1510,20 @@ async function executeChainBatchLive(chain, existingJobId = null) {
       requiresSolanaClaim,
       statusText: batch.bridgeTrackers.length
         ? `Confirmed on ${batch.chainName} · relaying to Solana in background…`
+        : hasDefiExitCall && !hasCctpAfterDefi
+        ? `Withdrawn from DeFi contract on ${batch.chainName} — rescanning unlocked balance…`
         : `Confirmed on ${batch.chainName}`,
     });
 
     showToast(
-      `${batch.chainName} submitted — Siphon Background Agent is tracking Solana settlement.`
+      hasDefiExitCall && !hasCctpAfterDefi
+        ? `${batch.chainName} smart-contract withdrawal confirmed! Rescanning wallet so you can bridge unlocked tokens.`
+        : `${batch.chainName} submitted — Siphon Background Agent is tracking Solana settlement.`
     );
     syncBackgroundJobs();
+    if (hasDefiExitCall && !hasCctpAfterDefi) {
+      setTimeout(() => runScan({ address: connectedEvm, family: 'evm', autoOpen: false }), 2500);
+    }
   } catch (err) {
     await patchJobLeg(jobId, chain, {
       status: 'failed',
@@ -1703,6 +1730,36 @@ function renderWalletModalContent() {
             <span class="mono wallet-option-action">${isBusy ? 'Connecting…' : activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
           </button>
         `);
+      }
+    }
+    if (activeFamily === 'cosmos') {
+      // Offer clickable Connect rows for all supported Cosmos wallets (deduped against detected ones)
+      const detectedIds = new Set(detectedFam.map((w) => w.id));
+      const cosmosChoices = [
+        { id: 'keplr', name: 'Keplr', logo: '/logos/keplr.svg', sub: 'Cosmos Hub · Osmosis · Noble · Celestia · Injective · Neutron' },
+        { id: 'leap', name: 'Leap Wallet', logo: '/logos/leap.svg', sub: 'All 6 Cosmos / IBC chains' },
+        { id: 'cosmostation', name: 'Cosmostation', logo: '/logos/cosmos.svg', sub: 'Cosmostation browser extension' },
+        { id: 'okx-cosmos', name: 'OKX Wallet (Cosmos)', logo: '/logos/okx.svg', sub: 'OKX multi-chain Cosmos provider' },
+      ].filter((cw) => !detectedIds.has(cw.id));
+      if (cosmosChoices.length) {
+        rows.push(
+          `<div class="wallet-section-label">${detectedFam.length ? 'Other Cosmos wallets' : 'Connect Cosmos Wallet'}</div>`
+        );
+        for (const cw of cosmosChoices) {
+          const isBusy = walletModalConnecting === `fam:${cw.id}`;
+          rows.push(`
+            <button type="button" class="wallet-option-row" data-pick-family-wallet="${escapeHtml(cw.id)}" ${walletModalConnecting ? 'disabled' : ''}>
+              <div class="wallet-option-left">
+                ${getWalletBrandBadge(cw.name, cw.logo)}
+                <div>
+                  <div class="wallet-option-name">${escapeHtml(cw.name)}</div>
+                  <div class="wallet-option-meta mono">${escapeHtml(cw.sub)}</div>
+                </div>
+              </div>
+              <span class="mono wallet-option-action">${isBusy ? 'Connecting…' : 'Connect →'}</span>
+            </button>
+          `);
+        }
       }
     }
     if (meta?.wallets?.length) {
@@ -2003,8 +2060,18 @@ function renderWalletModalContent() {
         const res = await connectFamilyWallet(activeFamily, { walletId });
         closeWalletModal();
         updateWalletButtons();
-        showToast(`Connected ${res.walletName} (${shortAddr(res.address)})`);
-        await runScan({ address: res.address, family: activeFamily, autoOpen: true });
+        const multiAddrs =
+          activeFamily === 'cosmos' && res.addressesByChain
+            ? Array.from(new Set(Object.values(res.addressesByChain).filter(Boolean)))
+            : [];
+        const chainCountNote =
+          multiAddrs.length > 1 ? ` · ${multiAddrs.length} Cosmos chains` : '';
+        showToast(`Connected ${res.walletName} (${shortAddr(res.address)})${chainCountNote}`);
+        await runScan({
+          address: multiAddrs.length > 1 ? multiAddrs.join(',') : res.address,
+          family: activeFamily,
+          autoOpen: true,
+        });
       } catch (err) {
         walletModalConnecting = null;
         walletModalError = err?.message || 'Wallet connection cancelled.';

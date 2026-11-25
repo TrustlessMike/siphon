@@ -114,6 +114,20 @@ def main():
               }};
               window.okxwallet = makeEvm('OKX');
               window.solflare = {{ async connect() {{ return {{ publicKey: {{ toString: () => '{SOL_PUBKEY}' }} }}; }} }};
+              window.keplr = {{
+                async enable(chainIds) {{
+                  window.__keplrEnabled = chainIds;
+                  return true;
+                }},
+                async getKey(chainId) {{
+                  const map = {{
+                    'cosmoshub-4': 'cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh',
+                    'osmosis-1': 'osmo1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh',
+                    'noble-1': 'noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh',
+                  }};
+                  return {{ bech32Address: map[chainId] || 'cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh' }};
+                }},
+              }};
               window.addEventListener('wallet-standard:app-ready', (e) => {{
                 e.detail.register({{
                   name: 'Phantom',
@@ -200,15 +214,19 @@ def main():
             }""")
             assert not brokenFamLogos, f"Broken family logos: {brokenFamLogos}"
 
-            # Verify switching to Bitcoin & Cosmos updates wallet modal & source chrome cleanly
+            # Verify switching to Cosmos & connecting Keplr enables multi-chain Cosmos wallets cleanly!
             pgD.click("#familyBar [data-family='cosmos']")
             pgD.wait_for_function("() => (document.querySelector('#connectEvmBtn')?.innerText || '').includes('Cosmos')", timeout=10000)
             pgD.click("#connectEvmBtn")
             pgD.wait_for_selector("#walletModalBackdrop:not(.hidden)")
             cosmosModalText = pgD.locator("#walletModalBackdrop").inner_text()
-            assert "Keplr" in cosmosModalText and "Leap" in cosmosModalText, cosmosModalText
-            pgD.keyboard.press("Escape")
-            pgD.wait_for_selector("#walletModalBackdrop", state="hidden")
+            assert "Keplr" in cosmosModalText and "Leap" in cosmosModalText and "Cosmostation" in cosmosModalText, cosmosModalText
+            pgD.click("[data-pick-family-wallet='keplr']")
+            pgD.wait_for_selector("#walletModalBackdrop", state="hidden", timeout=10000)
+            pgD.wait_for_function(
+                "() => (document.querySelector('#connectEvmBtn')?.innerText || '').includes('Keplr')",
+                timeout=10000,
+            )
 
             pgD.click("#familyBar [data-family='btc']")
             pgD.wait_for_function("() => (document.querySelector('#connectEvmBtn')?.innerText || '').includes('Bitcoin')", timeout=10000)

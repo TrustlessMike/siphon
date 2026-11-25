@@ -116,6 +116,7 @@ export interface ScannedAsset {
   protocol?: string;
   protocolAddress?: string;
   underlyingSymbol?: string;
+  underlyingAddress?: string;
   rawBalance: string;
   uiBalance: number;
   priceUsd: number;

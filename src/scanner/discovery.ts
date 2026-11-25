@@ -63,6 +63,88 @@ export function getL2IndexerProvider(): 'sim' | 'alchemy' | 'moralis' | 'none' {
   return 'none';
 }
 
+export interface DetectedDefiReceipt {
+  kind: 'aave_v3' | 'erc4626';
+  protocol: string;
+  protocolAddress: string;
+  underlyingAddress: string;
+}
+
+function decodeAbiAddressWord(hex: string): string | null {
+  const clean = hex.replace(/^0x/, '');
+  if (clean.length < 64) return null;
+  const addr = '0x' + clean.slice(24, 64).toLowerCase();
+  if (addr === '0x0000000000000000000000000000000000000000') return null;
+  return addr;
+}
+
+/**
+ * Probes arbitrary discovered ERC-20 contracts in ONE Multicall3 batch to automatically detect:
+ *  - ANY Aave v3 aToken via `UNDERLYING_ASSET_ADDRESS()` (0xb16a19de) + `POOL()` (0x7535d246)
+ *  - ANY ERC-4626 Vault (Morpho, Yearn v3, Spark, Sky, Ethena, Fluid, Euler) via `asset()` (0x38d52e0f)
+ */
+export async function probeDefiReceiptContracts(
+  chain: EvmChainId,
+  tokenAddresses: string[]
+): Promise<Map<string, DetectedDefiReceipt>> {
+  const detected = new Map<string, DetectedDefiReceipt>();
+  const cfg = EVM_CHAINS[chain];
+  const unique = Array.from(
+    new Set(tokenAddresses.filter((a) => /^0x[0-9a-fA-F]{40}$/.test(a)).map((a) => a.toLowerCase()))
+  ).slice(0, 20);
+  if (!cfg || !unique.length) return detected;
+
+  // 3 probes per token: [0] UNDERLYING_ASSET_ADDRESS(), [1] POOL(), [2] asset()
+  const calls = unique.flatMap((target) => [
+    { target, allowFailure: true, callData: '0xb16a19de' },
+    { target, allowFailure: true, callData: '0x7535d246' },
+    { target, allowFailure: true, callData: '0x38d52e0f' },
+  ]);
+
+  try {
+    const mcData = encodeMulticall3Aggregate3(calls);
+    const json = await evmJsonRpcCall<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [{ to: cfg.multicall3, data: mcData }, 'latest'],
+      3500
+    );
+    if (!json.result || json.result === '0x') return detected;
+    const results = decodeMulticall3Aggregate3(json.result);
+    for (let i = 0; i < unique.length; i++) {
+      const addr = unique[i];
+      const rUnderlying = results[i * 3];
+      const rPool = results[i * 3 + 1];
+      const rAsset = results[i * 3 + 2];
+
+      const aaveUnderlying = rUnderlying?.success ? decodeAbiAddressWord(rUnderlying.returnData) : null;
+      const aavePool = rPool?.success ? decodeAbiAddressWord(rPool.returnData) : null;
+      if (aaveUnderlying && aavePool) {
+        detected.set(addr, {
+          kind: 'aave_v3',
+          protocol: 'Aave v3',
+          protocolAddress: aavePool,
+          underlyingAddress: aaveUnderlying,
+        });
+        continue;
+      }
+
+      const erc4626Asset = rAsset?.success ? decodeAbiAddressWord(rAsset.returnData) : null;
+      if (erc4626Asset) {
+        detected.set(addr, {
+          kind: 'erc4626',
+          protocol: 'ERC-4626 Vault',
+          protocolAddress: addr,
+          underlyingAddress: erc4626Asset,
+        });
+      }
+    }
+  } catch {
+    // non-fatal probe
+  }
+  return detected;
+}
+
 export interface AaveAccountSafety {
   checked: boolean;
   hasActiveDebt: boolean;

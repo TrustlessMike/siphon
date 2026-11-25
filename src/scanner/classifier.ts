@@ -14,6 +14,7 @@ import {
   fetchDexLiquidityBatch,
   isEip2612Token,
   MIN_VERIFIED_DEX_LIQUIDITY_USD,
+  probeDefiReceiptContracts,
   simulateBurnTransferOnchain,
 } from './discovery.js';
 import { formatUnits, isValidEvmAddress, scanSingleEvmChain } from './rpc.js';
@@ -89,6 +90,7 @@ interface RawAssetSeed {
   protocol?: string;
   protocolAddress?: string;
   underlyingSymbol?: string;
+  underlyingAddress?: string;
   rawBalance: bigint;
   priceUsd: number;
   liquidityUsd: number;
@@ -231,6 +233,7 @@ function classifyAndBuildReport(params: {
       protocol: item.protocol,
       protocolAddress: item.protocolAddress,
       underlyingSymbol: item.underlyingSymbol,
+      underlyingAddress: item.underlyingAddress,
       rawBalance: item.rawBalance.toString(),
       uiBalance: round4(uiBalance),
       priceUsd: item.priceUsd,
@@ -472,6 +475,7 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
         protocol: tok.protocol,
         protocolAddress: tok.protocolAddress,
         underlyingSymbol: tok.underlyingSymbol,
+        underlyingAddress: tok.underlyingAddress,
         rawBalance: rawBal,
         priceUsd,
         liquidityUsd: priceUsd > 0 ? 5_000_000 : 0,
@@ -483,15 +487,55 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     const discoveredChainTokens = discoveredByChain.get(c.id) ?? [];
     if (discoveredChainTokens.length > 0) {
       const novelTokens = discoveredChainTokens.filter((dt) => !seenAddrs.has(dt.address.toLowerCase()));
-      const dexLiquidityMap = await fetchDexLiquidityBatch(
-        c.id,
-        novelTokens.map((dt) => dt.address)
-      );
+      const [dexLiquidityMap, defiReceiptMap] = await Promise.all([
+        fetchDexLiquidityBatch(
+          c.id,
+          novelTokens.map((dt) => dt.address)
+        ),
+        probeDefiReceiptContracts(
+          c.id,
+          novelTokens.map((dt) => dt.address)
+        ),
+      ]);
+
+      // Fetch prices for any auto-detected DeFi underlying assets (ERC-4626 vaults / Aave aTokens)
+      const defiUnderlyings = Array.from(defiReceiptMap.values()).map((d) => d.underlyingAddress);
+      const underlyingDexMap = defiUnderlyings.length
+        ? await fetchDexLiquidityBatch(c.id, defiUnderlyings)
+        : new Map();
 
       const extraDead: typeof novelTokens = [];
       for (const dt of novelTokens) {
         if (seenAddrs.has(dt.address.toLowerCase())) continue;
         seenAddrs.add(dt.address.toLowerCase());
+
+        const defiReceipt = defiReceiptMap.get(dt.address.toLowerCase());
+        if (defiReceipt) {
+          const isUsdcUnderlying =
+            defiReceipt.underlyingAddress.toLowerCase() === c.usdcAddress.toLowerCase();
+          const uDex = underlyingDexMap.get(defiReceipt.underlyingAddress.toLowerCase());
+          const priceUsd = isUsdcUnderlying ? 1.0 : uDex?.priceUsd ?? 0;
+          if (priceUsd > 0) {
+            rawAssets.push({
+              chain: c.id,
+              address: dt.address,
+              symbol: dt.symbol,
+              name: dt.name,
+              decimals: dt.decimals,
+              kind: 'defi_position',
+              protocol: defiReceipt.protocol,
+              protocolAddress: defiReceipt.protocolAddress,
+              underlyingSymbol: isUsdcUnderlying ? 'USDC' : dt.symbol.replace(/^[as]/, ''),
+              underlyingAddress: defiReceipt.underlyingAddress,
+              rawBalance: dt.rawBalance,
+              priceUsd,
+              liquidityUsd: isUsdcUnderlying ? 100_000_000 : Math.max(5_000_000, uDex?.liquidityUsd ?? 5_000_000),
+              dexLiquidityVerified: true,
+            });
+            continue;
+          }
+        }
+
         const dex = dexLiquidityMap.get(dt.address.toLowerCase());
         const verifiedLiq = dex?.liquidityUsd ?? 0;
         const verifiedPrice = dex && dex.priceUsd > 0 ? dex.priceUsd : 0;

@@ -302,6 +302,10 @@ if (typeof window !== 'undefined') {
   } catch {
     // non-browser context
   }
+  // Re-notify when late-injecting extensions (Keplr, Leap, Cosmostation, TronLink) finish mounting
+  window.addEventListener('load', () => notifyWalletDiscovery());
+  window.addEventListener('keplr_keystorechange', () => notifyWalletDiscovery());
+  window.addEventListener('leap_keystorechange', () => notifyWalletDiscovery());
 }
 
 export function getConnectedEvmAddress() {
@@ -999,11 +1003,27 @@ export function listAvailableFamilyWallets(family) {
 
   if (family === 'cosmos') {
     const out = [];
-    if (window.keplr) {
-      out.push({ id: 'keplr', name: 'Keplr', standard: 'Cosmos Extension', icon: '/logos/keplr.svg', provider: window.keplr });
+    const seen = new Set();
+    const addCosmos = (id, name, icon, provider, standard = 'Cosmos Extension') => {
+      if (!provider || seen.has(id)) return;
+      seen.add(id);
+      out.push({ id, name, standard, icon, provider });
+    };
+    if (window.keplr) addCosmos('keplr', 'Keplr', '/logos/keplr.svg', window.keplr);
+    if (window.leap) addCosmos('leap', 'Leap Wallet', '/logos/leap.svg', window.leap);
+    if (window.cosmostation?.providers?.keplr) {
+      addCosmos('cosmostation', 'Cosmostation', '/logos/cosmos.svg', window.cosmostation.providers.keplr);
+    } else if (window.cosmostation?.cosmos) {
+      addCosmos('cosmostation', 'Cosmostation', '/logos/cosmos.svg', window.cosmostation.cosmos, 'Cosmostation API');
     }
-    if (window.leap) {
-      out.push({ id: 'leap', name: 'Leap Wallet', standard: 'Cosmos Extension', icon: '/logos/leap.svg', provider: window.leap });
+    if (window.okxwallet?.keplr) {
+      addCosmos('okx-cosmos', 'OKX Wallet (Cosmos)', '/logos/okx.svg', window.okxwallet.keplr);
+    }
+    if (window.ctrl?.keplr || window.xfi?.keplr) {
+      addCosmos('ctrl', 'Ctrl / XDEFI', '/logos/cosmos.svg', window.ctrl?.keplr || window.xfi?.keplr);
+    }
+    if (window.frontier?.keplr) {
+      addCosmos('frontier', 'Frontier', '/logos/cosmos.svg', window.frontier.keplr);
     }
     return out;
   }
@@ -1091,20 +1111,98 @@ export function listAvailableFamilyWallets(family) {
   return [];
 }
 
+const COSMOS_CONNECT_CHAINS = [
+  { key: 'cosmoshub', chainId: 'cosmoshub-4' },
+  { key: 'osmosis', chainId: 'osmosis-1' },
+  { key: 'noble', chainId: 'noble-1' },
+  { key: 'celestia', chainId: 'celestia' },
+  { key: 'injective', chainId: 'injective-1' },
+  { key: 'neutron', chainId: 'neutron-1' },
+];
+
+async function readCosmosChainAddress(provider, chainId) {
+  if (typeof provider.getKey === 'function') {
+    const key = await provider.getKey(chainId);
+    if (key?.bech32Address) return key.bech32Address;
+  }
+  if (typeof provider.getOfflineSignerAuto === 'function') {
+    const signer = await provider.getOfflineSignerAuto(chainId);
+    const accs = await signer?.getAccounts?.();
+    if (accs?.[0]?.address) return accs[0].address;
+  }
+  if (typeof provider.getOfflineSigner === 'function') {
+    const signer = provider.getOfflineSigner(chainId);
+    const accs = await signer?.getAccounts?.();
+    if (accs?.[0]?.address) return accs[0].address;
+  }
+  if (typeof provider.request === 'function') {
+    const acc = await provider.request({ method: 'cos_account', params: { chainName: chainId } });
+    if (acc?.address) return acc.address;
+  }
+  return null;
+}
+
 export async function connectFamilyWallet(family, opts = {}) {
   if (family === 'evm') return connectEvmWallet(opts);
   const wallets = listAvailableFamilyWallets(family);
   if (!wallets.length) {
+    if (family === 'cosmos') {
+      throw new Error(
+        'No Cosmos extension detected on this page. Unlock Keplr, Leap, Cosmostation, or OKX Wallet and allow site access on 127.0.0.1, then retry.'
+      );
+    }
     throw new Error(`No ${family.toUpperCase()} browser wallet detected. Install a supported wallet or paste an address to inspect.`);
   }
   const chosen = (opts.walletId ? wallets.find((w) => w.id === opts.walletId) : null) || wallets[0];
   let address = null;
+  let addressesByChain = null;
 
   if (family === 'cosmos') {
-    const cosmosChainId = opts.chainId || 'cosmoshub-4';
-    await chosen.provider.enable(cosmosChainId);
-    const key = await chosen.provider.getKey(cosmosChainId);
-    address = key?.bech32Address || null;
+    const prov = chosen.provider;
+    const requestedChains = opts.chainId
+      ? [{ key: 'custom', chainId: opts.chainId }]
+      : COSMOS_CONNECT_CHAINS;
+    const chainIds = requestedChains.map((c) => c.chainId);
+
+    // 1. Try batch enable across all 6 Cosmos chains; fall back to individual enable if any single chain isn't supported
+    if (typeof prov.enable === 'function') {
+      try {
+        await prov.enable(chainIds);
+      } catch (batchErr) {
+        let enabledAny = false;
+        for (const cid of chainIds) {
+          try {
+            await prov.enable(cid);
+            enabledAny = true;
+          } catch {
+            // ignore unsupported optional chain
+          }
+        }
+        if (!enabledAny) {
+          throw new Error(
+            batchErr?.message || `${chosen.name} rejected chain connection — unlock your wallet and approve access.`
+          );
+        }
+      }
+    }
+
+    // 2. Read Bech32 address across every enabled Cosmos chain
+    const foundMap = {};
+    const settled = await Promise.allSettled(
+      requestedChains.map(async (c) => [c.key, await readCosmosChainAddress(prov, c.chainId)])
+    );
+    for (const r of settled) {
+      if (r.status === 'fulfilled' && r.value?.[1]) {
+        foundMap[r.value[0]] = r.value[1];
+      }
+    }
+    addressesByChain = foundMap;
+    address =
+      foundMap.cosmoshub ||
+      foundMap.osmosis ||
+      foundMap.noble ||
+      Object.values(foundMap)[0] ||
+      null;
   } else if (family === 'sui') {
     if (chosen.kind === 'standard') {
       const res = await chosen.wallet.features['standard:connect'].connect();
@@ -1158,6 +1256,7 @@ export async function connectFamilyWallet(family, opts = {}) {
   const session = {
     family,
     address,
+    addressesByChain,
     walletName: chosen.name,
     walletId: chosen.id,
     provider: chosen.provider || chosen.wallet,

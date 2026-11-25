@@ -264,16 +264,22 @@ function encodeErc20Transfer(to: string, amount: bigint): string {
 /**
  * Builds REAL directly signable DeFi withdrawal calldata for Aave v3, Compound v3, or ERC-4626 vaults.
  */
-async function buildDefiWithdrawExecution(
-  asset: ScannedAsset,
-  userAddress: string
-): Promise<PreparedExecution> {
+async function buildDefiWithdrawExecution(params: {
+  asset: ScannedAsset;
+  userAddress: string;
+  solanaDestination: string;
+  outputAsset: 'USDC' | 'SOL';
+  bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp';
+  feeConfig: ProtocolFeeConfig;
+}): Promise<PreparedExecution> {
+  const { asset, userAddress, solanaDestination, outputAsset, bridgePreference, feeConfig } = params;
   const evmChain = asEvmChain(asset.chain);
   const cfg = EVM_CHAINS[evmChain];
   const rawBal = BigInt(asset.rawBalance);
   const proto = (asset.protocol ?? '').toLowerCase();
+  const aavePoolTarget = asset.protocolAddress || cfg.aaveV3Pool;
 
-  if (proto.includes('aave') && cfg.aaveV3Pool) {
+  if (proto.includes('aave') && aavePoolTarget) {
     // Fund-safety guard: check live Aave v3 getUserAccountData(user).totalDebtBase
     // (or pre-flagged debt on asset) before allowing a MAX withdrawal!
     if (asset.aaveDebtUsd && asset.aaveDebtUsd > 0) {
@@ -287,7 +293,15 @@ async function buildDefiWithdrawExecution(
     }
 
     // Aave v3 Pool.withdraw(address asset, uint256 amount, address to) -> 0x69328dec
-    const underlying = asset.underlyingSymbol === 'USDC' ? cfg.usdcAddress : asset.address;
+    // MUST pass the underlying ERC-20 token address (never the aToken receipt address!).
+    const underlying =
+      asset.underlyingAddress ||
+      (asset.underlyingSymbol === 'USDC' ? cfg.usdcAddress : undefined);
+    if (!underlying) {
+      throw new Error(
+        `Cannot build Aave v3 Pool.withdraw for ${asset.symbol}: missing underlying ERC-20 asset address.`
+      );
+    }
     // Use type(uint256).max so accrued interest is withdrawn cleanly with zero dust left behind
     const maxUint256 = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
     const data = `0x69328dec${pad32Hex(underlying)}${maxUint256}${pad32Hex(userAddress)}`;
@@ -311,20 +325,22 @@ async function buildDefiWithdrawExecution(
           chainName: cfg.name,
           explorerUrl: cfg.explorerUrl,
           from: userAddress,
-          to: cfg.aaveV3Pool,
+          to: aavePoolTarget,
           data,
           value: '0x0',
         },
       ],
       notes: [
-        'After Aave withdrawal confirms, re-scan or click Bridge USDC to send the withdrawn balance to Solana.',
+        'After Aave withdrawal confirms, re-scan or click Bridge to send the unlocked balance to Solana.',
       ],
     };
   }
 
-  if (proto.includes('compound') && cfg.compoundV3Comet) {
+  const compoundTarget = asset.protocolAddress || asset.address || cfg.compoundV3Comet;
+  if (proto.includes('compound') && compoundTarget) {
     // Compound v3 Comet.withdraw(address asset, uint256 amount) -> 0xf3fef3a3
-    const data = `0xf3fef3a3${pad32Hex(cfg.usdcAddress)}${rawBal.toString(16).padStart(64, '0')}`;
+    const underlying = asset.underlyingAddress || cfg.usdcAddress;
+    const data = `0xf3fef3a3${pad32Hex(underlying)}${rawBal.toString(16).padStart(64, '0')}`;
     return {
       assetId: asset.id,
       action: asset.action,
@@ -333,31 +349,42 @@ async function buildDefiWithdrawExecution(
       chainId: cfg.chainId,
       chainName: cfg.name,
       explorerUrl: cfg.explorerUrl,
-      estimatedOutput: `${asset.uiBalance} USDC withdrawn to wallet`,
+      estimatedOutput: `${asset.uiBalance} ${asset.underlyingSymbol ?? 'USDC'} withdrawn to wallet`,
       estimatedSeconds: 12,
       transactions: [
         {
           stepId: 'compound_withdraw',
           label: `Withdraw ${asset.symbol} from Compound v3`,
-          description: `Calls Compound v3 Comet.withdraw(USDC, ${asset.uiBalance})`,
+          description: `Calls Compound v3 Comet.withdraw(${asset.underlyingSymbol ?? 'USDC'}, ${asset.uiBalance})`,
           chain: evmChain,
           chainId: cfg.chainId,
           chainName: cfg.name,
           explorerUrl: cfg.explorerUrl,
           from: userAddress,
-          to: cfg.compoundV3Comet,
+          to: compoundTarget,
           data,
           value: '0x0',
         },
       ],
       notes: [
-        'After Compound withdrawal confirms, bridge the unlocked USDC directly to Solana via Relay or Circle CCTP.',
+        'After Compound withdrawal confirms, bridge the unlocked asset directly to Solana via Relay or Circle CCTP.',
       ],
     };
   }
 
-  if (proto.includes('erc-4626') || proto.includes('spark')) {
+  if (
+    proto.includes('erc-4626') ||
+    proto.includes('erc4626') ||
+    proto.includes('spark') ||
+    proto.includes('sky') ||
+    proto.includes('morpho') ||
+    proto.includes('ethena') ||
+    proto.includes('yearn') ||
+    proto.includes('fluid') ||
+    proto.includes('vault')
+  ) {
     // ERC-4626 redeem(uint256 shares, address receiver, address owner) -> 0xba087652
+    const vaultTarget = asset.protocolAddress || asset.address;
     const data = `0xba087652${rawBal.toString(16).padStart(64, '0')}${pad32Hex(userAddress)}${pad32Hex(userAddress)}`;
     return {
       assetId: asset.id,
@@ -373,13 +400,13 @@ async function buildDefiWithdrawExecution(
         {
           stepId: 'erc4626_redeem',
           label: `Redeem ${asset.symbol} Vault Shares`,
-          description: `Calls ERC-4626 redeem(${asset.uiBalance} shares) directly on ${asset.address}`,
+          description: `Calls ERC-4626 redeem(${asset.uiBalance} shares) directly on ${vaultTarget}`,
           chain: evmChain,
           chainId: cfg.chainId,
           chainName: cfg.name,
           explorerUrl: cfg.explorerUrl,
           from: userAddress,
-          to: asset.address,
+          to: vaultTarget,
           data,
           value: '0x0',
         },
@@ -389,7 +416,14 @@ async function buildDefiWithdrawExecution(
   }
 
   // Lido stETH / wstETH are liquid ERC-20s that can swap & bridge directly to Solana via Relay/LI.FI!
-  return buildBridgeExecution(asset, userAddress, userAddress, 'USDC', 'auto', getProtocolFeeConfig());
+  return buildBridgeExecution(
+    asset,
+    userAddress,
+    solanaDestination,
+    outputAsset,
+    bridgePreference,
+    feeConfig
+  );
 }
 
 /**
@@ -998,7 +1032,14 @@ export async function prepareRealExecution(params: {
     asset.protocol &&
     !asset.protocol.toLowerCase().includes('lido')
   ) {
-    return buildDefiWithdrawExecution(asset, userAddress);
+    return buildDefiWithdrawExecution({
+      asset,
+      userAddress,
+      solanaDestination,
+      outputAsset,
+      bridgePreference,
+      feeConfig,
+    });
   }
 
   return buildBridgeExecution(

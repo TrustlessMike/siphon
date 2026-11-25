@@ -1098,3 +1098,102 @@ test('Two-Level Negative-ROI Guard: L1 dust, 10 L2 tokens batch rescue, ATA rent
   applyTwoLevelRoiToReport(btcReport, { hasSolanaUsdcAta: false });
   assert.ok(btcReport.assets.every((a) => typeof a.netRoiUsd === 'number' && Boolean(a.roiVerdict)));
 });
+
+test('Smart-contract DeFi withdrawals (Aave non-USDC, Compound cWETHv3, ERC-4626) & multi-chain Cosmos addresses', async () => {
+  const user = '0x71C7656EC7ab88b098defB751B7401B5f6d8976F';
+  const WETH_ETH = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
+  const A_ETH_WETH = '0x4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8';
+  const C_WETH_V3 = '0xA17581A9E3356d9A858b789D68B4d866e593aE94';
+  const S_USDS = '0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD';
+
+  const baseAsset = (overrides: Partial<ScannedAsset>): ScannedAsset => ({
+    id: 'eth:defi',
+    chain: 'ethereum',
+    chainName: 'Ethereum',
+    address: A_ETH_WETH,
+    symbol: 'aEthWETH',
+    name: 'Aave v3 WETH',
+    decimals: 18,
+    kind: 'defi_position',
+    rawBalance: '1000000000000000000',
+    uiBalance: 1,
+    priceUsd: 2600,
+    grossUsd: 2600,
+    liquidityUsd: 100_000_000,
+    estimatedGasUsd: 3.0,
+    batchedGasUsd: 2.0,
+    estimatedSlippageUsd: 0,
+    netUsdcSingle: 2597,
+    netUsdcBatched: 2598,
+    action: 'WITHDRAW_AND_BRIDGE',
+    actionReason: 'Withdraw DeFi position',
+    selectedByDefault: true,
+    honeypotSafe: true,
+    ...overrides,
+  });
+
+  // 1. Aave v3 aEthWETH MUST encode WETH_ETH (never the aToken address!) in Pool.withdraw(asset, MAX, to)
+  const aaveWeth = await prepareRealExecution({
+    asset: baseAsset({
+      protocol: 'Aave v3',
+      protocolAddress: '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2',
+      underlyingSymbol: 'WETH',
+      underlyingAddress: WETH_ETH,
+    }),
+    userAddress: user,
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+  });
+  assert.equal(aaveWeth.provider, 'aave_v3');
+  assert.equal(aaveWeth.transactions[0].to.toLowerCase(), '0x87870bca3f3fd6335c3f4ce8392d69350b4fa4e2');
+  assert.ok(aaveWeth.transactions[0].data.startsWith('0x69328dec'));
+  assert.ok(
+    aaveWeth.transactions[0].data.toLowerCase().includes(WETH_ETH.slice(2).toLowerCase()),
+    'Aave Pool.withdraw must pass underlying WETH address'
+  );
+  assert.ok(
+    !aaveWeth.transactions[0].data.toLowerCase().includes(A_ETH_WETH.slice(2).toLowerCase()),
+    'Aave Pool.withdraw must NOT pass the aToken address'
+  );
+
+  // 2. Compound v3 cWETHv3 MUST target cWETHv3 Comet contract & encode WETH_ETH in withdraw(asset, amount)
+  const compWeth = await prepareRealExecution({
+    asset: baseAsset({
+      id: 'eth:cwethv3',
+      address: C_WETH_V3,
+      symbol: 'cWETHv3',
+      protocol: 'Compound v3',
+      protocolAddress: C_WETH_V3,
+      underlyingSymbol: 'WETH',
+      underlyingAddress: WETH_ETH,
+    }),
+    userAddress: user,
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+  });
+  assert.equal(compWeth.provider, 'compound_v3');
+  assert.equal(compWeth.transactions[0].to.toLowerCase(), C_WETH_V3.toLowerCase());
+  assert.ok(compWeth.transactions[0].data.startsWith('0xf3fef3a3'));
+  assert.ok(compWeth.transactions[0].data.toLowerCase().includes(WETH_ETH.slice(2).toLowerCase()));
+
+  // 3. Sky / Morpho ERC-4626 vault MUST encode redeem(shares, receiver, owner) (0xba087652)
+  const skyVault = await prepareRealExecution({
+    asset: baseAsset({
+      id: 'eth:susds',
+      address: S_USDS,
+      symbol: 'sUSDS',
+      protocol: 'Sky (ERC-4626)',
+      protocolAddress: S_USDS,
+      underlyingSymbol: 'USDS',
+    }),
+    userAddress: user,
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+  });
+  assert.equal(skyVault.provider, 'erc4626');
+  assert.equal(skyVault.transactions[0].to.toLowerCase(), S_USDS.toLowerCase());
+  assert.ok(skyVault.transactions[0].data.startsWith('0xba087652'));
+
+  // 4. Multi-chain comma-separated Cosmos addresses match cosmosAdapter & detectAddressFamily
+  const multiCosmos =
+    'cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh,osmo1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh,noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh';
+  assert.equal(cosmosAdapter.matchesAddress(multiCosmos), true);
+  assert.equal(detectAddressFamily(multiCosmos), 'cosmos');
+});

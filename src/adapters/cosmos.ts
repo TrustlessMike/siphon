@@ -232,12 +232,84 @@ export const cosmosAdapter: ChainFamilyAdapter = {
   meta: COSMOS_FAMILY_META,
 
   matchesAddress(address: string): boolean {
-    return /^(cosmos|osmo|noble|celestia|inj|neutron)1[a-z0-9]{38,58}$/i.test(address.trim());
+    const parts = address
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!parts.length) return false;
+    return parts.every((p) =>
+      /^(cosmos|osmo|noble|celestia|inj|neutron)1[a-z0-9]{38,58}$/i.test(p)
+    );
   },
 
   async scanWallet(address: string, label?: string): Promise<ScanReport> {
     const start = Date.now();
-    const cleanAddr = address.trim();
+    const rawParts = address
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (rawParts.length > 1) {
+      // Multi-chain Cosmos wallet scan (all connected Keplr/Leap/Cosmostation/OKX chains in parallel!)
+      const subReports = await Promise.all(
+        rawParts.map((addr) => cosmosAdapter.scanWallet(addr, label))
+      );
+      const chains = subReports.flatMap((r) => r.chains);
+      const assets = subReports.flatMap((r) => r.assets);
+      const warnings = subReports.flatMap((r) => r.warnings);
+      const feeBps = subReports[0]?.totals.protocolFeeBps ?? getProtocolFeeConfig().feeBps;
+      const solPriceUsd = subReports[0]?.totals.solPriceUsd ?? 70;
+      const grossUsd = Number(assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+      const defiGrossUsd = Number(
+        assets.filter((a) => a.kind === 'defi_position').reduce((s, a) => s + a.grossUsd, 0).toFixed(2)
+      );
+      const protocolFeeUsd = Number(((grossUsd * feeBps) / 10_000).toFixed(2));
+      const singleTxGasUsd = Number(assets.reduce((s, a) => s + a.estimatedGasUsd, 0).toFixed(2));
+      const batchedGasUsd = Number(assets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(2));
+      const estimatedSlippageUsd = Number(
+        assets.reduce((s, a) => s + a.estimatedSlippageUsd, 0).toFixed(2)
+      );
+      const netSolanaUsdc = Number(
+        Math.max(0, grossUsd - protocolFeeUsd - batchedGasUsd - estimatedSlippageUsd).toFixed(2)
+      );
+      return applyTwoLevelRoiToReport({
+        scanId: `scan_cosmos_${crypto.randomBytes(4).toString('hex')}`,
+        family: 'cosmos',
+        mode: 'live_rpc',
+        walletAddress: rawParts[0],
+        walletLabel: label || `Cosmos Multi-Chain (${chains.length} chains)`,
+        scannedAt: new Date().toISOString(),
+        scanDurationMs: Date.now() - start,
+        chainsScanned: chains.length,
+        chains,
+        assets,
+        totals: {
+          grossUsd,
+          defiGrossUsd,
+          liquidGrossUsd: Number((grossUsd - defiGrossUsd).toFixed(2)),
+          protocolFeeBps: feeBps,
+          protocolFeeUsd,
+          singleTxGasUsd,
+          batchedGasUsd,
+          gasSavedUsd: Number(Math.max(0, singleTxGasUsd - batchedGasUsd).toFixed(2)),
+          estimatedSlippageUsd,
+          netSolanaUsdc,
+          solEquivalent: Number((netSolanaUsdc / solPriceUsd).toFixed(4)),
+          solPriceUsd,
+          defiPositionCount: assets.filter((a) => a.kind === 'defi_position').length,
+          liquidDustCount: assets.filter(
+            (a) => a.action === 'SELL_AND_BRIDGE' || a.action === 'BRIDGE_DIRECT_USDC'
+          ).length,
+          burnCandidateCount: 0,
+          honeypotSkippedCount: 0,
+          gasNegativeCount: assets.filter(
+            (a) => a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_NEGATIVE_ROI'
+          ).length,
+        },
+        warnings,
+      });
+    }
+
+    const cleanAddr = rawParts[0] ?? address.trim();
     const cfg = detectCosmosChainFromAddress(cleanAddr);
     const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
