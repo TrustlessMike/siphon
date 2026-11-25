@@ -4,7 +4,6 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
-  detectAddressFamily,
   getAdapterForChain,
   getAdapterForFamily,
   isEvmChain,
@@ -28,13 +27,19 @@ import {
   submitSignedGaslessIntent,
 } from '../relayer/sponsor.js';
 import {
+  detectAddress,
+  EnsResolutionError,
+  isValidEnsName,
+  resolveEnsNameOrThrow,
+} from '../scanner/address.js';
+import {
   CHAIN_LIST,
   DEAD_BURN_ADDRESS,
   getProtocolFeeConfig,
   PROTOCOL_FEE_BPS,
   SOLANA_CCTP_DOMAIN,
 } from '../scanner/chains.js';
-import { scanLiveWallet, scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
+import { scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
 import { fetchSolanaWalletBalances, getL2IndexerProvider } from '../scanner/discovery.js';
 import {
   SiphonAgentEngine,
@@ -205,6 +210,48 @@ class HttpError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+async function resolveEnsOnScanReport(rawScan: ScanReport): Promise<ScanReport> {
+  const ensNames = new Set<string>();
+  if (typeof rawScan.walletAddress === 'string' && isValidEnsName(rawScan.walletAddress)) {
+    ensNames.add(rawScan.walletAddress.trim().toLowerCase());
+  }
+  for (const a of rawScan.assets ?? []) {
+    if (typeof a.sourceWallet === 'string' && isValidEnsName(a.sourceWallet)) {
+      ensNames.add(a.sourceWallet.trim().toLowerCase());
+    }
+  }
+  if (ensNames.size === 0) return rawScan;
+
+  const resolvedMap = new Map<string, string>();
+  await Promise.all(
+    Array.from(ensNames).map(async (ensName) => {
+      resolvedMap.set(ensName, await resolveEnsNameOrThrow(ensName));
+    })
+  );
+
+  const walletEns = isValidEnsName(rawScan.walletAddress)
+    ? rawScan.walletAddress.trim().toLowerCase()
+    : null;
+  return {
+    ...rawScan,
+    walletAddress: walletEns
+      ? resolvedMap.get(walletEns) ?? rawScan.walletAddress
+      : rawScan.walletAddress,
+    walletLabel: rawScan.walletLabel || (walletEns ?? undefined),
+    assets: (rawScan.assets ?? []).map((a) => {
+      if (typeof a.sourceWallet === 'string' && isValidEnsName(a.sourceWallet)) {
+        const key = a.sourceWallet.trim().toLowerCase();
+        return {
+          ...a,
+          sourceWallet: resolvedMap.get(key) ?? a.sourceWallet,
+          sourceWalletLabel: a.sourceWalletLabel || key,
+        };
+      }
+      return a;
+    }),
+  };
 }
 
 function timingSafeStringEqual(a: string, b: string): boolean {
@@ -1062,21 +1109,24 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           report = await scanPresetWallet(body.presetId);
           report.family = 'evm';
         } else if (body.address) {
-          const detected = detectAddressFamily(body.address, body.family);
+          const detected = detectAddress(body.address, body.family);
           if (!detected) {
             return reply(400, {
               error:
-                'Invalid wallet address format. Supported: EVM (0x… / .eth), Cosmos (cosmos1…/osmo1…/noble1…/celestia1…/inj1…/neutron1…), Sui/Aptos (0x… 64-hex), TON (EQ…/UQ…), Tron (T…), Bitcoin (bc1…/1…/3…).',
+                'Invalid wallet address or checksum. Supported: EVM (0x… EIP-55 / .eth), Cosmos Bech32 (cosmos1…/osmo1…/noble1…/celestia1…/inj1…/neutron1…), Sui/Aptos (0x… Move hex), TON (EQ…/UQ…/Ef…/Uf… or -1:/0:), Tron (T… Base58Check / 41… hex), Bitcoin (bc1q…/bc1p…/1…/3…).',
             });
           }
           try {
-            if (detected === 'evm') {
-              report = await scanLiveWallet(body.address);
+            if (detected.family === 'evm') {
+              report = await getAdapterForFamily('evm').scanWallet(body.address);
               report.family = 'evm';
             } else {
-              report = await getAdapterForFamily(detected).scanWallet(body.address);
+              report = await getAdapterForFamily(detected.family).scanWallet(detected.normalized);
             }
           } catch (err) {
+            if (err instanceof EnsResolutionError) {
+              return reply(err.code === 'RPC_ERROR' ? 503 : 400, { error: err.message });
+            }
             const msg = err instanceof Error ? err.message : 'Invalid wallet address';
             if (msg.toLowerCase().includes('invalid')) {
               return reply(400, { error: msg });
@@ -1108,9 +1158,19 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           hasSolanaUsdcAta?: boolean;
         }>(req);
 
-        const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
-        if (!scan) {
+        const rawScan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
+        if (!rawScan) {
           return reply(400, { error: 'Valid scan or scanId is required' });
+        }
+
+        let scan: ScanReport;
+        try {
+          scan = await resolveEnsOnScanReport(rawScan);
+        } catch (err) {
+          if (err instanceof EnsResolutionError) {
+            return reply(err.code === 'RPC_ERROR' ? 503 : 400, { error: err.message });
+          }
+          throw err;
         }
 
         const solDestRaw = body.solanaDestination?.trim() ?? '';
