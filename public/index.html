@@ -32,14 +32,14 @@
           </a>
 
           <nav class="site-links" aria-label="Primary navigation">
-            <a href="#how-it-works">How It Works</a>
-            <button type="button" class="link-btn" data-open-app="scanner">Live Scanner</button>
-            <button type="button" class="link-btn" data-open-app="burns">Burn Policy</button>
+            <a href="#manifesto">Why Siphon</a>
+            <button type="button" class="link-btn" data-open-app="scanner">Migrator</button>
             <button type="button" class="link-btn" data-open-app="contract">Contract</button>
           </nav>
 
-          <div>
-            <button type="button" class="btn-pill-dark" id="navLaunchBtn">Launch Migrator</button>
+          <div class="site-nav-actions">
+            <button type="button" class="btn-outline-sm" id="siteConnectBtn">Connect Wallet</button>
+            <button type="button" class="btn-pill-dark btn-sm" id="navLaunchBtn">Launch Migrator</button>
           </div>
         </div>
       </header>
@@ -49,31 +49,31 @@
         <section class="hero-grid">
           <div class="hero-copy-col">
             <h1 class="hero-h1">
-              Drain every<br />
-              EVM chain into<br />
-              Solana USDC.
+              One chain.<br />
+              Fresh start.
             </h1>
             <p class="hero-sub">
-              Withdraw DeFi positions, batch-swap ERC-20 dust, burn dead tokens, and bridge native USDC to Solana via Circle CCTP.
+              Crypto splintered into too many chains and failed coins. Pull your capital off six EVM networks and move cleanly to Solana.
             </p>
 
-            <!-- Hero Inline EVM Wallet Scanner Pill (matches design comp) -->
-            <form class="hero-scan-pill" id="heroScanForm">
+            <div class="hero-cta-row">
+              <button type="button" class="btn-pill-dark" id="heroConnectBtn">Connect Wallet</button>
+              <button type="button" class="btn-outline-dark" data-open-app="scanner">Launch Migrator</button>
+            </div>
+
+            <form class="hero-inspect-form" id="heroScanForm">
               <input
                 type="text"
                 id="heroWalletInput"
-                class="hero-scan-input mono"
-                placeholder="0x… paste any EVM wallet"
-                aria-label="EVM wallet address to scan"
+                class="hero-inspect-input mono"
+                placeholder="Or inspect any 0x… EVM address"
+                aria-label="Inspect any EVM wallet address"
               />
-              <button type="submit" class="btn-pill-dark btn-scan" id="heroScanBtn">Scan Wallet</button>
+              <button type="submit" class="hero-inspect-btn" id="heroScanBtn">Scan →</button>
             </form>
 
-            <div class="preset-row">
-              <span class="preset-label">Try live:</span>
-              <button type="button" class="preset-chip" data-preset="veteran_defi">Multi-Chain DeFi Veteran</button>
-              <button type="button" class="preset-chip" data-preset="vitalik_live">vitalik.eth (Live RPC)</button>
-              <button type="button" class="preset-chip" data-preset="airdrop_farmer">Zero-Gas L2 Rescue</button>
+            <div class="hero-sample-row">
+              <button type="button" class="text-action muted" data-preset="vitalik_live">Inspect vitalik.eth live →</button>
             </div>
           </div>
 
@@ -84,72 +84,51 @@
               aria-label="3D porcelain, brushed titanium, and frosted ice-cyan Solana funnel sculpture"
             ></canvas>
             <div class="hero-stage-bar mono">
-              <span class="stage-dot-line">
-                <span class="dot-sm allow"></span>
-                <span>Multicall3 RPC live across 6 Circle CCTP chains</span>
-              </span>
-              <span class="stage-domain">DOMAIN 5 → SOLANA</span>
+              <span>Ethereum · Base · Arbitrum · Optimism · Polygon · Avalanche</span>
+              <span class="stage-domain">→ SOLANA</span>
             </div>
           </div>
         </section>
 
-        <!-- EXPOSED 4-COLUMN HAIRLINE SPEC STRIP -->
-        <section class="spec-strip" aria-label="Protocol specifications">
-          <div class="spec-cell">
-            <span class="ice-marker" aria-hidden="true"></span>
-            <div class="spec-title"><strong>6</strong> EVM Chains</div>
+        <!-- ONE SINGULAR EDITORIAL STORY SECTION -->
+        <section class="story-section" id="manifesto">
+          <div class="story-lead">
+            <h2>Crypto does not need twenty chains.</h2>
           </div>
-          <div class="spec-cell">
-            <span class="ice-marker" aria-hidden="true"></span>
-            <div class="spec-title"><strong>Circle</strong> CCTP 1:1</div>
-          </div>
-          <div class="spec-cell">
-            <span class="ice-marker" aria-hidden="true"></span>
-            <div class="spec-title"><strong>Aave</strong> · Comp · Lido</div>
-          </div>
-          <div class="spec-cell">
-            <span class="ice-marker" aria-hidden="true"></span>
-            <div class="spec-title"><strong>Safe</strong> Zero-Liq Burn</div>
+          <div class="story-prose">
+            <p>
+              Every cycle spun up another rollup, another bridge, and another wave of tokens that went to zero. Most wallets end up holding dust across six networks, deposits sitting in lending pools nobody checks anymore, and dead coins nobody will ever bid on.
+            </p>
+            <p>
+              Instead of managing the wreckage across half a dozen RPCs and gas tokens, Siphon lets you unwind it in one pass: withdraw from dormant protocols, sell liquid balances into USDC or SOL, burn the zero-liquidity junk, and settle on Solana.
+            </p>
           </div>
         </section>
 
-        <!-- 3-STAGE PIPELINE ARCHITECTURE -->
-        <section class="pillars-grid" id="how-it-works">
-          <article class="pillar-card">
-            <div class="pillar-index mono">01 / WITHDRAW &amp; SWEEP</div>
-            <h3>Smart-Contract DeFi Exits</h3>
-            <p>
-              Detects idle principal trapped in Aave v3, Compound v3, Lido, and ERC-4626 vaults via <code class="code-inline">Multicall3</code>, then redeems and consolidates everything into USDC inside one batched router call.
-            </p>
-            <button type="button" class="pillar-link" data-open-app="scanner">Scan DeFi positions →</button>
-          </article>
-
-          <article class="pillar-card">
-            <div class="pillar-index mono">02 / SELL OR BURN</div>
-            <h3>Net-Value Dust &amp; Isolated Burn</h3>
-            <p>
-              Quotes every ERC-20 against live gas costs: liquid tokens batch-swap into USDC; zero-liquidity rugged tokens burn cleanly to <code class="code-inline">0x…dEaD</code> inside <code class="code-inline">try/catch</code> so honeypots never revert your sweep.
-            </p>
-            <button type="button" class="pillar-link" data-open-app="burns">Inspect Burn Policy →</button>
-          </article>
-
-          <article class="pillar-card">
-            <div class="pillar-index mono">03 / BRIDGE 1:1</div>
-            <h3>Native Circle CCTP to Solana</h3>
-            <p>
-              Converts your Solana Ed25519 address into exact <code class="code-inline">bytes32</code> calldata and calls <code class="code-inline">depositForBurn</code> (Domain 5) so native Solana USDC lands with zero wrapped-asset risk.
-            </p>
-            <button type="button" class="pillar-link" data-open-app="contract">Read SiphonRouter.sol →</button>
-          </article>
+        <!-- 3 BARE ARCHITECTURAL COLUMNS (NO BADGES, NO NUMBERS, NO CODE PILLS) -->
+        <section class="capabilities-strip" aria-label="Core capabilities">
+          <div class="cap-cell">
+            <h3>Unwind protocols</h3>
+            <p>Withdraw principal directly from Aave v3, Compound v3, Lido, and ERC-4626 vaults across all six chains.</p>
+          </div>
+          <div class="cap-cell">
+            <h3>Route to Solana</h3>
+            <p>Consolidate liquid tokens and native balances via Relay, LI.FI, or Circle CCTP with one confirmation per chain.</p>
+          </div>
+          <div class="cap-cell">
+            <h3>Burn dead coins</h3>
+            <p>Simulate zero-liquidity transfers onchain before burning them cleanly, automatically skipping honeypots.</p>
+          </div>
         </section>
 
         <footer class="site-footer">
           <div class="footer-left">
-            <strong>Siphon Protocol</strong>
-            <span class="mono">Ethereum · Base · Arbitrum · Optimism · Polygon · Avalanche → Solana (Domain 5)</span>
+            <strong>Siphon</strong>
+            <span class="mono">6 EVM Chains → Solana</span>
           </div>
           <div class="footer-right">
-            <button type="button" class="link-btn" data-open-app="scanner">Launch Migrator</button>
+            <button type="button" class="link-btn" data-open-app="scanner">Migrator</button>
+            <button type="button" class="link-btn" data-open-app="burns">Burn Receipts</button>
             <button type="button" class="link-btn" data-open-app="contract">SiphonRouter.sol</button>
           </div>
         </footer>
@@ -203,11 +182,9 @@
               <button type="submit" class="btn-outline-dark" id="appScanBtn">Scan Live</button>
             </div>
             <div class="ctrl-presets">
-              <button type="button" class="text-action" data-preset="veteran_defi">Veteran DeFi</button>
+              <button type="button" class="text-action" data-preset="vitalik_live">vitalik.eth (Live RPC)</button>
               <span class="sep-dot">·</span>
-              <button type="button" class="text-action" data-preset="vitalik_live">vitalik.eth (Live)</button>
-              <span class="sep-dot">·</span>
-              <button type="button" class="text-action" data-preset="airdrop_farmer">Zero-Gas L2</button>
+              <button type="button" class="text-action muted" data-preset="veteran_defi">Sample DeFi wallet</button>
             </div>
           </form>
 
@@ -447,6 +424,31 @@
           </div>
         </section>
       </main>
+    </div>
+
+    <!-- UNIFIED DUAL-ECOSYSTEM WALLET MODAL (EVM + SOLANA) -->
+    <div class="wallet-modal-backdrop hidden" id="walletModalBackdrop" role="dialog" aria-modal="true" aria-labelledby="walletModalTitle">
+      <div class="wallet-modal">
+        <div class="wallet-modal-head">
+          <div>
+            <h3 id="walletModalTitle">Connect Wallet</h3>
+            <p id="walletModalSub" class="muted-xs">Connect your source EVM wallet and Solana destination.</p>
+          </div>
+          <button type="button" class="wallet-modal-close" id="walletModalCloseBtn" aria-label="Close wallet modal">×</button>
+        </div>
+        <div class="wallet-modal-tabs" role="tablist">
+          <button type="button" class="wallet-tab active" data-wallet-tab="evm" id="walletTabEvm">
+            EVM Source
+            <span class="wallet-tab-dot hidden" id="walletTabEvmDot"></span>
+          </button>
+          <button type="button" class="wallet-tab" data-wallet-tab="solana" id="walletTabSol">
+            Solana Destination
+            <span class="wallet-tab-dot hidden" id="walletTabSolDot"></span>
+          </button>
+        </div>
+        <div class="wallet-modal-list" id="walletModalList"></div>
+        <div class="wallet-modal-foot mono" id="walletModalFoot"></div>
+      </div>
     </div>
 
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>

@@ -1,6 +1,6 @@
 import { PublicKey } from '@solana/web3.js';
 import { DEAD_BURN_ADDRESS, EVM_CHAINS } from './chains.js';
-import { decodeMulticall3Aggregate3, encodeMulticall3Aggregate3 } from './rpc.js';
+import { decodeMulticall3Aggregate3, encodeMulticall3Aggregate3, evmJsonRpcCall } from './rpc.js';
 import type { EvmChainId } from './types.js';
 
 export const SOLANA_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -10,6 +10,212 @@ export const SOLANA_RPC_URLS = [
   'https://api.mainnet-beta.solana.com',
 ].filter((u): u is string => Boolean(u));
 export const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
+
+const DEXSCREENER_CHAIN_SLUGS: Record<EvmChainId, string> = {
+  ethereum: 'ethereum',
+  base: 'base',
+  arbitrum: 'arbitrum',
+  optimism: 'optimism',
+  polygon: 'polygon',
+  avalanche: 'avalanche',
+};
+
+const ALCHEMY_NETWORK_SUBDOMAINS: Partial<Record<EvmChainId, string>> = {
+  ethereum: 'eth-mainnet',
+  base: 'base-mainnet',
+  arbitrum: 'arb-mainnet',
+  optimism: 'opt-mainnet',
+  polygon: 'polygon-mainnet',
+};
+
+const MORALIS_CHAIN_HEX: Record<EvmChainId, string> = {
+  ethereum: '0x1',
+  base: '0x2105',
+  arbitrum: '0xa4b1',
+  optimism: '0xa',
+  polygon: '0x89',
+  avalanche: '0xa86a',
+};
+
+export const MIN_VERIFIED_DEX_LIQUIDITY_USD = 2_500;
+
+export function getL2IndexerProvider(): 'sim' | 'alchemy' | 'moralis' | 'none' {
+  if (process.env.SIM_API_KEY?.trim()) return 'sim';
+  if (process.env.ALCHEMY_API_KEY?.trim()) return 'alchemy';
+  if (process.env.MORALIS_API_KEY?.trim()) return 'moralis';
+  return 'none';
+}
+
+export interface AaveAccountSafety {
+  checked: boolean;
+  hasActiveDebt: boolean;
+  totalCollateralUsd: number;
+  totalDebtUsd: number;
+  healthFactor: number;
+  safeForMaxWithdraw: boolean;
+  reason: string;
+}
+
+/**
+ * Decodes Aave v3 Pool.getUserAccountData(address) 6-word return tuple:
+ * (totalCollateralBase, totalDebtBase, availableBorrowsBase, currentLiquidationThreshold, ltv, healthFactor).
+ */
+export function decodeAaveAccountData(hexResult: string): AaveAccountSafety {
+  const clean = hexResult.replace(/^0x/, '');
+  if (clean.length < 64 * 6) {
+    return {
+      checked: false,
+      hasActiveDebt: false,
+      totalCollateralUsd: 0,
+      totalDebtUsd: 0,
+      healthFactor: Number.POSITIVE_INFINITY,
+      safeForMaxWithdraw: true,
+      reason: 'Empty Aave account data response.',
+    };
+  }
+  const word = (i: number) => BigInt('0x' + clean.slice(i * 64, (i + 1) * 64));
+  const totalCollateralBase = word(0);
+  const totalDebtBase = word(1);
+  const hfRaw = word(5);
+
+  const totalCollateralUsd = Number(totalCollateralBase) / 1e8;
+  const totalDebtUsd = Number(totalDebtBase) / 1e8;
+  const hasActiveDebt = totalDebtBase > 0n;
+  const healthFactor =
+    !hasActiveDebt || hfRaw > 10n ** 24n ? Number.POSITIVE_INFINITY : Number(hfRaw) / 1e18;
+
+  return {
+    checked: true,
+    hasActiveDebt,
+    totalCollateralUsd: Number(totalCollateralUsd.toFixed(2)),
+    totalDebtUsd: Number(totalDebtUsd.toFixed(2)),
+    healthFactor: Number.isFinite(healthFactor) ? Number(healthFactor.toFixed(2)) : 999,
+    safeForMaxWithdraw: !hasActiveDebt,
+    reason: hasActiveDebt
+      ? `Active Aave v3 borrow detected ($${totalDebtUsd.toFixed(2)} debt · HF ${healthFactor.toFixed(2)}). Repay debt before MAX withdrawal to prevent revert or liquidation.`
+      : 'Verified onchain: zero Aave v3 debt (safe for MAX withdrawal).',
+  };
+}
+
+/**
+ * Queries Aave v3 Pool.getUserAccountData(user) (`0xbf92857c`) live onchain with multi-RPC failover.
+ */
+export async function checkAaveV3AccountSafety(
+  chain: EvmChainId,
+  userAddress: string
+): Promise<AaveAccountSafety> {
+  const cfg = EVM_CHAINS[chain];
+  if (!cfg?.aaveV3Pool || !/^0x[0-9a-fA-F]{40}$/.test(userAddress)) {
+    return {
+      checked: false,
+      hasActiveDebt: false,
+      totalCollateralUsd: 0,
+      totalDebtUsd: 0,
+      healthFactor: 999,
+      safeForMaxWithdraw: true,
+      reason: 'Aave v3 Pool not configured on this chain.',
+    };
+  }
+
+  const userPad = userAddress.replace(/^0x/, '').toLowerCase().padStart(64, '0');
+  const data = `0xbf92857c${userPad}`;
+  try {
+    const json = await evmJsonRpcCall<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [{ to: cfg.aaveV3Pool, data }, 'latest'],
+      3500
+    );
+    if (!json.result || json.result === '0x') {
+      return {
+        checked: false,
+        hasActiveDebt: false,
+        totalCollateralUsd: 0,
+        totalDebtUsd: 0,
+        healthFactor: 999,
+        safeForMaxWithdraw: true,
+        reason: 'Could not read Aave account data.',
+      };
+    }
+    return decodeAaveAccountData(json.result);
+  } catch {
+    return {
+      checked: false,
+      hasActiveDebt: false,
+      totalCollateralUsd: 0,
+      totalDebtUsd: 0,
+      healthFactor: 999,
+      safeForMaxWithdraw: true,
+      reason: 'Aave account check timed out.',
+    };
+  }
+}
+
+export interface DexLiquidityInfo {
+  priceUsd: number;
+  liquidityUsd: number;
+  volume24hUsd: number;
+  dexId?: string;
+}
+
+/**
+ * Batch-verifies real DEX liquidity & spot price for up to 30 token addresses on a chain
+ * using DexScreener's free public API so fake-price spam tokens never inflate portfolio totals.
+ */
+export async function fetchDexLiquidityBatch(
+  chain: EvmChainId,
+  tokenAddresses: string[]
+): Promise<Map<string, DexLiquidityInfo>> {
+  const out = new Map<string, DexLiquidityInfo>();
+  const slug = DEXSCREENER_CHAIN_SLUGS[chain];
+  const unique = Array.from(
+    new Set(
+      tokenAddresses
+        .filter((a) => /^0x[0-9a-fA-F]{40}$/.test(a))
+        .map((a) => a.toLowerCase())
+    )
+  ).slice(0, 30);
+
+  if (!slug || !unique.length) return out;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    const url = `https://api.dexscreener.com/tokens/v1/${slug}/${unique.join(',')}`;
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return out;
+
+    const pairs = (await res.json()) as Array<{
+      dexId?: string;
+      baseToken?: { address?: string };
+      priceUsd?: string;
+      liquidity?: { usd?: number };
+      volume?: { h24?: number };
+    }>;
+
+    if (!Array.isArray(pairs)) return out;
+    for (const pair of pairs) {
+      const addr = pair.baseToken?.address?.toLowerCase();
+      if (!addr) continue;
+      const liq = Number(pair.liquidity?.usd ?? 0);
+      const price = Number(pair.priceUsd ?? 0);
+      const vol = Number(pair.volume?.h24 ?? 0);
+      const prev = out.get(addr);
+      if (!prev || liq > prev.liquidityUsd) {
+        out.set(addr, {
+          priceUsd: Number.isFinite(price) ? price : 0,
+          liquidityUsd: Number.isFinite(liq) ? liq : 0,
+          volume24hUsd: Number.isFinite(vol) ? vol : 0,
+          dexId: pair.dexId,
+        });
+      }
+    }
+  } catch {
+    clearTimeout(timer);
+  }
+  return out;
+}
 
 const KNOWN_EIP2612_SYMBOLS = new Set([
   'USDC',
@@ -72,22 +278,12 @@ export async function detectPermit2Allowances(params: {
   );
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
-    const res = await fetch(cfg.rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'eth_call',
-        params: [{ to: cfg.multicall3, data: mcData }, 'latest'],
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-
-    const json = (await res.json()) as { result?: string };
+    const json = await evmJsonRpcCall<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [{ to: cfg.multicall3, data: mcData }, 'latest'],
+      3500
+    );
     if (!json.result || json.result === '0x') return approved;
 
     const decoded = decodeMulticall3Aggregate3(json.result);
@@ -192,6 +388,161 @@ export async function discoverEthereumTokens(
 }
 
 /**
+ * Discovers arbitrary ERC-20 tokens on ANY of the 6 EVM chains when SIM_API_KEY,
+ * MORALIS_API_KEY, or ALCHEMY_API_KEY is configured, falling back to Ethplorer on Ethereum.
+ */
+export async function discoverChainTokens(
+  chain: EvmChainId,
+  walletAddress: string,
+  maxTokens = 24
+): Promise<DiscoveredEthToken[]> {
+  const cfg = EVM_CHAINS[chain];
+  if (!cfg) return [];
+
+  const simKey = process.env.SIM_API_KEY?.trim();
+  if (simKey) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      const res = await fetch(
+        `https://api.sim.dune.com/v1/evm/balances/${encodeURIComponent(walletAddress)}?chain_ids=${cfg.chainId}&limit=${maxTokens}`,
+        { headers: { 'X-Sim-Api-Key': simKey }, signal: controller.signal }
+      );
+      clearTimeout(timer);
+      if (res.ok) {
+        const json = (await res.json()) as {
+          balances?: Array<{
+            address?: string;
+            amount?: string;
+            decimals?: number;
+            symbol?: string;
+            name?: string;
+            price_usd?: number;
+          }>;
+        };
+        const out: DiscoveredEthToken[] = [];
+        for (const b of json.balances ?? []) {
+          if (!b.address || b.address === 'native' || !/^0x[0-9a-fA-F]{40}$/.test(b.address)) continue;
+          if (!b.amount) continue;
+          try {
+            const rawBalance = BigInt(b.amount);
+            if (rawBalance <= 0n) continue;
+            out.push({
+              address: b.address,
+              symbol: (b.symbol || 'UNKNOWN').slice(0, 18),
+              name: (b.name || b.symbol || 'ERC-20 Token').slice(0, 48),
+              decimals: Math.min(36, Math.max(0, Number(b.decimals ?? 18))),
+              rawBalance,
+              ethplorerPriceUsd: Number(b.price_usd ?? 0),
+            });
+          } catch {
+            // ignore malformed balance
+          }
+        }
+        if (out.length) return out.slice(0, maxTokens);
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  const moralisKey = process.env.MORALIS_API_KEY?.trim();
+  if (moralisKey) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      const res = await fetch(
+        `https://deep-index.moralis.io/api/v2.2/${encodeURIComponent(walletAddress)}/erc20?chain=${MORALIS_CHAIN_HEX[chain]}`,
+        { headers: { 'X-API-Key': moralisKey }, signal: controller.signal }
+      );
+      clearTimeout(timer);
+      if (res.ok) {
+        const items = (await res.json()) as Array<{
+          token_address?: string;
+          symbol?: string;
+          name?: string;
+          decimals?: number;
+          balance?: string;
+        }>;
+        const out: DiscoveredEthToken[] = [];
+        for (const item of Array.isArray(items) ? items : []) {
+          if (!item.token_address || !item.balance || !/^0x[0-9a-fA-F]{40}$/.test(item.token_address)) continue;
+          try {
+            const rawBalance = BigInt(item.balance);
+            if (rawBalance <= 0n) continue;
+            out.push({
+              address: item.token_address,
+              symbol: (item.symbol || 'UNKNOWN').slice(0, 18),
+              name: (item.name || item.symbol || 'ERC-20 Token').slice(0, 48),
+              decimals: Math.min(36, Math.max(0, Number(item.decimals ?? 18))),
+              rawBalance,
+              ethplorerPriceUsd: 0,
+            });
+          } catch {
+            // ignore
+          }
+        }
+        if (out.length) return out.slice(0, maxTokens);
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  const alchemyKey = process.env.ALCHEMY_API_KEY?.trim();
+  const alchemySub = ALCHEMY_NETWORK_SUBDOMAINS[chain];
+  if (alchemyKey && alchemySub) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      const res = await fetch(`https://${alchemySub}.g.alchemy.com/v2/${alchemyKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'alchemy_getTokenBalances',
+          params: [walletAddress, 'erc20'],
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (res.ok) {
+        const json = (await res.json()) as {
+          result?: { tokenBalances?: Array<{ contractAddress?: string; tokenBalance?: string }> };
+        };
+        const out: DiscoveredEthToken[] = [];
+        for (const item of json.result?.tokenBalances ?? []) {
+          if (!item.contractAddress || !item.tokenBalance) continue;
+          try {
+            const rawBalance = BigInt(item.tokenBalance);
+            if (rawBalance <= 0n) continue;
+            out.push({
+              address: item.contractAddress,
+              symbol: item.contractAddress.slice(0, 6).toUpperCase(),
+              name: 'Discovered ERC-20',
+              decimals: 18,
+              rawBalance,
+              ethplorerPriceUsd: 0,
+            });
+          } catch {
+            // ignore
+          }
+        }
+        if (out.length) return out.slice(0, maxTokens);
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  if (chain === 'ethereum') {
+    return discoverEthereumTokens(walletAddress, maxTokens);
+  }
+  return [];
+}
+
+/**
  * Simulates `ERC20.transfer(0x000...dEaD, amount)` live via `eth_call` on the chain's RPC.
  * If the contract reverts or returns `false`, the token is flagged as an onchain honeypot / transfer-locked token.
  */
@@ -211,32 +562,19 @@ export async function simulateBurnTransferOnchain(params: {
   const data = `0xa9059cbb${deadPadded}${amtPadded}`;
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
-    const res = await fetch(cfg.rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'eth_call',
-        params: [
-          {
-            from: params.walletAddress,
-            to: params.tokenAddress,
-            data,
-          },
-          'latest',
-        ],
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-
-    const json = (await res.json()) as {
-      result?: string;
-      error?: { message?: string; code?: number };
-    };
+    const json = await evmJsonRpcCall<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [
+        {
+          from: params.walletAddress,
+          to: params.tokenAddress,
+          data,
+        },
+        'latest',
+      ],
+      3500
+    );
 
     if (json.error) {
       return {
@@ -282,21 +620,12 @@ export async function checkErc20Allowance(params: {
   const data = `0xdd62ed3e${ownerPad}${spenderPad}`;
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
-    const res = await fetch(cfg.rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'eth_call',
-        params: [{ to: params.tokenAddress, data }, 'latest'],
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    const json = (await res.json()) as { result?: string };
+    const json = await evmJsonRpcCall<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [{ to: params.tokenAddress, data }, 'latest'],
+      3500
+    );
     if (!json.result || json.result === '0x') return 0n;
     return BigInt(json.result);
   } catch {
@@ -308,6 +637,7 @@ export interface SolanaWalletBalance {
   address: string;
   solBalance: number;
   usdcBalance: number;
+  hasUsdcAta: boolean;
   slot: number;
   checkedAt: string;
 }
@@ -386,6 +716,7 @@ export async function fetchSolanaWalletBalances(
         address: pubkey,
         solBalance: Number((lamports / 1e9).toFixed(6)),
         usdcBalance: Number(usdcBalance.toFixed(6)),
+        hasUsdcAta: accounts.length > 0,
         slot: balRes.context?.slot ?? 0,
         checkedAt: new Date().toISOString(),
       };

@@ -1,11 +1,13 @@
 import { encodeCctpDepositForBurn, solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { DEAD_BURN_ADDRESS, EVM_CHAINS, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import {
+  checkAaveV3AccountSafety,
   checkErc20Allowance,
   isEip2612Token,
   simulateBurnTransferOnchain,
   SOLANA_USDC_MINT,
 } from '../scanner/discovery.js';
+import { evmJsonRpcCall } from '../scanner/rpc.js';
 import type { EvmChainId, ScannedAsset } from '../scanner/types.js';
 
 const RELAY_SOLANA_CHAIN_ID = 792703809;
@@ -134,6 +136,7 @@ export interface PreparedChainBatch {
     requestId?: string;
     estimatedOutput: string;
     estimatedSeconds: number;
+    requiresSolanaClaim?: boolean;
   }>;
   skippedAssets: Array<{
     assetId: string;
@@ -187,6 +190,18 @@ async function buildDefiWithdrawExecution(
   const proto = (asset.protocol ?? '').toLowerCase();
 
   if (proto.includes('aave') && cfg.aaveV3Pool) {
+    // Fund-safety guard: check live Aave v3 getUserAccountData(user).totalDebtBase
+    // (or pre-flagged debt on asset) before allowing a MAX withdrawal!
+    if (asset.aaveDebtUsd && asset.aaveDebtUsd > 0) {
+      throw new Error(
+        `Aave v3 safety guard: wallet has $${asset.aaveDebtUsd.toFixed(2)} active debt (HF ${asset.aaveHealthFactor?.toFixed(2) ?? '—'}). Repay borrow before MAX withdrawal to prevent revert or liquidation.`
+      );
+    }
+    const safety = await checkAaveV3AccountSafety(asset.chain, userAddress);
+    if (safety.checked && safety.hasActiveDebt) {
+      throw new Error(`Aave v3 safety guard: ${safety.reason}`);
+    }
+
     // Aave v3 Pool.withdraw(address asset, uint256 amount, address to) -> 0x69328dec
     const underlying = asset.underlyingSymbol === 'USDC' ? cfg.usdcAddress : asset.address;
     // Use type(uint256).max so accrued interest is withdrawn cleanly with zero dust left behind
@@ -888,9 +903,10 @@ export async function prepareChainBatchExecution(params: {
         provider: 'circle_cctp',
         estimatedOutput: `${asset.uiBalance.toFixed(2)} USDC (Atomic DeFi Exit + CCTP)`,
         estimatedSeconds: cfg.cctpAttestationSec,
+        requiresSolanaClaim: true,
       });
       notes.push(
-        `Bundled ${asset.protocol} ${asset.symbol} withdrawal + Circle CCTP bridge atomically in 1 click.`
+        `Bundled ${asset.protocol} ${asset.symbol} withdrawal + Circle CCTP bridge atomically in 1 click (poll /api/cctp/attestation for Solana receiveMessage claim).`
       );
     } else if (prep.provider === 'relay' || prep.provider === 'lifi' || prep.provider === 'circle_cctp') {
       bridgeTrackers.push({
@@ -900,6 +916,7 @@ export async function prepareChainBatchExecution(params: {
         requestId: prep.requestId,
         estimatedOutput: prep.estimatedOutput,
         estimatedSeconds: prep.estimatedSeconds,
+        requiresSolanaClaim: prep.provider === 'circle_cctp',
       });
     }
   });
@@ -1022,19 +1039,12 @@ export async function checkLiveExecutionStatus(params: {
 
   if (cfg && params.txHash) {
     try {
-      const res = await fetch(cfg.rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'eth_getTransactionReceipt',
-          params: [params.txHash],
-        }),
-      });
-      const json = (await res.json()) as {
-        result?: { status?: string; blockNumber?: string } | null;
-      };
+      const json = await evmJsonRpcCall<{ status?: string; blockNumber?: string } | null>(
+        cfg.rpcUrls,
+        'eth_getTransactionReceipt',
+        [params.txHash],
+        4000
+      );
       if (json.result) {
         evmConfirmed = json.result.status === '0x1';
         evmFailed = json.result.status === '0x0';

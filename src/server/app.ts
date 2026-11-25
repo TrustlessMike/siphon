@@ -3,7 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { buildMigrationPlan, solanaAddressToBytes32 } from '../bridge/cctp.js';
+import {
+  buildMigrationPlan,
+  fetchCctpAttestationForTx,
+  solanaAddressToBytes32,
+} from '../bridge/cctp.js';
 import {
   checkLiveExecutionStatus,
   prepareChainBatchExecution,
@@ -11,7 +15,7 @@ import {
 } from '../execution/tx-builder.js';
 import { CHAIN_LIST, DEAD_BURN_ADDRESS, PROTOCOL_FEE_BPS, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { scanLiveWallet, scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
-import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
+import { fetchSolanaWalletBalances, getL2IndexerProvider } from '../scanner/discovery.js';
 import type { EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -30,6 +34,7 @@ const ROOT_DIR = findPackageRoot(__dirname);
 const PUBLIC_DIR = path.resolve(ROOT_DIR, 'public');
 const CONTRACTS_DIR = path.resolve(ROOT_DIR, 'contracts');
 const THREE_BUILD_DIR = path.resolve(ROOT_DIR, 'node_modules/three/build');
+const DIST_VENDOR_DIR = path.resolve(ROOT_DIR, 'dist/vendor');
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -41,14 +46,34 @@ const MIME_TYPES: Record<string, string> = {
   '.png': 'image/png',
 };
 
+const MAX_JSON_BODY_BYTES = 1_048_576; // 1 MiB safety cap
+
+class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
   const chunks: Buffer[] = [];
+  let totalBytes = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buf.length;
+    if (totalBytes > MAX_JSON_BODY_BYTES) {
+      throw new HttpError(413, 'Request payload exceeds 1 MiB limit.');
+    }
+    chunks.push(buf);
   }
   const raw = Buffer.concat(chunks).toString('utf8');
   if (!raw.trim()) return {} as T;
-  return JSON.parse(raw) as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new HttpError(400, 'Malformed JSON request body.');
+  }
 }
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
@@ -59,7 +84,22 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   res.end(JSON.stringify(payload));
 }
 
-function serveStaticFile(res: ServerResponse, reqPath: string): boolean {
+function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): boolean {
+  if (reqPath === '/vendor/wallet-sdks.js') {
+    const bundleFile = path.join(DIST_VENDOR_DIR, 'wallet-sdks.js');
+    if (fs.existsSync(bundleFile)) {
+      res.writeHead(200, {
+        'Content-Type': 'application/javascript; charset=utf-8',
+        'Cache-Control': 'public, max-age=3600',
+        'Access-Control-Allow-Origin': '*',
+      });
+      if (isHead) res.end();
+      else fs.createReadStream(bundleFile).pipe(res);
+      return true;
+    }
+    return false;
+  }
+
   if (reqPath === '/vendor/three.module.js' || reqPath === '/vendor/three.core.js') {
     const fileName = path.basename(reqPath);
     const threeFile = path.join(THREE_BUILD_DIR, fileName);
@@ -69,7 +109,8 @@ function serveStaticFile(res: ServerResponse, reqPath: string): boolean {
         'Cache-Control': 'public, max-age=3600',
         'Access-Control-Allow-Origin': '*',
       });
-      fs.createReadStream(threeFile).pipe(res);
+      if (isHead) res.end();
+      else fs.createReadStream(threeFile).pipe(res);
       return true;
     }
     return false;
@@ -81,8 +122,16 @@ function serveStaticFile(res: ServerResponse, reqPath: string): boolean {
   if (!fs.existsSync(fullPath) || fs.statSync(fullPath).isDirectory()) return false;
 
   const ext = path.extname(fullPath);
-  res.writeHead(200, { 'Content-Type': MIME_TYPES[ext] ?? 'application/octet-stream' });
-  fs.createReadStream(fullPath).pipe(res);
+  const headers: Record<string, string> = {
+    'Content-Type': MIME_TYPES[ext] ?? 'application/octet-stream',
+  };
+  // Required by Coinbase Smart Wallet SDK popup communication
+  if (ext === '.html') {
+    headers['Cross-Origin-Opener-Policy'] = 'same-origin-allow-popups';
+  }
+  res.writeHead(200, headers);
+  if (isHead) res.end();
+  else fs.createReadStream(fullPath).pipe(res);
   return true;
 }
 
@@ -102,6 +151,15 @@ export function createSiphonServer() {
           chains: CHAIN_LIST.length,
           solanaCctpDomain: SOLANA_CCTP_DOMAIN,
           protocolFeeBps: PROTOCOL_FEE_BPS,
+          l2IndexerProvider: getL2IndexerProvider(),
+        });
+      }
+
+      if (method === 'GET' && pathname === '/api/config') {
+        return sendJson(res, 200, {
+          coinbaseSmartWalletEnabled: fs.existsSync(path.join(DIST_VENDOR_DIR, 'wallet-sdks.js')),
+          walletConnectProjectId: process.env.WALLETCONNECT_PROJECT_ID?.trim() || null,
+          l2IndexerProvider: getL2IndexerProvider(),
         });
       }
 
@@ -146,7 +204,15 @@ export function createSiphonServer() {
         if (body.presetId) {
           report = await scanPresetWallet(body.presetId);
         } else if (body.address) {
-          report = await scanLiveWallet(body.address);
+          try {
+            report = await scanLiveWallet(body.address);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Invalid wallet address';
+            if (msg.toLowerCase().includes('invalid evm')) {
+              return sendJson(res, 400, { error: msg });
+            }
+            throw err;
+          }
         } else {
           report = await scanPresetWallet('veteran_defi');
         }
@@ -203,11 +269,17 @@ export function createSiphonServer() {
         const address = url.searchParams.get('address')?.trim();
         if (!address) return sendJson(res, 400, { error: 'address query parameter is required' });
         try {
+          solanaAddressToBytes32(address);
+        } catch {
+          return sendJson(res, 400, { error: 'Invalid Solana address' });
+        }
+        try {
           const balances = await fetchSolanaWalletBalances(address);
           return sendJson(res, 200, balances);
         } catch (err) {
-          return sendJson(res, 400, {
-            error: err instanceof Error ? err.message : 'Invalid Solana address',
+          return sendJson(res, 503, {
+            rpcUnavailable: true,
+            error: err instanceof Error ? err.message : 'Solana RPC temporarily unavailable',
           });
         }
       }
@@ -296,6 +368,33 @@ export function createSiphonServer() {
         return sendJson(res, 200, status);
       }
 
+      if (method === 'POST' && pathname === '/api/cctp/attestation') {
+        const body = await readJsonBody<{
+          chain?: EvmChainId;
+          txHash?: string;
+          solanaDestination?: string;
+        }>(req);
+
+        if (!body.chain || !body.txHash || !/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim())) {
+          return sendJson(res, 400, {
+            error: 'chain and a valid 32-byte 0x txHash are required',
+          });
+        }
+
+        try {
+          const att = await fetchCctpAttestationForTx({
+            chain: body.chain,
+            txHash: body.txHash.trim(),
+            solanaDestination: body.solanaDestination?.trim(),
+          });
+          return sendJson(res, 200, att);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Could not fetch CCTP attestation',
+          });
+        }
+      }
+
       if (method === 'POST' && pathname === '/api/simulate') {
         const body = await readJsonBody<{
           scanId?: string;
@@ -343,12 +442,15 @@ export function createSiphonServer() {
         });
       }
 
-      if (method === 'GET' && serveStaticFile(res, pathname)) {
+      if ((method === 'GET' || method === 'HEAD') && serveStaticFile(res, pathname, method === 'HEAD')) {
         return;
       }
 
       return sendJson(res, 404, { error: 'Not found' });
     } catch (err) {
+      if (err instanceof HttpError) {
+        return sendJson(res, err.status, { error: err.message });
+      }
       return sendJson(res, 500, {
         error: err instanceof Error ? err.message : 'Internal server error',
       });

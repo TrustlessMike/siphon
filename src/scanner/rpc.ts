@@ -88,26 +88,76 @@ export function decodeMulticall3Aggregate3(
   return out;
 }
 
-async function jsonRpcBatch(
-  rpcUrl: string,
+export async function evmJsonRpcBatch(
+  rpcUrls: string[],
   requests: Array<{ id: number; method: string; params: unknown[] }>,
-  timeoutMs = 5000
-): Promise<Array<{ id: number; result?: string; error?: { message: string } }>> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(requests.map((r) => ({ jsonrpc: '2.0', ...r }))),
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
-    const parsed = await res.json();
-    return Array.isArray(parsed) ? parsed : [parsed];
-  } finally {
-    clearTimeout(timer);
+  timeoutMs = 4500
+): Promise<Array<{ id: number; result?: string; error?: { message: string; code?: number } }>> {
+  let lastErr: unknown;
+  for (const rpcUrl of rpcUrls) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requests.map((r) => ({ jsonrpc: '2.0', ...r }))),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        lastErr = new Error(`RPC HTTP ${res.status} (${rpcUrl})`);
+        continue;
+      }
+      const parsed = await res.json();
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      if (!arr.length || (arr.length === 1 && !arr[0]?.result && arr[0]?.error && requests.length > 1)) {
+        lastErr = new Error(arr[0]?.error?.message ?? 'Empty batch response');
+        continue;
+      }
+      return arr;
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;
+    }
   }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'All RPC endpoints failed'));
+}
+
+export async function evmJsonRpcCall<T = string>(
+  rpcUrls: string[],
+  method: string,
+  params: unknown[],
+  timeoutMs = 3800
+): Promise<{ result?: T; error?: { message?: string; code?: number } }> {
+  let lastErr: unknown;
+  for (const rpcUrl of rpcUrls) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        lastErr = new Error(`RPC HTTP ${res.status} (${rpcUrl})`);
+        continue;
+      }
+      const json = (await res.json()) as { result?: T; error?: { message?: string; code?: number } };
+      // Application-level revert (e.g. execution reverted on eth_call) is a valid onchain answer, not an RPC outage
+      if (json.result !== undefined || json.error !== undefined) {
+        return json;
+      }
+      lastErr = new Error('Empty JSON-RPC response');
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'All RPC endpoints failed'));
 }
 
 export interface LiveChainScanOutput {
@@ -142,7 +192,8 @@ export async function scanSingleEvmChain(
   );
 
   try {
-    const batch = await jsonRpcBatch(chain.rpcUrl, [
+    const urls = chain.rpcUrls?.length ? chain.rpcUrls : [chain.rpcUrl];
+    const batch = await evmJsonRpcBatch(urls, [
       { id: 1, method: 'eth_blockNumber', params: [] },
       { id: 2, method: 'eth_gasPrice', params: [] },
       { id: 3, method: 'eth_getBalance', params: [walletAddress, 'latest'] },

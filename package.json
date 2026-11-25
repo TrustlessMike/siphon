@@ -6,16 +6,22 @@
   "scripts": {
     "dev": "tsx watch src/server/index.ts",
     "start": "node dist/src/server/index.js",
-    "build": "tsc",
+    "build:vendor": "esbuild src/client/wallet-sdks.ts --bundle --format=esm --platform=browser --target=es2022 --minify --define:global=globalThis --define:process.env.NODE_ENV='\"production\"' --outfile=dist/vendor/wallet-sdks.js",
+    "build": "tsc && npm run build:vendor",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/*.test.ts",
+    "test:e2e": "python3 tests/e2e-playwright.py"
   },
   "dependencies": {
+    "@coinbase/wallet-sdk": "^4.4.0",
+    "@noble/hashes": "^1.4.0",
     "@solana/web3.js": "^1.98.0",
+    "@walletconnect/ethereum-provider": "^2.26.0",
     "three": "^0.174.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "esbuild": "^0.28.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }

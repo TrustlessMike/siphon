@@ -85,8 +85,8 @@ export function mountSiphonFunnelScene(canvas) {
   if (!canvas) return { setActive() {}, destroy() {} };
 
   const rect = canvas.getBoundingClientRect();
-  const w = Math.max(360, Math.round(rect.width || 560));
-  const h = Math.max(320, Math.round(rect.height || 440));
+  const w = Math.max(280, Math.round(rect.width || 560));
+  const h = Math.max(240, Math.round(rect.height || 430));
   const renderer = createRenderer(canvas, w, h);
   if (!renderer) return { setActive() {}, destroy() {} };
 
@@ -95,8 +95,15 @@ export function mountSiphonFunnelScene(canvas) {
   scene.environment = envRT.texture;
 
   const camera = new THREE.PerspectiveCamera(27, w / h, 0.1, 100);
-  camera.position.set(0, 2.05, 6.8);
-  camera.lookAt(0, -0.05, 0);
+  const fitCamera = (cw, ch) => {
+    const aspect = Math.max(0.75, cw / Math.max(1, ch));
+    const scale = aspect < 1.3 ? Math.min(1.38, 1.3 / aspect) : 1.0;
+    camera.aspect = cw / Math.max(1, ch);
+    camera.position.set(0, 2.05 * scale, 6.8 * scale);
+    camera.lookAt(0, -0.05, 0);
+    camera.updateProjectionMatrix();
+  };
+  fitCamera(w, h);
 
   scene.add(new THREE.HemisphereLight(0xffffff, 0xe2e8f0, 0.95));
   const key = new THREE.DirectionalLight(0xffffff, 1.5);
@@ -254,9 +261,9 @@ export function mountSiphonFunnelScene(canvas) {
   const ro = new ResizeObserver(() => {
     const r = canvas.getBoundingClientRect();
     if (r.width > 40 && r.height > 40) {
-      camera.aspect = r.width / r.height;
-      camera.updateProjectionMatrix();
+      fitCamera(r.width, r.height);
       renderer.setSize(Math.round(r.width), Math.round(r.height), false);
+      renderer.render(scene, camera);
     }
   });
   ro.observe(canvas);

@@ -5,14 +5,13 @@ pragma solidity ^0.8.24;
  * @title SiphonRouter
  * @notice Single-signature EVM-to-Solana migrator router.
  *
- * Atomically executes across a single user transaction (or Permit2 gas-sponsored relay):
- *   1. Withdraws user capital from DeFi smart contracts (Aave v3, Compound v3, ERC-4626 vaults)
- *   2. Pulls approved ERC-20 dust balances via Permit2 / allowance
- *   3. Swaps all liquid tokens into native chain USDC via approved DEX aggregator targets
- *   4. Safely burns user-selected zero-liquidity / dead tokens to 0x...dEaD using try/catch
- *      so a reverting honeypot or blacklisted scam token NEVER reverts the user's sweep
- *   5. Bridges the consolidated native USDC directly to the user's Solana wallet via Circle CCTP
- *      (TokenMessenger.depositForBurn, destinationDomain = 5, 32-byte Solana Ed25519 pubkey)
+ * Security-hardened execution flow:
+ *   1. Uses SafeERC20 low-level wrappers so non-standard tokens (e.g., Ethereum USDT) never revert
+ *   2. Pulls user aTokens before Aave v3 withdrawals so the router withdraws the user's actual collateral
+ *   3. Measures exact balance deltas per swap step so residual dust can never be swept across callers
+ *   4. Isolates user-selected zero-liquidity token burns inside try/catch so honeypots never revert a sweep
+ *   5. Bridges consolidated native USDC directly to the user's Solana Ed25519 bytes32 address via Circle CCTP
+ *   6. Two-step ownership transfer and hard-capped protocol fee (<= 100 bps)
  */
 
 interface IERC20 {
@@ -44,7 +43,45 @@ interface IERC4626Vault {
     function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
 }
 
+library SafeERC20Lite {
+    error SafeTransferFailed(address token);
+    error SafeTransferFromFailed(address token);
+    error SafeApproveFailed(address token);
+
+    function safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+        if (!ok || (data.length > 0 && !abi.decode(data, (bool)))) {
+            revert SafeTransferFailed(token);
+        }
+    }
+
+    function safeTransferFrom(address token, address from, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount)
+        );
+        if (!ok || (data.length > 0 && !abi.decode(data, (bool)))) {
+            revert SafeTransferFromFailed(token);
+        }
+    }
+
+    function safeApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+        if (!ok || (data.length > 0 && !abi.decode(data, (bool)))) {
+            revert SafeApproveFailed(token);
+        }
+    }
+
+    function forceApprove(address token, address spender, uint256 amount) internal {
+        safeApprove(token, spender, 0);
+        if (amount > 0) {
+            safeApprove(token, spender, amount);
+        }
+    }
+}
+
 contract SiphonRouter {
+    using SafeERC20Lite for address;
+
     /// @notice Canonical burn sink for verifiable zero-liquidity token disposal.
     address public constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
@@ -57,6 +94,7 @@ contract SiphonRouter {
     address public immutable usdc;
     ITokenMessengerCCTP public immutable cctpMessenger;
     address public owner;
+    address public pendingOwner;
     address public feeRecipient;
     uint16 public feeBps;
     uint256 private _reentrancyGuard = 1;
@@ -72,14 +110,16 @@ contract SiphonRouter {
 
     struct DefiExitStep {
         DefiKind kind;
-        address protocol;
-        address assetOrVault;
+        address protocol;       // Aave v3 Pool, Compound v3 Comet, or ERC-4626 Vault
+        address receiptToken;   // For AAVE_V3_WITHDRAW: user's aToken pulled before Pool.withdraw()
+        address underlyingAsset; // Underlying ERC-20 asset returned by protocol
         uint256 amount;
     }
 
     struct SwapStep {
         address tokenIn;
         uint256 amountIn;
+        bool pullFromUser;      // True for wallet ERC-20s; false when swapping output of a prior DefiExitStep
         address aggregator;
         bytes swapCalldata;
     }
@@ -112,10 +152,15 @@ contract SiphonRouter {
     event DeadTokenBurned(address indexed user, address indexed token, uint256 amount);
     event DeadTokenSkipped(address indexed user, address indexed token, string reason);
     event TargetUpdated(address indexed target, bool allowed);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event FeeUpdated(address indexed feeRecipient, uint16 feeBps);
 
     error ExpiredDeadline();
+    error InvalidAddress();
     error InvalidSolanaRecipient();
     error TargetNotAllowed(address target);
+    error AggregatorSwapFailed(address aggregator);
     error SlippageExceeded(uint256 actualUsdc, uint256 minExpected);
     error ZeroUsdcOutput();
     error Unauthorized();
@@ -140,6 +185,7 @@ contract SiphonRouter {
         address _feeRecipient,
         uint16 _feeBps
     ) {
+        if (_usdc == address(0) || _cctpMessenger == address(0)) revert InvalidAddress();
         if (_feeBps > MAX_FEE_BPS) revert FeeTooHigh();
         usdc = _usdc;
         cctpMessenger = ITokenMessengerCCTP(_cctpMessenger);
@@ -148,9 +194,38 @@ contract SiphonRouter {
         feeBps = _feeBps;
     }
 
+    receive() external payable {}
+
     function setAllowedTarget(address target, bool allowed) external onlyOwner {
+        if (target == address(0)) revert InvalidAddress();
         allowedTargets[target] = allowed;
         emit TargetUpdated(target, allowed);
+    }
+
+    function setFeeParams(address _feeRecipient, uint16 _feeBps) external onlyOwner {
+        if (_feeBps > MAX_FEE_BPS) revert FeeTooHigh();
+        feeRecipient = _feeRecipient;
+        feeBps = _feeBps;
+        emit FeeUpdated(_feeRecipient, _feeBps);
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert InvalidAddress();
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert Unauthorized();
+        address prev = owner;
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(prev, owner);
+    }
+
+    function rescueToken(address token, address to, uint256 amount) external onlyOwner nonReentrant {
+        if (to == address(0)) revert InvalidAddress();
+        token.safeTransfer(to, amount);
     }
 
     /**
@@ -170,18 +245,27 @@ contract SiphonRouter {
         for (uint256 i = 0; i < params.defiExits.length; i++) {
             DefiExitStep calldata exitStep = params.defiExits[i];
             if (!allowedTargets[exitStep.protocol]) revert TargetNotAllowed(exitStep.protocol);
+            if (exitStep.amount == 0) continue;
 
             if (exitStep.kind == DefiKind.AAVE_V3_WITHDRAW) {
+                if (exitStep.receiptToken == address(0) || exitStep.underlyingAsset == address(0)) {
+                    revert InvalidAddress();
+                }
+                // Pull the user's aTokens into the router first so Pool.withdraw burns the user's position
+                uint256 aBalBefore = IERC20(exitStep.receiptToken).balanceOf(address(this));
+                exitStep.receiptToken.safeTransferFrom(msg.sender, address(this), exitStep.amount);
+                uint256 aReceived = IERC20(exitStep.receiptToken).balanceOf(address(this)) - aBalBefore;
+
                 IAaveV3Pool(exitStep.protocol).withdraw(
-                    exitStep.assetOrVault,
-                    exitStep.amount,
+                    exitStep.underlyingAsset,
+                    aReceived,
                     address(this)
                 );
             } else if (exitStep.kind == DefiKind.COMPOUND_V3_WITHDRAW) {
                 ICompoundV3Comet(exitStep.protocol).withdrawFrom(
                     msg.sender,
                     address(this),
-                    exitStep.assetOrVault,
+                    exitStep.underlyingAsset,
                     exitStep.amount
                 );
             } else if (exitStep.kind == DefiKind.ERC4626_REDEEM) {
@@ -193,29 +277,36 @@ contract SiphonRouter {
             }
         }
 
-        // 2. Pull liquid ERC-20 dust & swap into native USDC via allowlisted aggregators
+        // 2. Pull liquid ERC-20 dust & swap exact amount into native USDC via allowlisted aggregators
         for (uint256 i = 0; i < params.swaps.length; i++) {
             SwapStep calldata s = params.swaps[i];
+            if (s.amountIn == 0) continue;
+
             if (s.tokenIn == usdc) {
-                IERC20(usdc).transferFrom(msg.sender, address(this), s.amountIn);
+                if (s.pullFromUser) {
+                    usdc.safeTransferFrom(msg.sender, address(this), s.amountIn);
+                }
                 continue;
             }
+
             if (!allowedTargets[s.aggregator]) revert TargetNotAllowed(s.aggregator);
 
-            uint256 pulled = s.amountIn;
-            if (IERC20(s.tokenIn).allowance(msg.sender, address(this)) >= pulled) {
-                IERC20(s.tokenIn).transferFrom(msg.sender, address(this), pulled);
+            uint256 swapAmount;
+            if (s.pullFromUser) {
+                uint256 balBefore = IERC20(s.tokenIn).balanceOf(address(this));
+                s.tokenIn.safeTransferFrom(msg.sender, address(this), s.amountIn);
+                swapAmount = IERC20(s.tokenIn).balanceOf(address(this)) - balBefore;
+            } else {
+                uint256 currentBal = IERC20(s.tokenIn).balanceOf(address(this));
+                swapAmount = s.amountIn < currentBal ? s.amountIn : currentBal;
             }
 
-            uint256 swapBal = IERC20(s.tokenIn).balanceOf(address(this));
-            if (swapBal == 0) continue;
+            if (swapAmount == 0) continue;
 
-            IERC20(s.tokenIn).approve(s.aggregator, 0);
-            IERC20(s.tokenIn).approve(s.aggregator, swapBal);
-
+            s.tokenIn.forceApprove(s.aggregator, swapAmount);
             (bool ok, ) = s.aggregator.call(s.swapCalldata);
-            require(ok, "AGGREGATOR_SWAP_FAILED");
-            IERC20(s.tokenIn).approve(s.aggregator, 0);
+            if (!ok) revert AggregatorSwapFailed(s.aggregator);
+            s.tokenIn.forceApprove(s.aggregator, 0);
         }
 
         // 3. Safely burn user-selected zero-liquidity / dead tokens (isolated try/catch)
@@ -224,15 +315,14 @@ contract SiphonRouter {
         for (uint256 i = 0; i < params.burns.length; i++) {
             BurnStep calldata b = params.burns[i];
             if (b.amount == 0) continue;
-            try IERC20(b.token).transferFrom(msg.sender, DEAD_ADDRESS, b.amount) returns (bool ok) {
-                if (ok) {
-                    burnedCount++;
-                    emit DeadTokenBurned(msg.sender, b.token, b.amount);
-                } else {
-                    skippedBurns++;
-                    emit DeadTokenSkipped(msg.sender, b.token, "TRANSFER_RETURNED_FALSE");
-                }
-            } catch {
+            (bool ok, bytes memory ret) = b.token.call(
+                abi.encodeWithSelector(IERC20.transferFrom.selector, msg.sender, DEAD_ADDRESS, b.amount)
+            );
+            bool succeeded = ok && (ret.length == 0 || (ret.length >= 32 && abi.decode(ret, (bool))));
+            if (succeeded) {
+                burnedCount++;
+                emit DeadTokenBurned(msg.sender, b.token, b.amount);
+            } else {
                 skippedBurns++;
                 emit DeadTokenSkipped(msg.sender, b.token, "HONEYPOT_OR_REVERT");
             }
@@ -249,18 +339,17 @@ contract SiphonRouter {
         }
 
         if (feeUsdc > 0 && feeRecipient != address(0)) {
-            IERC20(usdc).transfer(feeRecipient, feeUsdc);
+            usdc.safeTransfer(feeRecipient, feeUsdc);
         }
 
-        IERC20(usdc).approve(address(cctpMessenger), 0);
-        IERC20(usdc).approve(address(cctpMessenger), bridgedUsdc);
+        usdc.forceApprove(address(cctpMessenger), bridgedUsdc);
         cctpNonce = cctpMessenger.depositForBurn(
             bridgedUsdc,
             SOLANA_CCTP_DOMAIN,
             params.solanaRecipient,
             usdc
         );
-        IERC20(usdc).approve(address(cctpMessenger), 0);
+        usdc.forceApprove(address(cctpMessenger), 0);
 
         emit SiphonMigrated(
             msg.sender,

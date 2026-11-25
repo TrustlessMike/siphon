@@ -1,13 +1,23 @@
 import { mountSiphonFunnelScene } from './siphon-3d.js';
 import { renderConvergenceSvg } from './siphon-svg.js';
 import {
+  connectCoinbaseSmartWallet,
   connectEvmWallet,
   connectSolanaWallet,
+  connectWalletConnect,
+  disconnectEvmWallet,
+  disconnectSolanaWallet,
   getConnectedEvmAddress,
   getConnectedSolanaAddress,
+  getConnectedSolanaWalletName,
   getConnectedWalletName,
   getWalletBatchCapabilities,
+  getWalletConnectorConfig,
   isChainBatchSupported,
+  listAvailableEvmWallets,
+  listAvailableSolanaWallets,
+  loadWalletConnectorConfig,
+  refreshInstalledWallets,
   sendEip5792Batch,
   sendRealEvmTransaction,
   waitForEip5792Batch,
@@ -95,7 +105,8 @@ async function refreshSolanaBalance() {
   if (!solDest) return;
   try {
     solanaBalances = await api(`/api/solana/balance?address=${encodeURIComponent(solDest)}`);
-    const summary = `${solanaBalances.usdcBalance.toLocaleString(undefined, { minimumFractionDigits: 2 })} USDC · ${solanaBalances.solBalance.toFixed(4)} SOL (slot ${solanaBalances.slot.toLocaleString()})`;
+    const ataNote = solanaBalances.hasUsdcAta ? 'USDC ATA ready' : 'No USDC ATA yet (CCTP needs ~0.002 SOL)';
+    const summary = `${solanaBalances.usdcBalance.toLocaleString(undefined, { minimumFractionDigits: 2 })} USDC · ${solanaBalances.solBalance.toFixed(4)} SOL · ${ataNote} (slot ${solanaBalances.slot.toLocaleString()})`;
     if (badge) badge.textContent = `Live Solana: ${solanaBalances.usdcBalance.toFixed(2)} USDC · ${solanaBalances.solBalance.toFixed(3)} SOL`;
     if (execEl) execEl.textContent = summary;
   } catch (err) {
@@ -143,6 +154,8 @@ function updateWalletButtons() {
 
   const evmBtn = document.getElementById('connectEvmBtn');
   const solBtn = document.getElementById('connectSolBtn');
+  const siteBtn = document.getElementById('siteConnectBtn');
+  const heroBtn = document.getElementById('heroConnectBtn');
   const execEvm = document.getElementById('execConnectedEvm');
   const execBatch = document.getElementById('execBatchMode');
   const topBtn = document.getElementById('topExecuteLiveBtn');
@@ -155,6 +168,17 @@ function updateWalletButtons() {
   if (solBtn) {
     solBtn.textContent = solAddr ? `SOL: ${shortAddr(solAddr)}` : 'Connect Solana';
     solBtn.classList.toggle('connected', Boolean(solAddr));
+  }
+  if (siteBtn) {
+    siteBtn.textContent = evmAddr
+      ? `${shortAddr(evmAddr)}`
+      : solAddr
+      ? `SOL: ${shortAddr(solAddr)}`
+      : 'Connect Wallet';
+    siteBtn.classList.toggle('connected', Boolean(evmAddr || solAddr));
+  }
+  if (heroBtn) {
+    heroBtn.textContent = evmAddr ? `Connected: ${shortAddr(evmAddr)}` : 'Connect Wallet';
   }
   if (execEvm) {
     execEvm.textContent = evmAddr
@@ -388,7 +412,7 @@ function renderAssetTable() {
           </td>
           <td>
             <div class="asset-title">
-              ${escapeHtml(a.symbol)}${a.protocol ? ` <span class="muted-xs">· ${escapeHtml(a.protocol)}</span>` : ''}${a.permit2Approved ? `<span class="micro-pill permit2" title="Already approved on Uniswap Permit2 (no approval tx needed)">Permit2</span>` : a.eip2612Supported ? `<span class="micro-pill eip2612" title="Supports EIP-2612 gasless signature permit">EIP-2612</span>` : ''}
+              ${escapeHtml(a.symbol)}${a.protocol ? ` <span class="muted-xs">· ${escapeHtml(a.protocol)}</span>` : ''}${a.aaveDebtUsd > 0 ? `<span class="micro-pill" style="background:var(--block-bg);border-color:#fecaca;color:#991b1b;" title="${escapeHtml(a.actionReason)}">Debt Guard</span>` : a.permit2Approved ? `<span class="micro-pill permit2" title="Already approved on Uniswap Permit2 (no approval tx needed)">Permit2</span>` : a.eip2612Supported ? `<span class="micro-pill eip2612" title="Supports EIP-2612 gasless signature permit">EIP-2612</span>` : ''}
             </div>
             <div class="asset-sub">${escapeHtml(a.name)}</div>
           </td>
@@ -440,7 +464,7 @@ function renderLiveExecutionLog() {
   meta.textContent = `${liveExecutionLog.length} item(s)`;
   body.innerHTML = liveExecutionLog
     .map(
-      (entry) => `
+      (entry, idx) => `
       <tr>
         <td>
           <div class="asset-title">${escapeHtml(entry.title)}</div>
@@ -449,14 +473,41 @@ function renderLiveExecutionLog() {
         <td class="mono">${escapeHtml(entry.provider)}</td>
         <td class="mono">${escapeHtml(entry.estimatedOutput || '—')}</td>
         <td><span class="action-tag ${entry.toneClass}">${escapeHtml(entry.status)}</span></td>
-        <td class="mono" style="font-size:11.5px;">
-          ${entry.evmTxHash ? `<a class="explorer-link" href="${escapeHtml(entry.explorerUrl)}/tx/${escapeHtml(entry.evmTxHash)}" target="_blank" rel="noreferrer">EVM Tx ↗</a>` : '—'}
-          ${entry.solanaTxHash ? ` · <a class="explorer-link" href="https://solscan.io/tx/${escapeHtml(entry.solanaTxHash)}" target="_blank" rel="noreferrer">Solscan ↗</a>` : ''}
-        </td>
-      </tr>
-    `
+          <td class="mono" style="font-size:11.5px;">
+            ${entry.evmTxHash ? `<a class="explorer-link" href="${escapeHtml(entry.explorerUrl)}/tx/${escapeHtml(entry.evmTxHash)}" target="_blank" rel="noreferrer">EVM Tx ↗</a>` : '—'}
+            ${entry.solanaTxHash ? ` · <a class="explorer-link" href="https://solscan.io/tx/${escapeHtml(entry.solanaTxHash)}" target="_blank" rel="noreferrer">Solscan ↗</a>` : ''}
+            ${entry.requiresSolanaClaim && entry.evmTxHash ? ` · <button type="button" class="text-action" data-check-cctp="${idx}">Check CCTP Iris</button>` : ''}
+          </td>
+        </tr>
+      `
     )
     .join('');
+
+  body.querySelectorAll('[data-check-cctp]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const idx = Number(btn.dataset.checkCctp);
+      const entry = liveExecutionLog[idx];
+      if (!entry?.evmTxHash) return;
+      const solDest = document.getElementById('solanaDestInput')?.value.trim();
+      try {
+        btn.textContent = 'Checking Iris…';
+        const att = await api('/api/cctp/attestation', {
+          method: 'POST',
+          body: JSON.stringify({ chain: entry.chain, txHash: entry.evmTxHash, solanaDestination: solDest }),
+        });
+        entry.status =
+          att.attestationStatus === 'complete'
+            ? 'CCTP Attested · Ready to Claim'
+            : `CCTP: ${att.attestationStatus}`;
+        entry.detail = att.nextStep;
+        entry.toneClass = att.attestationStatus === 'complete' ? 'tag-defi' : 'tag-sell';
+        renderLiveExecutionLog();
+        showToast(att.nextStep);
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  });
 }
 
 async function pollLiveStatus(entry) {
@@ -627,6 +678,7 @@ async function executeChainBatchLive(chain) {
   renderLiveExecutionLog();
 
   try {
+    const hasSolanaSigner = Boolean(getConnectedSolanaAddress());
     const batch = await api('/api/tx/prepare-chain-batch', {
       method: 'POST',
       body: JSON.stringify({
@@ -636,11 +688,14 @@ async function executeChainBatchLive(chain) {
         solanaDestination: solDest,
         outputAsset,
         bridgePreference,
-        bundleDefiCctp: true,
+        // Only bundle direct Circle CCTP after DeFi USDC exits when Solana signer is connected or CCTP was explicitly chosen;
+        // otherwise withdraw cleanly to wallet so auto-delivered Relay/LI.FI can bridge with zero manual Solana claim.
+        bundleDefiCctp: hasSolanaSigner || bridgePreference === 'cctp',
       }),
     });
 
     entry.explorerUrl = batch.explorerUrl;
+    entry.requiresSolanaClaim = batch.bridgeTrackers.some((t) => t.requiresSolanaClaim);
     const trackerSummary = batch.bridgeTrackers
       .map((t) => `${t.assetSymbol}→${t.estimatedOutput}`)
       .slice(0, 2)
@@ -743,15 +798,27 @@ async function executeChainBatchLive(chain) {
         entry.evmTxHash = txHash;
         entry.status = `Submitted ${i + 1}/${batch.calls.length} (${shortAddr(txHash)})`;
         renderLiveExecutionLog();
+
+        // Wait for mining confirmation after withdraw/approve before firing the next dependent tx
+        const needsMiningBeforeNext =
+          i < batch.calls.length - 1 &&
+          (call.stepId.includes('withdraw') ||
+            call.stepId.includes('redeem') ||
+            call.stepId.includes('approve'));
+        if (needsMiningBeforeNext) {
+          entry.status = `Waiting confirm ${i + 1}/${batch.calls.length}…`;
+          renderLiveExecutionLog();
+          await waitForEvmReceipt(batch.chain, txHash);
+        }
       }
     }
 
-    // Track Relay / bridge landing on Solana for every bridged asset in the chain batch
-    const relayTracker = batch.bridgeTrackers.find((t) => t.provider === 'relay' && t.requestId);
-    if (relayTracker) {
+    // Track Relay / bridge landing on Solana across ALL bridged assets in the chain batch
+    const relayTrackers = batch.bridgeTrackers.filter((t) => t.provider === 'relay' && t.requestId);
+    if (relayTrackers.length > 0) {
       entry.provider = 'relay';
-      entry.requestId = relayTracker.requestId;
-      pollLiveStatus(entry);
+      entry.requestId = relayTrackers[0].requestId;
+      pollBatchBridgeTrackers(entry, batch.chain, relayTrackers);
     } else if (entry.evmTxHash) {
       pollLiveStatus(entry);
     }
@@ -905,6 +972,290 @@ async function loadContract() {
   }
 }
 
+async function waitForEvmReceipt(chain, txHash, maxAttempts = 12) {
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((r) => setTimeout(r, 1500));
+    try {
+      const st = await api('/api/tx/status', {
+        method: 'POST',
+        body: JSON.stringify({ chain, txHash }),
+      });
+      if (st.evmConfirmed || st.evmFailed) return st;
+    } catch {
+      // Keep polling
+    }
+  }
+  return null;
+}
+
+async function pollBatchBridgeTrackers(entry, chain, trackers) {
+  const landed = new Set();
+  for (let i = 0; i < 24; i++) {
+    await new Promise((r) => setTimeout(r, 2500));
+    for (const tr of trackers) {
+      if (landed.has(tr.requestId)) continue;
+      try {
+        const st = await api('/api/tx/status', {
+          method: 'POST',
+          body: JSON.stringify({
+            chain,
+            txHash: entry.evmTxHash,
+            requestId: tr.requestId,
+            provider: tr.provider,
+          }),
+        });
+        if (st.solanaTxHash && !entry.solanaTxHash) entry.solanaTxHash = st.solanaTxHash;
+        if (st.bridgeStatus === 'success') landed.add(tr.requestId);
+      } catch {
+        // Keep polling
+      }
+    }
+    if (landed.size > 0) {
+      entry.status =
+        landed.size === trackers.length
+          ? `Landed on Solana (${landed.size}/${trackers.length})`
+          : `Relaying (${landed.size}/${trackers.length} landed)`;
+      entry.toneClass = landed.size === trackers.length ? 'tag-defi' : 'tag-sell';
+      renderLiveExecutionLog();
+    }
+    if (landed.size === trackers.length) {
+      refreshSolanaBalance();
+      return;
+    }
+  }
+}
+
+let activeWalletModalTab = 'evm';
+
+function closeWalletModal() {
+  document.getElementById('walletModalBackdrop')?.classList.add('hidden');
+}
+
+async function handleEvmConnected({ address, walletName, capabilities }) {
+  updateWalletButtons();
+  const batchNote = capabilities?.anySupported
+    ? '1-Click EIP-5792 Batch armed'
+    : 'Sequential signing ready';
+  showToast(`Connected ${walletName} (${shortAddr(address)}) · ${batchNote}`);
+  await runScan({ address, autoOpen: true });
+}
+
+function renderWalletModalContent() {
+  const titleEl = document.getElementById('walletModalTitle');
+  const subEl = document.getElementById('walletModalSub');
+  const listEl = document.getElementById('walletModalList');
+  const footEl = document.getElementById('walletModalFoot');
+  const evmDot = document.getElementById('walletTabEvmDot');
+  const solDot = document.getElementById('walletTabSolDot');
+  if (!listEl) return;
+
+  const evmAddr = getConnectedEvmAddress();
+  const solAddr = getConnectedSolanaAddress();
+  evmDot?.classList.toggle('hidden', !evmAddr);
+  solDot?.classList.toggle('hidden', !solAddr);
+
+  document.querySelectorAll('.wallet-tab').forEach((t) => {
+    t.classList.toggle('active', t.dataset.walletTab === activeWalletModalTab);
+  });
+
+  const isEvm = activeWalletModalTab === 'evm';
+  const activeAddr = isEvm ? evmAddr : solAddr;
+  const activeName = isEvm ? getConnectedWalletName() : getConnectedSolanaWalletName();
+  const cfg = getWalletConnectorConfig();
+
+  titleEl.textContent = isEvm ? 'Connect EVM Wallet' : 'Connect Solana Wallet';
+  subEl.textContent = isEvm
+    ? 'Sign exits, swaps, burns, and bridges across six EVM chains.'
+    : 'Receive native USDC or SOL on Solana.';
+
+  const rows = [];
+
+  if (isEvm) {
+    const detected = listAvailableEvmWallets();
+    for (const w of detected) {
+      const iconHtml = w.icon
+        ? `<img src="${escapeHtml(w.icon)}" alt="" class="wallet-option-icon" />`
+        : `<span class="wallet-option-monogram">${escapeHtml(w.name.slice(0, 2).toUpperCase())}</span>`;
+      rows.push(`
+        <button type="button" class="wallet-option-row" data-pick-evm="${escapeHtml(w.id)}">
+          <div class="wallet-option-left">
+            ${iconHtml}
+            <div>
+              <div class="wallet-option-name">${escapeHtml(w.name)}</div>
+              <div class="wallet-option-meta mono">Detected · ${escapeHtml(w.standard)}</div>
+            </div>
+          </div>
+          <span class="mono wallet-option-action">${activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
+        </button>
+      `);
+    }
+
+    // Coinbase Smart Wallet works in any browser with zero extension installed (Passkey / popup + native EIP-5792)
+    if (cfg.coinbaseSmartWalletEnabled) {
+      rows.push(`
+        <button type="button" class="wallet-option-row" data-pick-coinbase="true">
+          <div class="wallet-option-left">
+            <span class="wallet-option-monogram">CB</span>
+            <div>
+              <div class="wallet-option-name">Coinbase Smart Wallet</div>
+              <div class="wallet-option-meta mono">Passkey / Popup · No extension needed</div>
+            </div>
+          </div>
+          <span class="mono wallet-option-action">${activeName === 'Coinbase Wallet' && activeAddr ? 'Connected' : 'Connect →'}</span>
+        </button>
+      `);
+    }
+
+    // WalletConnect v2 QR for mobile & hardware wallets
+    rows.push(`
+      <button type="button" class="wallet-option-row" data-pick-wc="true">
+        <div class="wallet-option-left">
+          <span class="wallet-option-monogram">WC</span>
+          <div>
+            <div class="wallet-option-name">WalletConnect (Mobile QR)</div>
+            <div class="wallet-option-meta mono">${
+              cfg.walletConnectProjectId
+                ? 'MetaMask · Rabby · Rainbow · Ledger'
+                : 'Mobile QR · Requires project ID'
+            }</div>
+          </div>
+        </div>
+        <span class="mono wallet-option-action">QR →</span>
+      </button>
+    `);
+  } else {
+    const solWallets = listAvailableSolanaWallets();
+    for (const w of solWallets) {
+      const iconHtml = w.icon
+        ? `<img src="${escapeHtml(w.icon)}" alt="" class="wallet-option-icon" />`
+        : `<span class="wallet-option-monogram">${escapeHtml(w.name.slice(0, 2).toUpperCase())}</span>`;
+      rows.push(`
+        <button type="button" class="wallet-option-row" data-pick-sol="${escapeHtml(w.id)}">
+          <div class="wallet-option-left">
+            ${iconHtml}
+            <div>
+              <div class="wallet-option-name">${escapeHtml(w.name)}</div>
+              <div class="wallet-option-meta mono">Detected · ${escapeHtml(w.standard)}</div>
+            </div>
+          </div>
+          <span class="mono wallet-option-action">${activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
+        </button>
+      `);
+    }
+
+    if (!solWallets.length) {
+      rows.push(`
+        <div class="wallet-modal-empty">
+          No Solana extension detected in this browser. Install Phantom, Backpack, or Solflare, or set your destination address below.
+        </div>
+      `);
+    }
+
+    const currentDest = document.getElementById('solanaDestInput')?.value.trim() || '';
+    rows.push(`
+      <form class="wallet-manual-form" id="modalSolanaManualForm">
+        <input type="text" id="modalSolanaInput" class="field-input mono" value="${escapeHtml(currentDest)}" placeholder="Paste any Solana address" aria-label="Solana destination address" />
+        <button type="submit" class="btn-outline-dark">Use</button>
+      </form>
+    `);
+  }
+
+  if (activeAddr) {
+    rows.push(`
+      <button type="button" class="wallet-disconnect-btn" id="walletModalDisconnectBtn">
+        Disconnect ${escapeHtml(activeName || (isEvm ? 'EVM' : 'Solana'))} (${escapeHtml(shortAddr(activeAddr))})
+      </button>
+    `);
+  }
+
+  listEl.innerHTML = rows.join('');
+  footEl.textContent = isEvm
+    ? 'Supports EIP-6963 extensions, Coinbase Smart Wallet, WalletConnect v2, and EIP-5792 batch signing.'
+    : 'Supports Solana Wallet Standard or direct destination address paste.';
+
+  const evmCallbacks = {
+    onAccountsChanged: (next) => {
+      updateWalletButtons();
+      if (next) runScan({ address: next, autoOpen: true });
+    },
+    onChainChanged: () => updateWalletButtons(),
+  };
+
+  listEl.querySelectorAll('[data-pick-evm]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const walletId = btn.dataset.pickEvm;
+      closeWalletModal();
+      try {
+        const res = await connectEvmWallet({ walletId, ...evmCallbacks });
+        await handleEvmConnected(res);
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  });
+
+  listEl.querySelector('[data-pick-coinbase]')?.addEventListener('click', async () => {
+    closeWalletModal();
+    try {
+      const res = await connectCoinbaseSmartWallet(evmCallbacks);
+      await handleEvmConnected(res);
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  listEl.querySelector('[data-pick-wc]')?.addEventListener('click', async () => {
+    closeWalletModal();
+    try {
+      const res = await connectWalletConnect(evmCallbacks);
+      await handleEvmConnected(res);
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  listEl.querySelectorAll('[data-pick-sol]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const walletId = btn.dataset.pickSol;
+      closeWalletModal();
+      try {
+        const { address, walletName } = await connectSolanaWallet({ walletId });
+        document.getElementById('solanaDestInput').value = address;
+        updateWalletButtons();
+        showToast(`Connected ${walletName}: ${shortAddr(address)}`);
+        await Promise.all([recomputePlan(), refreshSolanaBalance()]);
+      } catch (err) {
+        showToast(err.message);
+      }
+    });
+  });
+
+  document.getElementById('modalSolanaManualForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const addr = document.getElementById('modalSolanaInput')?.value.trim();
+    if (!addr) return;
+    document.getElementById('solanaDestInput').value = addr;
+    closeWalletModal();
+    showToast(`Destination set to ${shortAddr(addr)}`);
+    await Promise.all([recomputePlan(), refreshSolanaBalance()]);
+  });
+
+  document.getElementById('walletModalDisconnectBtn')?.addEventListener('click', () => {
+    if (isEvm) disconnectEvmWallet();
+    else disconnectSolanaWallet();
+    updateWalletButtons();
+    renderWalletModalContent();
+    showToast(isEvm ? 'Disconnected EVM wallet.' : 'Disconnected Solana wallet.');
+  });
+}
+
+function openWalletModal(kind = 'evm') {
+  refreshInstalledWallets();
+  activeWalletModalTab = kind;
+  renderWalletModalContent();
+  document.getElementById('walletModalBackdrop')?.classList.remove('hidden');
+}
+
 function wireEvents() {
   document.getElementById('navLaunchBtn').addEventListener('click', () => openApp('scanner'));
   document.getElementById('backToSiteBtn').addEventListener('click', showWebsite);
@@ -917,34 +1268,24 @@ function wireEvents() {
     btn.addEventListener('click', () => switchView(btn.dataset.view));
   });
 
-  document.getElementById('connectEvmBtn').addEventListener('click', async () => {
-    try {
-      const { address, walletName, capabilities } = await connectEvmWallet((next) => {
-        updateWalletButtons();
-        if (next) runScan({ address: next, autoOpen: true });
-      });
-      updateWalletButtons();
-      const batchNote = capabilities?.anySupported
-        ? 'EIP-5792 1-Click Batch armed!'
-        : 'Sequential signing ready.';
-      showToast(`Connected ${walletName} (${shortAddr(address)}) · ${batchNote}`);
-      await runScan({ address, autoOpen: true });
-    } catch (err) {
-      showToast(err.message);
-    }
+  document.getElementById('walletModalCloseBtn')?.addEventListener('click', closeWalletModal);
+  document.getElementById('walletModalBackdrop')?.addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) closeWalletModal();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeWalletModal();
+  });
+  document.querySelectorAll('.wallet-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      activeWalletModalTab = tab.dataset.walletTab;
+      renderWalletModalContent();
+    });
   });
 
-  document.getElementById('connectSolBtn').addEventListener('click', async () => {
-    try {
-      const { address, walletName } = await connectSolanaWallet();
-      document.getElementById('solanaDestInput').value = address;
-      updateWalletButtons();
-      showToast(`Connected ${walletName}: ${shortAddr(address)}`);
-      await Promise.all([recomputePlan(), refreshSolanaBalance()]);
-    } catch (err) {
-      showToast(err.message);
-    }
-  });
+  document.getElementById('siteConnectBtn')?.addEventListener('click', () => openWalletModal('evm'));
+  document.getElementById('heroConnectBtn')?.addEventListener('click', () => openWalletModal('evm'));
+  document.getElementById('connectEvmBtn').addEventListener('click', () => openWalletModal('evm'));
+  document.getElementById('connectSolBtn').addEventListener('click', () => openWalletModal('solana'));
 
   document.getElementById('heroScanForm').addEventListener('submit', (e) => {
     e.preventDefault();
@@ -1031,6 +1372,7 @@ function wireEvents() {
 }
 
 wireEvents();
+loadWalletConnectorConfig();
 heroScene = mountSiphonFunnelScene(document.getElementById('siphonHeroCanvas'));
-// Default load: REAL live mainnet scan of vitalik.eth (not a fake preset!)
+// Default load: REAL live mainnet scan of vitalik.eth
 runScan({ presetId: 'vitalik_live', autoOpen: false });

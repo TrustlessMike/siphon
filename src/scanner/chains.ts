@@ -5,6 +5,10 @@ export const DEAD_BURN_ADDRESS = '0x000000000000000000000000000000000000dEaD';
 export const SOLANA_CCTP_DOMAIN = 5;
 export const PROTOCOL_FEE_BPS = 35; // 0.35%
 
+function buildRpcUrls(envUrl: string | undefined, fallbacks: string[]): string[] {
+  return Array.from(new Set([envUrl?.trim(), ...fallbacks].filter((u): u is string => Boolean(u))));
+}
+
 export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
   ethereum: {
     id: 'ethereum',
@@ -13,6 +17,11 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     nativeSymbol: 'ETH',
     nativeLlamaId: 'coingecko:ethereum',
     rpcUrl: process.env.ETH_RPC_URL ?? 'https://ethereum-rpc.publicnode.com',
+    rpcUrls: buildRpcUrls(process.env.ETH_RPC_URL, [
+      'https://ethereum-rpc.publicnode.com',
+      'https://eth.drpc.org',
+      'https://1rpc.io/eth',
+    ]),
     explorerUrl: 'https://etherscan.io',
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
@@ -33,6 +42,11 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     nativeSymbol: 'ETH',
     nativeLlamaId: 'coingecko:ethereum',
     rpcUrl: process.env.BASE_RPC_URL ?? 'https://base-rpc.publicnode.com',
+    rpcUrls: buildRpcUrls(process.env.BASE_RPC_URL, [
+      'https://base-rpc.publicnode.com',
+      'https://base.drpc.org',
+      'https://mainnet.base.org',
+    ]),
     explorerUrl: 'https://basescan.org',
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
@@ -53,6 +67,11 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     nativeSymbol: 'ETH',
     nativeLlamaId: 'coingecko:ethereum',
     rpcUrl: process.env.ARB_RPC_URL ?? 'https://arbitrum-one-rpc.publicnode.com',
+    rpcUrls: buildRpcUrls(process.env.ARB_RPC_URL, [
+      'https://arbitrum-one-rpc.publicnode.com',
+      'https://arbitrum.drpc.org',
+      'https://arb1.arbitrum.io/rpc',
+    ]),
     explorerUrl: 'https://arbiscan.io',
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
@@ -73,6 +92,11 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     nativeSymbol: 'ETH',
     nativeLlamaId: 'coingecko:ethereum',
     rpcUrl: process.env.OP_RPC_URL ?? 'https://optimism-rpc.publicnode.com',
+    rpcUrls: buildRpcUrls(process.env.OP_RPC_URL, [
+      'https://optimism-rpc.publicnode.com',
+      'https://optimism.drpc.org',
+      'https://mainnet.optimism.io',
+    ]),
     explorerUrl: 'https://optimistic.etherscan.io',
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',
@@ -93,6 +117,11 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     nativeSymbol: 'POL',
     nativeLlamaId: 'coingecko:polygon-ecosystem-token',
     rpcUrl: process.env.POLYGON_RPC_URL ?? 'https://1rpc.io/matic',
+    rpcUrls: buildRpcUrls(process.env.POLYGON_RPC_URL, [
+      'https://1rpc.io/matic',
+      'https://polygon.drpc.org',
+      'https://polygon-bor-rpc.publicnode.com',
+    ]),
     explorerUrl: 'https://polygonscan.com',
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
@@ -113,6 +142,11 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     nativeSymbol: 'AVAX',
     nativeLlamaId: 'coingecko:avalanche-2',
     rpcUrl: process.env.AVAX_RPC_URL ?? 'https://avalanche-c-chain-rpc.publicnode.com',
+    rpcUrls: buildRpcUrls(process.env.AVAX_RPC_URL, [
+      'https://avalanche-c-chain-rpc.publicnode.com',
+      'https://avalanche.drpc.org',
+      'https://api.avax.network/ext/bc/C/rpc',
+    ]),
     explorerUrl: 'https://snowtrace.io',
     multicall3: MULTICALL3_ADDRESS,
     usdcAddress: '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E',

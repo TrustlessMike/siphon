@@ -23,6 +23,7 @@ export interface ChainConfig {
   nativeSymbol: string;
   nativeLlamaId: string;
   rpcUrl: string;
+  rpcUrls: string[];
   explorerUrl: string;
   multicall3: string;
   usdcAddress: string;
@@ -81,6 +82,9 @@ export interface ScannedAsset {
   honeypotSafe: boolean;
   eip2612Supported?: boolean;
   permit2Approved?: boolean;
+  aaveDebtUsd?: number;
+  aaveHealthFactor?: number;
+  dexLiquidityVerified?: boolean;
   calldataPreview?: string;
 }
 

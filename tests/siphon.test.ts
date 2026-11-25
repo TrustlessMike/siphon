@@ -2,10 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   buildMigrationPlan,
+  CCTP_MESSAGE_SENT_TOPIC,
   encodeCctpDepositForBurn,
+  extractCctpMessageFromLogs,
   solanaAddressToBytes32,
 } from '../src/bridge/cctp.js';
+import { prepareRealExecution } from '../src/execution/tx-builder.js';
 import { scanPresetWallet } from '../src/scanner/classifier.js';
+import { decodeAaveAccountData } from '../src/scanner/discovery.js';
 import {
   decodeMulticall3Aggregate3,
   encodeMulticall3Aggregate3,
@@ -216,8 +220,129 @@ test('Siphon HTTP API serves health, chains, scan, plan, simulate, contract, and
     );
     assert.equal(opBatch.savings.walletPopupsEip5792, 1);
     assert.ok(opBatch.savings.eip2612Count >= 2);
+
+    // Explicit empty selection must return 0 legs (Clear button regression check)
+    const emptyPlan = await fetch(`${base}/api/plan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scanId: scan.scanId,
+        selectedAssetIds: [],
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+      }),
+    }).then((r) => r.json());
+    assert.equal(emptyPlan.legs.length, 0);
+    assert.equal(emptyPlan.totals.netSolanaUsdc, 0);
+
+    // Invalid EVM address & malformed JSON must return 400 (not 500)
+    const badScanAddr = await fetch(`${base}/api/scan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address: '0xinvalid' }),
+    });
+    assert.equal(badScanAddr.status, 400);
+
+    const badJson = await fetch(`${base}/api/scan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{bad-json',
+    });
+    assert.equal(badJson.status, 400);
+
+    // Oversized JSON body (>1 MiB) returns 413
+    const hugeBody = await fetch(`${base}/api/scan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pad: 'a'.repeat(1_100_000) }),
+    });
+    assert.equal(hugeBody.status, 413);
+
+    // HEAD / returns 200 with Cross-Origin-Opener-Policy for Coinbase Smart Wallet SDK
+    const headRoot = await fetch(`${base}/`, { method: 'HEAD' });
+    assert.equal(headRoot.status, 200);
+    assert.equal(headRoot.headers.get('cross-origin-opener-policy'), 'same-origin-allow-popups');
+
+    // /api/config & /vendor/wallet-sdks.js
+    const cfg = await fetch(`${base}/api/config`).then((r) => r.json());
+    assert.equal(typeof cfg.coinbaseSmartWalletEnabled, 'boolean');
+    assert.ok(['sim', 'alchemy', 'moralis', 'none'].includes(cfg.l2IndexerProvider));
+
+    // /api/cctp/attestation validation (invalid hash -> 400)
+    const badAtt = await fetch(`${base}/api/cctp/attestation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chain: 'base', txHash: '0x123' }),
+    });
+    assert.equal(badAtt.status, 400);
+
+    // SiphonRouter.sol security invariants
+    assert.ok(contract.source.includes('library SafeERC20Lite'));
+    assert.ok(contract.source.includes('exitStep.receiptToken.safeTransferFrom'));
+    assert.ok(contract.source.includes('function acceptOwnership()'));
+    assert.ok(contract.source.includes('forceApprove'));
   } finally {
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test('Aave v3 debt safety guard decodes getUserAccountData and blocks MAX withdraw when debt > 0', async () => {
+  const word = (n: bigint) => n.toString(16).padStart(64, '0');
+  // 5000 USD collateral (8 dec), 1200 USD debt (8 dec), HF = 1.45 (18 dec)
+  const debtHex =
+    '0x' +
+    word(5000n * 10n ** 8n) +
+    word(1200n * 10n ** 8n) +
+    word(2000n * 10n ** 8n) +
+    word(8250n) +
+    word(8000n) +
+    word(145n * 10n ** 16n);
+  const decodedDebt = decodeAaveAccountData(debtHex);
+  assert.equal(decodedDebt.checked, true);
+  assert.equal(decodedDebt.hasActiveDebt, true);
+  assert.equal(decodedDebt.totalDebtUsd, 1200);
+  assert.equal(decodedDebt.healthFactor, 1.45);
+  assert.equal(decodedDebt.safeForMaxWithdraw, false);
+
+  // Zero-debt account is safe for MAX withdraw
+  const zeroDebtHex =
+    '0x' +
+    word(5000n * 10n ** 8n) +
+    word(0n) +
+    word(4000n * 10n ** 8n) +
+    word(8250n) +
+    word(8000n) +
+    word((1n << 256n) - 1n);
+  const decodedSafe = decodeAaveAccountData(zeroDebtHex);
+  assert.equal(decodedSafe.hasActiveDebt, false);
+  assert.equal(decodedSafe.safeForMaxWithdraw, true);
+
+  // prepareRealExecution MUST reject an Aave asset flagged with active debt
+  const scan = await scanPresetWallet('veteran_defi');
+  const aaveAsset = scan.assets.find((a) => a.protocol === 'Aave v3');
+  assert.ok(aaveAsset);
+  await assert.rejects(
+    () =>
+      prepareRealExecution({
+        asset: { ...aaveAsset, aaveDebtUsd: 1200, aaveHealthFactor: 1.45 },
+        userAddress: scan.walletAddress,
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+      }),
+    /Aave v3 safety guard/
+  );
+});
+
+test('Circle CCTP MessageSent log ABI extractor produces valid message bytes and keccak256 hash', () => {
+  const payload = Buffer.from('siphon-cctp-domain5-test-message', 'utf8');
+  const word = (n: number) => n.toString(16).padStart(64, '0');
+  const paddedPayload = payload.toString('hex').padEnd(Math.ceil(payload.length / 32) * 64, '0');
+  const encodedData = '0x' + word(0x20) + word(payload.length) + paddedPayload;
+
+  const extracted = extractCctpMessageFromLogs([
+    { topics: ['0x' + '00'.repeat(32)], data: '0x' },
+    { topics: [CCTP_MESSAGE_SENT_TOPIC], data: encodedData },
+  ]);
+  assert.ok(extracted);
+  assert.equal(extracted.messageBytesHex, '0x' + payload.toString('hex'));
+  assert.match(extracted.messageHash, /^0x[0-9a-f]{64}$/);
 });

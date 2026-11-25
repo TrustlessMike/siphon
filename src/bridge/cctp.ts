@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { keccak_256 } from '@noble/hashes/sha3';
 import { PublicKey } from '@solana/web3.js';
 import {
   DEAD_BURN_ADDRESS,
@@ -6,10 +7,19 @@ import {
   PROTOCOL_FEE_BPS,
   SOLANA_CCTP_DOMAIN,
 } from '../scanner/chains.js';
+import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
+import { evmJsonRpcCall } from '../scanner/rpc.js';
 import type { CctpBridgeLeg, EvmChainId, MigrationPlan, ScanReport } from '../scanner/types.js';
 
 // Circle CCTP TokenMessenger.depositForBurn(uint256,uint32,bytes32,address)
 const DEPOSIT_FOR_BURN_SELECTOR = '6fd3504e';
+// Circle CCTP MessageTransmitter event: MessageSent(bytes message)
+export const CCTP_MESSAGE_SENT_TOPIC =
+  '0x8c5261668696ce22758910d05bab8f186d6eb247ceac2af2e82c7dc17669b036';
+export const SOLANA_CCTP_PROGRAMS = {
+  messageTransmitter: 'CCTPmbSD7gX1bxKPAmg77w8oFzNFpaQiQUWD43TKaecd',
+  tokenMessengerMinter: 'CCTPiPYPc6AsJuwueEnWgSgucamXDZwBd53dQ11YiKX3',
+} as const;
 
 function round2(n: number): number {
   return Number(n.toFixed(2));
@@ -44,6 +54,156 @@ export function encodeCctpDepositForBurn(params: {
   return `0x${DEPOSIT_FOR_BURN_SELECTOR}${amtHex}${domHex}${recHex}${tokHex}`;
 }
 
+/**
+ * Extracts Circle CCTP `MessageSent(bytes)` raw message bytes and its `keccak256` message hash
+ * from EVM transaction receipt logs.
+ */
+export function extractCctpMessageFromLogs(
+  logs: Array<{ topics?: string[]; data?: string }>
+): { messageBytesHex: string; messageHash: string } | null {
+  for (const log of logs) {
+    const topic0 = log.topics?.[0]?.toLowerCase();
+    if (topic0 !== CCTP_MESSAGE_SENT_TOPIC || !log.data) continue;
+    const raw = log.data.replace(/^0x/, '');
+    if (raw.length < 128) continue;
+    const offsetBytes = Number(BigInt('0x' + raw.slice(0, 64)));
+    const lenStart = offsetBytes * 2;
+    if (raw.length < lenStart + 64) continue;
+    const msgByteLen = Number(BigInt('0x' + raw.slice(lenStart, lenStart + 64)));
+    const msgHex = raw.slice(lenStart + 64, lenStart + 64 + msgByteLen * 2);
+    if (msgHex.length !== msgByteLen * 2 || msgByteLen === 0) continue;
+
+    const msgBytes = Buffer.from(msgHex, 'hex');
+    const hashBytes = keccak_256(msgBytes);
+    const messageHash = '0x' + Buffer.from(hashBytes).toString('hex');
+    return {
+      messageBytesHex: '0x' + msgHex,
+      messageHash,
+    };
+  }
+  return null;
+}
+
+export interface CctpAttestationResult {
+  found: boolean;
+  chain: EvmChainId;
+  txHash: string;
+  messageHash?: string;
+  messageBytesHex?: string;
+  attestationStatus: 'not_found' | 'pending_confirmations' | 'complete' | 'error';
+  attestation?: string;
+  solanaProgramIds: typeof SOLANA_CCTP_PROGRAMS;
+  solanaDestinationReady?: {
+    address: string;
+    hasUsdcAta: boolean;
+    solBalance: number;
+    warning?: string;
+  };
+  nextStep: string;
+}
+
+/**
+ * Fetches an EVM transaction receipt, extracts the Circle CCTP `MessageSent` log,
+ * polls Circle's live Iris Attestation API, and checks whether the Solana recipient
+ * already has a USDC Associated Token Account (ATA) + SOL for `receiveMessage`.
+ */
+export async function fetchCctpAttestationForTx(params: {
+  chain: EvmChainId;
+  txHash: string;
+  solanaDestination?: string;
+}): Promise<CctpAttestationResult> {
+  const cfg = EVM_CHAINS[params.chain];
+  if (!cfg) throw new Error(`Unsupported chain: ${params.chain}`);
+
+  const receiptRes = await evmJsonRpcCall<{
+    status?: string;
+    logs?: Array<{ topics?: string[]; data?: string }>;
+  } | null>(cfg.rpcUrls, 'eth_getTransactionReceipt', [params.txHash], 4500);
+
+  const receipt = receiptRes.result;
+  if (!receipt || !Array.isArray(receipt.logs)) {
+    return {
+      found: false,
+      chain: params.chain,
+      txHash: params.txHash,
+      attestationStatus: 'not_found',
+      solanaProgramIds: SOLANA_CCTP_PROGRAMS,
+      nextStep: 'Transaction receipt not yet indexed on EVM RPC. Retry in a few seconds.',
+    };
+  }
+
+  const extracted = extractCctpMessageFromLogs(receipt.logs);
+  if (!extracted) {
+    return {
+      found: false,
+      chain: params.chain,
+      txHash: params.txHash,
+      attestationStatus: 'not_found',
+      solanaProgramIds: SOLANA_CCTP_PROGRAMS,
+      nextStep: 'No Circle CCTP MessageSent event found in this transaction.',
+    };
+  }
+
+  let attestationStatus: CctpAttestationResult['attestationStatus'] = 'pending_confirmations';
+  let attestation: string | undefined;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const irisRes = await fetch(
+      `https://iris-api.circle.com/v1/attestations/${extracted.messageHash}`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timer);
+    if (irisRes.ok) {
+      const irisJson = (await irisRes.json()) as { status?: string; attestation?: string };
+      if (irisJson.status === 'complete' && irisJson.attestation) {
+        attestationStatus = 'complete';
+        attestation = irisJson.attestation;
+      }
+    }
+  } catch {
+    attestationStatus = 'pending_confirmations';
+  }
+
+  let solanaDestinationReady: CctpAttestationResult['solanaDestinationReady'];
+  if (params.solanaDestination) {
+    try {
+      const bal = await fetchSolanaWalletBalances(params.solanaDestination);
+      const warning = !bal.hasUsdcAta
+        ? 'Destination Solana wallet has no USDC ATA yet — create ATA before or during receiveMessage (~0.00204 SOL rent).'
+        : bal.solBalance < 0.002
+        ? 'Destination Solana wallet has low SOL (< 0.002 SOL) to pay receiveMessage tx fee.'
+        : undefined;
+      solanaDestinationReady = {
+        address: bal.address,
+        hasUsdcAta: bal.hasUsdcAta,
+        solBalance: bal.solBalance,
+        warning,
+      };
+    } catch {
+      // non-fatal
+    }
+  }
+
+  const nextStep =
+    attestationStatus === 'complete'
+      ? `Circle Iris attestation is READY. Submit MessageTransmitter.receiveMessage(messageBytes, attestation) on Solana (${SOLANA_CCTP_PROGRAMS.messageTransmitter}) to mint native USDC.`
+      : `Waiting for Circle Iris finality on ${cfg.name} (~${cfg.cctpAttestationSec}s). Poll /api/cctp/attestation again until status === "complete".`;
+
+  return {
+    found: true,
+    chain: params.chain,
+    txHash: params.txHash,
+    messageHash: extracted.messageHash,
+    messageBytesHex: extracted.messageBytesHex,
+    attestationStatus,
+    attestation,
+    solanaProgramIds: SOLANA_CCTP_PROGRAMS,
+    solanaDestinationReady,
+    nextStep,
+  };
+}
+
 export interface BuildPlanInput {
   scan: ScanReport;
   selectedAssetIds?: string[];
@@ -64,10 +224,9 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
   } = input;
 
   const solanaMintRecipientBytes32 = solanaAddressToBytes32(solanaDestination);
-  const selectedSet =
-    selectedAssetIds && selectedAssetIds.length > 0
-      ? new Set(selectedAssetIds)
-      : new Set(scan.assets.filter((a) => a.selectedByDefault).map((a) => a.id));
+  const selectedSet = Array.isArray(selectedAssetIds)
+    ? new Set(selectedAssetIds)
+    : new Set(scan.assets.filter((a) => a.selectedByDefault).map((a) => a.id));
 
   const chosen = scan.assets.filter((a) => selectedSet.has(a.id));
   const chainOrder: EvmChainId[] = [

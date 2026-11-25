@@ -8,9 +8,12 @@ import {
 } from './chains.js';
 import { fetchLiveUsdPrices } from './prices.js';
 import {
+  checkAaveV3AccountSafety,
   detectPermit2Allowances,
-  discoverEthereumTokens,
+  discoverChainTokens,
+  fetchDexLiquidityBatch,
   isEip2612Token,
+  MIN_VERIFIED_DEX_LIQUIDITY_USD,
   simulateBurnTransferOnchain,
 } from './discovery.js';
 import { formatUnits, isValidEvmAddress, scanSingleEvmChain } from './rpc.js';
@@ -90,6 +93,9 @@ interface RawAssetSeed {
   liquidityUsd: number;
   honeypot?: boolean;
   permit2Approved?: boolean;
+  aaveDebtUsd?: number;
+  aaveHealthFactor?: number;
+  dexLiquidityVerified?: boolean;
 }
 
 function classifyAndBuildReport(params: {
@@ -179,11 +185,17 @@ function classifyAndBuildReport(params: {
       calldataPreview = encodeTransferPreview(DEAD_BURN_ADDRESS, item.rawBalance);
     } else if (item.kind === 'defi_position') {
       action = 'WITHDRAW_AND_BRIDGE';
-      actionReason =
-        item.underlyingSymbol === 'USDC'
-          ? `Withdraw from ${item.protocol} directly as native USDC → Circle CCTP to Solana.`
-          : `Withdraw ${item.underlyingSymbol ?? item.symbol} from ${item.protocol}, batch-swap to USDC → CCTP.`;
-      selectedByDefault = netUsdcBatched > 0.25;
+      const hasAaveDebt = Boolean(item.aaveDebtUsd && item.aaveDebtUsd > 0);
+      if (hasAaveDebt) {
+        actionReason = `Aave v3 debt guard: $${item.aaveDebtUsd?.toFixed(2)} active borrow (HF ${item.aaveHealthFactor?.toFixed(2) ?? '—'}). Repay debt before MAX withdraw.`;
+        selectedByDefault = false;
+      } else {
+        actionReason =
+          item.underlyingSymbol === 'USDC'
+            ? `Withdraw from ${item.protocol} directly as native USDC → Circle CCTP to Solana.`
+            : `Withdraw ${item.underlyingSymbol ?? item.symbol} from ${item.protocol}, batch-swap to USDC → CCTP.`;
+        selectedByDefault = netUsdcBatched > 0.25;
+      }
       calldataPreview = encodeAaveWithdrawPreview(
         item.address,
         item.rawBalance,
@@ -232,6 +244,9 @@ function classifyAndBuildReport(params: {
       eip2612Supported:
         item.kind !== 'dead_token' && isEip2612Token(item.chain, item.address, item.symbol),
       permit2Approved: Boolean(item.permit2Approved),
+      aaveDebtUsd: item.aaveDebtUsd,
+      aaveHealthFactor: item.aaveHealthFactor,
+      dexLiquidityVerified: item.dexLiquidityVerified,
       calldataPreview,
     };
   });
@@ -365,9 +380,11 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     ...TOKEN_REGISTRY.map((t) => t.llamaKey).filter((k): k is string => Boolean(k)),
   ];
 
-  const [prices, discoveredEth, ...chainOutputs] = await Promise.all([
+  const [prices, discoveredByChainArr, ...chainOutputs] = await Promise.all([
     fetchLiveUsdPrices(llamaKeys),
-    discoverEthereumTokens(cleanAddr, 24),
+    Promise.all(
+      CHAIN_LIST.map(async (c) => [c.id, await discoverChainTokens(c.id, cleanAddr, 24)] as const)
+    ),
     ...CHAIN_LIST.map((c) =>
       scanSingleEvmChain(
         c,
@@ -376,6 +393,7 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
       )
     ),
   ]);
+  const discoveredByChain = new Map(discoveredByChainArr);
 
   const solPriceUsd = prices.get('coingecko:solana') ?? 70;
   const chainMeta = new Map<
@@ -452,35 +470,49 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
       });
     }
 
-    // Merge real discovered arbitrary Ethereum ERC-20s (including long-tail dust & zero-liquidity dead tokens)
-    if (c.id === 'ethereum' && discoveredEth.length > 0) {
-      const extraDead: typeof discoveredEth = [];
-      for (const dt of discoveredEth) {
+    // Merge real discovered arbitrary ERC-20s with live DexScreener liquidity verification
+    // so fake-price spam / illiquid coins never inflate headline USD totals!
+    const discoveredChainTokens = discoveredByChain.get(c.id) ?? [];
+    if (discoveredChainTokens.length > 0) {
+      const novelTokens = discoveredChainTokens.filter((dt) => !seenAddrs.has(dt.address.toLowerCase()));
+      const dexLiquidityMap = await fetchDexLiquidityBatch(
+        c.id,
+        novelTokens.map((dt) => dt.address)
+      );
+
+      const extraDead: typeof novelTokens = [];
+      for (const dt of novelTokens) {
         if (seenAddrs.has(dt.address.toLowerCase())) continue;
         seenAddrs.add(dt.address.toLowerCase());
-        if (dt.ethplorerPriceUsd > 0) {
+        const dex = dexLiquidityMap.get(dt.address.toLowerCase());
+        const verifiedLiq = dex?.liquidityUsd ?? 0;
+        const verifiedPrice = dex && dex.priceUsd > 0 ? dex.priceUsd : 0;
+
+        // Require verified DEX liquidity >= $2,500 before counting a discovered long-tail token as sellable USD
+        if (verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD && verifiedPrice > 0) {
           rawAssets.push({
-            chain: 'ethereum',
+            chain: c.id,
             address: dt.address,
             symbol: dt.symbol,
             name: dt.name,
             decimals: dt.decimals,
             kind: 'erc20',
             rawBalance: dt.rawBalance,
-            priceUsd: dt.ethplorerPriceUsd,
-            liquidityUsd: 250_000,
+            priceUsd: verifiedPrice,
+            liquidityUsd: Math.round(verifiedLiq),
+            dexLiquidityVerified: true,
           });
         } else if (extraDead.length < 6) {
           extraDead.push(dt);
         }
       }
 
-      // Live onchain eth_call honeypot verification on discovered zero-liquidity dead tokens!
+      // Live onchain eth_call honeypot verification on discovered zero-liquidity / illiquid tokens!
       if (extraDead.length > 0) {
         const simChecks = await Promise.all(
           extraDead.map((dt) =>
             simulateBurnTransferOnchain({
-              chain: 'ethereum',
+              chain: c.id,
               walletAddress: cleanAddr,
               tokenAddress: dt.address,
               rawAmount: dt.rawBalance,
@@ -489,7 +521,7 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
         );
         extraDead.forEach((dt, idx) => {
           rawAssets.push({
-            chain: 'ethereum',
+            chain: c.id,
             address: dt.address,
             symbol: dt.symbol,
             name: dt.name,
@@ -499,8 +531,34 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
             priceUsd: 0,
             liquidityUsd: 0,
             honeypot: !simChecks[idx].safeToBurn,
+            dexLiquidityVerified: false,
           });
         });
+      }
+    }
+  }
+
+  // Run live Aave v3 getUserAccountData(user) debt safety checks on any chain with Aave positions
+  const aaveChains = Array.from(
+    new Set(
+      rawAssets
+        .filter((a) => a.kind === 'defi_position' && (a.protocol ?? '').toLowerCase().includes('aave'))
+        .map((a) => a.chain)
+    )
+  );
+  if (aaveChains.length > 0) {
+    const aaveChecks = await Promise.all(
+      aaveChains.map(async (chain) => [chain, await checkAaveV3AccountSafety(chain, cleanAddr)] as const)
+    );
+    const aaveMap = new Map(aaveChecks);
+    for (const a of rawAssets) {
+      if (a.kind === 'defi_position' && (a.protocol ?? '').toLowerCase().includes('aave')) {
+        const safety = aaveMap.get(a.chain);
+        if (safety?.checked && safety.hasActiveDebt) {
+          a.aaveDebtUsd = safety.totalDebtUsd;
+          a.aaveHealthFactor = safety.healthFactor;
+          warnings.push(`${EVM_CHAINS[a.chain].name} ${safety.reason}`);
+        }
       }
     }
   }
