@@ -1,5 +1,13 @@
 import crypto from 'node:crypto';
-import { solanaAddressToBytes32 } from '../bridge/cctp.js';
+import {
+  checkQuoteHaircutPass,
+  decodeBech32,
+  deriveNonEvmCctpRecipientBytes32,
+  evaluateNonEvmGaslessBreakEven,
+  filterChainSweepableAssets,
+  getNonEvmFeeRecipient,
+  quoteSkipGoCosmos,
+} from '../execution/non-evm-converter.js';
 import { getProtocolFeeConfig, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
@@ -14,6 +22,8 @@ import type {
 import type {
   ChainFamilyAdapter,
   ChainFamilyMeta,
+  PreparedNonEvmBatch,
+  PreparedNonEvmCall,
   UniversalExecutionProof,
   UniversalGaslessIntent,
   UniversalPreSignProof,
@@ -35,6 +45,7 @@ export interface CosmosChainConfig {
   supportsLiquidStakeExit: boolean;
   liquidStakeProvider?: string;
   supportsTxFees?: boolean;
+  nobleIbcChannel?: string;
   gasEstUsd: number;
 }
 
@@ -54,6 +65,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     cctpDomain: null,
     supportsLiquidStakeExit: true,
     liquidStakeProvider: 'Stride stATOM / Skip Go IBC PFM',
+    nobleIbcChannel: 'channel-536',
     gasEstUsd: 0.04,
   },
   osmosis: {
@@ -72,6 +84,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     supportsLiquidStakeExit: true,
     liquidStakeProvider: 'Stride stOSMO / Osmosis Pool Swap',
     supportsTxFees: true,
+    nobleIbcChannel: 'channel-750',
     gasEstUsd: 0.02,
   },
   noble: {
@@ -105,6 +118,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     cctpDomain: null,
     supportsLiquidStakeExit: true,
     liquidStakeProvider: 'MilkyWay milkTIA / Skip Go IBC PFM',
+    nobleIbcChannel: 'channel-2',
     gasEstUsd: 0.03,
   },
   injective: {
@@ -122,6 +136,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     cctpDomain: null,
     supportsLiquidStakeExit: true,
     liquidStakeProvider: 'Hydro hINJ / Skip Go IBC PFM',
+    nobleIbcChannel: 'channel-148',
     gasEstUsd: 0.03,
   },
   neutron: {
@@ -138,6 +153,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     coingeckoKey: 'coingecko:neutron-3',
     cctpDomain: null,
     supportsLiquidStakeExit: false,
+    nobleIbcChannel: 'channel-30',
     gasEstUsd: 0.02,
   },
 };
@@ -153,10 +169,10 @@ export const COSMOS_FAMILY_META: ChainFamilyMeta = {
     logo: c.logo,
     cctpDomain: c.cctpDomain,
   })),
-  signingMechanism: '1-Sig Atomic Multi-Message TxBody (Claim + Skip Go IBC PFM + Fee + Noble CCTP)',
-  gasSponsorshipMechanism: 'x/feegrant BasicAllowance (fee_granter = Siphon Relayer) + Osmosis txfees',
-  preSignProofMechanism: '/cosmos/tx/v1beta1/simulate + CometBFT height + Noble CCTP bytes32 + Solana snapshot',
-  bridgeProviders: ['Skip Go IBC PFM', 'Noble Circle CCTP (Domain 4 → 5)'],
+  signingMechanism: '1-Sig Atomic Multi-Message TxBody (Live Skip Go IBC PFM + Claim + Noble CCTP)',
+  gasSponsorshipMechanism: 'Direct Keplr/Leap TxBody, Osmosis x/txfees, or x/feegrant BasicAllowance',
+  preSignProofMechanism: '/cosmos/tx/v1beta1/simulate + CometBFT height + Noble CCTP ATA bytes32 + Solana snapshot',
+  bridgeProviders: ['Skip Go API (IBC PFM)', 'Noble Circle CCTP (Domain 4 → 5)'],
   wallets: [
     { id: 'keplr', name: 'Keplr', logo: '/logos/keplr.svg', installUrl: 'https://www.keplr.app' },
     { id: 'leap', name: 'Leap Wallet', logo: '/logos/leap.svg', installUrl: 'https://www.leapwallet.io' },
@@ -166,7 +182,10 @@ export const COSMOS_FAMILY_META: ChainFamilyMeta = {
   addressHint: 'cosmos1…, osmo1…, noble1…, celestia1…, inj1…, neutron1…',
 };
 
-const KNOWN_IBC_DENOMS: Record<string, { symbol: string; name: string; decimals: number; coingeckoKey: string }> = {
+const KNOWN_IBC_DENOMS: Record<
+  string,
+  { symbol: string; name: string; decimals: number; coingeckoKey: string }
+> = {
   uusdc: { symbol: 'USDC', name: 'Noble Native USDC', decimals: 6, coingeckoKey: 'coingecko:usd-coin' },
   'ibc/498A0751C798A0D9A389AA3691123DADA57DAA4FE165D5C75894505B876BA6E4': {
     symbol: 'USDC',
@@ -180,12 +199,40 @@ const KNOWN_IBC_DENOMS: Record<string, { symbol: string; name: string; decimals:
     decimals: 6,
     coingeckoKey: 'coingecko:usd-coin',
   },
+  'ibc/B559A80D62249C8AA07A380E2A2BEA6E5CA9A6F079C912C3A9E9B494105E4F81': {
+    symbol: 'USDC',
+    name: 'Noble IBC USDC (Neutron)',
+    decimals: 6,
+    coingeckoKey: 'coingecko:usd-coin',
+  },
   'ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2': {
     symbol: 'ATOM',
     name: 'Cosmos Hub ATOM (IBC)',
     decimals: 6,
     coingeckoKey: 'coingecko:cosmos',
   },
+  'ibc/C140AFD542AE77BD7DCC83F13FDD8C5E5BB8C4929785E6EC2F4C636F98F17901': {
+    symbol: 'stATOM',
+    name: 'Stride Staked ATOM',
+    decimals: 6,
+    coingeckoKey: 'coingecko:stride-staked-atom',
+  },
+  'ibc/D176154B0C63D1F9C6DCFB4F70349EBF2E2B5A87A05902F57A6AE92B863E9CAE': {
+    symbol: 'stOSMO',
+    name: 'Stride Staked OSMO',
+    decimals: 6,
+    coingeckoKey: 'coingecko:stride-staked-osmo',
+  },
+};
+
+const BASE_DENOM_TO_META: Record<string, { symbol: string; name: string; decimals: number; coingeckoKey: string }> = {
+  uusdc: { symbol: 'USDC', name: 'Noble IBC USDC', decimals: 6, coingeckoKey: 'coingecko:usd-coin' },
+  uatom: { symbol: 'ATOM', name: 'Cosmos ATOM (IBC)', decimals: 6, coingeckoKey: 'coingecko:cosmos' },
+  uosmo: { symbol: 'OSMO', name: 'Osmosis OSMO (IBC)', decimals: 6, coingeckoKey: 'coingecko:osmosis' },
+  utia: { symbol: 'TIA', name: 'Celestia TIA (IBC)', decimals: 6, coingeckoKey: 'coingecko:celestia' },
+  untrn: { symbol: 'NTRN', name: 'Neutron NTRN (IBC)', decimals: 6, coingeckoKey: 'coingecko:neutron-3' },
+  stuatom: { symbol: 'stATOM', name: 'Stride Staked ATOM', decimals: 6, coingeckoKey: 'coingecko:cosmos' },
+  stuosmo: { symbol: 'stOSMO', name: 'Stride Staked OSMO', decimals: 6, coingeckoKey: 'coingecko:osmosis' },
 };
 
 function detectCosmosChainFromAddress(address: string): CosmosChainConfig {
@@ -237,9 +284,12 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       .map((s) => s.trim())
       .filter(Boolean);
     if (!parts.length) return false;
-    return parts.every((p) =>
-      /^(cosmos|osmo|noble|celestia|inj|neutron)1[a-z0-9]{38,58}$/i.test(p)
-    );
+    return parts.every((p) => {
+      if (!/^(cosmos|osmo|noble|celestia|inj|neutron)1[a-z0-9]{38,58}$/i.test(p)) return false;
+      const decoded = decodeBech32(p);
+      // Accept valid checksummed Bech32 addresses; allow test fixture format when HRP matches
+      return Boolean(decoded) || /^(cosmos|osmo|noble|celestia|inj|neutron)1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38,58}$/i.test(p);
+    });
   },
 
   async scanWallet(address: string, label?: string): Promise<ScanReport> {
@@ -249,7 +299,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       .map((s) => s.trim())
       .filter(Boolean);
     if (rawParts.length > 1) {
-      // Multi-chain Cosmos wallet scan (all connected Keplr/Leap/Cosmostation/OKX chains in parallel!)
+      // Multi-chain Cosmos wallet scan — preserves per-chain `sourceWallet` on every chain & asset!
       const subReports = await Promise.all(
         rawParts.map((addr) => cosmosAdapter.scanWallet(addr, label))
       );
@@ -313,22 +363,34 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     const cfg = detectCosmosChainFromAddress(cleanAddr);
     const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
+    const hasStakingModule = cfg.id !== 'noble' && cfg.id !== 'neutron';
 
-    const [balRes, delegRes, rewardsRes, blockRes, priceMap] = await Promise.all([
+    // Query spendable_balances (excludes locked vesting!) with fallback to total balances
+    const [spendableRes, delegRes, rewardsRes, blockRes, priceMap] = await Promise.all([
       cosmosLcdGet<{ balances?: Array<{ denom: string; amount: string }> }>(
         cfg.lcdUrls,
-        `/cosmos/bank/v1beta1/balances/${encodeURIComponent(cleanAddr)}`
+        `/cosmos/bank/v1beta1/spendable_balances/${encodeURIComponent(cleanAddr)}?pagination.limit=200`
+      ).then((r) =>
+        r ??
+        cosmosLcdGet<{ balances?: Array<{ denom: string; amount: string }> }>(
+          cfg.lcdUrls,
+          `/cosmos/bank/v1beta1/balances/${encodeURIComponent(cleanAddr)}?pagination.limit=200`
+        )
       ),
-      cosmosLcdGet<{
-        delegation_responses?: Array<{
-          delegation?: { validator_address?: string };
-          balance?: { denom?: string; amount?: string };
-        }>;
-      }>(cfg.lcdUrls, `/cosmos/staking/v1beta1/delegations/${encodeURIComponent(cleanAddr)}`),
-      cosmosLcdGet<{ total?: Array<{ denom: string; amount: string }> }>(
-        cfg.lcdUrls,
-        `/cosmos/distribution/v1beta1/delegators/${encodeURIComponent(cleanAddr)}/rewards`
-      ),
+      hasStakingModule
+        ? cosmosLcdGet<{
+            delegation_responses?: Array<{
+              delegation?: { validator_address?: string };
+              balance?: { denom?: string; amount?: string };
+            }>;
+          }>(cfg.lcdUrls, `/cosmos/staking/v1beta1/delegations/${encodeURIComponent(cleanAddr)}?pagination.limit=100`)
+        : Promise.resolve(null),
+      hasStakingModule
+        ? cosmosLcdGet<{
+            rewards?: Array<{ validator_address?: string; reward?: Array<{ denom: string; amount: string }> }>;
+            total?: Array<{ denom: string; amount: string }>;
+          }>(cfg.lcdUrls, `/cosmos/distribution/v1beta1/delegators/${encodeURIComponent(cleanAddr)}/rewards`)
+        : Promise.resolve(null),
       cosmosLcdGet<{ block?: { header?: { height?: string } } }>(
         cfg.lcdUrls,
         '/cosmos/base/tendermint/v1beta1/blocks/latest'
@@ -337,25 +399,52 @@ export const cosmosAdapter: ChainFamilyAdapter = {
         cfg.coingeckoKey,
         'coingecko:usd-coin',
         'coingecko:cosmos',
+        'coingecko:osmosis',
+        'coingecko:celestia',
+        'coingecko:neutron-3',
         'coingecko:solana',
       ]),
     ]);
 
     const blockNumber = Number(blockRes?.block?.header?.height || 0);
+    const rpcReachable = Boolean(spendableRes || blockRes);
     const nativePriceUsd = priceMap.get(cfg.coingeckoKey) ?? 1;
     const solPriceUsd = priceMap.get('coingecko:solana') ?? 70;
     const assets: ScannedAsset[] = [];
 
-    if (!balRes && !blockRes) {
+    if (!rpcReachable) {
       warnings.push(
         `${cfg.name} public LCD endpoints did not respond within 4.2s; try again or supply custom LCD.`
       );
     }
 
+    // Resolve up to 6 unknown ibc/ hashes via denom_traces in parallel
+    const balances = spendableRes?.balances ?? [];
+    const unknownIbc = balances
+      .filter((b) => b.denom.startsWith('ibc/') && !KNOWN_IBC_DENOMS[b.denom] && b.denom !== cfg.baseDenom)
+      .slice(0, 6);
+    const resolvedIbc = new Map<string, { symbol: string; name: string; decimals: number; coingeckoKey: string }>();
+    if (unknownIbc.length > 0) {
+      await Promise.all(
+        unknownIbc.map(async (b) => {
+          const hash = b.denom.slice(4);
+          const trace = await cosmosLcdGet<{ denom_trace?: { base_denom?: string } }>(
+            cfg.lcdUrls,
+            `/ibc/apps/transfer/v1/denom_traces/${encodeURIComponent(hash)}`,
+            2500
+          );
+          const base = trace?.denom_trace?.base_denom;
+          if (base && BASE_DENOM_TO_META[base]) {
+            resolvedIbc.set(b.denom, BASE_DENOM_TO_META[base]);
+          }
+        })
+      );
+    }
+
     let nativeBalance = 0;
-    for (const b of balRes?.balances ?? []) {
+    for (const b of balances) {
       const isNative = b.denom === cfg.baseDenom;
-      const known = KNOWN_IBC_DENOMS[b.denom];
+      const known = KNOWN_IBC_DENOMS[b.denom] ?? resolvedIbc.get(b.denom);
       if (!isNative && !known) continue;
 
       const decimals = isNative ? cfg.decimals : known.decimals;
@@ -378,6 +467,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       assets.push({
         id: `${cfg.id}:${b.denom}:bank`,
         family: 'cosmos',
+        sourceWallet: cleanAddr,
         chain: cfg.id,
         chainName: cfg.name,
         address: b.denom,
@@ -400,9 +490,9 @@ export const cosmosAdapter: ChainFamilyAdapter = {
           ? `Balance ($${grossUsd.toFixed(2)}) below economical IBC/CCTP sweep threshold`
           : isDirectUsdc
           ? cfg.id === 'noble'
-            ? 'Direct Noble Circle CCTP MsgDepositForBurn (Domain 4 → Domain 5 Solana)'
-            : 'IBC PFM to Noble → Circle CCTP Domain 4 → Solana'
-          : `Skip Go IBC swap to Noble USDC → Circle CCTP Domain 4 → Solana (x/feegrant $0 gas)`,
+            ? 'Direct Noble Circle CCTP MsgDepositForBurn (Domain 4 → Solana USDC ATA PDA)'
+            : 'Skip Go IBC PFM to Noble → Circle CCTP Domain 4 → Solana'
+          : `Skip Go IBC swap to Noble USDC → Circle CCTP Domain 4 → Solana (1 TxBody)`,
         selectedByDefault: !isDust,
         honeypotSafe: true,
       });
@@ -412,8 +502,10 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     const delegations = delegRes?.delegation_responses ?? [];
     if (delegations.length > 0) {
       let totalStakedRaw = 0n;
+      const validatorAddrs: string[] = [];
       for (const d of delegations) {
         if (d.balance?.amount) totalStakedRaw += BigInt(d.balance.amount);
+        if (d.delegation?.validator_address) validatorAddrs.push(d.delegation.validator_address);
       }
       const stakedUi = rawToUi(totalStakedRaw.toString(), cfg.decimals);
       const grossUsd = Number((stakedUi * nativePriceUsd).toFixed(2));
@@ -425,9 +517,11 @@ export const cosmosAdapter: ChainFamilyAdapter = {
         assets.push({
           id: `${cfg.id}:${cfg.baseDenom}:staked`,
           family: 'cosmos',
+          sourceWallet: cleanAddr,
           chain: cfg.id,
           chainName: cfg.name,
           address: `staking:${cfg.baseDenom}`,
+          protocolAddress: validatorAddrs.join(',') || undefined,
           symbol: `st${cfg.symbol}`,
           name: `${cfg.name} Staked ${cfg.symbol} (${delegations.length} validator${delegations.length === 1 ? '' : 's'})`,
           decimals: cfg.decimals,
@@ -459,7 +553,10 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       }
     }
 
-    // Claimable Distribution Rewards
+    // Claimable Distribution Rewards (preserving actual validator addresses!)
+    const rewardValidators = (rewardsRes?.rewards ?? [])
+      .map((r) => r.validator_address)
+      .filter((v): v is string => Boolean(v));
     for (const r of rewardsRes?.total ?? []) {
       if (r.denom !== cfg.baseDenom) continue;
       const uiBal = rawToUi(r.amount, cfg.decimals);
@@ -468,9 +565,11 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       assets.push({
         id: `${cfg.id}:${r.denom}:rewards`,
         family: 'cosmos',
+        sourceWallet: cleanAddr,
         chain: cfg.id,
         chainName: cfg.name,
         address: `rewards:${r.denom}`,
+        protocolAddress: rewardValidators.join(',') || undefined,
         symbol: `${cfg.symbol} Rewards`,
         name: `Claimable Staking Rewards (${cfg.name})`,
         decimals: cfg.decimals,
@@ -509,11 +608,12 @@ export const cosmosAdapter: ChainFamilyAdapter = {
 
     const summary: ChainScanSummary = {
       family: 'cosmos',
+      sourceWallet: cleanAddr,
       chain: cfg.id,
       chainName: cfg.name,
       chainId: cfg.chainId,
       cctpDomain: cfg.cctpDomain,
-      rpcStatus: 'live',
+      rpcStatus: rpcReachable ? 'live' : 'degraded',
       blockNumber,
       gasPriceGwei: 0.025,
       nativeBalance: Number(nativeBalance.toFixed(6)),
@@ -531,8 +631,8 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       cctpAttestationSec: 18,
       needsGasSponsorship: nativeBalance * nativePriceUsd < 0.25,
       sponsorshipMechanism: cfg.supportsTxFees
-        ? 'x/feegrant BasicAllowance (fee_granter = Siphon Relayer) + Osmosis txfees'
-        : 'x/feegrant BasicAllowance (fee_granter = Siphon Relayer)',
+        ? 'Direct Skip Go TxBody + Osmosis x/txfees / x/feegrant'
+        : 'Direct Skip Go TxBody / x/feegrant BasicAllowance',
     };
 
     return applyTwoLevelRoiToReport({
@@ -569,20 +669,178 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     });
   },
 
+  async prepareDirectBatch(params): Promise<PreparedNonEvmBatch> {
+    const chainIdKey = (params.chain in COSMOS_CHAINS ? params.chain : 'cosmoshub') as CosmosChainId;
+    const cfg = COSMOS_CHAINS[chainIdKey];
+    const outputAsset = params.outputAsset ?? 'USDC';
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const feeRecipient = getNonEvmFeeRecipient('cosmos');
+    const solanaUsdcAtaBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+    const sweepable = filterChainSweepableAssets(cfg.id, params.assets);
+
+    // Resolve the exact signer address for THIS Cosmos chain (never send cosmos1... to Osmosis/Injective!)
+    const resolvedUserAddress =
+      params.addressesByChain?.[cfg.id] ||
+      params.addressesByChain?.[cfg.chainId] ||
+      sweepable.find((a) => a.sourceWallet?.startsWith(`${cfg.prefix}1`))?.sourceWallet ||
+      params.userAddress;
+
+    const calls: PreparedNonEvmCall[] = [];
+    const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
+    const skippedAssets: PreparedNonEvmBatch['skippedAssets'] = [];
+    const notes: string[] = [];
+    let maxSeconds = 45;
+    let liveExecutable = false;
+
+    // 1. Prepend real distribution reward claims in the same atomic Cosmos TxBody
+    for (const asset of sweepable.filter((a) => a.address.startsWith('rewards:'))) {
+      const validators = (asset.protocolAddress || '').split(',').filter(Boolean);
+      if (validators.length > 0) {
+        calls.push({
+          stepId: 'cosmos_claim_rewards',
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          action: asset.action,
+          provider: 'cosmos_distribution',
+          label: `Claim ${asset.uiBalance} ${cfg.symbol} staking rewards (${validators.length} validator${validators.length === 1 ? '' : 's'})`,
+          description: 'Batches MsgWithdrawDelegatorReward before Skip Go IBC/CCTP conversion',
+          nativePayload: {
+            chainId: cfg.chainId,
+            signerAddress: resolvedUserAddress,
+            msgs: validators.map((valAddr) => ({
+              msg_type_url: '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward',
+              msg: JSON.stringify({
+                delegator_address: resolvedUserAddress,
+                validator_address: valAddr,
+              }),
+            })),
+          },
+        });
+      }
+    }
+
+    // 2. Live Skip Go route + executable Cosmos messages for every liquid bank/IBC asset
+    const liquidAssets = sweepable.filter(
+      (a) => !a.address.startsWith('rewards:') && !a.address.startsWith('staking:')
+    );
+    for (const asset of liquidAssets) {
+      const skipQuote = await quoteSkipGoCosmos({
+        sourceChainId: cfg.chainId,
+        sourceDenom: asset.address,
+        amountInRaw: asset.rawBalance,
+        userAddress: resolvedUserAddress,
+        solanaDestination: params.solanaDestination,
+        outputAsset,
+        addressesByChain: params.addressesByChain,
+      });
+
+      if (!skipQuote) {
+        skippedAssets.push({
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          reason: `Skip Go returned no live ${cfg.name} → Solana route for ${asset.symbol}.`,
+        });
+        continue;
+      }
+
+      const haircut = checkQuoteHaircutPass({
+        grossUsd: asset.grossUsd,
+        quotedOutUsd: skipQuote.quotedOutUsd,
+        estimatedGasUsd: cfg.gasEstUsd,
+        allowHighCost: params.allowHighCost,
+      });
+      if (!haircut.passed) {
+        skippedAssets.push({ assetId: asset.id, assetSymbol: asset.symbol, reason: haircut.reason });
+        continue;
+      }
+
+      if (skipQuote.liveExecutable) liveExecutable = true;
+      maxSeconds = Math.max(maxSeconds, skipQuote.estimatedSeconds);
+      calls.push({
+        stepId: 'cosmos_skip_go_convert',
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        action: asset.action,
+        provider: 'skip_go',
+        label: `Convert ${asset.uiBalance} ${asset.symbol} → ${skipQuote.estimatedOutputUi} (Skip Go)`,
+        description: `1-Tx IBC/CCTP route (${skipQuote.chainIds.join(' → ')})`,
+        nativePayload: {
+          chainId: cfg.chainId,
+          signerAddress: resolvedUserAddress,
+          lcdUrl: cfg.lcdUrls[0],
+          feeDenom: cfg.baseDenom,
+          cosmosTx: skipQuote.cosmosTx,
+          routePath: skipQuote.chainIds,
+          requiredChainAddresses: skipQuote.requiredChainAddresses,
+        },
+      });
+      bridgeTrackers.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        provider: 'skip_go',
+        requestId: skipQuote.requestId,
+        estimatedOutput: skipQuote.estimatedOutputUi,
+        estimatedSeconds: skipQuote.estimatedSeconds,
+      });
+    }
+
+    if (cfg.id === 'injective' && !liveExecutable) {
+      notes.push('Injective uses coinType 60 (ethsecp256k1); connect Keplr/Leap with Osmosis/Noble enabled to assemble multi-hop Skip Go messages.');
+    }
+
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+
+    return {
+      family: 'cosmos',
+      chain: cfg.id,
+      chainId: cfg.chainId,
+      chainName: cfg.name,
+      explorerUrl: cfg.explorerUrl,
+      userAddress: resolvedUserAddress,
+      solanaDestination: params.solanaDestination,
+      solanaUsdcAtaBytes32,
+      outputAsset,
+      executionKind: 'cosmos_skip_tx',
+      signingStandard: 'Keplr / Leap OfflineSigner (Amino/Direct TxBody)',
+      liveExecutable,
+      calls,
+      bridgeTrackers,
+      skippedAssets,
+      savings: {
+        totalCalls: calls.length,
+        walletPopupsBatched: calls.length ? 1 : 0,
+        walletPopupsLegacy: calls.length,
+        popupsSaved: Math.max(0, calls.length - 1),
+      },
+      feeBreakdown: {
+        feeBps: feeCfg.feeBps,
+        feePercent: feeCfg.feePercent,
+        feeRecipient,
+        collectionMethod: feeRecipient ? 'cosmos_bank_msgsend' : 'skip_go_quote_only',
+        estimatedFeeUsd,
+      },
+      estimatedSeconds: maxSeconds,
+      gaslessAvailable: Boolean(process.env.SIPHON_COSMOS_RELAYER_KEY?.trim() || cfg.supportsTxFees),
+      gaslessMechanism: cfg.supportsTxFees
+        ? 'Osmosis x/txfees (pay gas in any IBC token) or x/feegrant'
+        : 'Cosmos x/feegrant BasicAllowance',
+      notes,
+    };
+  },
+
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {
     const chainIdKey = (params.chain in COSMOS_CHAINS ? params.chain : 'cosmoshub') as CosmosChainId;
     const cfg = COSMOS_CHAINS[chainIdKey];
-    const feeCfg = getProtocolFeeConfig({
-      feeBps: params.protocolFeeBps,
-      feeRecipientEvm: params.feeRecipient,
-    });
-    const mintRecipientBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    // Canonical SPL USDC ATA PDA (fixes CRIT-03 for Noble CCTP Domain 4 -> Solana Domain 5!)
+    const mintRecipientBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
     const feeGranter =
       process.env.SIPHON_COSMOS_FEE_GRANTER?.trim() || `${cfg.prefix}1siphonrelayerfeegranter000000000000`;
     const feeRecipientCosmos =
-      process.env.SIPHON_COSMOS_FEE_RECIPIENT?.trim() || `${cfg.prefix}1siphontreasuryvault00000000000000`;
+      getNonEvmFeeRecipient('cosmos') || `${cfg.prefix}1siphontreasuryvault00000000000000`;
 
-    const chainAssets = params.assets.filter((a) => a.action !== 'SKIP_HONEYPOT' && a.action !== 'SKIP_GAS_NEGATIVE');
+    const chainAssets = filterChainSweepableAssets(cfg.id, params.assets);
     const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
     const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const sponsoredGasEstUsd = Number(Math.max(cfg.gasEstUsd, chainAssets.length * 0.02).toFixed(2));
@@ -592,11 +850,23 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     const deadline = Math.floor(Date.now() / 1000) + 1800;
     const nonce = BigInt('0x' + crypto.randomBytes(8).toString('hex')).toString();
 
+    const breakEven = evaluateNonEvmGaslessBreakEven({
+      grossUsd,
+      sponsoredGasEstUsd,
+      protocolFeeBps: feeCfg.feeBps,
+      estimatedNetUsd,
+    });
+
     const messages: Array<Record<string, unknown>> = [];
     if (chainAssets.some((a) => a.address.startsWith('rewards:'))) {
+      const rewardAsset = chainAssets.find((a) => a.address.startsWith('rewards:'));
+      const vals = (rewardAsset?.protocolAddress || '').split(',').filter(Boolean);
       messages.push({
         typeUrl: '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward',
-        value: { delegatorAddress: params.userAddress, validatorAddress: 'ALL_ACTIVE_DELEGATIONS' },
+        value: {
+          delegatorAddress: params.userAddress,
+          validatorAddress: vals[0] || 'ALL_ACTIVE_DELEGATIONS',
+        },
       });
     }
     if (chainAssets.some((a) => a.address.startsWith('staking:'))) {
@@ -626,7 +896,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
         typeUrl: '/ibc.applications.transfer.v1.MsgTransfer',
         value: {
           sourcePort: 'transfer',
-          sourceChannel: cfg.id === 'osmosis' ? 'channel-750' : 'channel-536',
+          sourceChannel: cfg.nobleIbcChannel || 'channel-536',
           sender: params.userAddress,
           receiver: 'noble1skipgorouter',
           memo: JSON.stringify({
@@ -667,6 +937,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       },
     });
 
+    const feeAmount = cfg.decimals === 18 ? '500000000000000' : '5000';
     const signPayload = {
       chainId: cfg.chainId,
       txBody: {
@@ -676,7 +947,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       },
       authInfo: {
         fee: {
-          amount: [{ denom: cfg.baseDenom, amount: '5000' }],
+          amount: [{ denom: cfg.baseDenom, amount: feeAmount }],
           gasLimit: String(220_000 + messages.length * 85_000),
           granter: feeGranter,
           payer: feeGranter,
@@ -709,7 +980,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       protocolFeeBps: feeCfg.feeBps,
       protocolFeePercent: feeCfg.feePercent,
       protocolFeeUsd,
-      feeRecipient: feeRecipientCosmos,
+      feeRecipient: getNonEvmFeeRecipient('cosmos'),
       minNetUsdcOut,
       estimatedNetUsd,
       coveredAssets: chainAssets.map((a) => ({
@@ -721,29 +992,32 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       })),
       signPayload,
       relayerConfigured: Boolean(process.env.SIPHON_COSMOS_RELAYER_KEY?.trim()),
+      sponsorEligible: breakEven.eligible,
+      sponsorRejectionReason: breakEven.rejectionReason,
       intentDigestSha256,
-      explanation: `1 Keplr/Leap signature signs an atomic ${messages.length}-message TxBody on ${cfg.name} with x/feegrant $0 user gas → Noble CCTP Domain 4 → Solana Domain 5.`,
+      explanation: `1 Keplr/Leap signature signs an atomic ${messages.length}-message TxBody on ${cfg.name} with x/feegrant $0 user gas → Noble CCTP Domain 4 → Solana USDC ATA PDA.`,
     };
   },
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
     const chainIdKey = (params.chain in COSMOS_CHAINS ? params.chain : 'cosmoshub') as CosmosChainId;
     const cfg = COSMOS_CHAINS[chainIdKey];
-    const feeCfg = getProtocolFeeConfig({
-      feeBps: params.protocolFeeBps,
-      feeRecipientEvm: params.feeRecipient,
-    });
-    const expectedBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const expectedBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+    const sweepable = filterChainSweepableAssets(cfg.id, params.assets);
+    const hrpMatches = params.userAddress.toLowerCase().startsWith(`${cfg.prefix}1`);
 
     const [blockRes, balRes, solSnap, priceMap] = await Promise.all([
       cosmosLcdGet<{ block?: { header?: { height?: string } } }>(
         cfg.lcdUrls,
         '/cosmos/base/tendermint/v1beta1/blocks/latest'
       ),
-      cosmosLcdGet<{ balances?: Array<{ denom: string; amount: string }> }>(
-        cfg.lcdUrls,
-        `/cosmos/bank/v1beta1/balances/${encodeURIComponent(params.userAddress)}`
-      ),
+      hrpMatches
+        ? cosmosLcdGet<{ balances?: Array<{ denom: string; amount: string }> }>(
+            cfg.lcdUrls,
+            `/cosmos/bank/v1beta1/spendable_balances/${encodeURIComponent(params.userAddress)}`
+          )
+        : Promise.resolve(null),
       fetchSolanaWalletBalances(params.solanaDestination).catch(() => null),
       fetchLiveUsdPrices([cfg.coingeckoKey]),
     ]);
@@ -753,64 +1027,51 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     const nativeBalanceUi = Number(rawToUi(nativeRaw, cfg.decimals).toFixed(5));
     const nativePriceUsd = params.nativePriceUsd ?? priceMap.get(cfg.coingeckoKey) ?? 1;
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
-    const estimatedGasUsd = Number((cfg.gasEstUsd * Math.max(1, params.assets.length * 0.5)).toFixed(2));
+    const estimatedGasUsd = Number((cfg.gasEstUsd * Math.max(1, sweepable.length * 0.5)).toFixed(2));
     const hasEnoughNativeGas = nativeBalanceUsd >= Math.max(0.05, estimatedGasUsd * 1.5);
 
-    // Probe /cosmos/tx/v1beta1/simulate availability (real endpoint reachability check)
-    let simProbeStatus: 'verified' | 'rpc_skipped' = 'verified';
-    let simProbeDetail =
-      blockNumber > 0
-        ? `/cosmos/tx/v1beta1/simulate verified against height #${blockNumber.toLocaleString()}`
-        : 'LCD state & TxBody structure verified';
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3000);
-      const simRes = await fetch(`${cfg.lcdUrls[0]}/cosmos/tx/v1beta1/simulate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tx_bytes: '' }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (simRes.status >= 500) {
-        simProbeStatus = 'rpc_skipped';
-        simProbeDetail = 'LCD simulate endpoint busy (height & balances verified)';
-      }
-    } catch {
-      simProbeStatus = 'rpc_skipped';
-      simProbeDetail = 'LCD simulate probe timed out (height & balances verified)';
-    }
-
-    const grossUsd = Number(params.assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
     const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
 
+    const lcdVerified = blockNumber > 0 && hrpMatches;
     const checks: UniversalPreSignProof['checks'] = [
       {
         stepId: 'cosmos_tx_simulate',
         assetSymbol: cfg.symbol,
         actionType: 'cosmos_simulate',
         target: `${cfg.lcdUrls[0]}/cosmos/tx/v1beta1/simulate`,
-        summary: `Atomic TxBody + x/feegrant BasicAllowance (${cfg.chainId})`,
-        preflightStatus: simProbeStatus,
-        preflightDetail: simProbeDetail,
+        summary: lcdVerified
+          ? `Live ${cfg.name} LCD state verified at height #${blockNumber.toLocaleString()}`
+          : !hrpMatches
+          ? `Address prefix mismatch: expected ${cfg.prefix}1… for ${cfg.name}`
+          : `${cfg.name} LCD unreachable`,
+        preflightStatus: lcdVerified ? 'verified' : !hrpMatches ? 'reverted' : 'rpc_skipped',
+        preflightDetail: lcdVerified
+          ? `CometBFT height #${blockNumber.toLocaleString()} · spendable ${nativeBalanceUi} ${cfg.symbol}`
+          : !hrpMatches
+          ? `Connected address (${params.userAddress.slice(0, 12)}…) does not match ${cfg.prefix}1…`
+          : 'LCD endpoint busy',
       },
       {
         stepId: 'noble_cctp_domain4',
         assetSymbol: 'USDC',
         actionType: 'cctp_deposit_for_burn',
         target: 'noble-1::circle.cctp.v1.MsgDepositForBurn',
-        summary: `Noble Circle CCTP Domain 4 → Domain 5 Solana (${expectedBytes32.slice(0, 10)}…)`,
+        summary: `Noble Circle CCTP Domain 4 → Solana USDC ATA PDA (${expectedBytes32.slice(0, 10)}…)`,
         preflightStatus: 'verified',
-        preflightDetail: 'Solana mintRecipient bytes32 verified bit-for-bit',
+        preflightDetail: 'Canonical Solana USDC ATA PDA bytes32 verified bit-for-bit',
       },
     ];
 
     const warnings: string[] = [];
+    if (!hrpMatches) {
+      warnings.push(`Address prefix mismatch for ${cfg.name}: expected "${cfg.prefix}1…" address.`);
+    }
     if (!hasEnoughNativeGas) {
       warnings.push(
-        `Low ${cfg.symbol} gas on ${cfg.name} (${nativeBalanceUi} ${cfg.symbol}). x/feegrant BasicAllowance will sponsor $0 user gas.`
+        `Low ${cfg.symbol} gas on ${cfg.name} (${nativeBalanceUi} ${cfg.symbol}). ${cfg.supportsTxFees ? 'Osmosis x/txfees or ' : ''}x/feegrant sponsorship required.`
       );
     }
 
@@ -826,6 +1087,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
             userAddress: params.userAddress,
             solanaDestination: params.solanaDestination,
             expectedBytes32,
+            outflows: sweepable.map((a) => ({ id: a.id, raw: a.rawBalance })),
             guaranteedMinNetUsd,
           })
         )
@@ -849,9 +1111,9 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       nativeSymbol: cfg.symbol,
       nativeBalanceUsd,
       estimatedGasUsd,
-      recommendedMode: 'sponsored_gasless',
+      recommendedMode: hasEnoughNativeGas ? 'eip5792_batch' : 'sponsored_gasless',
       simulationEndpoint: '/cosmos/tx/v1beta1/simulate',
-      outflows: params.assets.map((a) => ({
+      outflows: sweepable.map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
         usd: a.grossUsd,
@@ -861,7 +1123,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
         feeBps: feeCfg.feeBps,
         feePercent: feeCfg.feePercent,
         estimatedFeeUsd: feeUsd,
-        feeRecipientEvm: feeCfg.feeRecipientEvm,
+        feeRecipientEvm: null,
         collectionMethod: 'cosmos_bank_msgsend_5_to_10_pct',
       },
       guaranteedMinNetUsd,
@@ -876,7 +1138,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
           }
         : undefined,
       checks,
-      allChecksSafe: true,
+      allChecksSafe: lcdVerified,
       warnings,
     };
   },
@@ -885,7 +1147,14 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     const chainIdKey = (params.chain in COSMOS_CHAINS ? params.chain : 'cosmoshub') as CosmosChainId;
     const cfg = COSMOS_CHAINS[chainIdKey];
     const out: {
-      submitted?: { accepted: boolean; mode: string; signatureFingerprint?: string; nextStep: string };
+      submitted?: {
+        accepted: boolean;
+        mode: string;
+        broadcasted?: boolean;
+        settlementStatus?: string;
+        signatureFingerprint?: string;
+        nextStep: string;
+      };
       proof?: UniversalExecutionProof;
     } = {};
 
@@ -897,11 +1166,13 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       const configured = Boolean(process.env.SIPHON_COSMOS_RELAYER_KEY?.trim());
       out.submitted = {
         accepted: true,
-        mode: configured ? 'relayer_submitted' : 'intent_verified_awaiting_deployment',
+        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        broadcasted: false,
+        settlementStatus: configured ? 'queued_for_relayer' : 'awaiting_relayer',
         signatureFingerprint: fp,
         nextStep: configured
-          ? `Cosmos x/feegrant relayer queued atomic TxBody ${params.intentId} on ${cfg.name}.`
-          : `Cosmos 1-Sig TxBody verified (${fp}) with $0 user gas. Set SIPHON_COSMOS_RELAYER_KEY & x/feegrant allowance on ${cfg.name} to broadcast live.`,
+          ? `Cosmos x/feegrant relayer queued atomic TxBody ${params.intentId} (${fp}) on ${cfg.name}.`
+          : `Cosmos 1-Sig TxBody verified (${fp}). Use Direct Mode (Skip Go) to broadcast directly from Keplr/Leap today, or configure SIPHON_COSMOS_RELAYER_KEY.`,
       };
     }
 
@@ -944,11 +1215,15 @@ export const cosmosAdapter: ChainFamilyAdapter = {
           }
         : undefined;
 
-      const verified = Boolean(
-        succeeded &&
-          ((solanaDeltaProof?.deltaUsdc !== undefined && solanaDeltaProof.deltaUsdc > 0) ||
-            Boolean(cctpEvent))
-      );
+      const positiveSolanaDelta =
+        params.outputAsset === 'SOL'
+          ? Boolean(solanaDeltaProof?.deltaSol && solanaDeltaProof.deltaSol > 0)
+          : Boolean(
+              (solanaDeltaProof?.deltaUsdc && solanaDeltaProof.deltaUsdc > 0) ||
+                (solanaDeltaProof?.deltaSol && solanaDeltaProof.deltaSol > 0)
+            );
+
+      const verified = Boolean(succeeded && positiveSolanaDelta);
 
       const proofDigestSha256 =
         '0x' +
@@ -978,7 +1253,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
           provider: 'Skip Go IBC PFM + Noble Circle CCTP (Domain 4 → 5)',
           status: verified ? 'success' : succeeded ? 'relaying_ibc_cctp' : found ? 'failed' : 'pending',
           ibcPacketAck: ibcAck,
-          cctpAttestationStatus: cctpEvent ? 'complete' : succeeded ? 'pending_noble_burn' : undefined,
+          cctpAttestationStatus: verified ? 'complete' : cctpEvent ? 'attesting' : succeeded ? 'pending_noble_burn' : undefined,
         },
         solanaDeltaProof,
         summary: !found

@@ -1,5 +1,15 @@
 import crypto from 'node:crypto';
-import { solanaAddressToBytes32 } from '../bridge/cctp.js';
+import {
+  checkQuoteHaircutPass,
+  deriveNonEvmCctpRecipientBytes32,
+  evaluateNonEvmGaslessBreakEven,
+  fetchWithRetry,
+  filterChainSweepableAssets,
+  getNonEvmFeeRecipient,
+  LIFI_SUI_CHAIN_ID,
+  normalizeMoveCoinType,
+  quoteLifiNonEvm,
+} from '../execution/non-evm-converter.js';
 import { getProtocolFeeConfig, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
@@ -9,36 +19,53 @@ import type { ChainScanSummary, ScannedAsset, ScanReport } from '../scanner/type
 import type {
   ChainFamilyAdapter,
   ChainFamilyMeta,
+  PreparedNonEvmBatch,
+  PreparedNonEvmCall,
   UniversalExecutionProof,
   UniversalGaslessIntent,
   UniversalPreSignProof,
 } from './interface.js';
 
+const SUI_GRAPHQL_URLS = [
+  process.env.SUI_GRAPHQL_URL?.trim(),
+  'https://graphql.mainnet.sui.io/graphql',
+].filter((u): u is string => Boolean(u));
+
 const SUI_RPC_URLS = [
-  'https://fullnode.mainnet.sui.io:443',
-  'https://sui-rpc.publicnode.com',
-];
+  process.env.SUI_RPC_URL?.trim(),
+  'https://mainnet.suiet.app',
+].filter((u): u is string => Boolean(u));
 
 const SUI_CCTP_DOMAIN = 8;
+const SUI_NATIVE_USDC_TYPE =
+  '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC';
 
-const KNOWN_SUI_COINS: Record<
-  string,
-  { symbol: string; name: string; decimals: number; coingeckoKey: string; isUsdc?: boolean }
-> = {
+interface KnownSuiCoinMeta {
+  symbol: string;
+  name: string;
+  decimals: number;
+  coingeckoKey: string;
+  /** True ONLY for Native Circle Sui USDC accepted by Circle CCTP Domain 8 */
+  isNativeCctpUsdc?: boolean;
+  isLst?: boolean;
+  protocol?: string;
+}
+
+const KNOWN_SUI_COINS: Record<string, KnownSuiCoinMeta> = {
   '0x2::sui::SUI': { symbol: 'SUI', name: 'Sui', decimals: 9, coingeckoKey: 'coingecko:sui' },
-  '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC': {
+  [SUI_NATIVE_USDC_TYPE]: {
     symbol: 'USDC',
     name: 'Native Sui USDC',
     decimals: 6,
     coingeckoKey: 'coingecko:usd-coin',
-    isUsdc: true,
+    isNativeCctpUsdc: true,
   },
+  // Wormhole wUSDC is NOT accepted by Circle CCTP — must swap via Cetus/LI.FI first
   '0x5d4b302506645c37ff133b98c4b50a5ae14841659738d6d733d59d0d217a93bf::coin::COIN': {
     symbol: 'wUSDC',
     name: 'Wormhole USDC (Sui)',
     decimals: 6,
     coingeckoKey: 'coingecko:usd-coin',
-    isUsdc: true,
   },
   '0xc060006111016b8a020ad5b33834984a437aaa7d3c74c18e09a95d48aceab08c::coin::COIN': {
     symbol: 'USDT',
@@ -58,6 +85,36 @@ const KNOWN_SUI_COINS: Record<
     decimals: 9,
     coingeckoKey: 'coingecko:walrus-2',
   },
+  '0x06864a6f921804860930db6ddbe2e16acdf8504495ea7481637a1c8b9a8fe54b::cetus::CETUS': {
+    symbol: 'CETUS',
+    name: 'Cetus Protocol',
+    decimals: 9,
+    coingeckoKey: 'coingecko:cetus-protocol',
+  },
+  '0xf325ce1300e8dac124071d3152c5c5ee6174914f8bc2161e88329cf579246efc::afsui::AFSUI': {
+    symbol: 'afSUI',
+    name: 'Aftermath Staked SUI',
+    decimals: 9,
+    coingeckoKey: 'coingecko:sui',
+    isLst: true,
+    protocol: 'Aftermath LST',
+  },
+  '0xbde4ba4c2e274a60ce15c1cfff9e5c42e41654ac8b6d906a57efa4bd3c29f47d::hasui::HASUI': {
+    symbol: 'haSUI',
+    name: 'Haedal Staked SUI',
+    decimals: 9,
+    coingeckoKey: 'coingecko:sui',
+    isLst: true,
+    protocol: 'Haedal LST',
+  },
+  '0x549e8b69270defbfafd4f94e17ec44cdbdd99820b33bda2278dea3b9a32d3f55::cert::CERT': {
+    symbol: 'vSUI',
+    name: 'Volo Staked SUI',
+    decimals: 9,
+    coingeckoKey: 'coingecko:sui',
+    isLst: true,
+    protocol: 'Volo LST',
+  },
 };
 
 export const SUI_FAMILY_META: ChainFamilyMeta = {
@@ -65,10 +122,10 @@ export const SUI_FAMILY_META: ChainFamilyMeta = {
   label: 'Sui',
   shortLabel: 'Sui',
   chains: [{ id: 'sui', name: 'Sui', nativeSymbol: 'SUI', logo: '/logos/sui.svg', cctpDomain: SUI_CCTP_DOMAIN }],
-  signingMechanism: '1-Sig Programmable Transaction Block (PTB) — unstake + swap + fee + CCTP',
-  gasSponsorshipMechanism: 'Sui Native Sponsored Transaction (gasData.owner = Siphon Relayer, $0 user SUI)',
-  preSignProofMechanism: 'sui_dryRunTransactionBlock + checkpoint state + Circle CCTP bytes32 + Solana snapshot',
-  bridgeProviders: ['Circle CCTP (Domain 8 → 5)', 'Wormhole / Mayan'],
+  signingMechanism: '1-Sig Programmable Transaction Block (PTB) — Direct Wallet Standard or Sponsored Gas',
+  gasSponsorshipMechanism: 'Direct PTB or Sui Native Sponsored Transaction (gasData.owner = Siphon Relayer, $0 user SUI)',
+  preSignProofMechanism: 'Sui GraphQL / gRPC state + dryRunTransactionBlock + Circle CCTP ATA bytes32 + Solana snapshot',
+  bridgeProviders: ['LI.FI (Sui MVM)', 'Circle CCTP (Domain 8 → 5)', 'Cetus / Mayan'],
   wallets: [
     { id: 'slush', name: 'Slush (Sui Wallet)', logo: '/logos/slush.svg', installUrl: 'https://slush.app' },
     { id: 'phantom-sui', name: 'Phantom (Sui)', logo: '/logos/phantom.svg', installUrl: 'https://phantom.app' },
@@ -78,24 +135,39 @@ export const SUI_FAMILY_META: ChainFamilyMeta = {
   addressHint: '0x… (64-hex Sui address)',
 };
 
+async function suiGraphql<T>(query: string, timeoutMs = 4500): Promise<T | null> {
+  for (const url of SUI_GRAPHQL_URLS) {
+    const res = await fetchWithRetry(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ query }),
+      },
+      timeoutMs
+    );
+    if (res && res.ok) {
+      const json = (await res.json()) as { data?: T; errors?: unknown[] };
+      if (json.data && (!json.errors || !json.errors.length)) return json.data;
+    }
+  }
+  return null;
+}
+
 async function suiRpc<T>(method: string, params: unknown[], timeoutMs = 4200): Promise<T | null> {
   for (const url of SUI_RPC_URLS) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      const res = await fetch(url, {
+    const res = await fetchWithRetry(
+      url,
+      {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (res.ok) {
-        const json = (await res.json()) as { result?: T; error?: unknown };
-        if (!json.error && json.result !== undefined) return json.result;
-      }
-    } catch {
-      // try next Sui fullnode
+      },
+      timeoutMs
+    );
+    if (res && res.ok) {
+      const json = (await res.json()) as { result?: T; error?: unknown };
+      if (!json.error && json.result !== undefined) return json.result;
     }
   }
   return null;
@@ -125,80 +197,153 @@ export const suiAdapter: ChainFamilyAdapter = {
     const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
 
-    const [balances, stakes, checkpoint, priceMap] = await Promise.all([
-      suiRpc<Array<{ coinType: string; totalBalance: string }>>('suix_getAllBalances', [cleanAddr]),
-      suiRpc<Array<{ stakes?: Array<{ principal?: string; estimatedReward?: string }> }>>('suix_getStakes', [cleanAddr]),
-      suiRpc<string>('sui_getLatestCheckpointSequenceNumber', []),
+    const escapedAddr = cleanAddr.replace(/[^0-9a-fA-Fx]/g, '');
+    const gqlQuery = `{
+      checkpoint { sequenceNumber }
+      address(address: "${escapedAddr}") {
+        balances(first: 50) { nodes { coinType { repr } totalBalance } }
+        objects(filter: { type: "0x3::staking_pool::StakedSui" }, first: 30) {
+          nodes { address contents { json } }
+        }
+      }
+    }`;
+
+    const [gqlData, priceMap] = await Promise.all([
+      suiGraphql<{
+        checkpoint?: { sequenceNumber?: number };
+        address?: {
+          balances?: { nodes?: Array<{ coinType?: { repr?: string }; totalBalance?: string }> };
+          objects?: { nodes?: Array<{ address?: string; contents?: { json?: Record<string, unknown> } }> };
+        };
+      }>(gqlQuery),
       fetchLiveUsdPrices([
         'coingecko:sui',
         'coingecko:usd-coin',
         'coingecko:tether',
         'coingecko:deep',
         'coingecko:walrus-2',
+        'coingecko:cetus-protocol',
         'coingecko:solana',
       ]),
     ]);
 
-    if (!balances && !checkpoint) {
-      warnings.push('Sui Mainnet fullnode RPC did not respond within 4.2s.');
+    let blockNumber = Number(gqlData?.checkpoint?.sequenceNumber ?? 0);
+    let balanceItems: Array<{ coinType: string; totalBalance: string }> =
+      (gqlData?.address?.balances?.nodes ?? [])
+        .filter((n) => n.coinType?.repr && n.totalBalance)
+        .map((n) => ({
+          coinType: normalizeMoveCoinType(n.coinType!.repr!),
+          totalBalance: String(n.totalBalance),
+        }));
+    let stakedObjects = gqlData?.address?.objects?.nodes ?? [];
+    let rpcReachable = Boolean(gqlData && blockNumber > 0);
+
+    // Fallback to live JSON-RPC provider if GraphQL endpoint didn't respond
+    if (!rpcReachable) {
+      const [rpcBals, rpcStakes, rpcCp] = await Promise.all([
+        suiRpc<Array<{ coinType: string; totalBalance: string }>>('suix_getAllBalances', [cleanAddr]),
+        suiRpc<Array<{ stakes?: Array<{ stakedSuiId?: string; status?: string; principal?: string; estimatedReward?: string }> }>>('suix_getStakes', [cleanAddr]),
+        suiRpc<string>('sui_getLatestCheckpointSequenceNumber', []),
+      ]);
+      if (rpcCp || rpcBals) {
+        rpcReachable = true;
+        blockNumber = Number(rpcCp || 0);
+        balanceItems = (rpcBals ?? []).map((b) => ({
+          coinType: normalizeMoveCoinType(b.coinType),
+          totalBalance: b.totalBalance,
+        }));
+        stakedObjects = (rpcStakes ?? []).flatMap((vg) =>
+          (vg.stakes ?? [])
+            .filter((s) => !s.status || s.status === 'Active')
+            .map((s) => ({
+              address: s.stakedSuiId,
+              contents: {
+                json: {
+                  principal: s.principal,
+                  estimated_reward: s.estimatedReward,
+                },
+              },
+            }))
+        );
+      } else {
+        warnings.push('Sui Mainnet GraphQL & fallback RPC endpoints did not respond within timeout.');
+      }
     }
 
-    const blockNumber = Number(checkpoint || 0);
     const suiPrice = priceMap.get('coingecko:sui') ?? 2.45;
     const solPrice = priceMap.get('coingecko:solana') ?? 70;
     const assets: ScannedAsset[] = [];
     let nativeBalance = 0;
 
-    for (const b of balances ?? []) {
+    for (const b of balanceItems) {
       const meta = KNOWN_SUI_COINS[b.coinType];
       if (!meta) continue;
       const uiBal = unitsToUi(b.totalBalance, meta.decimals);
       if (uiBal <= 0) continue;
       if (b.coinType === '0x2::sui::SUI') nativeBalance = uiBal;
 
-      const priceUsd = priceMap.get(meta.coingeckoKey) ?? (meta.isUsdc ? 1 : 0);
+      const priceUsd = priceMap.get(meta.coingeckoKey) ?? (meta.isNativeCctpUsdc ? 1 : 0);
       const grossUsd = Number((uiBal * priceUsd).toFixed(2));
       const gasUsd = 0.01;
-      const slippageUsd = meta.isUsdc ? 0 : Number((grossUsd * 0.0025).toFixed(2));
+      const slippageUsd = meta.isNativeCctpUsdc ? 0 : Number((grossUsd * 0.0025).toFixed(2));
       const isDust = grossUsd < 0.25;
 
       assets.push({
         id: `sui:${b.coinType}`,
         family: 'sui',
+        sourceWallet: cleanAddr,
         chain: 'sui',
         chainName: 'Sui',
         address: b.coinType,
         symbol: meta.symbol,
         name: meta.name,
         decimals: meta.decimals,
-        kind: b.coinType === '0x2::sui::SUI' ? 'native' : 'erc20',
+        kind: meta.isLst ? 'defi_position' : b.coinType === '0x2::sui::SUI' ? 'native' : 'erc20',
+        protocol: meta.protocol,
+        underlyingSymbol: meta.isLst ? 'SUI' : undefined,
         rawBalance: b.totalBalance,
         uiBalance: Number(uiBal.toFixed(6)),
         priceUsd,
         grossUsd,
-        liquidityUsd: meta.isUsdc ? 400_000_000 : 50_000_000,
+        liquidityUsd: meta.isNativeCctpUsdc ? 400_000_000 : 50_000_000,
         estimatedGasUsd: gasUsd,
         batchedGasUsd: 0.005,
         estimatedSlippageUsd: slippageUsd,
         netUsdcSingle: Math.max(0, Number((grossUsd - gasUsd - slippageUsd).toFixed(2))),
         netUsdcBatched: Math.max(0, Number((grossUsd - 0.005 - slippageUsd).toFixed(2))),
-        action: isDust ? 'SKIP_GAS_NEGATIVE' : meta.isUsdc ? 'BRIDGE_DIRECT_USDC' : 'SELL_AND_BRIDGE',
+        action: isDust
+          ? 'SKIP_GAS_NEGATIVE'
+          : meta.isNativeCctpUsdc
+          ? 'BRIDGE_DIRECT_USDC'
+          : 'SELL_AND_BRIDGE',
         actionReason: isDust
           ? 'Sub-$0.25 dust on Sui'
-          : meta.isUsdc
-          ? 'Direct Native Circle CCTP on Sui (Domain 8 → Domain 5 Solana) in Sponsored PTB'
-          : 'Atomic Sui PTB swap (Cetus/7K) → Native Circle CCTP → Solana ($0 user SUI gas)',
+          : meta.isNativeCctpUsdc
+          ? 'Direct Native Circle CCTP on Sui (Domain 8 → Solana USDC ATA PDA) in 1-Sig PTB'
+          : meta.isLst
+          ? `Direct LST Swap (${meta.symbol} → Solana via LI.FI/Cetus PTB, bypasses unstake wait)`
+          : 'Atomic Sui PTB swap (LI.FI / Cetus) → Solana USDC/SOL',
         selectedByDefault: !isDust,
         honeypotSafe: true,
       });
     }
 
-    // Delegated SUI stakes
+    // Active Delegated SUI stakes (GraphQL 0x3::staking_pool::StakedSui objects)
     let totalStakeMist = 0n;
-    for (const validatorGroup of stakes ?? []) {
-      for (const s of validatorGroup.stakes ?? []) {
-        if (s.principal) totalStakeMist += BigInt(s.principal);
-        if (s.estimatedReward) totalStakeMist += BigInt(s.estimatedReward);
+    const activeStakeIds: string[] = [];
+    for (const obj of stakedObjects) {
+      const json = obj.contents?.json;
+      const principal = String(json?.principal ?? '0');
+      const reward = String(json?.estimated_reward ?? '0');
+      try {
+        const p = BigInt(principal);
+        const r = BigInt(reward);
+        if (p + r > 0n) {
+          totalStakeMist += p + r;
+          if (obj.address) activeStakeIds.push(obj.address);
+        }
+      } catch {
+        // ignore malformed stake object
       }
     }
     if (totalStakeMist > 0n) {
@@ -208,11 +353,12 @@ export const suiAdapter: ChainFamilyAdapter = {
         assets.push({
           id: 'sui:native_stake',
           family: 'sui',
+          sourceWallet: cleanAddr,
           chain: 'sui',
           chainName: 'Sui',
-          address: '0x3::sui_system::StakedSui',
+          address: activeStakeIds.length ? `staked:${activeStakeIds.join(',')}` : '0x3::sui_system::StakedSui',
           symbol: 'Staked SUI',
-          name: 'Sui Native Validator Stake + Rewards',
+          name: `Sui Native Validator Stake (${Math.max(1, activeStakeIds.length)} object${activeStakeIds.length === 1 ? '' : 's'})`,
           decimals: 9,
           kind: 'defi_position',
           protocol: 'Sui Native Staking',
@@ -228,7 +374,7 @@ export const suiAdapter: ChainFamilyAdapter = {
           netUsdcSingle: Math.max(0, Number((grossUsd * 0.997 - 0.015).toFixed(2))),
           netUsdcBatched: Math.max(0, Number((grossUsd * 0.997 - 0.006).toFixed(2))),
           action: 'WITHDRAW_AND_BRIDGE',
-          actionReason: 'PTB sui_system::request_withdraw_stake + swap + Circle CCTP in 1 sponsored signature',
+          actionReason: 'PTB sui_system::request_withdraw_stake + swap + bridge to Solana in 1 signature',
           selectedByDefault: true,
           honeypotSafe: true,
           stakedExitMode: 'native_unstake',
@@ -250,11 +396,12 @@ export const suiAdapter: ChainFamilyAdapter = {
 
     const summary: ChainScanSummary = {
       family: 'sui',
+      sourceWallet: cleanAddr,
       chain: 'sui',
       chainName: 'Sui',
       chainId: 'sui:mainnet',
       cctpDomain: SUI_CCTP_DOMAIN,
-      rpcStatus: 'live',
+      rpcStatus: rpcReachable ? 'live' : 'degraded',
       blockNumber,
       gasPriceGwei: 0.001,
       nativeBalance: Number(nativeBalance.toFixed(6)),
@@ -271,7 +418,7 @@ export const suiAdapter: ChainFamilyAdapter = {
       gasSavedByBatchUsd: Number(Math.max(0, singleTxGasUsd - batchedGasUsd).toFixed(3)),
       cctpAttestationSec: 16,
       needsGasSponsorship: nativeBalance < 0.05,
-      sponsorshipMechanism: 'Sui Native Sponsored Transaction (gasData.owner = Siphon Relayer)',
+      sponsorshipMechanism: 'Direct 1-Sig PTB or Sui Native Sponsored Transaction (gasData.owner)',
     };
 
     return applyTwoLevelRoiToReport({
@@ -308,16 +455,186 @@ export const suiAdapter: ChainFamilyAdapter = {
     });
   },
 
+  async prepareDirectBatch(params): Promise<PreparedNonEvmBatch> {
+    const outputAsset = params.outputAsset ?? 'USDC';
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const feeRecipient = getNonEvmFeeRecipient('sui');
+    const solanaUsdcAtaBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+    const sweepable = filterChainSweepableAssets('sui', params.assets);
+
+    const calls: PreparedNonEvmCall[] = [];
+    const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
+    const skippedAssets: PreparedNonEvmBatch['skippedAssets'] = [];
+    const notes: string[] = [];
+    let maxSeconds = 20;
+    let liveExecutable = false;
+
+    for (const asset of sweepable) {
+      if (asset.id === 'sui:native_stake' || asset.address.startsWith('staked:')) {
+        const stakeIds = asset.address.startsWith('staked:')
+          ? asset.address.slice('staked:'.length).split(',').filter(Boolean)
+          : [];
+        calls.push({
+          stepId: 'sui_withdraw_stake',
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          action: asset.action,
+          provider: 'sui_native_staking',
+          label: `Unstake ${asset.uiBalance} SUI in PTB`,
+          description: `Calls 0x3::sui_system::request_withdraw_stake for ${Math.max(1, stakeIds.length)} active StakedSui object(s)`,
+          nativePayload: {
+            kind: 'moveCall',
+            target: '0x3::sui_system::request_withdraw_stake',
+            arguments: ['0x5', stakeIds],
+          },
+        });
+        continue;
+      }
+
+      const normCoin = normalizeMoveCoinType(asset.address);
+      const isNativeUsdc = normCoin === SUI_NATIVE_USDC_TYPE;
+
+      if (isNativeUsdc && outputAsset === 'USDC' && params.bridgePreference === 'cctp') {
+        calls.push({
+          stepId: 'sui_cctp_burn',
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          action: asset.action,
+          provider: 'circle_cctp',
+          label: `Circle CCTP Domain 8 → Solana USDC ATA (${asset.uiBalance} USDC)`,
+          description: `Burns Native Sui USDC to canonical Solana USDC ATA PDA (${solanaUsdcAtaBytes32.slice(0, 14)}…)`,
+          nativePayload: {
+            kind: 'moveCall',
+            target: 'cctp::token_messenger_minter::deposit_for_burn',
+            coinType: SUI_NATIVE_USDC_TYPE,
+            amountRaw: asset.rawBalance,
+            sourceDomain: SUI_CCTP_DOMAIN,
+            destinationDomain: SOLANA_CCTP_DOMAIN,
+            mintRecipientBytes32: solanaUsdcAtaBytes32,
+          },
+        });
+        bridgeTrackers.push({
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          provider: 'circle_cctp',
+          estimatedOutput: `${asset.uiBalance.toFixed(2)} USDC`,
+          estimatedSeconds: 18,
+          requiresSolanaClaim: true,
+        });
+        continue;
+      }
+
+      const fullCoinTag = normCoin === '0x2::sui::SUI'
+        ? '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI'
+        : normCoin;
+      const quote = await quoteLifiNonEvm({
+        fromChainId: LIFI_SUI_CHAIN_ID,
+        fromToken: fullCoinTag,
+        fromAmount: asset.rawBalance,
+        fromAddress: params.userAddress,
+        solanaDestination: params.solanaDestination,
+        outputAsset,
+      });
+
+      if (quote) {
+        const haircut = checkQuoteHaircutPass({
+          grossUsd: asset.grossUsd,
+          quotedOutUsd: quote.quotedOutUsd,
+          estimatedGasUsd: quote.estimatedGasUsd,
+          allowHighCost: params.allowHighCost,
+        });
+        if (!haircut.passed) {
+          skippedAssets.push({ assetId: asset.id, assetSymbol: asset.symbol, reason: haircut.reason });
+          continue;
+        }
+        if (quote.liveExecutable) liveExecutable = true;
+        maxSeconds = Math.max(maxSeconds, quote.estimatedSeconds);
+        calls.push({
+          stepId: 'sui_lifi_convert',
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          action: asset.action,
+          provider: 'lifi',
+          label: `Convert ${asset.uiBalance} ${asset.symbol} → ${quote.estimatedOutputUi} (${quote.tool})`,
+          description: quote.liveExecutable
+            ? `Live Sui PTB via LI.FI (${quote.tool}) directly to Solana ${outputAsset}`
+            : `Live LI.FI route quoted (${quote.estimatedOutputUi}); connect funded Sui wallet to build live PTB bytes`,
+          nativePayload: {
+            kind: 'sui_ptb_transaction',
+            transactionRequest: quote.transactionRequest,
+            routeSummary: quote.routeSummary,
+            fromCoinType: fullCoinTag,
+            amountRaw: asset.rawBalance,
+            solanaDestination: params.solanaDestination,
+          },
+        });
+        bridgeTrackers.push({
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          provider: 'lifi',
+          requestId: quote.requestId,
+          estimatedOutput: quote.estimatedOutputUi,
+          estimatedSeconds: quote.estimatedSeconds,
+        });
+      } else {
+        skippedAssets.push({
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          reason: `No live Sui → Solana route returned for ${asset.symbol} (amount may be below bridge minimum).`,
+        });
+      }
+    }
+
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    if (!liveExecutable && calls.length > 0) {
+      notes.push('Connect a funded Slush or Phantom (Sui) wallet to serialize and execute live PTB bytes via Wallet Standard.');
+    }
+
+    return {
+      family: 'sui',
+      chain: 'sui',
+      chainId: 'sui:mainnet',
+      chainName: 'Sui',
+      explorerUrl: 'https://suiscan.xyz/mainnet',
+      userAddress: params.userAddress,
+      solanaDestination: params.solanaDestination,
+      solanaUsdcAtaBytes32,
+      outputAsset,
+      executionKind: 'sui_ptb',
+      signingStandard: 'Sui Wallet Standard (sui:signAndExecuteTransaction)',
+      liveExecutable,
+      calls,
+      bridgeTrackers,
+      skippedAssets,
+      savings: {
+        totalCalls: calls.length,
+        walletPopupsBatched: calls.length ? 1 : 0,
+        walletPopupsLegacy: calls.length,
+        popupsSaved: Math.max(0, calls.length - 1),
+      },
+      feeBreakdown: {
+        feeBps: feeCfg.feeBps,
+        feePercent: feeCfg.feePercent,
+        feeRecipient,
+        collectionMethod: feeRecipient ? 'sui_ptb_split_coins' : 'bridge_quote_only',
+        estimatedFeeUsd,
+      },
+      estimatedSeconds: maxSeconds,
+      gaslessAvailable: Boolean(process.env.SIPHON_SUI_SPONSOR_PRIVATE_KEY?.trim()),
+      gaslessMechanism: 'Sui Native Sponsored PTB (gasData.owner = Siphon Sponsor)',
+      notes,
+    };
+  },
+
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {
-    const feeCfg = getProtocolFeeConfig({
-      feeBps: params.protocolFeeBps,
-      feeRecipientEvm: params.feeRecipient,
-    });
-    const mintRecipientBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    // Canonical SPL USDC ATA PDA (never raw Solana owner pubkey!)
+    const mintRecipientBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
     const sponsorAddress =
-      process.env.SIPHON_SUI_SPONSOR_ADDRESS?.trim() ||
+      getNonEvmFeeRecipient('sui') ||
       '0x00000000000000000000000000000000000000000000000000000000000051f0';
-    const chainAssets = params.assets.filter((a) => a.action !== 'SKIP_HONEYPOT' && a.action !== 'SKIP_GAS_NEGATIVE');
+    const chainAssets = filterChainSweepableAssets('sui', params.assets);
     const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
     const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const sponsoredGasEstUsd = 0.01;
@@ -327,15 +644,23 @@ export const suiAdapter: ChainFamilyAdapter = {
     const deadline = Math.floor(Date.now() / 1000) + 1800;
     const nonce = BigInt('0x' + crypto.randomBytes(8).toString('hex')).toString();
 
+    const breakEven = evaluateNonEvmGaslessBreakEven({
+      grossUsd,
+      sponsoredGasEstUsd,
+      protocolFeeBps: feeCfg.feeBps,
+      estimatedNetUsd,
+    });
+
     const commands: Array<Record<string, unknown>> = [];
-    if (chainAssets.some((a) => a.kind === 'defi_position')) {
+    if (chainAssets.some((a) => a.kind === 'defi_position' && a.id === 'sui:native_stake')) {
       commands.push({ moveCall: '0x3::sui_system::request_withdraw_stake', args: ['0x5', 'StakedSuiObjects'] });
     }
     for (const a of chainAssets.filter((x) => x.action === 'SELL_AND_BRIDGE')) {
       commands.push({
         moveCall: 'cetus_aggregator::swap_to_usdc',
-        coinType: a.address,
+        coinType: normalizeMoveCoinType(a.address),
         amountIn: a.rawBalance,
+        targetCoinType: SUI_NATIVE_USDC_TYPE,
       });
     }
     commands.push({
@@ -350,6 +675,7 @@ export const suiAdapter: ChainFamilyAdapter = {
       sourceDomain: SUI_CCTP_DOMAIN,
       destinationDomain: SOLANA_CCTP_DOMAIN,
       mintRecipient: mintRecipientBytes32,
+      burnCoinType: SUI_NATIVE_USDC_TYPE,
       minNetUsdcOut,
     });
 
@@ -363,6 +689,7 @@ export const suiAdapter: ChainFamilyAdapter = {
         sponsored: true,
       },
       commands,
+      expirationEpochOffset: 2,
       expiration: deadline,
       nonce,
     };
@@ -389,7 +716,7 @@ export const suiAdapter: ChainFamilyAdapter = {
       protocolFeeBps: feeCfg.feeBps,
       protocolFeePercent: feeCfg.feePercent,
       protocolFeeUsd,
-      feeRecipient: sponsorAddress,
+      feeRecipient: getNonEvmFeeRecipient('sui'),
       minNetUsdcOut,
       estimatedNetUsd,
       coveredAssets: chainAssets.map((a) => ({
@@ -401,35 +728,51 @@ export const suiAdapter: ChainFamilyAdapter = {
       })),
       signPayload,
       relayerConfigured: Boolean(process.env.SIPHON_SUI_SPONSOR_PRIVATE_KEY?.trim()),
+      sponsorEligible: breakEven.eligible,
+      sponsorRejectionReason: breakEven.rejectionReason,
       intentDigestSha256,
-      explanation: `1 Slush/Phantom signature authorizes an atomic ${commands.length}-command Sui PTB with gasData.owner = Siphon Relayer ($0 user SUI) → Circle CCTP Domain 8 → Solana Domain 5.`,
+      explanation: `1 Slush/Phantom signature authorizes an atomic ${commands.length}-command Sui PTB with gasData.owner = Siphon Relayer ($0 user SUI) → Circle CCTP Domain 8 → Solana USDC ATA PDA.`,
     };
   },
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
-    const feeCfg = getProtocolFeeConfig({
-      feeBps: params.protocolFeeBps,
-      feeRecipientEvm: params.feeRecipient,
-    });
-    const expectedBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const expectedBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+    const sweepable = filterChainSweepableAssets('sui', params.assets);
+    const escapedAddr = params.userAddress.replace(/[^0-9a-fA-Fx]/g, '');
 
-    const [checkpoint, suiBal, solSnap, priceMap] = await Promise.all([
-      suiRpc<string>('sui_getLatestCheckpointSequenceNumber', []),
-      suiRpc<{ totalBalance: string }>('suix_getBalance', [params.userAddress, '0x2::sui::SUI']),
+    const [gqlData, solSnap, priceMap] = await Promise.all([
+      suiGraphql<{
+        checkpoint?: { sequenceNumber?: number };
+        address?: { balance?: { totalBalance?: string } };
+      }>(
+        `{ checkpoint { sequenceNumber } address(address: "${escapedAddr}") { balance(type: "0x2::sui::SUI") { totalBalance } } }`
+      ),
       fetchSolanaWalletBalances(params.solanaDestination).catch(() => null),
       fetchLiveUsdPrices(['coingecko:sui']),
     ]);
 
-    const blockNumber = Number(checkpoint || 0);
-    const nativeBalanceUi = Number(unitsToUi(suiBal?.totalBalance || '0', 9).toFixed(5));
+    let blockNumber = Number(gqlData?.checkpoint?.sequenceNumber ?? 0);
+    let rawSui = gqlData?.address?.balance?.totalBalance ?? null;
+    if (!blockNumber) {
+      const [cp, bal] = await Promise.all([
+        suiRpc<string>('sui_getLatestCheckpointSequenceNumber', []),
+        suiRpc<{ totalBalance: string }>('suix_getBalance', [params.userAddress, '0x2::sui::SUI']),
+      ]);
+      blockNumber = Number(cp || 0);
+      rawSui = bal?.totalBalance ?? '0';
+    }
+
+    const nativeBalanceUi = Number(unitsToUi(rawSui || '0', 9).toFixed(5));
     const nativePriceUsd = params.nativePriceUsd ?? priceMap.get('coingecko:sui') ?? 2.45;
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
     const estimatedGasUsd = 0.01;
     const hasEnoughNativeGas = nativeBalanceUi >= 0.05;
-    const grossUsd = Number(params.assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
     const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
+    const rpcVerified = blockNumber > 0;
 
     const proofDigestSha256 =
       '0x' +
@@ -441,10 +784,19 @@ export const suiAdapter: ChainFamilyAdapter = {
             checkpoint: blockNumber,
             userAddress: params.userAddress,
             expectedBytes32,
+            outflows: sweepable.map((a) => ({ id: a.id, raw: a.rawBalance })),
             guaranteedMinNetUsd,
           })
         )
         .digest('hex');
+
+    const warnings: string[] = [];
+    if (!hasEnoughNativeGas) {
+      warnings.push(`Low SUI balance (${nativeBalanceUi} SUI). Native Sponsored PTB sets gasData.owner = Siphon Relayer ($0 user gas).`);
+    }
+    if (!rpcVerified) {
+      warnings.push('Sui Mainnet GraphQL/RPC checkpoint could not be reached for live verification.');
+    }
 
     return {
       proofId: `prf_sui_${crypto.randomBytes(4).toString('hex')}`,
@@ -464,9 +816,9 @@ export const suiAdapter: ChainFamilyAdapter = {
       nativeSymbol: 'SUI',
       nativeBalanceUsd,
       estimatedGasUsd,
-      recommendedMode: 'sponsored_gasless',
-      simulationEndpoint: 'sui_dryRunTransactionBlock',
-      outflows: params.assets.map((a) => ({
+      recommendedMode: hasEnoughNativeGas ? 'eip5792_batch' : 'sponsored_gasless',
+      simulationEndpoint: 'graphql.mainnet.sui.io + dryRunTransactionBlock',
+      outflows: sweepable.map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
         usd: a.grossUsd,
@@ -476,7 +828,7 @@ export const suiAdapter: ChainFamilyAdapter = {
         feeBps: feeCfg.feeBps,
         feePercent: feeCfg.feePercent,
         estimatedFeeUsd: feeUsd,
-        feeRecipientEvm: feeCfg.feeRecipientEvm,
+        feeRecipientEvm: null,
         collectionMethod: 'sui_ptb_split_coins_5_to_10_pct',
       },
       guaranteedMinNetUsd,
@@ -495,47 +847,58 @@ export const suiAdapter: ChainFamilyAdapter = {
           stepId: 'sui_dry_run_ptb',
           assetSymbol: 'SUI',
           actionType: 'sui_ptb_dry_run',
-          target: 'fullnode.mainnet.sui.io::sui_dryRunTransactionBlock',
-          summary: `Sponsored PTB verified against checkpoint #${blockNumber.toLocaleString()}`,
-          preflightStatus: blockNumber > 0 ? 'verified' : 'rpc_skipped',
-          preflightDetail:
-            blockNumber > 0
-              ? `Live Sui checkpoint #${blockNumber.toLocaleString()} + gasData.owner sponsorship verified`
-              : 'Sui RPC busy',
+          target: 'graphql.mainnet.sui.io/graphql',
+          summary: rpcVerified
+            ? `Sui GraphQL state verified at checkpoint #${blockNumber.toLocaleString()}`
+            : 'Sui GraphQL checkpoint unreachable',
+          preflightStatus: rpcVerified ? 'verified' : 'rpc_skipped',
+          preflightDetail: rpcVerified
+            ? `Live Sui checkpoint #${blockNumber.toLocaleString()} (${nativeBalanceUi} SUI) verified`
+            : 'Sui GraphQL/RPC unavailable',
         },
         {
           stepId: 'sui_cctp_domain8',
           assetSymbol: 'USDC',
           actionType: 'cctp_deposit_for_burn',
           target: 'cctp::token_messenger_minter::deposit_for_burn',
-          summary: `Native Sui Circle CCTP Domain 8 → Domain 5 Solana`,
+          summary: `Native Sui Circle CCTP Domain 8 → Solana USDC ATA PDA`,
           preflightStatus: 'verified',
-          preflightDetail: 'Solana mintRecipient bytes32 verified bit-for-bit',
+          preflightDetail: `Canonical Solana USDC ATA bytes32 (${expectedBytes32.slice(0, 14)}…) verified`,
         },
       ],
-      allChecksSafe: true,
-      warnings: hasEnoughNativeGas
-        ? []
-        : [`Low SUI balance (${nativeBalanceUi} SUI). Native Sponsored PTB sets gasData.owner = Siphon Relayer ($0 user gas).`],
+      allChecksSafe: rpcVerified,
+      warnings,
     };
   },
 
   async relayAndProve(params) {
     const out: {
-      submitted?: { accepted: boolean; mode: string; signatureFingerprint?: string; nextStep: string };
+      submitted?: {
+        accepted: boolean;
+        mode: string;
+        broadcasted?: boolean;
+        settlementStatus?: string;
+        signatureFingerprint?: string;
+        nextStep: string;
+      };
       proof?: UniversalExecutionProof;
     } = {};
 
     if (params.signature && params.intentId) {
+      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
+        throw new Error('Signed Sui gasless PTB intent expired. Re-sign a fresh intent.');
+      }
       const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
       const configured = Boolean(process.env.SIPHON_SUI_SPONSOR_PRIVATE_KEY?.trim());
       out.submitted = {
         accepted: true,
-        mode: configured ? 'relayer_submitted' : 'intent_verified_awaiting_deployment',
+        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        broadcasted: false,
+        settlementStatus: configured ? 'queued_for_sponsor' : 'awaiting_relayer',
         signatureFingerprint: fp,
         nextStep: configured
-          ? `Sui gas sponsor co-signed & broadcast PTB ${params.intentId}.`
-          : `Sui 1-Sig PTB verified (${fp}) with $0 user SUI. Set SIPHON_SUI_SPONSOR_PRIVATE_KEY to co-sign gasData.owner live on Sui Mainnet.`,
+          ? `Sui gas sponsor queued PTB ${params.intentId} (${fp}) for co-signing.`
+          : `Sui 1-Sig PTB verified (${fp}). Switch to Direct Mode to execute immediately with your Slush/Phantom wallet, or configure SIPHON_SUI_SPONSOR_PRIVATE_KEY for $0 gas.`,
       };
     }
 
@@ -573,6 +936,14 @@ export const suiAdapter: ChainFamilyAdapter = {
           }
         : undefined;
 
+      const positiveSolanaDelta =
+        params.outputAsset === 'SOL'
+          ? Boolean(solanaDeltaProof?.deltaSol && solanaDeltaProof.deltaSol > 0)
+          : Boolean(
+              (solanaDeltaProof?.deltaUsdc && solanaDeltaProof.deltaUsdc > 0) ||
+                (solanaDeltaProof?.deltaSol && solanaDeltaProof.deltaSol > 0)
+            );
+
       const proofDigestSha256 =
         '0x' +
         crypto
@@ -580,8 +951,9 @@ export const suiAdapter: ChainFamilyAdapter = {
           .update(JSON.stringify({ family: 'sui', digest: params.txHash, succeeded, solanaDeltaProof }))
           .digest('hex');
 
+      const userLower = params.userAddress.toLowerCase();
       out.proof = {
-        verified: Boolean(succeeded && solanaDeltaProof?.deltaUsdc && solanaDeltaProof.deltaUsdc > 0),
+        verified: Boolean(succeeded && positiveSolanaDelta),
         family: 'sui',
         proofDigestSha256,
         verifiedAt: new Date().toISOString(),
@@ -596,27 +968,30 @@ export const suiAdapter: ChainFamilyAdapter = {
           gasUsed: txBlock?.effects?.gasUsed?.computationCost,
           nativeSymbol: 'SUI',
         },
-        decodedTransfers: (txBlock?.balanceChanges ?? []).map((bc) => {
-          const meta = KNOWN_SUI_COINS[bc.coinType];
-          const dec = meta?.decimals ?? 9;
-          return {
-            tokenAddress: bc.coinType,
-            symbol: sanitizeTokenSymbol(meta?.symbol ?? bc.coinType.split('::').pop(), 'COIN'),
-            from: params.userAddress,
-            to: bc.owner?.AddressOwner || 'ptb',
-            amountUi: Math.abs(unitsToUi(bc.amount.replace('-', ''), dec)),
-            category: bc.amount.startsWith('-') ? 'user_outflow' : 'other',
-          };
-        }),
+        decodedTransfers: (txBlock?.balanceChanges ?? [])
+          .filter((bc) => !userLower || bc.owner?.AddressOwner?.toLowerCase() === userLower)
+          .map((bc) => {
+            const norm = normalizeMoveCoinType(bc.coinType);
+            const meta = KNOWN_SUI_COINS[norm];
+            const dec = meta?.decimals ?? 9;
+            return {
+              tokenAddress: norm,
+              symbol: sanitizeTokenSymbol(meta?.symbol ?? norm.split('::').pop(), 'COIN'),
+              from: params.userAddress,
+              to: bc.owner?.AddressOwner || 'ptb',
+              amountUi: Math.abs(unitsToUi(bc.amount.replace('-', ''), dec)),
+              category: bc.amount.startsWith('-') ? 'user_outflow' : 'other',
+            };
+          }),
         bridgeProof: {
-          provider: 'Circle CCTP (Sui Domain 8 → Solana Domain 5)',
-          status: succeeded ? 'attesting_cctp' : found ? 'failed' : 'pending',
+          provider: params.provider === 'lifi' ? 'LI.FI (Sui → Solana)' : 'Circle CCTP (Sui Domain 8 → Solana Domain 5)',
+          status: positiveSolanaDelta ? 'success' : succeeded ? 'relaying' : found ? 'failed' : 'pending',
         },
         solanaDeltaProof,
         summary: !found
           ? 'Sui transaction digest not yet indexed.'
           : succeeded
-          ? `Verified on Sui checkpoint #${txBlock?.checkpoint ?? '—'} · Circle CCTP → Solana tracked.`
+          ? `Verified on Sui checkpoint #${txBlock?.checkpoint ?? '—'} · Solana settlement tracked.`
           : 'Sui PTB execution failed.',
       };
     }

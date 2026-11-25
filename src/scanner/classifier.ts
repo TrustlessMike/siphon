@@ -9,7 +9,10 @@ import {
 import { fetchLiveUsdPrices } from './prices.js';
 import {
   AAVE_V2_LENDING_POOLS,
+  computeYearnV2UnderlyingRaw,
   discoverUniswapV3NftPositions,
+  encodeErc4626Redeem,
+  encodeYearnV2Withdraw,
   type Erc4626VaultState,
   identifyProtocolExtractorId,
   probeErc4626VaultStates,
@@ -20,6 +23,7 @@ import {
   checkAaveV3AccountSafety,
   detectPermit2Allowances,
   discoverChainTokens,
+  discoverDefiProtocolPositions,
   fetchDexLiquidityBatch,
   isEip2612Token,
   MIN_VERIFIED_DEX_LIQUIDITY_USD,
@@ -124,6 +128,14 @@ interface RawAssetSeed {
   nftTokenId?: string;
   nftLiquidity?: string;
   nftManagerAddress?: string;
+  protocolUrl?: string;
+  protocolLogoUrl?: string;
+  defiPositionType?: string;
+  defiDebtUsd?: number;
+  defiHealthFactor?: number;
+  defiUnlockAt?: number;
+  defiNetUsd?: number;
+  defiDebtSummary?: string;
 }
 
 function classifyAndBuildReport(params: {
@@ -226,6 +238,8 @@ function classifyAndBuildReport(params: {
           decimals: item.decimals,
           protocol: item.protocol,
           protocolAddress: item.protocolAddress,
+          protocolUrl: item.protocolUrl,
+          protocolLogoUrl: item.protocolLogoUrl,
           underlyingSymbol: item.underlyingSymbol,
           underlyingAddress: item.underlyingAddress,
           rawBalance: item.rawBalance.toString(),
@@ -246,8 +260,19 @@ function classifyAndBuildReport(params: {
           lpRouterAddress: item.lpRouterAddress,
           nftTokenId: item.nftTokenId,
           nftManagerAddress: item.nftManagerAddress,
+          defiPositionType: item.defiPositionType,
+          defiDebtUsd: item.defiDebtUsd,
+          defiHealthFactor: item.defiHealthFactor,
+          defiUnlockAt: item.defiUnlockAt,
+          defiNetUsd: item.defiNetUsd,
+          defiDebtSummary: item.defiDebtSummary,
         },
         vaultState: item.vaultState,
+        expectedUnderlyingRaw: item.expectedUnderlyingRaw,
+        expectedUnderlyingUi:
+          item.expectedUnderlyingRaw !== undefined
+            ? round4(formatUnits(item.expectedUnderlyingRaw, item.underlyingDecimals ?? item.decimals))
+            : undefined,
         expectedSecondaryRaw: item.expectedSecondaryRaw,
         expectedSecondaryUi:
           item.expectedSecondaryRaw !== undefined
@@ -271,11 +296,19 @@ function classifyAndBuildReport(params: {
             : `Withdraw ${item.underlyingSymbol ?? item.symbol} from ${item.protocol} → Solana via Relay / LI.FI.`;
         selectedByDefault = netUsdcBatched > 0.25;
       }
-      calldataPreview = encodeAaveWithdrawPreview(
-        item.underlyingAddress || item.address,
-        item.rawBalance,
-        walletAddress
-      );
+      if (defiExitPlan.protocolId === 'external_protocol') {
+        calldataPreview = undefined;
+      } else if (defiExitPlan.protocolId === 'yearn_v2') {
+        calldataPreview = encodeYearnV2Withdraw(item.rawBalance);
+      } else if (defiExitPlan.protocolId === 'erc4626') {
+        calldataPreview = encodeErc4626Redeem(item.rawBalance, walletAddress, walletAddress);
+      } else {
+        calldataPreview = encodeAaveWithdrawPreview(
+          item.underlyingAddress || item.address,
+          item.rawBalance,
+          walletAddress
+        );
+      }
     } else if (isDirectUsdc) {
       action = 'BRIDGE_DIRECT_USDC';
       actionReason = 'Native USDC — direct route to Solana via Relay (~2s), LI.FI, or Circle CCTP.';
@@ -338,6 +371,14 @@ function classifyAndBuildReport(params: {
       nftTokenId: item.nftTokenId,
       nftLiquidity: item.nftLiquidity,
       nftManagerAddress: item.nftManagerAddress,
+      protocolUrl: item.protocolUrl,
+      protocolLogoUrl: item.protocolLogoUrl,
+      defiPositionType: item.defiPositionType,
+      defiDebtUsd: item.defiDebtUsd,
+      defiHealthFactor: item.defiHealthFactor,
+      defiUnlockAt: item.defiUnlockAt,
+      defiNetUsd: item.defiNetUsd,
+      defiDebtSummary: item.defiDebtSummary,
     };
   });
 
@@ -474,11 +515,12 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     ...TOKEN_REGISTRY.map((t) => t.llamaKey).filter((k): k is string => Boolean(k)),
   ];
 
-  const [prices, discoveredByChainArr, ...chainOutputs] = await Promise.all([
+  const [prices, discoveredByChainArr, discoveredProtocolPositions, ...chainOutputs] = await Promise.all([
     fetchLiveUsdPrices(llamaKeys),
     Promise.all(
       CHAIN_LIST.map(async (c) => [c.id, await discoverChainTokens(c.id, cleanAddr, 24)] as const)
     ),
+    discoverDefiProtocolPositions(cleanAddr),
     ...CHAIN_LIST.map((c) =>
       scanSingleEvmChain(
         c,
@@ -583,13 +625,17 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
         }),
       ]);
 
-      // Fetch prices for any auto-detected DeFi underlying assets (ERC-4626 / Aave / Compound v2 / LP token0+token1)
+      // Fetch prices for any auto-detected DeFi underlying assets (ERC-4626 / Yearn v2 / Aave / Compound v2 / LP token0+token1)
       const defiUnderlyings = Array.from(defiReceiptMap.values()).flatMap((d) =>
         d.secondaryUnderlyingAddress ? [d.underlyingAddress, d.secondaryUnderlyingAddress] : [d.underlyingAddress]
       );
-      const underlyingDexMap = defiUnderlyings.length
-        ? await fetchDexLiquidityBatch(c.id, defiUnderlyings)
-        : new Map();
+      const llamaChainSlug = c.id === 'avalanche' ? 'avax' : c.id === 'bnb' ? 'bsc' : c.id;
+      const [underlyingDexMap, underlyingLlamaMap] = defiUnderlyings.length
+        ? await Promise.all([
+            fetchDexLiquidityBatch(c.id, defiUnderlyings),
+            fetchLiveUsdPrices(defiUnderlyings.map((u) => `${llamaChainSlug}:${u}`)),
+          ])
+        : [new Map(), new Map<string, number>()];
 
       const extraDead: typeof novelTokens = [];
       for (const dt of novelTokens) {
@@ -601,13 +647,15 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
           const isUsdcUnderlying =
             defiReceipt.underlyingAddress.toLowerCase() === c.usdcAddress.toLowerCase();
           const uDex = underlyingDexMap.get(defiReceipt.underlyingAddress.toLowerCase());
-          const uPriceUsd = isUsdcUnderlying ? 1.0 : uDex?.priceUsd ?? 0;
+          const uLlama = underlyingLlamaMap.get(`${llamaChainSlug}:${defiReceipt.underlyingAddress}`);
+          const uPriceUsd = isUsdcUnderlying ? 1.0 : uDex?.priceUsd || uLlama || 0;
 
           if (defiReceipt.protocolId === 'uniswap_v2_lp' && defiReceipt.secondaryUnderlyingAddress) {
             const isUsdc1 =
               defiReceipt.secondaryUnderlyingAddress.toLowerCase() === c.usdcAddress.toLowerCase();
             const u1Dex = underlyingDexMap.get(defiReceipt.secondaryUnderlyingAddress.toLowerCase());
-            const u1PriceUsd = isUsdc1 ? 1.0 : u1Dex?.priceUsd ?? 0;
+            const u1Llama = underlyingLlamaMap.get(`${llamaChainSlug}:${defiReceipt.secondaryUnderlyingAddress}`);
+            const u1PriceUsd = isUsdc1 ? 1.0 : u1Dex?.priceUsd || u1Llama || 0;
             const dec0 = isUsdcUnderlying ? 6 : 18;
             const dec1 = isUsdc1 ? 6 : 18;
             const ui0 = defiReceipt.expectedUnderlyingRaw
@@ -652,14 +700,35 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
 
           if (uPriceUsd > 0) {
             let effectivePriceUsd = uPriceUsd;
+            let expectedUnderlyingRaw = defiReceipt.expectedUnderlyingRaw;
+            let underlyingSymbol = isUsdcUnderlying ? 'USDC' : dt.symbol.replace(/^[ascv]/i, '');
+            let underlyingDecimals = isUsdcUnderlying ? 6 : dt.decimals;
+
             if (defiReceipt.protocolId === 'compound_v2' && defiReceipt.expectedUnderlyingRaw) {
               const uDec = isUsdcUnderlying ? 6 : 18;
+              underlyingDecimals = uDec;
               const expectedUi = formatUnits(defiReceipt.expectedUnderlyingRaw, uDec);
               const cUi = formatUnits(dt.rawBalance, dt.decimals);
               if (cUi > 0 && expectedUi > 0) {
                 effectivePriceUsd = (expectedUi * uPriceUsd) / cUi;
               }
+            } else if (defiReceipt.protocolId === 'yearn_v2' && defiReceipt.exchangeRateStored) {
+              underlyingSymbol = isUsdcUnderlying
+                ? 'USDC'
+                : dt.symbol.replace(/^yv/i, '') || dt.symbol;
+              underlyingDecimals = dt.decimals;
+              expectedUnderlyingRaw = computeYearnV2UnderlyingRaw(
+                dt.rawBalance,
+                defiReceipt.exchangeRateStored,
+                dt.decimals
+              );
+              const expectedUi = formatUnits(expectedUnderlyingRaw, dt.decimals);
+              const shareUi = formatUnits(dt.rawBalance, dt.decimals);
+              if (shareUi > 0 && expectedUi > 0) {
+                effectivePriceUsd = (expectedUi * uPriceUsd) / shareUi;
+              }
             }
+
             rawAssets.push({
               chain: c.id,
               address: dt.address,
@@ -669,10 +738,10 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
               kind: 'defi_position',
               protocol: defiReceipt.protocol,
               protocolAddress: defiReceipt.protocolAddress,
-              underlyingSymbol: isUsdcUnderlying ? 'USDC' : dt.symbol.replace(/^[ascv]/i, ''),
+              underlyingSymbol,
               underlyingAddress: defiReceipt.underlyingAddress,
-              underlyingDecimals: isUsdcUnderlying ? 6 : dt.decimals,
-              expectedUnderlyingRaw: defiReceipt.expectedUnderlyingRaw,
+              underlyingDecimals,
+              expectedUnderlyingRaw,
               rawBalance: dt.rawBalance,
               priceUsd: effectivePriceUsd,
               liquidityUsd: isUsdcUnderlying ? 100_000_000 : Math.max(5_000_000, uDex?.liquidityUsd ?? 5_000_000),
@@ -766,6 +835,109 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
         priceUsd: 0,
         liquidityUsd: 5_000_000,
         dexLiquidityVerified: true,
+      });
+    }
+  }
+
+  // Merge protocol-indexed DeFi positions (lending, locked/veNFT, staking, margin deposits, vaults)
+  // while deduplicating against any onchain-probed receipt tokens (Aave, Compound, ERC-4626, Yearn v2, Uni LP)
+  if (discoveredProtocolPositions.length > 0) {
+    const onchainDefiAssets = rawAssets.filter((a) => a.kind === 'defi_position');
+    const existingDefiByPool = new Map<string, RawAssetSeed>();
+    for (const a of onchainDefiAssets) {
+      existingDefiByPool.set(`${a.chain}:${a.address.toLowerCase()}`, a);
+      if (a.protocolAddress) {
+        existingDefiByPool.set(`${a.chain}:${a.protocolAddress.toLowerCase()}`, a);
+      }
+    }
+
+    const toSafeRawBalance = (amount: number, decimals: number): bigint => {
+      if (!Number.isFinite(amount) || amount <= 0) return 1n;
+      const dec = Math.min(18, Math.max(0, Math.round(decimals)));
+      const fixed = amount.toFixed(Math.min(8, dec));
+      const [intPart, fracPart = ''] = fixed.split('.');
+      const paddedFrac = fracPart.padEnd(dec, '0').slice(0, dec);
+      try {
+        const val = BigInt(`${intPart || '0'}${paddedFrac}`);
+        return val > 0n ? val : 1n;
+      } catch {
+        return 1n;
+      }
+    };
+
+    for (const pos of discoveredProtocolPositions) {
+      const poolKey = `${pos.chain}:${pos.poolAddress.toLowerCase()}`;
+      const existing = existingDefiByPool.get(poolKey);
+      if (existing) {
+        // Enrich onchain-detected position (e.g. Yearn v2 yvOP/yvUSDT) with protocol logo & URL, don't duplicate
+        if (!existing.protocolUrl && pos.protocolSiteUrl) existing.protocolUrl = pos.protocolSiteUrl;
+        if (!existing.protocolLogoUrl && pos.protocolLogoUrl) existing.protocolLogoUrl = pos.protocolLogoUrl;
+        continue;
+      }
+
+      // Also skip if an onchain Aave/Compound/Lido position on the same chain already covers this protocol + underlying
+      const primaryList = pos.supplyTokens.length ? pos.supplyTokens : pos.rewardTokens;
+      const sorted = [...primaryList].sort((a, b) => b.amount * b.priceUsd - a.amount * a.priceUsd);
+      const primary = sorted[0];
+      if (!primary) continue;
+
+      const protoLow = pos.protocolName.toLowerCase();
+      const duplicateNative = onchainDefiAssets.some(
+        (a) =>
+          a.chain === pos.chain &&
+          a.underlyingAddress &&
+          primary.address !== 'native' &&
+          a.underlyingAddress.toLowerCase() === primary.address.toLowerCase() &&
+          (a.protocol ?? '').toLowerCase().includes(protoLow.split(' ')[0])
+      );
+      if (duplicateNative) continue;
+
+      const decimals = Math.min(18, Math.max(0, primary.decimals));
+      const rawBalance = toSafeRawBalance(primary.amount, decimals);
+      const effectivePriceUsd =
+        primary.priceUsd > 0
+          ? primary.priceUsd
+          : primary.amount > 0 && pos.assetUsdValue > 0
+          ? pos.assetUsdValue / primary.amount
+          : 0;
+      if (effectivePriceUsd <= 0) continue;
+
+      const debtSummary =
+        pos.borrowTokens.length > 0
+          ? pos.borrowTokens
+              .map((b) => {
+                const usd = b.amount * b.priceUsd;
+                return `${b.amount.toLocaleString(undefined, { maximumFractionDigits: 2 })} ${b.symbol} ($${usd.toFixed(2)})`;
+              })
+              .join(' + ') + ' borrowed'
+          : undefined;
+
+      rawAssets.push({
+        chain: pos.chain,
+        address: pos.poolAddress,
+        symbol: primary.symbol,
+        name: pos.description
+          ? `${pos.protocolName} · ${pos.description}`
+          : `${pos.protocolName} ${pos.positionType} (${primary.symbol})`,
+        decimals,
+        kind: 'defi_position',
+        protocol: pos.protocolName,
+        protocolAddress: pos.poolAddress,
+        protocolUrl: pos.protocolSiteUrl,
+        protocolLogoUrl: pos.protocolLogoUrl,
+        underlyingSymbol: primary.symbol,
+        underlyingAddress: primary.address !== 'native' ? primary.address : undefined,
+        underlyingDecimals: decimals,
+        rawBalance,
+        priceUsd: effectivePriceUsd,
+        liquidityUsd: 1_000_000,
+        dexLiquidityVerified: true,
+        defiPositionType: pos.positionType,
+        defiDebtUsd: pos.debtUsdValue > 0 ? pos.debtUsdValue : undefined,
+        defiHealthFactor: pos.healthRate,
+        defiUnlockAt: pos.unlockAt,
+        defiNetUsd: pos.netUsdValue,
+        defiDebtSummary: debtSummary,
       });
     }
   }

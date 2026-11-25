@@ -72,25 +72,29 @@ export type DefiExitStrategy =
   | 'direct_swap_bypass_cooldown'
   | 'safe_partial_debt_exit'
   | 'two_step_guided'
-  | 'cooldown_blocked';
+  | 'cooldown_blocked'
+  | 'external_app_exit';
 
 export type DefiRouteKind =
   | 'direct_swap'
   | 'protocol_unwind'
   | 'partial_unwind'
-  | 'unbonding_required';
+  | 'unbonding_required'
+  | 'external_app';
 
 export type DefiPreflightStatus = 'verified' | 'warning' | 'blocked';
 
 export type DefiProtocolExtractorId =
   | 'erc4626'
+  | 'yearn_v2'
   | 'aave_v3'
   | 'aave_v2'
   | 'compound_v3'
   | 'compound_v2'
   | 'uniswap_v2_lp'
   | 'uniswap_v3_nft'
-  | 'liquid_receipt';
+  | 'liquid_receipt'
+  | 'external_protocol';
 
 export interface DefiExitPlan {
   protocolId: DefiProtocolExtractorId;
@@ -122,6 +126,13 @@ export interface DefiExitPlan {
   supportsAtomicBatch?: boolean;
   simulatedAtBlock?: number;
   simulatedLive?: boolean;
+  protocolUrl?: string;
+  protocolLogoUrl?: string;
+  positionType?: string;
+  debtUsd?: number;
+  netUsd?: number;
+  unlockAt?: number;
+  debtSummary?: string;
 }
 
 export interface ChainedFollowUpAsset {
@@ -248,15 +259,25 @@ export interface ScannedAsset {
   nftTokenId?: string;
   nftLiquidity?: string;
   nftManagerAddress?: string;
+  /** Optional protocol-indexed DeFi metadata (e.g. 40 Acres, Wayfinder, Carbon, Velodrome veNFT) */
+  protocolUrl?: string;
+  protocolLogoUrl?: string;
+  defiPositionType?: string;
+  defiDebtUsd?: number;
+  defiHealthFactor?: number;
+  defiUnlockAt?: number;
+  defiNetUsd?: number;
+  defiDebtSummary?: string;
 }
 
 export interface ChainScanSummary {
   family?: ChainFamily;
+  sourceWallet?: string;
   chain: AnyChainId;
   chainName: string;
   chainId: number | string;
   cctpDomain: number | null;
-  rpcStatus: 'live' | 'preset';
+  rpcStatus: 'live' | 'preset' | 'degraded';
   blockNumber: number;
   gasPriceGwei: number;
   nativeBalance: number;

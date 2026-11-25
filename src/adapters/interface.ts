@@ -59,8 +59,78 @@ export interface UniversalGaslessIntent {
   /** Kept for EVM eth_signTypedData_v4 backward compatibility */
   typedData?: Record<string, unknown>;
   relayerConfigured: boolean;
+  sponsorEligible?: boolean;
+  sponsorRejectionReason?: string;
   intentDigestSha256: string;
   explanation: string;
+}
+
+export type NonEvmExecutionKind =
+  | 'cosmos_skip_tx'
+  | 'sui_ptb'
+  | 'aptos_entry_fn'
+  | 'ton_tonconnect_batch'
+  | 'tron_tvm_tx'
+  | 'btc_psbt';
+
+export interface PreparedNonEvmCall {
+  stepId: string;
+  assetId: string;
+  assetSymbol: string;
+  action: ScannedAsset['action'];
+  provider: string;
+  label: string;
+  description: string;
+  /** Native wallet-ready payload for the target non-EVM family (PSBT hex, TonConnect messages, TVM contract tx, Skip Go cosmos_tx, Sui PTB commands, Aptos entry function) */
+  nativePayload: Record<string, unknown>;
+}
+
+export interface PreparedNonEvmBatch {
+  family: Exclude<ChainFamily, 'evm'>;
+  chain: AnyChainId;
+  chainId: number | string;
+  chainName: string;
+  explorerUrl: string;
+  userAddress: string;
+  solanaDestination: string;
+  solanaUsdcAtaBytes32: string;
+  outputAsset: 'USDC' | 'SOL';
+  executionKind: NonEvmExecutionKind;
+  signingStandard: string;
+  /** True when native payloads contain live executable transaction data from a quote/builder (vs preview-only metadata) */
+  liveExecutable: boolean;
+  calls: PreparedNonEvmCall[];
+  bridgeTrackers: Array<{
+    assetId: string;
+    assetSymbol: string;
+    provider: string;
+    requestId?: string;
+    estimatedOutput: string;
+    estimatedSeconds: number;
+    requiresSolanaClaim?: boolean;
+  }>;
+  skippedAssets: Array<{
+    assetId: string;
+    assetSymbol: string;
+    reason: string;
+  }>;
+  savings: {
+    totalCalls: number;
+    walletPopupsBatched: number;
+    walletPopupsLegacy: number;
+    popupsSaved: number;
+  };
+  feeBreakdown: {
+    feeBps: number;
+    feePercent: number;
+    feeRecipient: string | null;
+    collectionMethod: string;
+    estimatedFeeUsd: number;
+  };
+  estimatedSeconds: number;
+  gaslessAvailable: boolean;
+  gaslessMechanism: string;
+  notes: string[];
 }
 
 export interface UniversalPreSignProof {
@@ -185,6 +255,18 @@ export interface ChainFamilyAdapter {
     protocolFeeBps?: number;
     feeRecipient?: string | null;
   }): Promise<UniversalGaslessIntent>;
+  prepareDirectBatch?(params: {
+    chain: AnyChainId;
+    assets: ScannedAsset[];
+    userAddress: string;
+    solanaDestination: string;
+    outputAsset?: 'USDC' | 'SOL';
+    bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+    protocolFeeBps?: number;
+    feeRecipient?: string | null;
+    allowHighCost?: boolean;
+    addressesByChain?: Record<string, string>;
+  }): Promise<PreparedNonEvmBatch>;
   simulatePreSignProof(params: {
     chain: AnyChainId;
     assets: ScannedAsset[];
@@ -200,6 +282,7 @@ export interface ChainFamilyAdapter {
     chain: AnyChainId;
     userAddress: string;
     solanaDestination: string;
+    outputAsset?: 'USDC' | 'SOL';
     txHash?: string;
     intentId?: string;
     signature?: string;
@@ -213,6 +296,9 @@ export interface ChainFamilyAdapter {
     submitted?: {
       accepted: boolean;
       mode: string;
+      broadcasted?: boolean;
+      settlementStatus?: string;
+      txHash?: string;
       signatureFingerprint?: string;
       nextStep: string;
     };

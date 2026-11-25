@@ -1,5 +1,11 @@
 import crypto from 'node:crypto';
-import { solanaAddressToBytes32 } from '../bridge/cctp.js';
+import {
+  deriveNonEvmCctpRecipientBytes32,
+  evaluateNonEvmGaslessBreakEven,
+  fetchWithRetry,
+  filterChainSweepableAssets,
+  getNonEvmFeeRecipient,
+} from '../execution/non-evm-converter.js';
 import { getProtocolFeeConfig, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
@@ -8,28 +14,133 @@ import type { ChainScanSummary, ScannedAsset, ScanReport } from '../scanner/type
 import type {
   ChainFamilyAdapter,
   ChainFamilyMeta,
+  PreparedNonEvmBatch,
+  PreparedNonEvmCall,
   UniversalExecutionProof,
   UniversalGaslessIntent,
   UniversalPreSignProof,
 } from './interface.js';
 
 const APTOS_REST_URLS = [
-  'https://fullnode.mainnet.aptoslabs.com/v1',
+  process.env.APTOS_RPC_URL?.trim(),
+  'https://api.mainnet.aptoslabs.com/v1',
   'https://aptos-rest.publicnode.com/v1',
-];
+].filter((u): u is string => Boolean(u));
+
+const APTOS_GRAPHQL_URL =
+  process.env.APTOS_INDEXER_URL?.trim() || 'https://api.mainnet.aptoslabs.com/v1/graphql';
 
 const APTOS_CCTP_DOMAIN = 9;
+// Official Circle CCTP TokenMessengerMinter on Aptos Mainnet
+const APTOS_CCTP_TOKEN_MESSENGER =
+  '0x081e86cebf457a0c6004f35bd648a2794698f52e0dde09a48619dcd3d4294924';
+const APTOS_NATIVE_APT_FA = '0x000000000000000000000000000000000000000000000000000000000000000a';
 const APTOS_NATIVE_USDC_FA = '0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b';
+const APTOS_NATIVE_USDT_FA = '0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b';
+
+interface CanonicalAptosAsset {
+  symbol: string;
+  name: string;
+  decimals: number;
+  coingeckoKey: string;
+  /** True ONLY for Native Circle FA USDC accepted by Aptos Circle CCTP Domain 9 */
+  isNativeCctpUsdc?: boolean;
+  isNativeApt?: boolean;
+  isLst?: boolean;
+  protocol?: string;
+}
+
+// Strict canonical Aptos asset allowlist (CoinStore + Fungible Assets) — prevents fake "*usdc*" spoofing!
+const CANONICAL_APTOS_ASSETS: Record<string, CanonicalAptosAsset> = {
+  '0x1::aptos_coin::aptoscoin': {
+    symbol: 'APT',
+    name: 'Aptos Coin',
+    decimals: 8,
+    coingeckoKey: 'coingecko:aptos',
+    isNativeApt: true,
+  },
+  '0xa': {
+    symbol: 'APT',
+    name: 'Aptos Coin (FA)',
+    decimals: 8,
+    coingeckoKey: 'coingecko:aptos',
+    isNativeApt: true,
+  },
+  [APTOS_NATIVE_APT_FA]: {
+    symbol: 'APT',
+    name: 'Aptos Coin (FA)',
+    decimals: 8,
+    coingeckoKey: 'coingecko:aptos',
+    isNativeApt: true,
+  },
+  [APTOS_NATIVE_USDC_FA]: {
+    symbol: 'USDC',
+    name: 'Native Aptos USDC (FA)',
+    decimals: 6,
+    coingeckoKey: 'coingecko:usd-coin',
+    isNativeCctpUsdc: true,
+  },
+  [APTOS_NATIVE_USDT_FA]: {
+    symbol: 'USDt',
+    name: 'Native Aptos Tether USDt (FA)',
+    decimals: 6,
+    coingeckoKey: 'coingecko:tether',
+  },
+  // Legacy bridged CoinStores — NOT native CCTP USDC (must swap via Panora/Liquidswap first!)
+  '0xf22bede237a07e121b56d91a491eb7bcdfd1f5907926a9e58338f964a01b17fa::asset::usdc': {
+    symbol: 'zUSDC',
+    name: 'LayerZero Bridged USDC (Aptos)',
+    decimals: 6,
+    coingeckoKey: 'coingecko:usd-coin',
+  },
+  '0xf22bede237a07e121b56d91a491eb7bcdfd1f5907926a9e58338f964a01b17fa::asset::usdt': {
+    symbol: 'zUSDT',
+    name: 'LayerZero Bridged USDT (Aptos)',
+    decimals: 6,
+    coingeckoKey: 'coingecko:tether',
+  },
+  '0x5e156f1207d0ebfa19a9eeff00d62a282278fb8719f4fab3a586a0a2c0fffbea::coin::t': {
+    symbol: 'whUSDC',
+    name: 'Wormhole Bridged USDC (Aptos)',
+    decimals: 6,
+    coingeckoKey: 'coingecko:usd-coin',
+  },
+  // Aptos Liquid Staking Tokens (LSTs)
+  '0x111ae3e5bc816a5e63c2da97d0aa3886519e0cd5e4b046659fa35796bd11542a::amapt_token::amnisapt': {
+    symbol: 'amAPT',
+    name: 'Amnis Staked APT',
+    decimals: 8,
+    coingeckoKey: 'coingecko:aptos',
+    isLst: true,
+    protocol: 'Amnis LST',
+  },
+  '0x111ae3e5bc816a5e63c2da97d0aa3886519e0cd5e4b046659fa35796bd11542a::stapt_token::stakedapt': {
+    symbol: 'stAPT',
+    name: 'Amnis Staked APT (Yield)',
+    decimals: 8,
+    coingeckoKey: 'coingecko:aptos',
+    isLst: true,
+    protocol: 'Amnis LST',
+  },
+  '0xfaf4e633ae9eb31366c9ca24214231760926576c7b625313b3688b5e900731f6::staking::thalaapt': {
+    symbol: 'thAPT',
+    name: 'Thala Staked APT',
+    decimals: 8,
+    coingeckoKey: 'coingecko:aptos',
+    isLst: true,
+    protocol: 'Thala LST',
+  },
+};
 
 export const APTOS_FAMILY_META: ChainFamilyMeta = {
   family: 'aptos',
   label: 'Aptos',
   shortLabel: 'Aptos',
   chains: [{ id: 'aptos', name: 'Aptos', nativeSymbol: 'APT', logo: '/logos/aptos.svg', cctpDomain: APTOS_CCTP_DOMAIN }],
-  signingMechanism: '1-Sig Move Sweep Router Entry Function (siphon::sweep_router::atomic_sweep)',
-  gasSponsorshipMechanism: 'Aptos Native Fee Payer Transaction (FeePayerRawTransaction, $0 user APT)',
-  preSignProofMechanism: '/v1/transactions/simulate + ledger version + CCTP bytes32 + Solana snapshot',
-  bridgeProviders: ['Circle CCTP (Domain 9 → 5)', 'Wormhole'],
+  signingMechanism: 'Direct Move Entry Function (Petra / Phantom) or Native FeePayerRawTransaction',
+  gasSponsorshipMechanism: 'Direct Petra/Phantom or Aptos Native Fee Payer Transaction ($0 user APT)',
+  preSignProofMechanism: 'Aptos Indexer GraphQL + /v1/transactions/simulate + Circle CCTP ATA bytes32 + Solana snapshot',
+  bridgeProviders: ['Circle CCTP (Domain 9 → 5)', 'Panora / Wormhole'],
   wallets: [
     { id: 'petra', name: 'Petra Wallet', logo: '/logos/petra.svg', installUrl: 'https://petra.app' },
     { id: 'phantom-aptos', name: 'Phantom (Aptos)', logo: '/logos/phantom.svg', installUrl: 'https://phantom.app' },
@@ -41,35 +152,52 @@ export const APTOS_FAMILY_META: ChainFamilyMeta = {
 
 async function aptosGet<T>(path: string, timeoutMs = 4200): Promise<T | null> {
   for (const base of APTOS_REST_URLS) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      const res = await fetch(`${base}${path}`, { signal: controller.signal });
-      clearTimeout(timer);
-      if (res.ok) return (await res.json()) as T;
-    } catch {
-      // failover
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (process.env.APTOS_API_KEY?.trim()) {
+      headers.Authorization = `Bearer ${process.env.APTOS_API_KEY.trim()}`;
     }
+    const res = await fetchWithRetry(`${base}${path}`, { headers }, timeoutMs);
+    if (res && res.ok) return (await res.json()) as T;
+  }
+  return null;
+}
+
+async function aptosGraphql<T>(query: string, timeoutMs = 4200): Promise<T | null> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+  };
+  if (process.env.APTOS_API_KEY?.trim()) {
+    headers.Authorization = `Bearer ${process.env.APTOS_API_KEY.trim()}`;
+  }
+  const res = await fetchWithRetry(
+    APTOS_GRAPHQL_URL,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ query }),
+    },
+    timeoutMs
+  );
+  if (res && res.ok) {
+    const j = (await res.json()) as { data?: T; errors?: unknown[] };
+    if (j.data && (!j.errors || !j.errors.length)) return j.data;
   }
   return null;
 }
 
 async function aptosView<T>(payload: Record<string, unknown>, timeoutMs = 3500): Promise<T | null> {
   for (const base of APTOS_REST_URLS) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      const res = await fetch(`${base}/view`, {
+    const res = await fetchWithRetry(
+      `${base}/view`,
+      {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (res.ok) return (await res.json()) as T;
-    } catch {
-      // failover
-    }
+      },
+      timeoutMs
+    );
+    if (res && res.ok) return (await res.json()) as T;
   }
   return null;
 }
@@ -97,12 +225,36 @@ export const aptosAdapter: ChainFamilyAdapter = {
     const cleanAddr = address.trim();
     const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
+    const safeAddr = cleanAddr.replace(/[^0-9a-fA-Fx]/g, '');
 
-    const [ledger, resources, usdcFaRes, priceMap] = await Promise.all([
+    const faQuery = `{
+      current_fungible_asset_balances(
+        where: { owner_address: { _eq: "${safeAddr}" }, amount: { _gt: "0" } },
+        limit: 50
+      ) {
+        amount
+        asset_type
+        metadata { symbol name decimals }
+      }
+    }`;
+
+    const [ledger, gqlFa, resources, aptFaRes, usdcFaRes, priceMap] = await Promise.all([
       aptosGet<{ ledger_version?: string; block_height?: string }>(''),
+      aptosGraphql<{
+        current_fungible_asset_balances?: Array<{
+          amount: string | number;
+          asset_type: string;
+          metadata?: { symbol?: string; name?: string; decimals?: number };
+        }>;
+      }>(faQuery),
       aptosGet<Array<{ type: string; data?: Record<string, unknown> }>>(
-        `/accounts/${encodeURIComponent(cleanAddr)}/resources`
+        `/accounts/${encodeURIComponent(cleanAddr)}/resources?limit=200`
       ),
+      aptosView<[string]>({
+        function: '0x1::primary_fungible_store::balance',
+        type_arguments: ['0x1::fungible_asset::Metadata'],
+        arguments: [cleanAddr, '0xa'],
+      }),
       aptosView<[string]>({
         function: '0x1::primary_fungible_store::balance',
         type_arguments: ['0x1::fungible_asset::Metadata'],
@@ -111,106 +263,109 @@ export const aptosAdapter: ChainFamilyAdapter = {
       fetchLiveUsdPrices(['coingecko:aptos', 'coingecko:usd-coin', 'coingecko:tether', 'coingecko:solana']),
     ]);
 
-    if (!ledger && !resources) {
-      warnings.push('Aptos Mainnet REST API did not respond within 4.2s.');
+    const rpcReachable = Boolean(ledger || resources || gqlFa);
+    if (!rpcReachable) {
+      warnings.push('Aptos Mainnet REST & Indexer GraphQL APIs did not respond within 4.2s.');
     }
 
     const blockNumber = Number(ledger?.block_height || ledger?.ledger_version || 0);
     const aptPrice = priceMap.get('coingecko:aptos') ?? 6.1;
     const solPrice = priceMap.get('coingecko:solana') ?? 70;
     const assets: ScannedAsset[] = [];
+    const seenAssetTypes = new Set<string>();
     let nativeBalance = 0;
 
-    // Parse CoinStore resources
+    const pushCanonicalAsset = (assetType: string, rawVal: string) => {
+      const key = assetType.trim().toLowerCase();
+      const canonical = CANONICAL_APTOS_ASSETS[key];
+      if (!canonical) return;
+      const dedupeKey = canonical.isNativeApt ? 'apt:native' : key;
+      if (seenAssetTypes.has(dedupeKey)) return;
+
+      let rawBig = 0n;
+      try {
+        rawBig = BigInt(String(rawVal).split('.')[0] || '0');
+      } catch {
+        return;
+      }
+      if (rawBig <= 0n) return;
+      seenAssetTypes.add(dedupeKey);
+
+      const uiBal = unitsToUi(rawBig.toString(), canonical.decimals);
+      if (canonical.isNativeApt) nativeBalance = uiBal;
+
+      const priceUsd = priceMap.get(canonical.coingeckoKey) ?? (canonical.isNativeCctpUsdc ? 1.0 : 0);
+      const grossUsd = Number((uiBal * priceUsd).toFixed(2));
+      const gasUsd = 0.008;
+      const slippageUsd = canonical.isNativeCctpUsdc ? 0 : Number((grossUsd * 0.0025).toFixed(2));
+      const isDust = grossUsd < 0.25;
+
+      assets.push({
+        id: `aptos:${assetType}`,
+        family: 'aptos',
+        sourceWallet: cleanAddr,
+        chain: 'aptos',
+        chainName: 'Aptos',
+        address: assetType,
+        symbol: canonical.symbol,
+        name: canonical.name,
+        decimals: canonical.decimals,
+        kind: canonical.isLst ? 'defi_position' : canonical.isNativeApt ? 'native' : 'erc20',
+        protocol: canonical.protocol,
+        underlyingSymbol: canonical.isLst ? 'APT' : undefined,
+        rawBalance: rawBig.toString(),
+        uiBalance: Number(uiBal.toFixed(6)),
+        priceUsd,
+        grossUsd,
+        liquidityUsd: canonical.isNativeCctpUsdc ? 350_000_000 : 40_000_000,
+        estimatedGasUsd: gasUsd,
+        batchedGasUsd: 0.004,
+        estimatedSlippageUsd: slippageUsd,
+        netUsdcSingle: Math.max(0, Number((grossUsd - gasUsd - slippageUsd).toFixed(2))),
+        netUsdcBatched: Math.max(0, Number((grossUsd - 0.004 - slippageUsd).toFixed(2))),
+        action: isDust
+          ? 'SKIP_GAS_NEGATIVE'
+          : canonical.isNativeCctpUsdc
+          ? 'BRIDGE_DIRECT_USDC'
+          : 'SELL_AND_BRIDGE',
+        actionReason: isDust
+          ? 'Sub-$0.25 dust on Aptos'
+          : canonical.isNativeCctpUsdc
+          ? 'Direct Native Circle CCTP (Aptos Domain 9 → Solana USDC ATA PDA)'
+          : 'Swap to Native FA USDC (Panora/Liquidswap) → Circle CCTP Domain 9 → Solana',
+        selectedByDefault: !isDust,
+        honeypotSafe: true,
+      });
+    };
+
+    // 1. Primary: Aptos Indexer GraphQL (covers ALL Fungible Assets including AIP-63 FA APT 0xa, Native USDC FA, Native USDt FA, & migrated Coins!)
+    for (const row of gqlFa?.current_fungible_asset_balances ?? []) {
+      if (row.asset_type && row.amount !== undefined) {
+        pushCanonicalAsset(row.asset_type, String(row.amount));
+      }
+    }
+
+    // 2. Direct /v1/view fallbacks for AIP-63 FA APT (0xa) and Native USDC FA
+    if (aptFaRes?.[0] && !seenAssetTypes.has('apt:native')) {
+      pushCanonicalAsset('0xa', aptFaRes[0]);
+    }
+    if (usdcFaRes?.[0] && !seenAssetTypes.has(APTOS_NATIVE_USDC_FA)) {
+      pushCanonicalAsset(APTOS_NATIVE_USDC_FA, usdcFaRes[0]);
+    }
+
+    // 3. Legacy CoinStore resources (strict canonical allowlist only — no substring matching!)
     for (const r of resources ?? []) {
       const m = r.type.match(/^0x1::coin::CoinStore<(.+)>$/);
       if (!m) continue;
       const coinType = m[1];
       const rawVal = String((r.data?.coin as { value?: string } | undefined)?.value ?? '0');
-      if (!rawVal || rawVal === '0') continue;
-
-      const isApt = coinType === '0x1::aptos_coin::AptosCoin';
-      const isUsdc = coinType.toLowerCase().includes('usdc');
-      const isUsdt = coinType.toLowerCase().includes('usdt');
-      if (!isApt && !isUsdc && !isUsdt) continue;
-
-      const decimals = isApt ? 8 : 6;
-      const symbol = isApt ? 'APT' : isUsdc ? 'USDC' : 'USDT';
-      const name = isApt ? 'Aptos Coin' : isUsdc ? 'USD Coin (Aptos)' : 'Tether USD (Aptos)';
-      const uiBal = unitsToUi(rawVal, decimals);
-      if (isApt) nativeBalance = uiBal;
-
-      const priceUsd = isApt ? aptPrice : 1.0;
-      const grossUsd = Number((uiBal * priceUsd).toFixed(2));
-      const gasUsd = 0.01;
-      const slippageUsd = isUsdc ? 0 : Number((grossUsd * 0.0025).toFixed(2));
-      const isDust = grossUsd < 0.25;
-
-      assets.push({
-        id: `aptos:${coinType}`,
-        family: 'aptos',
-        chain: 'aptos',
-        chainName: 'Aptos',
-        address: coinType,
-        symbol,
-        name,
-        decimals,
-        kind: isApt ? 'native' : 'erc20',
-        rawBalance: rawVal,
-        uiBalance: Number(uiBal.toFixed(6)),
-        priceUsd,
-        grossUsd,
-        liquidityUsd: isUsdc ? 300_000_000 : 40_000_000,
-        estimatedGasUsd: gasUsd,
-        batchedGasUsd: 0.005,
-        estimatedSlippageUsd: slippageUsd,
-        netUsdcSingle: Math.max(0, Number((grossUsd - gasUsd - slippageUsd).toFixed(2))),
-        netUsdcBatched: Math.max(0, Number((grossUsd - 0.005 - slippageUsd).toFixed(2))),
-        action: isDust ? 'SKIP_GAS_NEGATIVE' : isUsdc ? 'BRIDGE_DIRECT_USDC' : 'SELL_AND_BRIDGE',
-        actionReason: isDust
-          ? 'Sub-$0.25 dust on Aptos'
-          : isUsdc
-          ? 'Native Circle CCTP (Aptos Domain 9 → Solana Domain 5) via FeePayerRawTransaction'
-          : 'Single Move sweep router payload + Native Fee Payer ($0 APT) → Circle CCTP / Wormhole',
-        selectedByDefault: !isDust,
-        honeypotSafe: true,
-      });
-    }
-
-    // Native Fungible Asset USDC balance
-    if (usdcFaRes?.[0] && BigInt(usdcFaRes[0]) > 0n) {
-      const uiUsdc = unitsToUi(usdcFaRes[0], 6);
-      const grossUsd = Number(uiUsdc.toFixed(2));
-      if (grossUsd >= 0.25) {
-        assets.push({
-          id: `aptos:fa:${APTOS_NATIVE_USDC_FA}`,
-          family: 'aptos',
-          chain: 'aptos',
-          chainName: 'Aptos',
-          address: APTOS_NATIVE_USDC_FA,
-          symbol: 'USDC',
-          name: 'Native Aptos Fungible Asset USDC',
-          decimals: 6,
-          kind: 'erc20',
-          rawBalance: usdcFaRes[0],
-          uiBalance: Number(uiUsdc.toFixed(6)),
-          priceUsd: 1.0,
-          grossUsd,
-          liquidityUsd: 350_000_000,
-          estimatedGasUsd: 0.008,
-          batchedGasUsd: 0.004,
-          estimatedSlippageUsd: 0,
-          netUsdcSingle: Math.max(0, Number((grossUsd - 0.008).toFixed(2))),
-          netUsdcBatched: Math.max(0, Number((grossUsd - 0.004).toFixed(2))),
-          action: 'BRIDGE_DIRECT_USDC',
-          actionReason: 'Direct Native Circle CCTP (Domain 9 → Domain 5 Solana) via FeePayerRawTransaction',
-          selectedByDefault: true,
-          honeypotSafe: true,
-        });
-      }
+      pushCanonicalAsset(coinType, rawVal);
     }
 
     const grossUsd = Number(assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const defiGrossUsd = Number(
+      assets.filter((a) => a.kind === 'defi_position').reduce((s, a) => s + a.grossUsd, 0).toFixed(2)
+    );
     const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const batchedGasUsd = Number(assets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(3));
     const singleTxGasUsd = Number(assets.reduce((s, a) => s + a.estimatedGasUsd, 0).toFixed(3));
@@ -221,18 +376,19 @@ export const aptosAdapter: ChainFamilyAdapter = {
 
     const summary: ChainScanSummary = {
       family: 'aptos',
+      sourceWallet: cleanAddr,
       chain: 'aptos',
       chainName: 'Aptos',
       chainId: 1,
       cctpDomain: APTOS_CCTP_DOMAIN,
-      rpcStatus: 'live',
+      rpcStatus: rpcReachable ? 'live' : 'degraded',
       blockNumber,
       gasPriceGwei: 0.001,
       nativeBalance: Number(nativeBalance.toFixed(6)),
       nativeSymbol: 'APT',
       nativePriceUsd: aptPrice,
       assetCount: assets.length,
-      defiCount: 0,
+      defiCount: assets.filter((a) => a.kind === 'defi_position').length,
       liquidCount: assets.filter((a) => a.action === 'SELL_AND_BRIDGE' || a.action === 'BRIDGE_DIRECT_USDC').length,
       burnCount: 0,
       skippedCount: assets.filter((a) => a.action === 'SKIP_GAS_NEGATIVE').length,
@@ -242,7 +398,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
       gasSavedByBatchUsd: Number(Math.max(0, singleTxGasUsd - batchedGasUsd).toFixed(3)),
       cctpAttestationSec: 18,
       needsGasSponsorship: nativeBalance < 0.05,
-      sponsorshipMechanism: 'Aptos Native Fee Payer Transaction (FeePayerRawTransaction)',
+      sponsorshipMechanism: 'Direct Move Entry Function or Native FeePayerRawTransaction ($0 user APT)',
     };
 
     return applyTwoLevelRoiToReport({
@@ -258,8 +414,8 @@ export const aptosAdapter: ChainFamilyAdapter = {
       assets,
       totals: {
         grossUsd,
-        defiGrossUsd: 0,
-        liquidGrossUsd: grossUsd,
+        defiGrossUsd,
+        liquidGrossUsd: Number((grossUsd - defiGrossUsd).toFixed(2)),
         protocolFeeBps: feeCfg.feeBps,
         protocolFeeUsd,
         singleTxGasUsd,
@@ -269,7 +425,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
         netSolanaUsdc,
         solEquivalent: Number((netSolanaUsdc / solPrice).toFixed(4)),
         solPriceUsd: solPrice,
-        defiPositionCount: 0,
+        defiPositionCount: summary.defiCount,
         liquidDustCount: summary.liquidCount,
         burnCandidateCount: 0,
         honeypotSkippedCount: 0,
@@ -279,16 +435,136 @@ export const aptosAdapter: ChainFamilyAdapter = {
     });
   },
 
+  async prepareDirectBatch(params): Promise<PreparedNonEvmBatch> {
+    const outputAsset = params.outputAsset ?? 'USDC';
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const feeRecipient = getNonEvmFeeRecipient('aptos');
+    const solanaUsdcAtaBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+    const sweepable = filterChainSweepableAssets('aptos', params.assets);
+
+    const calls: PreparedNonEvmCall[] = [];
+    const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
+    const skippedAssets: PreparedNonEvmBatch['skippedAssets'] = [];
+    const notes: string[] = [];
+    let liveExecutable = false;
+
+    for (const asset of sweepable) {
+      const isNativeUsdcFa = asset.address.trim().toLowerCase() === APTOS_NATIVE_USDC_FA;
+      if (isNativeUsdcFa && outputAsset === 'USDC') {
+        // Real Aptos Circle CCTP Domain 9 Move entry function targeting canonical Solana USDC ATA PDA!
+        const rawAmt = BigInt(asset.rawBalance || '0');
+        const feeRaw = feeRecipient ? (rawAmt * BigInt(feeCfg.feeBps)) / 10_000n : 0n;
+        const netBurnRaw = rawAmt - feeRaw;
+
+        if (feeRecipient && feeRaw > 0n) {
+          calls.push({
+            stepId: 'aptos_protocol_fee_fa',
+            assetId: asset.id,
+            assetSymbol: asset.symbol,
+            action: asset.action,
+            provider: 'aptos_fa_transfer',
+            label: `Protocol Fee (${feeCfg.feePercent}% USDC)`,
+            description: `Transfers ${feeCfg.feePercent}% Native FA USDC fee to Siphon treasury`,
+            nativePayload: {
+              type: 'entry_function_payload',
+              function: '0x1::primary_fungible_store::transfer',
+              type_arguments: ['0x1::fungible_asset::Metadata'],
+              arguments: [APTOS_NATIVE_USDC_FA, feeRecipient, feeRaw.toString()],
+            },
+          });
+        }
+
+        // Convert bytes32 hex to byte array vector<u8> expected by Move CCTP deposit_for_burn
+        const recipientBytes = Array.from(Buffer.from(solanaUsdcAtaBytes32.slice(2), 'hex'));
+        calls.push({
+          stepId: 'aptos_cctp_deposit_for_burn',
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          action: asset.action,
+          provider: 'circle_cctp',
+          label: `Circle CCTP Domain 9 → Solana USDC ATA (${(Number(netBurnRaw) / 1e6).toFixed(2)} USDC)`,
+          description: `Calls Circle TokenMessengerMinter.deposit_for_burn targeting canonical Solana USDC ATA PDA`,
+          nativePayload: {
+            type: 'entry_function_payload',
+            function: `${APTOS_CCTP_TOKEN_MESSENGER}::token_messenger::deposit_for_burn`,
+            type_arguments: [],
+            arguments: [
+              netBurnRaw.toString(),
+              SOLANA_CCTP_DOMAIN,
+              recipientBytes,
+              APTOS_NATIVE_USDC_FA,
+            ],
+          },
+        });
+        liveExecutable = true;
+        bridgeTrackers.push({
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          provider: 'circle_cctp',
+          estimatedOutput: `${(Number(netBurnRaw) / 1e6).toFixed(2)} USDC`,
+          estimatedSeconds: 20,
+          requiresSolanaClaim: true,
+        });
+      } else {
+        skippedAssets.push({
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          reason: `Swap ${asset.symbol} → Native Aptos USDC FA (Panora/Liquidswap) first, or set PANORA_API_KEY for automated swap+CCTP quoting.`,
+        });
+      }
+    }
+
+    if (!calls.length && sweepable.length > 0) {
+      notes.push('Native Aptos USDC FA bridges directly via Circle CCTP Domain 9 in 1 Petra/Phantom signature; non-USDC Aptos tokens require a Panora/Liquidswap swap step first.');
+    }
+
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+
+    return {
+      family: 'aptos',
+      chain: 'aptos',
+      chainId: 1,
+      chainName: 'Aptos',
+      explorerUrl: 'https://explorer.aptoslabs.com',
+      userAddress: params.userAddress,
+      solanaDestination: params.solanaDestination,
+      solanaUsdcAtaBytes32,
+      outputAsset,
+      executionKind: 'aptos_entry_fn',
+      signingStandard: 'Petra / Phantom Aptos signAndSubmitTransaction (Move Entry Function)',
+      liveExecutable,
+      calls,
+      bridgeTrackers,
+      skippedAssets,
+      savings: {
+        totalCalls: calls.length,
+        walletPopupsBatched: calls.length,
+        walletPopupsLegacy: calls.length,
+        popupsSaved: 0,
+      },
+      feeBreakdown: {
+        feeBps: feeCfg.feeBps,
+        feePercent: feeCfg.feePercent,
+        feeRecipient,
+        collectionMethod: feeRecipient ? 'aptos_fa_transfer_plus_cctp' : 'circle_cctp_only',
+        estimatedFeeUsd,
+      },
+      estimatedSeconds: 20,
+      gaslessAvailable: Boolean(process.env.SIPHON_APTOS_FEE_PAYER_KEY?.trim()),
+      gaslessMechanism: 'Aptos Native FeePayerRawTransaction ($0 user APT)',
+      notes,
+    };
+  },
+
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {
-    const feeCfg = getProtocolFeeConfig({
-      feeBps: params.protocolFeeBps,
-      feeRecipientEvm: params.feeRecipient,
-    });
-    const mintRecipientBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    // Canonical SPL USDC ATA PDA (fixes CRIT-03 for Aptos CCTP Domain 9 -> Solana Domain 5!)
+    const mintRecipientBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
     const feePayerAddress =
-      process.env.SIPHON_APTOS_FEE_PAYER?.trim() ||
+      getNonEvmFeeRecipient('aptos') ||
       '0x00000000000000000000000000000000000000000000000000000000000051f0';
-    const chainAssets = params.assets.filter((a) => a.action !== 'SKIP_HONEYPOT' && a.action !== 'SKIP_GAS_NEGATIVE');
+    const chainAssets = filterChainSweepableAssets('aptos', params.assets);
     const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
     const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const sponsoredGasEstUsd = 0.01;
@@ -296,6 +572,13 @@ export const aptosAdapter: ChainFamilyAdapter = {
     const minNetUsdcOut = BigInt(Math.round(estimatedNetUsd * 0.985 * 1_000_000)).toString();
     const deadline = Math.floor(Date.now() / 1000) + 1800;
     const nonce = BigInt('0x' + crypto.randomBytes(8).toString('hex')).toString();
+
+    const breakEven = evaluateNonEvmGaslessBreakEven({
+      grossUsd,
+      sponsoredGasEstUsd,
+      protocolFeeBps: feeCfg.feeBps,
+      estimatedNetUsd,
+    });
 
     const signPayload = {
       transactionType: 'FeePayerRawTransaction',
@@ -341,7 +624,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
       protocolFeeBps: feeCfg.feeBps,
       protocolFeePercent: feeCfg.feePercent,
       protocolFeeUsd,
-      feeRecipient: feePayerAddress,
+      feeRecipient: getNonEvmFeeRecipient('aptos'),
       minNetUsdcOut,
       estimatedNetUsd,
       coveredAssets: chainAssets.map((a) => ({
@@ -353,20 +636,25 @@ export const aptosAdapter: ChainFamilyAdapter = {
       })),
       signPayload,
       relayerConfigured: Boolean(process.env.SIPHON_APTOS_FEE_PAYER_KEY?.trim()),
+      sponsorEligible: breakEven.eligible,
+      sponsorRejectionReason: breakEven.rejectionReason,
       intentDigestSha256,
-      explanation: `1 Petra/Phantom signature signs a Move FeePayerRawTransaction ($0 user APT gas) routing ${chainAssets.length} asset(s) via Circle CCTP Domain 9 / Wormhole → Solana.`,
+      explanation: `1 Petra/Phantom signature signs a Move FeePayerRawTransaction ($0 user APT gas) routing ${chainAssets.length} asset(s) via Circle CCTP Domain 9 → Solana USDC ATA PDA.`,
     };
   },
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
-    const feeCfg = getProtocolFeeConfig({
-      feeBps: params.protocolFeeBps,
-      feeRecipientEvm: params.feeRecipient,
-    });
-    const expectedBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const expectedBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+    const sweepable = filterChainSweepableAssets('aptos', params.assets);
 
-    const [ledger, aptCoinRes, solSnap, priceMap] = await Promise.all([
+    const [ledger, aptFaRes, aptCoinRes, solSnap, priceMap] = await Promise.all([
       aptosGet<{ block_height?: string; ledger_version?: string }>(''),
+      aptosView<[string]>({
+        function: '0x1::primary_fungible_store::balance',
+        type_arguments: ['0x1::fungible_asset::Metadata'],
+        arguments: [params.userAddress, '0xa'],
+      }),
       aptosGet<{ data?: { coin?: { value?: string } } }>(
         `/accounts/${encodeURIComponent(params.userAddress)}/resource/0x1::coin::CoinStore%3C0x1::aptos_coin::AptosCoin%3E`
       ),
@@ -375,15 +663,17 @@ export const aptosAdapter: ChainFamilyAdapter = {
     ]);
 
     const blockNumber = Number(ledger?.block_height || ledger?.ledger_version || 0);
-    const nativeBalanceUi = Number(unitsToUi(aptCoinRes?.data?.coin?.value || '0', 8).toFixed(5));
+    const rawApt = aptFaRes?.[0] || aptCoinRes?.data?.coin?.value || '0';
+    const nativeBalanceUi = Number(unitsToUi(rawApt, 8).toFixed(5));
     const nativePriceUsd = params.nativePriceUsd ?? priceMap.get('coingecko:aptos') ?? 6.1;
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
     const estimatedGasUsd = 0.01;
     const hasEnoughNativeGas = nativeBalanceUi >= 0.05;
-    const grossUsd = Number(params.assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
     const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
+    const rpcVerified = blockNumber > 0;
 
     const proofDigestSha256 =
       '0x' +
@@ -395,10 +685,19 @@ export const aptosAdapter: ChainFamilyAdapter = {
             blockNumber,
             userAddress: params.userAddress,
             expectedBytes32,
+            outflows: sweepable.map((a) => ({ id: a.id, raw: a.rawBalance })),
             guaranteedMinNetUsd,
           })
         )
         .digest('hex');
+
+    const warnings: string[] = [];
+    if (!hasEnoughNativeGas) {
+      warnings.push(`Low APT gas (${nativeBalanceUi} APT). FeePayerRawTransaction covers $0 user gas.`);
+    }
+    if (!rpcVerified) {
+      warnings.push('Aptos REST API could not be reached for live block height verification.');
+    }
 
     return {
       proofId: `prf_aptos_${crypto.randomBytes(4).toString('hex')}`,
@@ -418,9 +717,9 @@ export const aptosAdapter: ChainFamilyAdapter = {
       nativeSymbol: 'APT',
       nativeBalanceUsd,
       estimatedGasUsd,
-      recommendedMode: 'sponsored_gasless',
+      recommendedMode: hasEnoughNativeGas ? 'sequential' : 'sponsored_gasless',
       simulationEndpoint: '/v1/transactions/simulate',
-      outflows: params.assets.map((a) => ({
+      outflows: sweepable.map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
         usd: a.grossUsd,
@@ -430,7 +729,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
         feeBps: feeCfg.feeBps,
         feePercent: feeCfg.feePercent,
         estimatedFeeUsd: feeUsd,
-        feeRecipientEvm: feeCfg.feeRecipientEvm,
+        feeRecipientEvm: null,
         collectionMethod: 'move_sweep_router_5_to_10_pct',
       },
       guaranteedMinNetUsd,
@@ -449,47 +748,58 @@ export const aptosAdapter: ChainFamilyAdapter = {
           stepId: 'aptos_simulate_tx',
           assetSymbol: 'APT',
           actionType: 'aptos_move_simulate',
-          target: 'fullnode.mainnet.aptoslabs.com/v1/transactions/simulate',
-          summary: `FeePayerRawTransaction verified at block #${blockNumber.toLocaleString()}`,
-          preflightStatus: blockNumber > 0 ? 'verified' : 'rpc_skipped',
-          preflightDetail:
-            blockNumber > 0
-              ? `Live Aptos block #${blockNumber.toLocaleString()} + Fee Payer payload verified`
-              : 'Aptos REST busy',
+          target: 'api.mainnet.aptoslabs.com/v1/transactions/simulate',
+          summary: rpcVerified
+            ? `Aptos live state verified at block #${blockNumber.toLocaleString()} (${nativeBalanceUi} APT)`
+            : 'Aptos REST unreachable',
+          preflightStatus: rpcVerified ? 'verified' : 'rpc_skipped',
+          preflightDetail: rpcVerified
+            ? `Live Aptos block #${blockNumber.toLocaleString()} · AIP-63 FA APT + Fee Payer ready`
+            : 'Aptos REST busy',
         },
         {
           stepId: 'aptos_cctp_domain9',
           assetSymbol: 'USDC',
           actionType: 'cctp_deposit_for_burn',
-          target: 'cctp::token_messenger_minter::deposit_for_burn',
-          summary: `Native Circle CCTP Domain 9 / Wormhole → Domain 5 Solana`,
+          target: 'cctp::token_messenger::deposit_for_burn',
+          summary: `Native Circle CCTP Domain 9 → Solana USDC ATA PDA`,
           preflightStatus: 'verified',
-          preflightDetail: 'Solana mintRecipient bytes32 verified bit-for-bit',
+          preflightDetail: `Canonical Solana USDC ATA bytes32 (${expectedBytes32.slice(0, 14)}…) verified`,
         },
       ],
-      allChecksSafe: true,
-      warnings: hasEnoughNativeGas
-        ? []
-        : [`Low APT gas (${nativeBalanceUi} APT). FeePayerRawTransaction covers $0 user gas.`],
+      allChecksSafe: rpcVerified,
+      warnings,
     };
   },
 
   async relayAndProve(params) {
     const out: {
-      submitted?: { accepted: boolean; mode: string; signatureFingerprint?: string; nextStep: string };
+      submitted?: {
+        accepted: boolean;
+        mode: string;
+        broadcasted?: boolean;
+        settlementStatus?: string;
+        signatureFingerprint?: string;
+        nextStep: string;
+      };
       proof?: UniversalExecutionProof;
     } = {};
 
     if (params.signature && params.intentId) {
+      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
+        throw new Error('Signed Aptos FeePayer intent expired. Re-sign a fresh intent.');
+      }
       const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
       const configured = Boolean(process.env.SIPHON_APTOS_FEE_PAYER_KEY?.trim());
       out.submitted = {
         accepted: true,
-        mode: configured ? 'relayer_submitted' : 'intent_verified_awaiting_deployment',
+        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        broadcasted: false,
+        settlementStatus: configured ? 'queued_for_fee_payer' : 'awaiting_relayer',
         signatureFingerprint: fp,
         nextStep: configured
-          ? `Aptos Fee Payer co-signed & submitted ${params.intentId}.`
-          : `Aptos 1-Sig Move intent verified (${fp}) with $0 user APT. Set SIPHON_APTOS_FEE_PAYER_KEY to co-sign FeePayerRawTransaction live.`,
+          ? `Aptos Fee Payer queued ${params.intentId} (${fp}).`
+          : `Aptos 1-Sig Move intent verified (${fp}). Use Direct Mode (Petra/Phantom) for immediate CCTP Domain 9 execution, or configure SIPHON_APTOS_FEE_PAYER_KEY.`,
       };
     }
 
@@ -522,6 +832,14 @@ export const aptosAdapter: ChainFamilyAdapter = {
           }
         : undefined;
 
+      const positiveSolanaDelta =
+        params.outputAsset === 'SOL'
+          ? Boolean(solanaDeltaProof?.deltaSol && solanaDeltaProof.deltaSol > 0)
+          : Boolean(
+              (solanaDeltaProof?.deltaUsdc && solanaDeltaProof.deltaUsdc > 0) ||
+                (solanaDeltaProof?.deltaSol && solanaDeltaProof.deltaSol > 0)
+            );
+
       const proofDigestSha256 =
         '0x' +
         crypto
@@ -530,7 +848,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
           .digest('hex');
 
       out.proof = {
-        verified: Boolean(succeeded && solanaDeltaProof?.deltaUsdc && solanaDeltaProof.deltaUsdc > 0),
+        verified: Boolean(succeeded && positiveSolanaDelta),
         family: 'aptos',
         proofDigestSha256,
         verifiedAt: new Date().toISOString(),
@@ -547,14 +865,14 @@ export const aptosAdapter: ChainFamilyAdapter = {
         },
         decodedTransfers: [],
         bridgeProof: {
-          provider: 'Circle CCTP (Aptos Domain 9) / Wormhole → Solana',
-          status: succeeded ? 'attesting_cctp' : found ? 'failed' : 'pending',
+          provider: 'Circle CCTP (Aptos Domain 9 → Solana USDC ATA)',
+          status: positiveSolanaDelta ? 'success' : succeeded ? 'attesting_cctp' : found ? 'failed' : 'pending',
         },
         solanaDeltaProof,
         summary: !found
           ? 'Aptos transaction not yet indexed.'
           : succeeded
-          ? `Verified on Aptos version #${txInfo?.version ?? '—'} · Circle CCTP / Wormhole → Solana tracked.`
+          ? `Verified on Aptos version #${txInfo?.version ?? '—'} · Circle CCTP → Solana tracked.`
           : 'Aptos transaction aborted.',
       };
     }

@@ -175,11 +175,13 @@ export interface PreparedExecution {
     | 'relay'
     | 'lifi'
     | 'circle_cctp'
+    | 'enso_multi_input'
     | 'aave_v3'
     | 'aave_v2'
     | 'compound_v3'
     | 'compound_v2'
     | 'erc4626'
+    | 'yearn_v2'
     | 'uniswap_v2_lp'
     | 'uniswap_v3_nft'
     | 'erc20_burn';
@@ -252,6 +254,18 @@ export interface PreparedChainBatch {
   estimatedSeconds: number;
   defiExitPlans?: Record<string, DefiExitPlan>;
   chainedFollowUpPlans?: ChainedFollowUpPlan[];
+  dustConsolidation?: {
+    consolidated: boolean;
+    provider?: 'enso_multi_input';
+    consolidatedTokenCount: number;
+    consolidatedAssetIds: string[];
+    estimatedUsdcOut?: string;
+    approvalsSkipped: number;
+    swapPopupsEliminated: number;
+    instantGaslessEligibleIds: string[];
+    instantGaslessCount: number;
+    legacyRequiresApprovalCount: number;
+  };
   notes: string[];
 }
 
@@ -1163,6 +1177,140 @@ export type CompoundSafetyCheckFn = (params: {
   targetAddress: string;
 }) => Promise<CompoundAccountSafety>;
 
+export interface MultiInputSwapQuoteResult {
+  provider: 'enso_multi_input';
+  routerAddress: string;
+  data: string;
+  value: string;
+  gas?: string;
+  outUsdcRaw: string;
+  outUsdcDecimals: number;
+  estimatedGasUsd?: number;
+  estimatedSeconds?: number;
+}
+
+export type MultiInputSwapQuoteFn = (params: {
+  chain: EvmChainId;
+  assets: ScannedAsset[];
+  userAddress: string;
+  usdcAddress: string;
+  slippageBps?: number;
+}) => Promise<MultiInputSwapQuoteResult | null>;
+
+export type Erc20AllowanceCheckFn = (params: {
+  chain: EvmChainId;
+  tokenAddress: string;
+  owner: string;
+  spender: string;
+}) => Promise<bigint>;
+
+/**
+ * Collapses N >= 2 non-USDC ERC-20 dust tokens into 1 single multi-input swap → chain USDC
+ * via Enso Shortcut Bundle API (requires ENSO_API_KEY). Eliminates N-1 swap popups on
+ * legacy EOAs (e.g. Rabby 0.94.x) and reduces batch gas on EIP-5792/7702 wallets.
+ */
+export async function tryEnsoMultiInputDustSwap(params: {
+  chain: EvmChainId;
+  assets: ScannedAsset[];
+  userAddress: string;
+  usdcAddress: string;
+  slippageBps?: number;
+}): Promise<MultiInputSwapQuoteResult | null> {
+  const apiKey = process.env.ENSO_API_KEY?.trim();
+  if (!apiKey) return null;
+  const cfg = EVM_CHAINS[params.chain];
+  if (!cfg || params.assets.length < 2) return null;
+
+  const slippageBps = Math.max(50, Math.min(500, Number(params.slippageBps ?? 150)));
+  const url = new URL('https://api.enso.finance/api/v1/shortcuts/bundle');
+  url.searchParams.set('chainId', String(cfg.chainId));
+  url.searchParams.set('fromAddress', params.userAddress);
+  url.searchParams.set('routingStrategy', 'router');
+
+  const actions = params.assets.map((asset) => ({
+    protocol: 'enso',
+    action: 'route',
+    args: {
+      tokenIn: asset.address,
+      tokenOut: params.usdcAddress,
+      amountIn: asset.rawBalance,
+      slippage: String(slippageBps),
+    },
+  }));
+
+  try {
+    const res = await fetchQuote(
+      url.toString(),
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(actions),
+      },
+      8000
+    );
+    if (!res || !res.ok) return null;
+
+    const json = (await res.json()) as {
+      gas?: string | number;
+      amountsOut?: Record<string, string>;
+      tx?: {
+        to?: string;
+        data?: string;
+        value?: string;
+      };
+    };
+
+    const routerTo = json.tx?.to?.trim();
+    const txData = json.tx?.data?.trim();
+    if (!routerTo || !txData) return null;
+
+    const amountsOut = json.amountsOut ?? {};
+    const outEntry = Object.entries(amountsOut).find(
+      ([addr]) => addr.toLowerCase() === params.usdcAddress.toLowerCase()
+    );
+    const outUsdcRaw = outEntry?.[1] ?? '0';
+    if (!/^\d+$/.test(outUsdcRaw) || BigInt(outUsdcRaw) <= 0n) return null;
+
+    return {
+      provider: 'enso_multi_input',
+      routerAddress: routerTo,
+      data: txData,
+      value: toHexWei(json.tx?.value),
+      gas: json.gas ? toHexWei(String(json.gas)) : undefined,
+      outUsdcRaw,
+      outUsdcDecimals: cfg.id === 'bnb' ? 18 : 6,
+      estimatedSeconds: 12,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function validateMultiInputRouterTarget(params: {
+  routerAddress: string;
+  txData: string;
+  userAddress: string;
+  usdcAddress: string;
+  inputAssets: ScannedAsset[];
+}): boolean {
+  try {
+    const cleanRouter = assertEvmAddress(params.routerAddress, 'multiInputRouter').toLowerCase();
+    if (!/^0x[0-9a-fA-F]{8,}$/.test(params.txData)) return false;
+    if (cleanRouter === params.userAddress.toLowerCase()) return false;
+    if (cleanRouter === DEAD_BURN_ADDRESS.toLowerCase()) return false;
+    if (cleanRouter === params.usdcAddress.toLowerCase()) return false;
+    for (const asset of params.inputAssets) {
+      if (asset.address.toLowerCase() === cleanRouter) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Prepares REAL executable mainnet transaction(s) for any scanned asset:
  *   - DeFi Position -> Aave v2/v3 (full or safe partial exit) / Compound v2/v3 / ERC-4626 / Uni v2/v3 LP / Direct Swap liquid receipt
@@ -1303,7 +1451,10 @@ export async function prepareChainBatchExecution(params: {
   protocolFeeBps?: number;
   feeRecipientEvm?: string | null;
   allowHighCost?: boolean;
+  consolidateMultiInputDust?: boolean;
   followUpQuoteFn?: FollowUpQuoteFn;
+  multiInputSwapQuoteFn?: MultiInputSwapQuoteFn;
+  allowanceCheckFn?: Erc20AllowanceCheckFn;
   aaveSafetyCheckFn?: AaveSafetyCheckFn;
   compoundSafetyCheckFn?: CompoundSafetyCheckFn;
 }): Promise<PreparedChainBatch> {
@@ -1318,7 +1469,10 @@ export async function prepareChainBatchExecution(params: {
     protocolFeeBps,
     feeRecipientEvm,
     allowHighCost = false,
+    consolidateMultiInputDust = true,
     followUpQuoteFn,
+    multiInputSwapQuoteFn,
+    allowanceCheckFn,
     aaveSafetyCheckFn,
     compoundSafetyCheckFn,
   } = params;
@@ -1364,7 +1518,212 @@ export async function prepareChainBatchExecution(params: {
     executableAssets.push(asset);
   }
 
-  const results = await settleWithConcurrency(executableAssets, QUOTE_CONCURRENCY, (asset) =>
+  const rawCalls: PreparedBatchCall[] = [];
+  const bridgeTrackers: PreparedChainBatch['bridgeTrackers'] = [];
+  const chainedFollowUpPlans: ChainedFollowUpPlan[] = [];
+  const defiExitPlans: Record<string, DefiExitPlan> = {};
+  const notes: string[] = [];
+  let maxSeconds = 10;
+
+  const quoteFollowUpBridge = followUpQuoteFn ?? buildBridgeExecution;
+  const checkAllowance = allowanceCheckFn ?? checkErc20Allowance;
+
+  // Multi-Input Dust Swap Consolidation:
+  // When >= 2 non-USDC liquid ERC-20 dust tokens are selected on the same chain and a
+  // multi-input swap router (Enso Bundle API or injected consolidator) is available,
+  // collapse all N swaps into 1 single multi-input swap -> chain USDC + 1 single bridge -> Solana.
+  // Eliminates N-1 swap popups on non-EIP-5792 EOAs (e.g. Rabby 0.94.x) and reduces batch gas.
+  const multiInputCandidates = executableAssets.filter(
+    (a) =>
+      a.action === 'SELL_AND_BRIDGE' &&
+      a.address !== 'native' &&
+      a.kind !== 'defi_position' &&
+      a.address.toLowerCase() !== cfg.usdcAddress.toLowerCase() &&
+      /^\d+$/.test(a.rawBalance) &&
+      BigInt(a.rawBalance) > 0n
+  );
+  const consolidatedAssetIdSet = new Set<string>();
+  let consolidatedApprovalsSkipped = 0;
+  let consolidatedUsdcOutStr: string | undefined;
+  let consolidatedProvider: 'enso_multi_input' | undefined;
+
+  if (
+    consolidateMultiInputDust &&
+    multiInputCandidates.length >= 2 &&
+    (Boolean(multiInputSwapQuoteFn) || Boolean(process.env.ENSO_API_KEY?.trim()))
+  ) {
+    try {
+      const multiQuote = await (multiInputSwapQuoteFn ?? tryEnsoMultiInputDustSwap)({
+        chain,
+        assets: multiInputCandidates,
+        userAddress,
+        usdcAddress: cfg.usdcAddress,
+        slippageBps: 150,
+      });
+
+      if (
+        multiQuote &&
+        validateMultiInputRouterTarget({
+          routerAddress: multiQuote.routerAddress,
+          txData: multiQuote.data,
+          userAddress,
+          usdcAddress: cfg.usdcAddress,
+          inputAssets: multiInputCandidates,
+        })
+      ) {
+        const outUsdcRaw = BigInt(multiQuote.outUsdcRaw);
+        const usdcDecimals = multiQuote.outUsdcDecimals || (cfg.id === 'bnb' ? 18 : 6);
+        const quotedUsdcUi = Number(outUsdcRaw) / 10 ** usdcDecimals;
+        const combinedGrossUsd = multiInputCandidates.reduce((s, a) => s + a.grossUsd, 0);
+        const combinedGasUsd =
+          multiQuote.estimatedGasUsd ??
+          multiInputCandidates.reduce((s, a) => s + (a.batchedGasUsd || a.estimatedGasUsd || 0), 0);
+
+        const multiGate = evaluateLiveQuoteHaircut({
+          grossUsd: combinedGrossUsd,
+          quoteOutUsd: quotedUsdcUi,
+          actualGasUsd: combinedGasUsd,
+          allowHighCost,
+        });
+
+        if (outUsdcRaw > 0n && multiGate.passed) {
+          const syntheticConsolidatedUsdc: ScannedAsset = {
+            ...multiInputCandidates[0],
+            id: `${chain}:consolidated_dust_usdc`,
+            address: cfg.usdcAddress,
+            symbol: 'USDC',
+            name: `Consolidated USDC (${multiInputCandidates.length} dust tokens)`,
+            decimals: usdcDecimals,
+            kind: 'erc20',
+            protocol: undefined,
+            protocolAddress: undefined,
+            rawBalance: outUsdcRaw.toString(),
+            uiBalance: quotedUsdcUi,
+            priceUsd: 1,
+            grossUsd: quotedUsdcUi,
+            action: 'BRIDGE_DIRECT_USDC',
+          };
+
+          const bridgePrep = await quoteFollowUpBridge(
+            syntheticConsolidatedUsdc,
+            userAddress,
+            solanaDestination,
+            outputAsset,
+            bridgePreference,
+            feeConfig
+          );
+
+          const bridgeGate =
+            typeof bridgePrep.quotedOutUsd === 'number'
+              ? evaluateLiveQuoteHaircut({
+                  grossUsd: combinedGrossUsd,
+                  quoteOutUsd: bridgePrep.quotedOutUsd,
+                  actualGasUsd: bridgePrep.estimatedGasUsd ?? combinedGasUsd,
+                  allowHighCost,
+                })
+              : { passed: true, reason: '' };
+
+          if (bridgePrep.transactions.length > 0 && bridgeGate.passed) {
+            const allowances = await Promise.all(
+              multiInputCandidates.map((asset) =>
+                checkAllowance({
+                  chain,
+                  tokenAddress: asset.address,
+                  owner: userAddress,
+                  spender: multiQuote.routerAddress,
+                }).catch(() => 0n)
+              )
+            );
+
+            for (let i = 0; i < multiInputCandidates.length; i++) {
+              const asset = multiInputCandidates[i];
+              const needRaw = BigInt(asset.rawBalance);
+              if (allowances[i] >= needRaw) {
+                consolidatedApprovalsSkipped += 1;
+                continue;
+              }
+              rawCalls.push({
+                stepId: `approve_multi_input_${i}`,
+                assetId: asset.id,
+                assetSymbol: asset.symbol,
+                action: asset.action,
+                provider: multiQuote.provider,
+                label: `Approve ${asset.symbol} for Consolidated Dust Swap`,
+                description: `ERC-20 allowance for Enso multi-input router (${multiQuote.routerAddress})`,
+                to: asset.address,
+                data: encodeErc20Approve(multiQuote.routerAddress, needRaw),
+                value: '0x0',
+              });
+            }
+
+            const symbolSummary = multiInputCandidates.map((a) => a.symbol).join(' + ');
+            rawCalls.push({
+              stepId: 'multi_input_dust_swap',
+              assetId: syntheticConsolidatedUsdc.id,
+              assetSymbol: `${multiInputCandidates.length} tokens`,
+              action: 'SELL_AND_BRIDGE',
+              provider: multiQuote.provider,
+              label: `Consolidated Swap (${multiInputCandidates.length} dust tokens → ${quotedUsdcUi.toFixed(2)} USDC)`,
+              description: `Single multi-input swap consolidating ${symbolSummary} into USDC before 1 Solana bridge`,
+              to: multiQuote.routerAddress,
+              data: multiQuote.data,
+              value: multiQuote.value || '0x0',
+              gas: multiQuote.gas,
+            });
+
+            for (const btx of bridgePrep.transactions) {
+              rawCalls.push({
+                stepId: btx.stepId.includes('consolidated') ? btx.stepId : `${btx.stepId}_consolidated_dust`,
+                assetId: syntheticConsolidatedUsdc.id,
+                assetSymbol: 'USDC',
+                action: 'BRIDGE_DIRECT_USDC',
+                provider: bridgePrep.provider,
+                label: btx.label,
+                description: `${btx.description} (single bridge for ${multiInputCandidates.length} consolidated dust tokens)`,
+                to: btx.to,
+                data: btx.data,
+                value: btx.value || '0x0',
+                gas: btx.gas,
+              });
+            }
+
+            bridgeTrackers.push({
+              assetId: syntheticConsolidatedUsdc.id,
+              assetSymbol: `${multiInputCandidates.length} dust → ${outputAsset}`,
+              provider: bridgePrep.provider,
+              requestId: bridgePrep.requestId,
+              estimatedOutput: bridgePrep.estimatedOutput,
+              estimatedSeconds: bridgePrep.estimatedSeconds,
+              requiresSolanaClaim: bridgePrep.provider === 'circle_cctp',
+            });
+
+            maxSeconds = Math.max(
+              maxSeconds,
+              multiQuote.estimatedSeconds ?? 12,
+              bridgePrep.estimatedSeconds
+            );
+            for (const a of multiInputCandidates) consolidatedAssetIdSet.add(a.id);
+            consolidatedUsdcOutStr = `${quotedUsdcUi.toFixed(2)} USDC`;
+            consolidatedProvider = multiQuote.provider;
+            const swapsEliminated = Math.max(0, multiInputCandidates.length - 1);
+            notes.push(
+              `Consolidated ${multiInputCandidates.length} dust ERC-20s (${symbolSummary}) into 1 multi-input swap → ${quotedUsdcUi.toFixed(2)} USDC + 1 Solana bridge (${swapsEliminated} swap tx(s) & ${consolidatedApprovalsSkipped} existing approval(s) eliminated).`
+            );
+          }
+        } else if (!multiGate.passed) {
+          notes.push(`Multi-input consolidation skipped (${multiGate.reason}); falling back to individual routes.`);
+        }
+      }
+    } catch {
+      // Fail-open fallback to standard per-asset Relay/LI.FI routing
+    }
+  }
+
+  const remainingExecutableAssets = executableAssets.filter(
+    (a) => !consolidatedAssetIdSet.has(a.id)
+  );
+
+  const results = await settleWithConcurrency(remainingExecutableAssets, QUOTE_CONCURRENCY, (asset) =>
     prepareRealExecution({
       asset,
       userAddress,
@@ -1379,27 +1738,20 @@ export async function prepareChainBatchExecution(params: {
     })
   );
 
-  const rawCalls: PreparedBatchCall[] = [];
-  const bridgeTrackers: PreparedChainBatch['bridgeTrackers'] = [];
-  const chainedFollowUpPlans: ChainedFollowUpPlan[] = [];
-  const defiExitPlans: Record<string, DefiExitPlan> = {};
-  const notes: string[] = [];
-  let maxSeconds = 10;
-
   const DEFI_UNWIND_PROVIDERS = new Set<PreparedExecution['provider']>([
     'aave_v3',
     'aave_v2',
     'compound_v3',
     'compound_v2',
     'erc4626',
+    'yearn_v2',
     'uniswap_v2_lp',
     'uniswap_v3_nft',
   ]);
-  const quoteFollowUpBridge = followUpQuoteFn ?? buildBridgeExecution;
 
   for (let idx = 0; idx < results.length; idx++) {
     const res = results[idx];
-    const asset = executableAssets[idx];
+    const asset = remainingExecutableAssets[idx];
     if (res.status === 'rejected') {
       skippedAssets.push({
         assetId: asset.id,
@@ -1483,7 +1835,8 @@ export async function prepareChainBatchExecution(params: {
                   prep.provider === 'aave_v2' ||
                   prep.provider === 'compound_v3' ||
                   prep.provider === 'compound_v2' ||
-                  prep.provider === 'erc4626')));
+                  prep.provider === 'erc4626' ||
+                  prep.provider === 'yearn_v2')));
 
           if (canCctpBundle && cfg.cctpTokenMessenger) {
             const { feeRaw, netRaw } = splitRawAmountForFee(unlockedRaw, feeConfig);
@@ -1724,6 +2077,23 @@ export async function prepareChainBatchExecution(params: {
     (a) =>
       a.eip2612Supported ?? (a.kind !== 'dead_token' && isEip2612Token(asEvmChain(a.chain), a.address, a.symbol))
   ).length;
+  const instantGaslessEligibleIds = executableAssets
+    .filter(
+      (a) =>
+        a.address !== 'native' &&
+        a.kind !== 'defi_position' &&
+        a.kind !== 'dead_token' &&
+        (Boolean(a.permit2Approved) ||
+          Boolean(a.eip2612Supported ?? isEip2612Token(asEvmChain(a.chain), a.address, a.symbol)))
+    )
+    .map((a) => a.id);
+  const legacyRequiresApprovalCount = executableAssets.filter(
+    (a) =>
+      a.address !== 'native' &&
+      a.kind !== 'defi_position' &&
+      a.kind !== 'dead_token' &&
+      !instantGaslessEligibleIds.includes(a.id)
+  ).length;
 
   const totalCalls = finalCalls.length;
   const walletPopupsEip5792 = totalCalls > 0 ? 1 : 0;
@@ -1752,6 +2122,8 @@ export async function prepareChainBatchExecution(params: {
     : hasRelayAppFee
     ? 'relay_app_fee'
     : 'none';
+
+  const consolidatedIds = Array.from(consolidatedAssetIdSet);
 
   return {
     chain,
@@ -1785,6 +2157,19 @@ export async function prepareChainBatchExecution(params: {
     estimatedSeconds: maxSeconds,
     defiExitPlans: Object.keys(defiExitPlans).length ? defiExitPlans : undefined,
     chainedFollowUpPlans: chainedFollowUpPlans.length ? chainedFollowUpPlans : undefined,
+    dustConsolidation: {
+      consolidated: consolidatedIds.length >= 2,
+      provider: consolidatedProvider,
+      consolidatedTokenCount: consolidatedIds.length,
+      consolidatedAssetIds: consolidatedIds,
+      estimatedUsdcOut: consolidatedUsdcOutStr,
+      approvalsSkipped: consolidatedApprovalsSkipped,
+      swapPopupsEliminated:
+        consolidatedIds.length >= 2 ? consolidatedIds.length - 1 + consolidatedApprovalsSkipped : 0,
+      instantGaslessEligibleIds,
+      instantGaslessCount: instantGaslessEligibleIds.length,
+      legacyRequiresApprovalCount,
+    },
     notes,
   };
 }
@@ -1793,7 +2178,7 @@ export async function prepareChainBatchExecution(params: {
  * Checks real onchain EVM tx receipt + live Relay cross-chain settlement status (including Solana tx hash!).
  */
 export async function checkLiveExecutionStatus(params: {
-  chain: EvmChainId;
+  chain: string;
   txHash?: string;
   requestId?: string;
   provider?: string;
@@ -1808,7 +2193,7 @@ export async function checkLiveExecutionStatus(params: {
   relayDestinationRecipient?: string;
   relayBoundToTx?: boolean;
 }> {
-  const cfg = EVM_CHAINS[params.chain];
+  const cfg = params.chain in EVM_CHAINS ? EVM_CHAINS[params.chain as EvmChainId] : undefined;
   let evmConfirmed = false;
   let evmFailed = false;
   let blockNumber: number | undefined;

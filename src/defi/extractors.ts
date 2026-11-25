@@ -39,6 +39,11 @@ export const DEFI_SELECTORS = {
   redeem4626: '0xba087652', // redeem(uint256,address,address)
   cooldownDuration: '0x35269315', // Ethena sUSDe cooldownDuration()
 
+  // Yearn v2 Vaults (yvOP, yvUSDT, yvUSDC, yvWETH, etc.)
+  yearnV2Token: '0xfc0c546a', // token()
+  yearnV2PricePerShare: '0x99530b06', // pricePerShare()
+  yearnV2Withdraw: '0x2e1a7d4d', // withdraw(uint256)
+
   // Aave v3 & Aave v2
   aaveWithdraw: '0x69328dec', // withdraw(address,uint256,address)
   aaveGetUserAccountData: '0xbf92857c', // getUserAccountData(address)
@@ -196,9 +201,9 @@ export function validateTrustedProtocolTarget(params: {
     return { trusted: true };
   }
 
-  // ERC-4626 vaults and Compound v2 cTokens must ALWAYS call redeem() on the receipt token itself —
+  // ERC-4626 vaults, Yearn v2 vaults, and Compound v2 cTokens must ALWAYS call redeem/withdraw on the receipt token itself —
   // never allow a spoofed receipt token to redirect calldata to an unrelated third-party target!
-  if (protocolId === 'erc4626' || protocolId === 'compound_v2') {
+  if (protocolId === 'erc4626' || protocolId === 'yearn_v2' || protocolId === 'compound_v2') {
     if (targetLower !== assetLower) {
       return {
         trusted: false,
@@ -206,6 +211,13 @@ export function validateTrustedProtocolTarget(params: {
       };
     }
     return { trusted: true };
+  }
+
+  if (protocolId === 'external_protocol') {
+    return {
+      trusted: false,
+      reason: `External protocol position must be managed on its protocol app — Siphon only executes verified native protocol extractors.`,
+    };
   }
 
   return { trusted: true };
@@ -499,6 +511,21 @@ export function encodeCompoundV3Withdraw(underlyingAsset: string, amount: bigint
 // Compound v2 / Venus / Benqi cToken.redeem(uint256 redeemTokens)
 export function encodeCompoundV2Redeem(cTokenAmount: bigint): string {
   return `${DEFI_SELECTORS.compoundV2Redeem}${padUint256(cTokenAmount)}`;
+}
+
+// Yearn v2 Vault.withdraw(uint256 maxShares)
+export function encodeYearnV2Withdraw(shares: bigint): string {
+  return `${DEFI_SELECTORS.yearnV2Withdraw}${padUint256(shares)}`;
+}
+
+export function computeYearnV2UnderlyingRaw(
+  sharesRaw: bigint,
+  pricePerShare: bigint,
+  vaultDecimals: number
+): bigint {
+  if (sharesRaw <= 0n || pricePerShare <= 0n) return 0n;
+  const scale = 10n ** BigInt(Math.max(0, Math.min(36, vaultDecimals)));
+  return (sharesRaw * pricePerShare) / scale;
 }
 
 export function computeCompoundV2UnderlyingRaw(
@@ -1261,8 +1288,8 @@ export async function probeExpandedDefiContracts(params: {
 
   if (!cfg || !unique.length) return detected;
 
-  // 13 probes per token in 1 Multicall3 batch
-  const PROBES_PER_TOKEN = 13;
+  // 15 probes per token in 1 Multicall3 batch
+  const PROBES_PER_TOKEN = 15;
   const calls = unique.flatMap((target) => [
     { target, allowFailure: true, callData: DEFI_SELECTORS.aaveUnderlyingAsset }, // 0
     { target, allowFailure: true, callData: DEFI_SELECTORS.aaveV3Pool }, // 1
@@ -1277,6 +1304,8 @@ export async function probeExpandedDefiContracts(params: {
     { target, allowFailure: true, callData: DEFI_SELECTORS.totalSupply }, // 10
     { target, allowFailure: true, callData: DEFI_SELECTORS.factory }, // 11
     { target, allowFailure: true, callData: DEFI_SELECTORS.stable }, // 12
+    { target, allowFailure: true, callData: DEFI_SELECTORS.yearnV2Token }, // 13
+    { target, allowFailure: true, callData: DEFI_SELECTORS.yearnV2PricePerShare }, // 14
   ]);
 
   try {
@@ -1414,6 +1443,19 @@ export async function probeExpandedDefiContracts(params: {
           expectedUnderlyingRaw: amounts?.amount0,
           expectedSecondaryRaw: amounts?.amount1,
         });
+        continue;
+      }
+
+      const yearnToken = results[base + 13]?.success ? decodeAbiAddressWord(results[base + 13].returnData) : null;
+      const yearnPps = results[base + 14]?.success ? decodeAbiUint256Word(results[base + 14].returnData) : null;
+      if (yearnToken && yearnPps !== null && yearnPps > 0n) {
+        detected.set(addr, {
+          protocolId: 'yearn_v2',
+          protocol: 'Yearn v2',
+          protocolAddress: addr,
+          underlyingAddress: yearnToken,
+          exchangeRateStored: yearnPps,
+        });
       }
     }
   } catch {
@@ -1543,8 +1585,18 @@ export async function discoverUniswapV3NftPositions(
 
 export function identifyProtocolExtractorId(asset: Pick<
   ScannedAsset,
-  'protocol' | 'symbol' | 'address' | 'nftTokenId' | 'lpToken0Address' | 'lpToken1Address'
+  | 'protocol'
+  | 'symbol'
+  | 'address'
+  | 'nftTokenId'
+  | 'lpToken0Address'
+  | 'lpToken1Address'
+  | 'defiPositionType'
+  | 'defiExitPlan'
 >): DefiProtocolExtractorId {
+  if (asset.defiExitPlan?.protocolId === 'external_protocol') {
+    return 'external_protocol';
+  }
   const proto = (asset.protocol ?? '').toLowerCase();
   if (asset.nftTokenId || proto.includes('uniswap v3') || proto.includes('aerodrome cl')) {
     return 'uniswap_v3_nft';
@@ -1559,8 +1611,12 @@ export function identifyProtocolExtractorId(asset: Pick<
     proto.includes('quickswap') ||
     proto.includes(' lp')
   ) {
+    if (asset.defiPositionType && !(asset.lpToken0Address && asset.lpToken1Address)) {
+      return 'external_protocol';
+    }
     return 'uniswap_v2_lp';
   }
+  if (proto.includes('yearn v2') || proto.includes('yearn2')) return 'yearn_v2';
   if (proto.includes('aave v2')) return 'aave_v2';
   if (proto.includes('aave')) return 'aave_v3';
   if (proto.includes('compound v2') || proto.includes('venus') || proto.includes('benqi')) {
@@ -1584,6 +1640,9 @@ export function identifyProtocolExtractorId(asset: Pick<
   if (isLiquidReceiptToken(asset.symbol, asset.address)) {
     return 'liquid_receipt';
   }
+  if (asset.defiPositionType) {
+    return 'external_protocol';
+  }
   return 'erc4626';
 }
 
@@ -1596,6 +1655,8 @@ export interface ResolveDefiExitPlanInput {
     | 'decimals'
     | 'protocol'
     | 'protocolAddress'
+    | 'protocolUrl'
+    | 'protocolLogoUrl'
     | 'underlyingSymbol'
     | 'underlyingAddress'
     | 'rawBalance'
@@ -1619,11 +1680,20 @@ export interface ResolveDefiExitPlanInput {
     | 'nftTokenId'
     | 'nftLiquidity'
     | 'nftManagerAddress'
+    | 'defiPositionType'
+    | 'defiDebtUsd'
+    | 'defiHealthFactor'
+    | 'defiUnlockAt'
+    | 'defiNetUsd'
+    | 'defiDebtSummary'
+    | 'defiExitPlan'
   >;
   outputAsset?: 'USDC' | 'SOL';
   vaultState?: Erc4626VaultState;
   aaveSafety?: AaveAccountSafety;
   compoundSafety?: CompoundAccountSafety;
+  expectedUnderlyingRaw?: bigint;
+  expectedUnderlyingUi?: number;
   expectedSecondaryRaw?: bigint;
   expectedSecondaryUi?: number;
   preflightStatus?: DefiPreflightStatus;
@@ -1652,7 +1722,127 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
   const hasDeepDexLiquidity =
     Boolean(liquidReceipt) && (asset.liquidityUsd >= 50_000 || asset.liquidityUsd === 0);
 
-  // 0. Security check against spoofed/untrusted protocolAddress injection (skip for direct DEX liquid receipts)
+  // 0. Protocol-indexed external positions (e.g. 40 Acres lending, Wayfinder lock, Carbon deposit, Velodrome veNFT)
+  // Always surfaced transparently with exact debt/lock/value metadata — never blindly executed with synthetic calldata.
+  if (protocolId === 'external_protocol') {
+    const uSym = asset.underlyingSymbol ?? asset.symbol;
+    const posType = asset.defiPositionType || 'Position';
+    const debtUsd = Number(asset.defiDebtUsd ?? 0);
+    const netUsd =
+      typeof asset.defiNetUsd === 'number'
+        ? asset.defiNetUsd
+        : Number(Math.max(0, asset.grossUsd - debtUsd).toFixed(2));
+    const nowSec = Math.floor(Date.now() / 1000);
+    const isTimeLocked = Boolean(
+      (asset.defiUnlockAt && asset.defiUnlockAt > nowSec) ||
+        posType.toLowerCase().includes('lock')
+    );
+
+    if (isTimeLocked) {
+      const unlockDateStr = asset.defiUnlockAt
+        ? new Date(asset.defiUnlockAt * 1000).toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+            timeZone: 'UTC',
+          })
+        : null;
+      return {
+        protocolId: 'external_protocol',
+        protocolName,
+        routeKind: 'unbonding_required',
+        exitStrategy: 'cooldown_blocked',
+        preflightStatus: 'blocked',
+        preflightReason:
+          input.preflightReason ||
+          (unlockDateStr
+            ? `Locked on ${protocolName} until ${unlockDateStr} (${asset.uiBalance} ${uSym} · $${asset.grossUsd.toFixed(2)}). Manage unlock on ${protocolName}.`
+            : `Locked ${posType.toLowerCase()} position on ${protocolName} (${asset.uiBalance} ${uSym} · $${asset.grossUsd.toFixed(2)}). Unlock on ${protocolName} before bridging.`),
+        plainEnglishSteps: [
+          unlockDateStr
+            ? `Wait until ${unlockDateStr} and unlock ${asset.uiBalance} ${uSym} on ${protocolName}`
+            : `Unlock ${asset.uiBalance} ${uSym} directly on ${protocolName}`,
+          `Return to Siphon to sweep unlocked ${uSym} to Solana ${outputAsset}`,
+        ],
+        cooldownDetected: true,
+        underlyingSymbol: uSym,
+        underlyingAddress: asset.underlyingAddress,
+        underlyingDecimals: asset.decimals,
+        supportsAtomicBatch: false,
+        protocolUrl: asset.protocolUrl,
+        protocolLogoUrl: asset.protocolLogoUrl,
+        positionType: posType,
+        debtUsd: debtUsd > 0 ? debtUsd : undefined,
+        netUsd,
+        unlockAt: asset.defiUnlockAt,
+        debtSummary: asset.defiDebtSummary,
+        simulatedLive: input.simulatedLive,
+        simulatedAtBlock: input.simulatedAtBlock,
+      };
+    }
+
+    if (debtUsd > 0) {
+      const hfPart =
+        typeof asset.defiHealthFactor === 'number'
+          ? ` · Health Factor ${asset.defiHealthFactor.toFixed(2)}`
+          : '';
+      const debtDetail = asset.defiDebtSummary || `$${debtUsd.toFixed(2)} borrowed`;
+      return {
+        protocolId: 'external_protocol',
+        protocolName,
+        routeKind: 'partial_unwind',
+        exitStrategy: 'external_app_exit',
+        preflightStatus: 'blocked',
+        preflightReason:
+          input.preflightReason ||
+          `Active borrow on ${protocolName} (${debtDetail}${hfPart} · Net $${netUsd.toFixed(2)}). Repay debt or manage collateral directly on ${protocolName}.`,
+        plainEnglishSteps: [
+          `Open ${protocolName} to repay ${debtDetail} or adjust collateral (Net $${netUsd.toFixed(2)})`,
+          `Return to Siphon once unlocked to sweep ${uSym} to Solana ${outputAsset}`,
+        ],
+        underlyingSymbol: uSym,
+        underlyingAddress: asset.underlyingAddress,
+        underlyingDecimals: asset.decimals,
+        projectedHealthFactor: asset.defiHealthFactor,
+        supportsAtomicBatch: false,
+        protocolUrl: asset.protocolUrl,
+        protocolLogoUrl: asset.protocolLogoUrl,
+        positionType: posType,
+        debtUsd,
+        netUsd,
+        debtSummary: asset.defiDebtSummary,
+        simulatedLive: input.simulatedLive,
+        simulatedAtBlock: input.simulatedAtBlock,
+      };
+    }
+
+    return {
+      protocolId: 'external_protocol',
+      protocolName,
+      routeKind: 'external_app',
+      exitStrategy: 'external_app_exit',
+      preflightStatus: 'blocked',
+      preflightReason:
+        input.preflightReason ||
+        `${protocolName} ${posType} ($${asset.grossUsd.toFixed(2)} ${uSym}) uses custom protocol contracts — withdraw on ${protocolName}, then sweep to Solana ${outputAsset}.`,
+      plainEnglishSteps: [
+        `Withdraw ${asset.uiBalance} ${uSym} directly on ${protocolName}`,
+        `Sweep unlocked ${uSym} to Solana ${outputAsset} in 1 click`,
+      ],
+      underlyingSymbol: uSym,
+      underlyingAddress: asset.underlyingAddress,
+      underlyingDecimals: asset.decimals,
+      supportsAtomicBatch: false,
+      protocolUrl: asset.protocolUrl,
+      protocolLogoUrl: asset.protocolLogoUrl,
+      positionType: posType,
+      netUsd,
+      simulatedLive: input.simulatedLive,
+      simulatedAtBlock: input.simulatedAtBlock,
+    };
+  }
+
+  // 0b. Security check against spoofed/untrusted protocolAddress injection (skip for direct DEX liquid receipts)
   if (
     !(liquidReceipt && hasDeepDexLiquidity) &&
     asset.protocolAddress &&
@@ -2032,6 +2222,45 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
     };
   }
 
+  // 6b. Yearn v2 Vault (yvOP, yvUSDT, yvUSDC, etc. — direct withdraw(uint256))
+  if (protocolId === 'yearn_v2') {
+    const uSym = asset.underlyingSymbol ?? asset.symbol.replace(/^yv/i, '') ?? 'underlying';
+    const uDec = asset.decimals;
+    const expectedRaw = input.expectedUnderlyingRaw ?? rawBal;
+    const expectedUi =
+      input.expectedUnderlyingUi ?? Number(formatUnits(expectedRaw, uDec).toFixed(6));
+    const shareRate = asset.uiBalance > 0 ? Number((expectedUi / asset.uiBalance).toFixed(6)) : 1;
+    return {
+      protocolId: 'yearn_v2',
+      protocolName,
+      routeKind: 'protocol_unwind',
+      exitStrategy: 'instant_1click_unwind',
+      preflightStatus: input.preflightStatus ?? 'verified',
+      preflightReason:
+        input.preflightReason ||
+        `${protocolName} vault verified: ${asset.uiBalance} ${asset.symbol} withdraws ~${expectedUi} ${uSym} directly to your wallet.`,
+      plainEnglishSteps: [
+        `Withdraw ${asset.uiBalance} ${asset.symbol} from ${protocolName} into ~${expectedUi} ${uSym}`,
+        uSym === 'USDC' && outputAsset === 'USDC'
+          ? `Bridge ${uSym} directly to Solana USDC`
+          : `Swap & bridge ${uSym} to Solana ${outputAsset}`,
+      ],
+      cooldownDetected: false,
+      expectedUnderlyingRaw: expectedRaw.toString(),
+      expectedUnderlyingUi: expectedUi,
+      underlyingSymbol: uSym,
+      underlyingAddress: asset.underlyingAddress,
+      underlyingDecimals: uDec,
+      shareExchangeRate: shareRate,
+      supportsAtomicBatch: true,
+      protocolUrl: asset.protocolUrl,
+      protocolLogoUrl: asset.protocolLogoUrl,
+      positionType: asset.defiPositionType ?? 'Yield',
+      simulatedLive: input.simulatedLive,
+      simulatedAtBlock: input.simulatedAtBlock,
+    };
+  }
+
   // 7. Standard ERC-4626 Vault (Morpho, Yearn v3, Fluid, Euler, etc.)
   const uSym = asset.underlyingSymbol ?? 'underlying';
   const uDec = asset.decimals;
@@ -2090,6 +2319,7 @@ export interface DefiExtractorBuildResult {
     | 'compound_v3'
     | 'compound_v2'
     | 'erc4626'
+    | 'yearn_v2'
     | 'uniswap_v2_lp'
     | 'uniswap_v3_nft'
     | 'direct_swap';
@@ -2637,6 +2867,72 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
           `Executes decreaseLiquidity + collect + burn atomically in a single NonfungiblePositionManager.multicall transaction.`,
         ],
       };
+    },
+  },
+
+  yearn_v2: {
+    id: 'yearn_v2',
+    name: 'Yearn v2 Vault',
+    matches: (asset) => identifyProtocolExtractorId(asset) === 'yearn_v2',
+    buildExtraction: ({ asset, chain, exitPlan }) => {
+      const vaultTarget = asset.protocolAddress || asset.address;
+      const trust = validateTrustedProtocolTarget({
+        chain,
+        protocolId: 'yearn_v2',
+        assetAddress: asset.address,
+        protocolAddress: vaultTarget,
+      });
+      if (!trust.trusted) {
+        throw new Error(trust.reason || `Untrusted Yearn v2 vault target.`);
+      }
+      const rawBal = BigInt(asset.rawBalance);
+      const uSym = asset.underlyingSymbol ?? exitPlan?.underlyingSymbol ?? asset.symbol.replace(/^yv/i, '');
+      const uAddr = asset.underlyingAddress ?? exitPlan?.underlyingAddress ?? '';
+      const uDec = exitPlan?.underlyingDecimals ?? asset.decimals;
+      const expectedRaw = exitPlan?.expectedUnderlyingRaw ? BigInt(exitPlan.expectedUnderlyingRaw) : rawBal;
+      const expectedUi =
+        exitPlan?.expectedUnderlyingUi ?? Number(formatUnits(expectedRaw, uDec).toFixed(6));
+
+      return {
+        protocolId: 'yearn_v2',
+        provider: 'yearn_v2',
+        transactions: [
+          {
+            stepId: 'yearn_v2_withdraw',
+            label: `Withdraw ${asset.symbol} from Yearn v2`,
+            description: `Calls Yearn v2 Vault.withdraw(${asset.uiBalance} shares) directly on ${vaultTarget}`,
+            to: vaultTarget,
+            data: encodeYearnV2Withdraw(rawBal),
+            value: '0x0',
+          },
+        ],
+        unlockedAssets: uAddr
+          ? [
+              {
+                address: uAddr,
+                symbol: uSym,
+                decimals: uDec,
+                expectedRawAmount: expectedRaw,
+                expectedUiAmount: expectedUi,
+                estimatedUsd: asset.grossUsd,
+              },
+            ]
+          : [],
+        estimatedOutput: `${expectedUi} ${uSym} withdrawn from ${asset.symbol}`,
+        estimatedSeconds: 15,
+        notes: ['Calls Yearn v2 withdraw(uint256) to unlock underlying tokens directly into your wallet.'],
+      };
+    },
+  },
+
+  external_protocol: {
+    id: 'external_protocol',
+    name: 'External DeFi Protocol',
+    matches: (asset) => identifyProtocolExtractorId(asset) === 'external_protocol',
+    buildExtraction: ({ asset }) => {
+      throw new Error(
+        `${asset.protocol || 'This DeFi protocol'} (${asset.symbol}) requires managing on the protocol app${asset.protocolUrl ? ` (${asset.protocolUrl})` : ''} before sweeping to Solana.`
+      );
     },
   },
 };

@@ -364,6 +364,87 @@ def main():
             scene_running = pgD.evaluate("() => Boolean(window.__siphonHeroScene?.isRunning?.())")
             assert raf_after == raf_before and not scene_running, f"3D rAF leaked while hidden: {raf_before}->{raf_after}, running={scene_running}"
 
+            # 1D-bis. Verify Lite mode default hides EIP / routing / fee / program details,
+            # and switching to Pro mode reveals & persists them
+            lite_check = pgD.evaluate("""() => {
+              const isVis = (sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                const st = getComputedStyle(el);
+                const r = el.getBoundingClientRect();
+                return st.display !== 'none' && r.width > 0 && r.height > 0;
+              };
+              const cardText = document.querySelector('.sweep-summary-card')?.innerText || '';
+              return {
+                mode: document.documentElement.dataset.uiMode,
+                liteCostVisible: isVis('#summaryLiteCostText'),
+                bridgeRouteVisible: isVis('#bridgePrefSelect'),
+                feeDrawerBtnVisible: isVis('#toggleFeeDrawerBtn'),
+                modeSwitchVisible: isVis('.mode-switch-bar'),
+                verifyProofVisible: isVis('#verifyProofBtn'),
+                chainQueueVisible: isVis('#chainQueueList'),
+                agentsTabVisible: isVis(".app-tab[data-view='agents']"),
+                contractTabVisible: isVis(".app-tab[data-view='contract']"),
+                unifyBtnVisible: isVis('#toggleUnifyBarBtn'),
+                defiTechVisible: isVis('.defi-tech-details'),
+                hasEipInLiteCard: /EIP-5792|Permit2|7702|Bridge Route|Protocol Fee/i.test(cardText),
+                overflowLite: document.documentElement.scrollWidth - window.innerWidth,
+              };
+            }""")
+            assert lite_check["mode"] == "lite", lite_check
+            assert lite_check["liteCostVisible"], lite_check
+            assert not any([
+                lite_check["bridgeRouteVisible"],
+                lite_check["feeDrawerBtnVisible"],
+                lite_check["modeSwitchVisible"],
+                lite_check["verifyProofVisible"],
+                lite_check["chainQueueVisible"],
+                lite_check["agentsTabVisible"],
+                lite_check["contractTabVisible"],
+                lite_check["unifyBtnVisible"],
+                lite_check["defiTechVisible"],
+            ]), f"Pro-only controls leaked in Lite mode: {lite_check}"
+            assert not lite_check["hasEipInLiteCard"], f"Technical EIP/route copy leaked in Lite card: {lite_check}"
+            assert lite_check["overflowLite"] <= 0, lite_check
+            maybe_shot(pgD, "goal_desktop_lite_1440.png", full_page=True)
+
+            # Switch to Pro mode and verify all Pro controls + EIP / program data appear
+            pgD.click(".ui-mode-btn[data-ui-mode='pro']")
+            pgD.wait_for_function("() => document.documentElement.dataset.uiMode === 'pro'", timeout=5000)
+            pro_check = pgD.evaluate("""() => {
+              const isVis = (sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                const st = getComputedStyle(el);
+                const r = el.getBoundingClientRect();
+                return st.display !== 'none' && r.width > 0 && r.height > 0;
+              };
+              return {
+                mode: document.documentElement.dataset.uiMode,
+                stored: localStorage.getItem('siphon_ui_mode'),
+                liteCostVisible: isVis('#summaryLiteCostText'),
+                bridgeRouteVisible: isVis('#bridgePrefSelect'),
+                feeDrawerBtnVisible: isVis('#toggleFeeDrawerBtn'),
+                modeSwitchVisible: isVis('.mode-switch-bar'),
+                verifyProofVisible: isVis('#verifyProofBtn'),
+                chainQueueVisible: isVis('#chainQueueList'),
+                agentsTabVisible: isVis(".app-tab[data-view='agents']"),
+                contractTabVisible: isVis(".app-tab[data-view='contract']"),
+              };
+            }""")
+            assert pro_check["mode"] == "pro" and pro_check["stored"] == "pro", pro_check
+            assert not pro_check["liteCostVisible"], pro_check
+            assert all([
+                pro_check["bridgeRouteVisible"],
+                pro_check["feeDrawerBtnVisible"],
+                pro_check["modeSwitchVisible"],
+                pro_check["verifyProofVisible"],
+                pro_check["chainQueueVisible"],
+                pro_check["agentsTabVisible"],
+                pro_check["contractTabVisible"],
+            ]), f"Pro controls missing in Pro mode: {pro_check}"
+            maybe_shot(pgD, "goal_desktop_pro_1440.png", full_page=True)
+
             # 1E. Zero-Default-Dest Guard Backtest: sweep, per-chain batch, DeFi extract, and mandate MUST be hard-blocked!
             jobs_posted = {"n": 0}
             mandates_posted = {"n": 0}
@@ -500,7 +581,28 @@ def main():
                 overflowD[view] = pgD.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
                 if view == "agents":
                     pgD.wait_for_function("() => (document.querySelector('#claudeMcpConfigHost')?.innerText || '').includes('siphon')", timeout=5000)
-                    pgD.click("#simulateAiProposalBtn")
+                    # Queue a real permission request via POST /api/agents/approvals (replaces removed demo button)
+                    queued_ok = pgD.evaluate("""async () => {
+                      const dest = document.getElementById('solanaDestInput')?.value?.trim();
+                      const res = await fetch('/api/agents/approvals', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-Siphon-Requested-With': 'siphon-ui' },
+                        body: JSON.stringify({
+                          client: 'claude_mcp',
+                          actionType: 'dust_convert',
+                          summary: 'E2E Dust Rescue Proposal',
+                          sourceWallets: ['0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045'],
+                          chains: ['base', 'optimism'],
+                          solanaDestination: dest,
+                          grossUsd: 120,
+                          estimatedNetUsdc: 112,
+                        }),
+                      });
+                      return res.ok;
+                    }""")
+                    assert queued_ok, "Failed to queue real agent approval via POST /api/agents/approvals"
+                    pgD.click(".app-tab[data-view='scanner']")
+                    pgD.click(".app-tab[data-view='agents']")
                     pgD.wait_for_function("() => (document.querySelector('#agentApprovalsHost')?.innerText || '').includes('Approve Permission')", timeout=5000)
                     pgD.click("[data-decision='approve']")
                     pgD.wait_for_function("() => (document.querySelector('#agentApprovalsHost')?.innerText || '').includes('approved')", timeout=5000)
@@ -516,11 +618,16 @@ def main():
                 elif view == "contract":
                     pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonRouter')", timeout=5000)
 
+            # Switching back to Lite from Contracts view must gracefully return to Sweep view
+            pgD.click(".ui-mode-btn[data-ui-mode='lite']")
+            pgD.wait_for_function("() => document.documentElement.dataset.uiMode === 'lite' && document.getElementById('view-scanner')?.classList.contains('active')", timeout=5000)
+
             assert all(v <= 0 for v in overflowD.values()), f"Desktop overflow: {overflowD}"
             assert not errsD, f"Desktop errors: {errsD}"
             assert not badHttpD, f"Desktop bad HTTP: {badHttpD}"
             results["desktop_1440"] = {
                 "ok": True,
+                "liteAndProVerified": True,
                 "zeroDefaultDestVerified": True,
                 "rafPausedWhenHidden": True,
                 "atomicRequiredForFeeBatch": True,
@@ -740,6 +847,10 @@ def main():
             # 2B. Dust Converter (#selectDustBtn) <-> Planner <-> #runLiveQueueBtn Sync Backtest!
             pgS.click("#navLaunchBtn")
             pgS.wait_for_selector("#appShell:not(.hidden)")
+            pgS.click(".ui-mode-btn[data-ui-mode='pro']")
+            pgS.fill("#appEvmInput", VET_ADDR)
+            pgS.click("#appScanBtn")
+            pgS.wait_for_selector("#assetListBody .asset-row", timeout=8000)
             pgS.click("#selectDustBtn")
             pgS.wait_for_function("() => document.getElementById('tabLegCount')?.textContent === '1'", timeout=8000)
             dust_sync = pgS.evaluate("""() => ({
@@ -925,6 +1036,7 @@ def main():
             pgL.click("[data-pick-evm]")
             pgL.wait_for_selector("#appShell:not(.hidden)", timeout=15000)
             pgL.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent === '6'", timeout=15000)
+            pgL.click(".ui-mode-btn[data-ui-mode='pro']")
 
             # Connect Solana before sweeping
             pgL.click("#connectSolBtn")
@@ -1192,7 +1304,11 @@ def main():
             pgT.wait_for_selector("#walletModalBackdrop", state="hidden")
             pgT.wait_for_timeout(200)
 
-            overflowT = {}
+            overflowT = {
+                "scanner_lite": pgT.evaluate("() => document.documentElement.scrollWidth - window.innerWidth"),
+            }
+            pgT.click(".ui-mode-btn[data-ui-mode='pro']")
+            pgT.wait_for_timeout(120)
             for view in ["scanner", "activity", "agents", "contract"]:
                 pgT.click(f".app-tab[data-view='{view}']")
                 pgT.wait_for_timeout(150)
@@ -1283,6 +1399,12 @@ def main():
             }""")
             assert badge_vis["total"] > 0 and badge_vis["visible"] == badge_vis["total"], f"Mobile safety badges hidden: {badge_vis}"
 
+            # Verify Lite mode 0px overflow on mobile before switching to Pro for full-view checks
+            overflowM["scanner_lite"] = pgM.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
+            maybe_shot(pgM, "goal_mobile_lite_390.png", full_page=True)
+
+            pgM.click(".ui-mode-btn[data-ui-mode='pro']")
+            pgM.wait_for_timeout(150)
             pgM.locator(".defi-tech-details > summary").first.click()
             pgM.wait_for_timeout(150)
             overflowM["scanner_defi"] = pgM.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")

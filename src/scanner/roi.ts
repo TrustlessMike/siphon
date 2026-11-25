@@ -782,6 +782,7 @@ export function pruneNegativeRoiAssets(
   for (const a of assets) {
     const ev = evaluateAssetRoi(a, opts);
     evaluations.push(ev);
+    if (a.kind === 'defi_position' && a.defiExitPlan?.preflightStatus === 'blocked') continue;
     if (ev.verdict === 'honeypot_blocked') blockedHoneypots.push(a);
     else if (ev.verdict === 'zero_liquidity_burn') optionalBurns.push(a);
     else if (ev.roiVerdict === 'negative_roi') prunedNegativeRoi.push(a);
@@ -1249,6 +1250,11 @@ export function applyTwoLevelRoiToReport(
           continue;
         }
         if (a.aaveDebtUsd && a.aaveDebtUsd > 0) {
+          a.selectedByDefault = false;
+          continue;
+        }
+        // Preserve blocked/locked/external DeFi positions as visible DeFi rows without auto-selecting or converting to dust skip
+        if (a.kind === 'defi_position' && a.defiExitPlan?.preflightStatus === 'blocked') {
           a.selectedByDefault = false;
           continue;
         }

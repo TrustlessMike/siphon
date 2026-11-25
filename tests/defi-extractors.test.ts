@@ -5,6 +5,7 @@ import {
   computeAaveSafePartialWithdrawal,
   computeCompoundV2UnderlyingRaw,
   computeUniswapV2UnderlyingAmounts,
+  computeYearnV2UnderlyingRaw,
   decodeUniswapV2Reserves,
   decodeUniswapV3Position,
   DEFI_SELECTORS,
@@ -12,9 +13,11 @@ import {
   encodeErc4626MaxRedeem,
   encodeErc4626PreviewRedeem,
   encodeErc4626Redeem,
+  encodeYearnV2Withdraw,
   isLiquidReceiptToken,
   MAX_UINT128,
   resolveDefiExitPlan,
+  validateTrustedProtocolTarget,
 } from '../src/defi/extractors.js';
 import { translateDefiRevertToPlainEnglish } from '../src/defi/preflight.js';
 import {
@@ -785,4 +788,124 @@ test('Plain-English revert translator & HTTP API (/api/defi/preflight, /api/scan
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test('Yearn v2 vaults (yvOP/yvUSDT) build 1-click withdraw(uint256) and external protocol DeFi positions fail closed', async () => {
+  // 1. Yearn v2 underlying math + withdraw(uint256) calldata
+  const yvUsdtVault = '0xFaee21D0f0Af88EE72BB6d68E54a90E6EC2616de';
+  const usdtOp = '0x94b008aa00579c1307b0ef2c499ad98a8ce58e58';
+  const shares = 1_018_149n;
+  const pps = 501_993n;
+  const expectedUsdt = computeYearnV2UnderlyingRaw(shares, pps, 6);
+  assert.equal(expectedUsdt, 511_103n);
+
+  const yvAsset = makeDefiAsset({
+    id: 'op:yearn_v2_yvusdt',
+    chain: 'optimism',
+    chainName: 'Optimism',
+    address: yvUsdtVault,
+    symbol: 'yvUSDT',
+    name: 'USDT yVault',
+    decimals: 6,
+    protocol: 'Yearn v2',
+    protocolAddress: yvUsdtVault,
+    underlyingSymbol: 'USDT',
+    underlyingAddress: usdtOp,
+    rawBalance: shares.toString(),
+    uiBalance: 1.0181,
+    priceUsd: 0.502,
+    grossUsd: 0.51,
+  });
+
+  const yvPlan = resolveDefiExitPlan({
+    asset: yvAsset,
+    expectedUnderlyingRaw: expectedUsdt,
+    expectedUnderlyingUi: 0.5111,
+  });
+  assert.equal(yvPlan.protocolId, 'yearn_v2');
+  assert.equal(yvPlan.exitStrategy, 'instant_1click_unwind');
+  assert.equal(yvPlan.preflightStatus, 'verified');
+
+  const yvPrep = await prepareRealExecution({
+    asset: { ...yvAsset, defiExitPlan: yvPlan },
+    userAddress: USER,
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+  });
+  assert.equal(yvPrep.provider, 'yearn_v2');
+  assert.equal(yvPrep.transactions[0].to.toLowerCase(), yvUsdtVault.toLowerCase());
+  assert.equal(yvPrep.transactions[0].data, encodeYearnV2Withdraw(shares));
+  assert.equal(yvPrep.chainedFollowUpPlan?.unlockedAssets[0].expectedRawAmount, expectedUsdt.toString());
+
+  // Spoofed Yearn v2 target must be rejected
+  const spoofYearn = validateTrustedProtocolTarget({
+    chain: 'optimism',
+    protocolId: 'yearn_v2',
+    assetAddress: yvUsdtVault,
+    protocolAddress: '0x1111111111111111111111111111111111111111',
+  });
+  assert.equal(spoofYearn.trusted, false);
+
+  // 2. External protocol positions (locked, active debt, zero-debt) always surface clearly and fail closed on direct execution
+  const lockedPlan = resolveDefiExitPlan({
+    asset: makeDefiAsset({
+      id: 'eth:wayfinder_locked',
+      protocol: 'Wayfinder',
+      protocolAddress: '0x4a3826bd2e8a31956ad0397a49efde5e0d825238',
+      protocolUrl: 'https://wayfinder.ai/',
+      symbol: 'PRIME',
+      underlyingSymbol: 'PRIME',
+      uiBalance: 454,
+      grossUsd: 48.97,
+      defiPositionType: 'Locked',
+      defiUnlockAt: Math.floor(Date.now() / 1000) + 86400 * 180,
+    }),
+  });
+  assert.equal(lockedPlan.protocolId, 'external_protocol');
+  assert.equal(lockedPlan.exitStrategy, 'cooldown_blocked');
+  assert.equal(lockedPlan.preflightStatus, 'blocked');
+  assert.equal(lockedPlan.cooldownDetected, true);
+
+  const debtPlan = resolveDefiExitPlan({
+    asset: makeDefiAsset({
+      id: 'base:40acres_lending',
+      chain: 'base',
+      chainName: 'Base',
+      protocol: '40 Acres',
+      protocolAddress: '0x40ac2e40acb7bdd6ec83e468143262fe216529ec',
+      protocolUrl: 'https://www.40acres.finance/',
+      symbol: 'AERO',
+      underlyingSymbol: 'AERO',
+      uiBalance: 928.73,
+      grossUsd: 374.66,
+      defiPositionType: 'Lending',
+      defiDebtUsd: 180.13,
+      defiNetUsd: 194.53,
+      defiHealthFactor: 2.08,
+      defiDebtSummary: '179.93 USDC ($180.13) borrowed',
+    }),
+  });
+  assert.equal(debtPlan.protocolId, 'external_protocol');
+  assert.equal(debtPlan.exitStrategy, 'external_app_exit');
+  assert.equal(debtPlan.preflightStatus, 'blocked');
+  assert.match(debtPlan.preflightReason, /Health Factor 2\.08/i);
+  assert.match(debtPlan.preflightReason, /Net \$194\.53/i);
+
+  await assert.rejects(
+    prepareRealExecution({
+      asset: makeDefiAsset({
+        id: 'base:40acres_lending_exec',
+        chain: 'base',
+        chainName: 'Base',
+        protocol: '40 Acres',
+        protocolAddress: '0x40ac2e40acb7bdd6ec83e468143262fe216529ec',
+        protocolUrl: 'https://www.40acres.finance/',
+        symbol: 'AERO',
+        defiPositionType: 'Lending',
+        defiExitPlan: debtPlan,
+      }),
+      userAddress: USER,
+      solanaDestination: SAMPLE_SOLANA_WALLET,
+    }),
+    /external protocol|protocol app/i
+  );
 });

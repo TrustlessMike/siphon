@@ -1,6 +1,14 @@
-import { resolveProtocolFeeBps } from './chains.js';
+import { EVM_CHAINS, resolveProtocolFeeBps } from './chains.js';
+import { isEip2612Token } from './discovery.js';
 import { evaluateAssetRoi, evaluateChainBatchRoi, normalizeBatchWalletKey } from './roi.js';
-import type { AnyChainId, ScannedAsset, ScanReport } from './types.js';
+import type { AnyChainId, EvmChainId, ScannedAsset, ScanReport } from './types.js';
+
+export type DustExecutionLane =
+  | 'instant_single_sig'
+  | 'hybrid_single_sig_and_multi_swap'
+  | 'multi_input_batch'
+  | 'single_asset_bridge'
+  | 'skip_negative_roi';
 
 export interface DustChainPlan {
   chain: AnyChainId;
@@ -18,6 +26,18 @@ export interface DustChainPlan {
   recommendedRoute: 'local_batch_single_bridge' | 'direct_per_token_bridge' | 'skip_negative_roi';
   convertibleAssetIds: string[];
   skippedAssetIds: string[];
+  /** Two-lane signature reduction breakdown (Permit2 + EIP-2612 instant 1-sig vs consolidated multi-input swap) */
+  instantSingleSigAssetIds: string[];
+  multiInputSwapAssetIds: string[];
+  instantSingleSigCount: number;
+  permit2ReadyCount: number;
+  eip2612Count: number;
+  multiInputSwapCount: number;
+  naiveLegacySignatures: number;
+  optimizedLegacySignatures: number;
+  eip5792Signatures: number;
+  signaturesEliminated: number;
+  recommendedExecutionLane: DustExecutionLane;
   breakEvenHint?: string;
 }
 
@@ -32,6 +52,14 @@ export interface DustConversionPlan {
   estimatedNetSolanaUsdc: number;
   totalBatchRescueGainUsd: number;
   convertibleAssetIds: string[];
+  instantSingleSigAssetIds: string[];
+  multiInputSwapAssetIds: string[];
+  instantSingleSigCount: number;
+  multiInputSwapCount: number;
+  totalNaiveLegacySignatures: number;
+  totalOptimizedLegacySignatures: number;
+  totalEip5792Signatures: number;
+  totalSignaturesEliminated: number;
   chains: DustChainPlan[];
 }
 
@@ -129,6 +157,75 @@ export function planDustConversion(params: {
       ? skipped.map((s) => s.asset.id)
       : items.map((a) => a.id);
 
+    const convertibleAssets = isLegProfitable ? convertible.map((c) => c.asset) : [];
+    const isEvmChain = chain in EVM_CHAINS;
+    const instantSingleSigAssets: ScannedAsset[] = [];
+    const multiInputSwapAssets: ScannedAsset[] = [];
+    let permit2ReadyCount = 0;
+    let eip2612Count = 0;
+    let nativeCount = 0;
+
+    for (const asset of convertibleAssets) {
+      if (asset.address === 'native') {
+        nativeCount += 1;
+        continue;
+      }
+      const hasPermit2 = Boolean(asset.permit2Approved);
+      const hasEip2612 = Boolean(
+        asset.eip2612Supported ??
+          (isEvmChain && isEip2612Token(chain as EvmChainId, asset.address, asset.symbol))
+      );
+      if (hasPermit2) permit2ReadyCount += 1;
+      if (hasEip2612) eip2612Count += 1;
+
+      if (isEvmChain && (hasPermit2 || hasEip2612)) {
+        instantSingleSigAssets.push(asset);
+      } else {
+        multiInputSwapAssets.push(asset);
+      }
+    }
+
+    const instantSingleSigAssetIds = instantSingleSigAssets.map((a) => a.id);
+    const multiInputSwapAssetIds = multiInputSwapAssets.map((a) => a.id);
+
+    // Signature reduction math for non-EIP-5792 EOAs (e.g. Rabby 0.94.x) vs EIP-5792/7702 smart EOAs:
+    // - Naive per-token swap+bridge on a legacy EOA: 2 signatures per ERC-20 (approve + swap) + 1 per native.
+    // - Optimized Two-Lane on a legacy EOA:
+    //     * Instant Lane (Permit2 / EIP-2612): 1 off-chain EIP-712 signature covers ALL instant tokens.
+    //     * Multi-Input Lane (M legacy ERC-20s): M approves + 1 consolidated multi-input swap + 1 bridge
+    //       (when M >= 2, saving M - 2 swap/bridge popups; when M == 1, 2 sigs).
+    //     * Native gas token (if present): 1 sig.
+    const erc20Count = instantSingleSigAssets.length + multiInputSwapAssets.length;
+    const naiveLegacySignatures = isLegProfitable
+      ? isEvmChain
+        ? erc20Count * 2 + nativeCount
+        : convertibleAssets.length
+      : 0;
+    const instantLaneSigs = instantSingleSigAssets.length > 0 ? 1 : 0;
+    const legacyLaneSigs = !isEvmChain
+      ? multiInputSwapAssets.length
+      : multiInputSwapAssets.length >= 2
+      ? multiInputSwapAssets.length + 2
+      : multiInputSwapAssets.length * 2;
+    const optimizedLegacySignatures = isLegProfitable
+      ? Math.min(naiveLegacySignatures, instantLaneSigs + legacyLaneSigs + nativeCount)
+      : 0;
+    const eip5792Signatures = isLegProfitable ? 1 : 0;
+    const signaturesEliminated = Math.max(0, naiveLegacySignatures - optimizedLegacySignatures);
+
+    let recommendedExecutionLane: DustExecutionLane = 'skip_negative_roi';
+    if (isLegProfitable) {
+      if (instantSingleSigAssets.length > 0 && multiInputSwapAssets.length === 0 && nativeCount === 0) {
+        recommendedExecutionLane = 'instant_single_sig';
+      } else if (instantSingleSigAssets.length > 0 && multiInputSwapAssets.length > 0) {
+        recommendedExecutionLane = 'hybrid_single_sig_and_multi_swap';
+      } else if (multiInputSwapAssets.length >= 2) {
+        recommendedExecutionLane = 'multi_input_batch';
+      } else {
+        recommendedExecutionLane = 'single_asset_bridge';
+      }
+    }
+
     allConvertibleIds.push(...finalConvertibleIds);
 
     chains.push({
@@ -147,11 +244,25 @@ export function planDustConversion(params: {
       recommendedRoute: isLegProfitable ? batchRoi.routeComparison.recommendedStrategy : 'skip_negative_roi',
       convertibleAssetIds: finalConvertibleIds,
       skippedAssetIds: finalSkippedIds,
+      instantSingleSigAssetIds,
+      multiInputSwapAssetIds,
+      instantSingleSigCount: instantSingleSigAssetIds.length,
+      permit2ReadyCount,
+      eip2612Count,
+      multiInputSwapCount: multiInputSwapAssetIds.length,
+      naiveLegacySignatures,
+      optimizedLegacySignatures,
+      eip5792Signatures,
+      signaturesEliminated,
+      recommendedExecutionLane,
       breakEvenHint: batchRoi.breakEvenHint,
     });
   }
 
   chains.sort((a, b) => b.batchedConversionNetUsd - a.batchedConversionNetUsd);
+
+  const allInstantSingleSigIds = chains.flatMap((c) => c.instantSingleSigAssetIds);
+  const allMultiInputSwapIds = chains.flatMap((c) => c.multiInputSwapAssetIds);
 
   return {
     maxDustThresholdUsd,
@@ -168,6 +279,14 @@ export function planDustConversion(params: {
     estimatedNetSolanaUsdc: round2(chains.reduce((s, c) => s + c.batchedConversionNetUsd, 0)),
     totalBatchRescueGainUsd: round2(chains.reduce((s, c) => s + c.batchRescueGainUsd, 0)),
     convertibleAssetIds: allConvertibleIds,
+    instantSingleSigAssetIds: allInstantSingleSigIds,
+    multiInputSwapAssetIds: allMultiInputSwapIds,
+    instantSingleSigCount: allInstantSingleSigIds.length,
+    multiInputSwapCount: allMultiInputSwapIds.length,
+    totalNaiveLegacySignatures: chains.reduce((s, c) => s + c.naiveLegacySignatures, 0),
+    totalOptimizedLegacySignatures: chains.reduce((s, c) => s + c.optimizedLegacySignatures, 0),
+    totalEip5792Signatures: chains.reduce((s, c) => s + c.eip5792Signatures, 0),
+    totalSignaturesEliminated: chains.reduce((s, c) => s + c.signaturesEliminated, 0),
     chains,
   };
 }

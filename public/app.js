@@ -9,6 +9,7 @@ import {
   disconnectEvmWallet,
   disconnectFamilyWallet,
   disconnectSolanaWallet,
+  executeNonEvmDirectBatch,
   getConnectedEvmAddress,
   getConnectedFamilyWallet,
   getConnectedSolanaAddress,
@@ -39,12 +40,14 @@ let currentScan = null;
 let currentPlan = null;
 let selectedAssetIds = new Set();
 let batchRescuedDustIds = new Set();
+let lastDustPlan = null;
 let activeFamily = 'evm';
 let familyMetas = {};
 let activeFilter = 'all';
 let activeChainFilter = 'all';
 let activeView = 'scanner';
 let executionMode = 'direct'; // 'direct' | 'gasless'
+let uiMode = 'lite'; // 'lite' | 'pro'
 let outputAsset = 'USDC';
 let heroScene = null;
 let contractData = null;
@@ -58,6 +61,8 @@ let unifiedWallets = []; // [{ address, label, family }]
 let agentMandates = [];
 let agentApprovals = [];
 let pluginSetupData = null;
+let lastIssuedTokens = { claude_mcp: null, chatgpt_action: null };
+let latestIssuedToken = null;
 let defiStepperState = null;
 let manualDestConfirmedAddress = null;
 let isSweepQueueRunning = false;
@@ -66,6 +71,9 @@ let planSeq = 0;
 let solBalSeq = 0;
 
 const FEE_RECIPIENT_STORAGE_KEY = 'siphon_fee_recipient_evm';
+const UI_MODE_STORAGE_KEY = 'siphon_ui_mode';
+const PRO_ONLY_FILTERS = new Set(['low_efficiency', 'burn', 'skipped']);
+const PRO_ONLY_VIEWS = new Set(['agents', 'contract']);
 // Neutral all-zero Solana System Program address used strictly for read-only /api/plan previews
 // when the user has not yet connected or entered a Solana destination. Never used for execution.
 const PREVIEW_SOLANA_PLACEHOLDER = '11111111111111111111111111111111';
@@ -182,8 +190,12 @@ function syncDestinationUiState() {
   if (mandateNote) {
     const verified = getVerifiedSolanaDestination();
     mandateNote.textContent = verified
-      ? `Immutably locks destination → ${shortAddr(verified)}`
+      ? `Locked destination → ${shortAddr(verified)}`
       : 'Connect Solana or confirm a destination address first';
+    const destDot = document.getElementById('mandateDestDot');
+    destDot?.classList.toggle('is-ready', Boolean(verified));
+    const inlineConnectBtn = document.getElementById('mandateConnectSolBtn');
+    inlineConnectBtn?.classList.toggle('hidden', Boolean(verified));
   }
 }
 
@@ -390,6 +402,75 @@ function getActiveFeeRecipientEvm() {
   return null;
 }
 
+function isProMode() {
+  return uiMode === 'pro';
+}
+
+function syncUiModeButtons() {
+  document.documentElement.dataset.uiMode = uiMode;
+  document.querySelectorAll('.ui-mode-btn[data-ui-mode]').forEach((btn) => {
+    const isActive = btn.dataset.uiMode === uiMode;
+    btn.classList.toggle('active', isActive);
+    btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+  });
+}
+
+function initUiMode() {
+  let saved = null;
+  try {
+    saved = window.localStorage?.getItem(UI_MODE_STORAGE_KEY);
+  } catch {
+    saved = null;
+  }
+  uiMode = saved === 'pro' ? 'pro' : 'lite';
+  syncUiModeButtons();
+}
+
+function setUiMode(mode, { persist = true, silent = false } = {}) {
+  const next = mode === 'pro' ? 'pro' : 'lite';
+  const changed = next !== uiMode;
+  uiMode = next;
+  if (persist) {
+    try {
+      window.localStorage?.setItem(UI_MODE_STORAGE_KEY, uiMode);
+    } catch {
+      // ignore storage errors
+    }
+  }
+  syncUiModeButtons();
+
+  if (uiMode === 'lite') {
+    document.getElementById('feeOptionsDrawer')?.classList.add('hidden');
+    document.getElementById('unifiedWalletsBar')?.classList.add('hidden');
+    if (PRO_ONLY_VIEWS.has(activeView)) {
+      switchView('scanner');
+    }
+    if (PRO_ONLY_FILTERS.has(activeFilter)) {
+      activeFilter = 'all';
+      document.querySelectorAll('.filter-pill').forEach((b) => {
+        b.classList.toggle('active', b.dataset.filter === 'all');
+      });
+    }
+  }
+
+  updateFamilyChrome();
+  updateWalletButtons();
+  if (currentScan && currentPlan) {
+    renderAll();
+  }
+  const modal = document.getElementById('walletModalBackdrop');
+  if (modal && !modal.classList.contains('hidden')) {
+    renderWalletModalContent();
+  }
+  if (changed && !silent) {
+    showToast(
+      uiMode === 'pro'
+        ? 'Pro mode enabled — showing routing, EIP batching, proofs, and contract tools.'
+        : 'Lite mode enabled — simplified view.'
+    );
+  }
+}
+
 function showWebsite() {
   document.getElementById('siteShell').classList.remove('hidden');
   document.getElementById('appShell').classList.add('hidden');
@@ -401,6 +482,9 @@ function showWebsite() {
 
 function openApp(viewName = 'scanner') {
   const mapped = viewName === 'burns' || viewName === 'pipeline' ? 'activity' : viewName;
+  if (PRO_ONLY_VIEWS.has(mapped) && !isProMode()) {
+    setUiMode('pro', { persist: true, silent: true });
+  }
   document.getElementById('siteShell').classList.add('hidden');
   document.getElementById('appShell').classList.remove('hidden');
   heroScene?.setPaused(true);
@@ -424,6 +508,7 @@ function switchView(viewName) {
 window.showWebsite = showWebsite;
 window.openApp = openApp;
 window.switchView = switchView;
+window.setUiMode = setUiMode;
 
 async function refreshSolanaBalance() {
   const seq = ++solBalSeq;
@@ -491,6 +576,60 @@ function getActiveSourceWallet() {
   return getConnectedFamilyWallet(activeFamily);
 }
 
+function renderEmptyScanState() {
+  const meta = familyMetas[activeFamily];
+  const famShort = meta?.shortLabel || (activeFamily === 'evm' ? 'EVM' : activeFamily.toUpperCase());
+
+  const badge = document.getElementById('scanModeBadge');
+  if (badge) {
+    badge.textContent = 'Live RPC';
+    badge.classList.remove('is-live');
+  }
+  const sourceSummaryEl = document.getElementById('sourceSummaryText');
+  if (sourceSummaryEl) {
+    sourceSummaryEl.textContent = `Connect a ${famShort} wallet or enter an address to scan`;
+  }
+  const tabLegEl = document.getElementById('tabLegCount');
+  if (tabLegEl) tabLegEl.textContent = '0';
+  const tabBurnEl = document.getElementById('tabBurnCount');
+  if (tabBurnEl) {
+    const activeJobsCount = backgroundJobs.filter((j) => j.status === 'active').length;
+    tabBurnEl.textContent = String(activeJobsCount);
+  }
+  const defiPanel = document.getElementById('defiUnwindPanel');
+  if (defiPanel) defiPanel.classList.add('hidden');
+  const defiGroups = document.getElementById('defiProtocolGroups');
+  if (defiGroups) defiGroups.innerHTML = '';
+  const chainFilterBar = document.getElementById('chainFilterBar');
+  if (chainFilterBar) chainFilterBar.innerHTML = '';
+  const assetListBody = document.getElementById('assetListBody');
+  if (assetListBody) {
+    assetListBody.innerHTML = `<div style="text-align:center; padding:42px 16px; color:var(--ink-3); font-size:13px;">Connect a ${escapeHtml(famShort)} wallet or enter an address above to scan balances across chains.</div>`;
+  }
+  const chainQueueList = document.getElementById('chainQueueList');
+  if (chainQueueList) chainQueueList.innerHTML = '';
+  const netEl = document.getElementById('kpiNetUsdc');
+  if (netEl) netEl.textContent = outputAsset === 'SOL' ? '0.00 SOL' : '$0.00';
+  const subEl = document.getElementById('kpiNetSub');
+  if (subEl) subEl.textContent = outputAsset === 'SOL' ? '≈ $0.00 USDC · ~2–15s auto-fill' : '≈ 0.00 SOL · ~2–15s auto-fill';
+  const selTextEl = document.getElementById('summarySelectedText');
+  if (selTextEl) selTextEl.textContent = '0 assets · 0 chains';
+  const gasEl = document.getElementById('summaryGasText');
+  if (gasEl) gasEl.textContent = '$0.00 · 1 click / chain';
+  const feeEl = document.getElementById('summaryFeeText');
+  if (feeEl) feeEl.textContent = `${(getActiveProtocolFeeBps() / 100).toFixed(1)}% · $0.00`;
+  const burnCount = document.getElementById('burnManifestCount');
+  if (burnCount) burnCount.textContent = '0 tokens';
+  const burnBody = document.getElementById('burnTableBody');
+  if (burnBody) {
+    burnBody.innerHTML = `<tr><td colspan="5" style="text-align:center; padding:28px; color:var(--ink-3);">Scan a wallet to detect zero-liquidity or honeypot tokens.</td></tr>`;
+  }
+  const svgHost = document.getElementById('convergenceSvgHost');
+  if (svgHost) svgHost.innerHTML = '';
+  renderPreSignProofCard(null);
+  updateWalletButtons();
+}
+
 function updateFamilyChrome() {
   const meta = familyMetas[activeFamily];
   document.querySelectorAll('.family-pill[data-family]').forEach((btn) => {
@@ -500,24 +639,15 @@ function updateFamilyChrome() {
   if (appIn && meta?.addressHint) {
     appIn.placeholder = `Scan ${meta.addressHint}`;
   }
-  const presetsBar = document.getElementById('sourcePresetsBar');
-  if (presetsBar) {
-    if (activeFamily === 'evm') {
-      presetsBar.innerHTML = `
-        <button type="button" class="text-action" data-preset="vitalik_live">vitalik.eth</button>
-        <span class="sep-dot">·</span>
-        <button type="button" class="text-action muted" data-preset="veteran_defi">Sample DeFi</button>
-      `;
-      presetsBar.querySelectorAll('[data-preset]').forEach((btn) => {
-        btn.addEventListener('click', () => runScan({ presetId: btn.dataset.preset, autoOpen: false }));
-      });
-    } else if (meta?.sampleAddress) {
-      presetsBar.innerHTML = `
-        <button type="button" class="text-action" id="familySampleBtn">${escapeHtml(meta.sampleLabel || `Sample ${meta.shortLabel}`)}</button>
-      `;
-      document.getElementById('familySampleBtn')?.addEventListener('click', () => {
-        runScan({ address: meta.sampleAddress, family: activeFamily, autoOpen: false });
-      });
+  if (!currentScan) {
+    const famShort = meta?.shortLabel || (activeFamily === 'evm' ? 'EVM' : activeFamily.toUpperCase());
+    const sourceSummaryEl = document.getElementById('sourceSummaryText');
+    if (sourceSummaryEl) {
+      sourceSummaryEl.textContent = `Connect a ${famShort} wallet or enter an address to scan`;
+    }
+    const assetListBody = document.getElementById('assetListBody');
+    if (assetListBody) {
+      assetListBody.innerHTML = `<div style="text-align:center; padding:42px 16px; color:var(--ink-3); font-size:13px;">Connect a ${escapeHtml(famShort)} wallet or enter an address above to scan balances across chains.</div>`;
     }
   }
   const proofBtn = document.getElementById('verifyProofBtn');
@@ -530,27 +660,28 @@ function updateFamilyChrome() {
   updateWalletButtons();
 }
 
-function selectFamily(family, { autoScanSample = true } = {}) {
+function selectFamily(family, { autoScanConnected = true } = {}) {
   activeFamily = family || 'evm';
-  if (activeFamily !== 'evm') {
-    executionMode = 'gasless';
-    document.querySelectorAll('.mode-opt[data-exec-mode]').forEach((b) => {
-      b.classList.toggle('active', b.dataset.execMode === executionMode);
-    });
-  }
+  // Default to Direct conversion mode across all families (matches Rabby/EVM UX; users can still toggle Gasless)
+  executionMode = 'direct';
+  document.querySelectorAll('.mode-opt[data-exec-mode]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.execMode === executionMode);
+  });
   updateFamilyChrome();
-  const meta = familyMetas[activeFamily];
   const connected = getConnectedFamilyWallet(activeFamily);
-  if (autoScanSample) {
-    if (connected?.address) {
-      runScan({ address: connected.address, family: activeFamily, autoOpen: false });
-    } else if (activeFamily === 'evm') {
-      if (currentScan?.family && currentScan.family !== 'evm') {
-        runScan({ presetId: 'vitalik_live', autoOpen: false });
-      }
-    } else if (meta?.sampleAddress) {
-      runScan({ address: meta.sampleAddress, family: activeFamily, autoOpen: false });
-    }
+  if (autoScanConnected && connected?.address) {
+    runScan({ address: connected.address, family: activeFamily, autoOpen: false });
+  } else if (currentScan?.family && currentScan.family !== activeFamily) {
+    currentScan = null;
+    currentPlan = null;
+    selectedAssetIds.clear();
+    batchRescuedDustIds.clear();
+    lastDustPlan = null;
+    renderDustStrategyBanner();
+    defiStepperState = null;
+    const appIn = document.getElementById('appEvmInput');
+    if (appIn) appIn.value = '';
+    renderEmptyScanState();
   }
 }
 
@@ -617,18 +748,25 @@ function updateWalletButtons() {
       ctaBtn.textContent = 'Sweep in progress…';
       ctaBtn.disabled = true;
     } else if (!srcAddr) {
-      ctaBtn.textContent = `Connect ${famShort} Wallet to Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`;
+      ctaBtn.textContent = isProMode()
+        ? `Connect ${famShort} Wallet to Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`
+        : `Connect ${famShort} Wallet to Sweep`;
       ctaBtn.disabled = false;
-    } else if (executionMode === 'gasless' || activeFamily !== 'evm') {
+    } else if (!isProMode()) {
+      ctaBtn.textContent = `Sweep to Solana →`;
+      ctaBtn.disabled = false;
+    } else if (executionMode === 'gasless') {
       ctaBtn.textContent = `Gasless 1-Sig Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'}) →`;
       ctaBtn.disabled = false;
     } else {
-      ctaBtn.textContent = `Sweep ${n} ${n === 1 ? 'Chain' : 'Chains'} to Solana →`;
+      ctaBtn.textContent = `Convert & Sweep ${n} ${n === 1 ? 'Chain' : 'Chains'} to Solana →`;
       ctaBtn.disabled = false;
     }
   }
   if (ctaNote) {
-    if (activeFamily !== 'evm' && meta?.gasSponsorshipMechanism) {
+    if (!isProMode()) {
+      ctaNote.textContent = 'Sweeps directly to your Solana wallet';
+    } else if (activeFamily !== 'evm' && meta?.gasSponsorshipMechanism) {
       ctaNote.textContent = meta.gasSponsorshipMechanism;
     } else if (executionMode === 'gasless') {
       ctaNote.textContent = `$0 native gas required · 1 off-chain Permit2 / EIP-7702 signature · gas paid from fee`;
@@ -644,7 +782,12 @@ function updateWalletButtons() {
 
 let scanSeq = 0;
 
-async function runScan({ address = null, family = null, presetId = null, autoOpen = false } = {}) {
+async function runScan({ address = null, family = null, autoOpen = false } = {}) {
+  const cleanAddr = String(address || '').trim();
+  if (!cleanAddr) {
+    showToast('Enter a wallet address to scan.');
+    return;
+  }
   const seq = ++scanSeq;
   heroScene?.setActive(true);
   const scanBtn = document.getElementById('appScanBtn');
@@ -653,11 +796,7 @@ async function runScan({ address = null, family = null, presetId = null, autoOpe
     scanBtn.textContent = 'Scanning…';
   }
   try {
-    const payload = presetId
-      ? { presetId }
-      : address
-      ? { address, family: family || activeFamily }
-      : { presetId: 'vitalik_live' };
+    const payload = { address: cleanAddr, family: family || activeFamily };
     const scan = await api('/api/scan', {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -665,14 +804,10 @@ async function runScan({ address = null, family = null, presetId = null, autoOpe
     if (seq !== scanSeq) return;
     currentScan = scan;
     batchRescuedDustIds.clear();
+    lastDustPlan = null;
+    renderDustStrategyBanner();
     if (scan.family && scan.family !== activeFamily) {
       activeFamily = scan.family;
-      if (activeFamily !== 'evm') {
-        executionMode = 'gasless';
-        document.querySelectorAll('.mode-opt[data-exec-mode]').forEach((b) => {
-          b.classList.toggle('active', b.dataset.execMode === executionMode);
-        });
-      }
     }
     updateFamilyChrome();
     activeChainFilter = 'all';
@@ -685,17 +820,14 @@ async function runScan({ address = null, family = null, presetId = null, autoOpe
 
     const appIn = document.getElementById('appEvmInput');
     if (appIn) appIn.value = currentScan.walletAddress;
-    if (address) {
+    if (cleanAddr) {
       const heroIn = document.getElementById('heroWalletInput');
       if (heroIn) heroIn.value = currentScan.walletAddress;
     }
 
     const badge = document.getElementById('scanModeBadge');
     if (badge) {
-      badge.textContent =
-        currentScan.mode === 'live_rpc'
-          ? `Live · ${currentScan.scanDurationMs}ms`
-          : currentScan.walletLabel || 'Sample';
+      badge.textContent = `Live · ${currentScan.scanDurationMs}ms`;
       badge.classList.toggle('is-live', currentScan.mode === 'live_rpc');
     }
 
@@ -781,15 +913,18 @@ function renderAll() {
   const tabBurnEl = document.getElementById('tabBurnCount');
   const activeJobsCount = backgroundJobs.filter((j) => j.status === 'active').length;
   if (tabBurnEl) {
-    tabBurnEl.textContent = String(activeJobsCount || currentPlan.burnManifest.length);
+    tabBurnEl.textContent = String(
+      isProMode() ? activeJobsCount || currentPlan.burnManifest.length : activeJobsCount
+    );
   }
 
   // Quiet source strip summary
   const sourceSummaryEl = document.getElementById('sourceSummaryText');
   if (sourceSummaryEl) {
+    const activeChainCount = currentScan.chains.filter((c) => c.assetCount > 0).length;
     const blockedNote =
-      t.honeypotsSkippedCount > 0 ? ` · ${t.honeypotsSkippedCount} honeypot blocked` : '';
-    sourceSummaryEl.textContent = `$${currentScan.totals.grossUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} across ${currentScan.chains.filter((c) => c.assetCount > 0).length} chains${blockedNote}`;
+      isProMode() && t.honeypotsSkippedCount > 0 ? ` · ${t.honeypotsSkippedCount} honeypot blocked` : '';
+    sourceSummaryEl.textContent = `$${currentScan.totals.grossUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} across ${activeChainCount} ${activeChainCount === 1 ? 'chain' : 'chains'}${blockedNote}`;
   }
 
   // Right Sticky Sweep Card: Payout Hero
@@ -805,7 +940,11 @@ function renderAll() {
   }
   const subEl = document.getElementById('kpiNetSub');
   if (subEl) {
-    const eta = pref === 'cctp' ? `~${t.estimatedFastestSec || 20}s Circle CCTP` : '~2–15s auto-fill';
+    const eta = !isProMode()
+      ? 'arrives in seconds'
+      : pref === 'cctp'
+      ? `~${t.estimatedFastestSec || 20}s Circle CCTP`
+      : '~2–15s auto-fill';
     subEl.textContent =
       outputAsset === 'SOL'
         ? `≈ $${t.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })} USDC · ${eta}`
@@ -815,8 +954,18 @@ function renderAll() {
   // Receipt Summary Rows
   const selTextEl = document.getElementById('summarySelectedText');
   if (selTextEl) {
-    const burnPart = t.tokensBurnedCount > 0 ? ` · ${t.tokensBurnedCount} burns` : '';
-    selTextEl.textContent = `${t.tokensSoldCount + t.defiWithdrawnCount} assets${burnPart} (${currentPlan.legs.length} chains)`;
+    const assetCount = t.tokensSoldCount + t.defiWithdrawnCount;
+    const chainCount = currentPlan.legs.length;
+    const burnPart = isProMode() && t.tokensBurnedCount > 0 ? ` · ${t.tokensBurnedCount} burns` : '';
+    selTextEl.textContent = `${assetCount} ${assetCount === 1 ? 'asset' : 'assets'}${burnPart} (${chainCount} ${chainCount === 1 ? 'chain' : 'chains'})`;
+  }
+  const liteCostEl = document.getElementById('summaryLiteCostText');
+  if (liteCostEl) {
+    const combinedFees = safeNum(t.totalGasUsd) + safeNum(t.protocolFeeUsd);
+    liteCostEl.textContent =
+      currentPlan.legs.length > 0
+        ? `~$${combinedFees.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+        : '$0.00';
   }
   const routeLogosEl = document.getElementById('summaryRouteLogos');
   if (routeLogosEl) routeLogosEl.innerHTML = getBridgeProviderLogosHtml(pref);
@@ -901,6 +1050,18 @@ function formatRoiTooltip(a) {
 function renderRoiVerdictBadge(a) {
   if (a.action === 'SKIP_HONEYPOT') return `<span class="action-tag tag-skip">Honeypot</span>`;
   if (a.action === 'BURN_ZERO_LIQUIDITY') return `<span class="action-tag tag-burn">Burn $0</span>`;
+  if (isDefiAsset(a) && a.defiExitPlan?.preflightStatus === 'blocked') {
+    const tip = escapeHtml(a.defiExitPlan?.preflightReason || a.actionReason || '');
+    if (a.defiExitPlan.exitStrategy === 'cooldown_blocked' || a.defiExitPlan.cooldownDetected) {
+      return `<span class="roi-pill roi-low" title="${tip}">Locked</span>`;
+    }
+    if ((a.defiDebtUsd || a.defiExitPlan.debtUsd || 0) > 0) {
+      return `<span class="roi-pill roi-low" title="${tip}">Debt Guard</span>`;
+    }
+    if (a.defiExitPlan.exitStrategy === 'external_app_exit') {
+      return `<span class="action-tag tag-defi" title="${tip}">Protocol App</span>`;
+    }
+  }
   const v = a.roiVerdict;
   const pct = typeof a.effectiveCostPct === 'number' ? a.effectiveCostPct.toFixed(0) : null;
   const net = typeof a.netRoiUsd === 'number' ? a.netRoiUsd : null;
@@ -989,6 +1150,7 @@ function getPlainDisplayToken(asset, plan) {
     lowSym.startsWith('susde') ||
     lowSym.startsWith('gt') ||
     lowSym.startsWith('mw') ||
+    lowSym.startsWith('yv') ||
     lowSym.includes('vault');
   if (isReceiptToken) return underlying;
   return sym || underlying;
@@ -997,44 +1159,80 @@ function getPlainDisplayToken(asset, plan) {
 function normalizeDefiPosition(asset, targetOut = outputAsset) {
   const plan = asset?.defiExitPlan && typeof asset.defiExitPlan === 'object' ? asset.defiExitPlan : null;
   const protocolGroup = getProtocolGroupName(asset);
-  const protocolLogo = getProtocolLogoPath(protocolGroup) || getProtocolLogoPath(asset?.protocol) || '/logos/vault.svg';
+  const localLogo = getProtocolLogoPath(protocolGroup) || getProtocolLogoPath(asset?.protocol) || '/logos/vault.svg';
+  const remoteLogo = safeHttpUrl(asset?.protocolLogoUrl || plan?.protocolLogoUrl);
+  const protocolLogo = localLogo === '/logos/vault.svg' && remoteLogo ? remoteLogo : localLogo;
+  const protocolUrl = safeHttpUrl(asset?.protocolUrl || plan?.protocolUrl);
   const chainLogo = getChainLogoPath(asset?.chain);
-  const modeRaw = String(plan?.mode || plan?.exitMode || plan?.strategy || '').toLowerCase();
+  const modeRaw = String(
+    plan?.exitStrategy || plan?.routeKind || plan?.mode || plan?.exitMode || plan?.strategy || ''
+  ).toLowerCase();
   const statusRaw = String(plan?.preflightStatus || plan?.status || plan?.healthStatus || '').toLowerCase();
   const protoLow = protocolGroup.toLowerCase();
+
+  const debtUsd = Number(asset?.aaveDebtUsd || asset?.defiDebtUsd || plan?.debtUsd || 0);
+  const netUsd =
+    typeof asset?.defiNetUsd === 'number'
+      ? asset.defiNetUsd
+      : typeof plan?.netUsd === 'number'
+      ? plan.netUsd
+      : null;
+  const healthFactor =
+    typeof asset?.aaveHealthFactor === 'number'
+      ? asset.aaveHealthFactor
+      : typeof asset?.defiHealthFactor === 'number'
+      ? asset.defiHealthFactor
+      : typeof plan?.projectedHealthFactor === 'number'
+      ? plan.projectedHealthFactor
+      : null;
+  const unlockAt = Number(asset?.defiUnlockAt || plan?.unlockAt || 0);
+  const isExternalApp = Boolean(
+    plan?.protocolId === 'external_protocol' ||
+      plan?.exitStrategy === 'external_app_exit' ||
+      plan?.routeKind === 'external_app'
+  );
 
   const hasDebt = Boolean(
     plan?.debtGuardActive ||
       modeRaw.includes('debt') ||
       modeRaw.includes('partial') ||
-      (typeof asset?.aaveDebtUsd === 'number' && asset.aaveDebtUsd > 0)
+      debtUsd > 0
+  );
+  const explicitSwapStrategy = Boolean(
+    modeRaw.includes('direct_swap') ||
+      modeRaw.includes('instant_dex_swap') ||
+      modeRaw.includes('swap') ||
+      asset?.stakedExitMode === 'instant_liquid_stake'
   );
   const hasCooldown = Boolean(
-    modeRaw.includes('cooldown') ||
-      modeRaw.includes('lock') ||
-      modeRaw.includes('unstake') ||
-      statusRaw === 'cooldown' ||
-      statusRaw === 'locked' ||
-      asset?.stakedExitMode === 'native_unstake' ||
-      asset?.stakedExitMode === 'scheduled_authz_autosweep'
+    !explicitSwapStrategy &&
+      (plan?.cooldownDetected ||
+        modeRaw.includes('cooldown') ||
+        modeRaw.includes('unbonding') ||
+        modeRaw.includes('lock') ||
+        modeRaw.includes('unstake') ||
+        statusRaw === 'cooldown' ||
+        statusRaw === 'locked' ||
+        unlockAt > Math.floor(Date.now() / 1000) ||
+        asset?.stakedExitMode === 'native_unstake' ||
+        asset?.stakedExitMode === 'scheduled_authz_autosweep')
   );
   const isInstantSwap = Boolean(
-    modeRaw.includes('instant') ||
-      modeRaw.includes('swap') ||
-      asset?.stakedExitMode === 'instant_liquid_stake' ||
-      protoLow.includes('lido')
+    explicitSwapStrategy || (!hasCooldown && protoLow.includes('lido'))
   );
 
   let category = 'one_click';
   if (hasCooldown) category = 'cooldown';
   else if (hasDebt) category = 'debt_guard';
   else if (isInstantSwap) category = 'instant_swap';
+  else if (isExternalApp) category = 'external_app';
 
   const defaultBadges = {
     one_click: '⚡ 1-Click Extract → Solana',
     instant_swap: '🔄 Instant Swap (Skips Cooldown)',
-    debt_guard: '🛡️ Safe Partial (Debt Guard)',
+    debt_guard: isExternalApp ? '🛡️ Active Borrow · Protocol App' : '🛡️ Safe Partial (Debt Guard)',
     cooldown: '⏳ Cooldown / Locked',
+    external_app: '↗ Protocol App Position',
   };
   const badgeText =
     plan?.badgeLabel || plan?.humanBadge
@@ -1048,6 +1246,8 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
       ? plan.withdrawableUi
       : typeof plan?.maxSafeWithdrawUi === 'number'
       ? plan.maxSafeWithdrawUi
+      : typeof plan?.expectedUnderlyingUi === 'number' && plan.expectedUnderlyingUi > 0
+      ? plan.expectedUnderlyingUi
       : Number(asset?.uiBalance || 0);
   const amountFmt = withdrawableUi.toLocaleString(undefined, { maximumFractionDigits: 4 });
 
@@ -1070,10 +1270,20 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
       : 1;
   const sigLabel = sigCount <= 1 ? '1 signature' : `${sigCount} guided steps`;
 
+  const posType = asset?.defiPositionType || plan?.positionType || '';
   const customRoute = plan?.routeLine || plan?.routeSummary || plan?.plainRoute;
-  const routeLine = customRoute
-    ? sanitizePlainDefiText(customRoute)
-    : `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken} → Solana ${targetOut} · ${sigLabel}`;
+  let routeLine;
+  if (customRoute) {
+    routeLine = sanitizePlainDefiText(customRoute);
+  } else if (isExternalApp && hasDebt) {
+    const netPart = netUsd !== null ? ` · Net $${netUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '';
+    const hfPart = healthFactor !== null ? ` · HF ${healthFactor.toFixed(2)}` : '';
+    routeLine = `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken} supplied${netPart}${hfPart}`;
+  } else if (isExternalApp) {
+    routeLine = `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken}${posType ? ` · ${posType}` : ''}`;
+  } else {
+    routeLine = `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken} → Solana ${targetOut} · ${sigLabel}`;
+  }
 
   // Pre-flight status pill & plain-English warning reason
   let preflightLevel = 'verified'; // 'verified' | 'warn' | 'blocked'
@@ -1087,27 +1297,63 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
       statusRaw === 'failed' ||
       asset?.action === 'SKIP_HONEYPOT'
   );
+  const safePartialReady = Boolean(
+    plan?.safePartialSupported ||
+      plan?.exitStrategy === 'safe_partial_debt_exit' ||
+      (typeof plan?.maxSafeWithdrawUi === 'number' && plan.maxSafeWithdrawUi > 0) ||
+      (typeof plan?.safeMaxWithdrawUsd === 'number' && plan.safeMaxWithdrawUsd > 0)
+  );
+  const planReason = sanitizePlainDefiText(
+    plan?.blockReason || plan?.preflightReason || plan?.preflightMessage || plan?.warning || plan?.reason
+  );
 
-  if (explicitlyBlocked) {
+  if (explicitlyBlocked && hasCooldown) {
+    preflightLevel = 'blocked';
+    const unlockStr =
+      unlockAt > 0
+        ? new Date(unlockAt * 1000).toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+            timeZone: 'UTC',
+          })
+        : '';
+    preflightLabel = unlockStr ? `⏳ Locked until ${unlockStr}` : '⏳ Locked';
+    warningReason =
+      planReason || 'This position is currently locked and must unlock before it can be withdrawn.';
+  } else if (explicitlyBlocked && hasDebt) {
+    preflightLevel = 'blocked';
+    preflightLabel =
+      healthFactor !== null
+        ? `🛡️ Debt guard · HF ${healthFactor.toFixed(2)}`
+        : '🛡️ Debt guard active';
+    warningReason =
+      planReason ||
+      `Active borrow of $${debtUsd.toFixed(2)}. Repay debt or manage directly on ${protocolGroup}.`;
+  } else if (explicitlyBlocked && isExternalApp) {
+    preflightLevel = 'blocked';
+    preflightLabel = `↗ Manage on ${protocolGroup}`;
+    warningReason =
+      planReason ||
+      `Withdraw on ${protocolGroup}, then sweep unlocked ${displayToken} to Solana.`;
+  } else if (explicitlyBlocked) {
     preflightLevel = 'blocked';
     preflightLabel = '✕ Cannot withdraw';
-    warningReason =
-      sanitizePlainDefiText(plan?.blockReason || plan?.preflightMessage || plan?.warning || plan?.reason) ||
-      'Pre-flight check detected a restriction on this position.';
+    warningReason = planReason || 'Pre-flight check detected a restriction on this position.';
   } else if (hasCooldown) {
     preflightLevel = 'warn';
     preflightLabel = '⏳ Cooldown required';
     warningReason =
-      sanitizePlainDefiText(plan?.preflightMessage || plan?.cooldownLabel || plan?.warning || plan?.reason) ||
+      planReason ||
+      sanitizePlainDefiText(plan?.cooldownLabel) ||
       'This protocol requires an unbonding cooldown period before tokens can be bridged to Solana.';
   } else if (hasDebt) {
-    const safePartialReady = Boolean(plan?.safePartialSupported || (typeof plan?.maxSafeWithdrawUi === 'number' && plan.maxSafeWithdrawUi > 0));
     preflightLevel = safePartialReady ? 'warn' : 'blocked';
     preflightLabel = safePartialReady ? '🛡️ Safe partial ready' : '🛡️ Debt guard active';
-    const debtStr = typeof asset?.aaveDebtUsd === 'number' ? `$${asset.aaveDebtUsd.toFixed(2)}` : 'active';
-    const hfStr = typeof asset?.aaveHealthFactor === 'number' ? ` (health factor ${asset.aaveHealthFactor.toFixed(2)})` : '';
+    const debtStr = debtUsd > 0 ? `$${debtUsd.toFixed(2)}` : 'active';
+    const hfStr = healthFactor !== null ? ` (health factor ${healthFactor.toFixed(2)})` : '';
     warningReason =
-      sanitizePlainDefiText(plan?.preflightMessage || plan?.warning || plan?.reason) ||
+      planReason ||
       (safePartialReady
         ? `Active borrow of ${debtStr}${hfStr}. Siphon withdraws only the safe excess collateral.`
         : `Active borrow of ${debtStr}${hfStr}. Repay borrow before full withdrawal to protect your position.`);
@@ -1125,12 +1371,13 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
   } else if (statusRaw === 'warn' || statusRaw === 'warning' || statusRaw === 'caution') {
     preflightLevel = 'warn';
     preflightLabel = sanitizePlainDefiText(plan?.preflightLabel) || '⚠ Review before exit';
-    warningReason = sanitizePlainDefiText(plan?.preflightMessage || plan?.warning || plan?.reason) || '';
+    warningReason = planReason || '';
   }
 
   const isReady =
-    preflightLevel === 'verified' ||
-    (preflightLevel === 'warn' && !hasCooldown && (!hasDebt || Boolean(plan?.safePartialSupported || (typeof plan?.maxSafeWithdrawUi === 'number' && plan.maxSafeWithdrawUi > 0))));
+    !isExternalApp &&
+    (preflightLevel === 'verified' ||
+      (preflightLevel === 'warn' && !hasCooldown && (!hasDebt || safePartialReady)));
 
   const contractAddress =
     plan?.contractAddress || plan?.targetContract || plan?.poolAddress || asset?.protocolAddress || asset?.address || '—';
@@ -1141,6 +1388,7 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
     asset,
     protocolGroup,
     protocolLogo,
+    protocolUrl,
     chainLogo,
     category,
     badgeText,
@@ -1149,6 +1397,9 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
     preflightLabel,
     warningReason,
     isReady,
+    isExternalApp,
+    debtUsd,
+    netUsd,
     requiresTwoStep,
     sigCount,
     underlyingSym,
@@ -1200,7 +1451,7 @@ function renderDefiGuidedStepper() {
       <div class="inline-logo-row">
         <span class="agent-pulse-dot ${st.active ? '' : 'is-idle'}"></span>
         <strong>${escHtml(st.title)}</strong>
-        <span class="mono muted-xs">${escHtml(st.mode === 'two_stage' ? 'Guided 2-Stage Auto-Bridge' : '1-Click Atomic Extract')}</span>
+        <span class="mono muted-xs pro-only">${escHtml(st.mode === 'two_stage' ? 'Guided 2-Stage Auto-Bridge' : '1-Click Atomic Extract')}</span>
       </div>
       ${
         st.dismissible
@@ -1306,6 +1557,7 @@ function renderDefiUnwindPanel() {
       groupMap.set(key, {
         name: key,
         logo: pos.protocolLogo,
+        protocolUrl: pos.protocolUrl || '',
         positions: [],
         totalUsd: 0,
         readyCount: 0,
@@ -1314,6 +1566,7 @@ function renderDefiUnwindPanel() {
     const grp = groupMap.get(key);
     grp.positions.push(pos);
     grp.totalUsd += Number(pos.asset.grossUsd || 0);
+    if (!grp.protocolUrl && pos.protocolUrl) grp.protocolUrl = pos.protocolUrl;
     if (pos.isReady) grp.readyCount += 1;
   }
   const groups = Array.from(groupMap.values()).sort((a, b) => b.totalUsd - a.totalUsd);
@@ -1327,7 +1580,7 @@ function renderDefiUnwindPanel() {
           const badgeClass =
             pos.category === 'one_click'
               ? 'defi-badge-oneclick'
-              : pos.category === 'instant_swap'
+              : pos.category === 'instant_swap' || pos.category === 'external_app'
               ? 'defi-badge-swap'
               : pos.category === 'debt_guard'
               ? 'defi-badge-guard'
@@ -1339,6 +1592,10 @@ function renderDefiUnwindPanel() {
               ? 'defi-status-warn'
               : 'defi-status-blocked';
           const usdStr = `$${Number(a.grossUsd || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+          const netSubStr =
+            pos.debtUsd > 0 && pos.netUsd !== null
+              ? `Net $${pos.netUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
+              : a.chainName;
 
           const techDetailsRows = [
             `<div class="defi-tech-kv"><span>Protocol contract</span><code class="mono">${escHtml(pos.contractAddress)}</code></div>`,
@@ -1374,20 +1631,41 @@ function renderDefiUnwindPanel() {
                       ? `<div class="defi-pos-warning is-${escHtml(pos.preflightLevel)}">${escHtml(pos.warningReason)}</div>`
                       : ''
                   }
-                  <details class="defi-tech-details">
+                  <details class="defi-tech-details pro-only">
                     <summary>Technical details</summary>
                     <div class="defi-tech-grid">${techDetailsRows}</div>
                   </details>
                 </div>
                 <div class="defi-pos-right">
                   <strong class="mono defi-pos-usd">${escHtml(usdStr)}</strong>
-                  <span class="mono muted-xs">${escHtml(a.chainName)}</span>
+                  <span class="mono muted-xs">${escHtml(netSubStr)}</span>
                 </div>
               </div>
             </div>
           `;
         })
         .join('');
+
+      const headerActionHtml =
+        grp.readyCount > 0
+          ? `<button
+              type="button"
+              class="btn-outline-sm defi-proto-extract-btn"
+              data-extract-protocol="${escHtml(grp.name)}"
+            >Extract ${escHtml(grp.name)} →</button>`
+          : grp.protocolUrl
+          ? `<a
+              class="btn-outline-sm defi-proto-extract-btn"
+              href="${escHtml(grp.protocolUrl)}"
+              target="_blank"
+              rel="noreferrer"
+              style="text-decoration:none; display:inline-flex; align-items:center;"
+            >Manage on ${escHtml(grp.name)} ↗</a>`
+          : `<button
+              type="button"
+              class="btn-outline-sm defi-proto-extract-btn"
+              disabled
+            >Locked / Guarded</button>`;
 
       return `
         <div class="defi-protocol-group" data-protocol-group="${escHtml(grp.name)}">
@@ -1401,20 +1679,19 @@ function renderDefiUnwindPanel() {
                 <span class="mono muted-xs">${grp.positions.length} ${grp.positions.length === 1 ? 'position' : 'positions'} · $${grp.totalUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
               </div>
             </div>
-            <button
-              type="button"
-              class="btn-outline-sm defi-proto-extract-btn"
-              data-extract-protocol="${escHtml(grp.name)}"
-              ${grp.readyCount === 0 ? 'disabled' : ''}
-            >
-              ${grp.readyCount > 0 ? `Extract ${escHtml(grp.name)} →` : 'Locked / Guarded'}
-            </button>
+            ${headerActionHtml}
           </div>
           <div class="defi-pos-list">${posRowsHtml}</div>
         </div>
       `;
     })
     .join('');
+
+  groupsHost.querySelectorAll('.defi-proto-logo-img').forEach((img) => {
+    img.addEventListener('error', () => {
+      if (!img.src.endsWith('/logos/vault.svg')) img.src = '/logos/vault.svg';
+    });
+  });
 
   // Wire checkboxes inside DeFi panel to stay 100% synced with selectedAssetIds & plan
   groupsHost.querySelectorAll('.defi-pos-chk').forEach((chk) => {
@@ -1564,7 +1841,7 @@ function renderAssetList() {
 
   const filtered = currentScan.assets.filter((a) => {
     if (activeChainFilter !== 'all' && a.chain !== activeChainFilter) return false;
-    if (activeFilter === 'defi') return a.action === 'WITHDRAW_AND_BRIDGE';
+    if (activeFilter === 'defi') return isDefiAsset(a);
     if (activeFilter === 'dust')
       return (
         a.grossUsd > 0 &&
@@ -1598,8 +1875,12 @@ function renderAssetList() {
   host.innerHTML = filtered
     .map((a) => {
       const checked = selectedAssetIds.has(a.id);
-      const disabled = a.action === 'SKIP_HONEYPOT';
-      const protoLogo = a.protocol ? getProtocolLogoPath(a.protocol) : null;
+      const defiNorm = isDefiAsset(a) ? normalizeDefiPosition(a, outputAsset) : null;
+      const disabled = a.action === 'SKIP_HONEYPOT' || Boolean(defiNorm && defiNorm.preflightLevel === 'blocked');
+      const localProtoLogo = a.protocol ? getProtocolLogoPath(a.protocol) : null;
+      const remoteProtoLogo = safeHttpUrl(a.protocolLogoUrl || a.defiExitPlan?.protocolLogoUrl);
+      const protoLogo =
+        localProtoLogo === '/logos/vault.svg' && remoteProtoLogo ? remoteProtoLogo : localProtoLogo;
       const chainLogo = getChainLogoPath(a.chain);
       const mainLogo = protoLogo || (a.symbol === 'USDC' ? '/logos/usdc.svg' : chainLogo);
       const showSubLogo = Boolean(protoLogo || a.symbol === 'USDC');
@@ -1610,12 +1891,11 @@ function renderAssetList() {
           ? 'Blocked'
           : `$${a.grossUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
       const balStr = `${a.uiBalance.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${a.symbol}`;
-      const defiNorm = isDefiAsset(a) ? normalizeDefiPosition(a, outputAsset) : null;
       const debtBadge =
         defiNorm && defiNorm.category === 'debt_guard'
           ? `<span class="micro-pill" style="background:var(--hold-bg);border-color:#fde68a;color:#92400e;">Debt Guard</span>`
           : defiNorm && defiNorm.category === 'cooldown'
-          ? `<span class="micro-pill" style="background:var(--hold-bg);border-color:#fde68a;color:#92400e;">Cooldown</span>`
+          ? `<span class="micro-pill" style="background:var(--hold-bg);border-color:#fde68a;color:#92400e;">Locked</span>`
           : a.aaveDebtUsd > 0
           ? `<span class="micro-pill" style="background:var(--block-bg);border-color:#fecaca;color:#991b1b;">Debt Guard</span>`
           : '';
@@ -1975,7 +2255,7 @@ function renderBackgroundAgentUI() {
         if (safeTxHash(leg.evmTxHash)) {
           const proveBtn = document.createElement('button');
           proveBtn.type = 'button';
-          proveBtn.className = 'text-action';
+          proveBtn.className = 'text-action pro-only';
           proveBtn.dataset.proveJobId = String(activeJob.jobId || '');
           proveBtn.dataset.proveChain = String(leg.chain || '');
           proveBtn.textContent = 'Prove ✓';
@@ -2079,7 +2359,7 @@ function renderBackgroundAgentUI() {
         if (leg.requiresSolanaClaim && safeTxHash(leg.evmTxHash)) {
           const cctpBtn = document.createElement('button');
           cctpBtn.type = 'button';
-          cctpBtn.className = 'text-action';
+          cctpBtn.className = 'text-action pro-only';
           cctpBtn.dataset.checkCctpJob = String(job.jobId || '');
           cctpBtn.dataset.checkCctpChain = String(leg.chain || '');
           cctpBtn.textContent = 'Check CCTP Iris';
@@ -2300,8 +2580,9 @@ async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress,
       deadline: intent.deadline,
     }),
   });
+  const broadcasted = Boolean(receipt.broadcasted || (receipt.mode === 'relayer_submitted' && receipt.txHash));
   await patchJobLeg(jobId, chain, {
-    status: receipt.mode === 'relayer_submitted' ? 'relaying' : 'attested',
+    status: broadcasted ? 'relaying' : 'queued',
     provider: intent.mode,
     evmTxHash: receipt.txHash,
     statusText: receipt.nextStep,
@@ -2323,8 +2604,10 @@ async function sendCallsWithFallback({
   const chainCap = isChainBatchSupported(chainId);
   let submittedHashes = [];
   let usedEip5792 = false;
+  const shouldTryEip5792 =
+    chainCap.supported || (chainCap.status === 'unknown' && calls.length > 1);
 
-  if (chainCap.supported || calls.length > 1) {
+  if (shouldTryEip5792) {
     try {
       await patchJobLeg(jobId, chain, {
         status: 'signing',
@@ -2509,23 +2792,106 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
       });
     }
 
-    const isNonEvm = (currentScan.family || activeFamily) !== 'evm';
-    const connectedSrc = srcSession?.address || null;
+    const legFamily =
+      chainAssets[0]?.family ||
+      (currentScan.family && currentScan.family !== 'mixed' ? currentScan.family : activeFamily);
+    const isNonEvm = legFamily !== 'evm';
+    const legSession = isNonEvm ? getConnectedFamilyWallet(legFamily) : srcSession;
+    const connectedSrc =
+      (legFamily === 'cosmos' && legSession?.addressesByChain?.[chain]) ||
+      legSession?.address ||
+      null;
     if (isNonEvm) {
+      const effectiveNonEvmAddr =
+        connectedSrc || chainAssets[0]?.sourceWallet || userAddress;
+      if (executionMode === 'gasless') {
+        if (!connectedSrc) {
+          await patchJobLeg(jobId, chain, {
+            status: 'signing',
+            statusText: `Connect ${legFamily.toUpperCase()} wallet to sign gasless sweep`,
+          });
+          openWalletModal('evm');
+          return;
+        }
+        await executeGaslessIntentChain(chain, jobId, chainAssets, connectedSrc, solDest);
+        if (isDefiGuided) {
+          updateDefiStepperStep('withdraw', { status: 'done', detail: 'Signed 1-click withdrawal & bridge intent' });
+          updateDefiStepperStep('bridge', { status: 'done', detail: `Relaying to Solana ${outputAsset}` });
+          updateDefiStepperStep('confirm', { status: 'active', detail: 'Confirming arrival on Solana…' }, { dismissible: true });
+        }
+        return;
+      }
+
+      // Direct Native Non-EVM Conversion Mode (mirrors EVM/Rabby prepare-chain-batch -> native wallet execution!)
+      const nonEvmBatch = await api('/api/tx/prepare-chain-batch', {
+        method: 'POST',
+        body: JSON.stringify({
+          chain,
+          assets: chainAssets,
+          userAddress: effectiveNonEvmAddr,
+          solanaDestination: solDest,
+          outputAsset,
+          bridgePreference,
+          protocolFeeBps,
+          addressesByChain: legSession?.addressesByChain || undefined,
+        }),
+      });
+
+      if (!nonEvmBatch.calls?.length) {
+        const skipReason =
+          (nonEvmBatch.skippedAssets || []).map((s) => `${s.assetSymbol}: ${s.reason}`).join(' · ') ||
+          nonEvmBatch.notes?.[0] ||
+          `No live ${legFamily.toUpperCase()} → Solana conversion routes available`;
+        await patchJobLeg(jobId, chain, {
+          status: 'skipped',
+          statusText: skipReason,
+        });
+        if (isDefiGuided) {
+          updateDefiStepperStep('withdraw', { status: 'failed', detail: skipReason }, { active: false, dismissible: true });
+        }
+        showToast(skipReason);
+        return;
+      }
+
       if (!connectedSrc) {
         await patchJobLeg(jobId, chain, {
           status: 'signing',
-          statusText: `Connect ${(currentScan.family || activeFamily).toUpperCase()} wallet to sign 1-sig gasless sweep`,
+          callsBatched: nonEvmBatch.calls.length,
+          popupsSaved: nonEvmBatch.savings?.popupsSaved ?? 0,
+          statusText: `${nonEvmBatch.calls.length} live ${nonEvmBatch.chainName} step(s) ready — connect ${legFamily.toUpperCase()} wallet to sign`,
         });
         openWalletModal('evm');
         return;
       }
-      await executeGaslessIntentChain(chain, jobId, chainAssets, connectedSrc, solDest);
+
+      const primaryTracker = nonEvmBatch.bridgeTrackers?.[0];
+      const execRes = await executeNonEvmDirectBatch(legFamily, nonEvmBatch, {
+        expectedSolanaDestination: solDest,
+        onStep: (idx, total, call) => {
+          patchJobLeg(jobId, chain, {
+            status: 'signing',
+            provider: call.provider,
+            callsBatched: total,
+            statusText: `Confirm step ${idx + 1}/${total} in ${legSession?.walletName || legFamily.toUpperCase()}: ${call.label}`,
+          });
+        },
+      });
+
+      const primaryTxHash = execRes.txHashes?.[execRes.txHashes.length - 1];
+      await patchJobLeg(jobId, chain, {
+        status: 'relaying',
+        provider: primaryTracker?.provider || execRes.mode,
+        evmTxHash: primaryTxHash,
+        requestId: primaryTracker?.requestId,
+        requiresSolanaClaim: Boolean(primaryTracker?.requiresSolanaClaim),
+        statusText: `Submitted on ${nonEvmBatch.chainName} (${primaryTracker?.estimatedOutput || outputAsset}) · tracking settlement to Solana…`,
+      });
       if (isDefiGuided) {
-        updateDefiStepperStep('withdraw', { status: 'done', detail: 'Signed 1-click withdrawal & bridge intent' });
+        updateDefiStepperStep('withdraw', { status: 'done', detail: `Confirmed on ${nonEvmBatch.chainName}` });
         updateDefiStepperStep('bridge', { status: 'done', detail: `Relaying to Solana ${outputAsset}` });
         updateDefiStepperStep('confirm', { status: 'active', detail: 'Confirming arrival on Solana…' }, { dismissible: true });
       }
+      showToast(`${nonEvmBatch.chainName}: conversion submitted → tracking arrival on Solana.`);
       return;
     }
 
@@ -2542,8 +2908,15 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
         protocolFeeBps,
         feeRecipientEvm,
         bundleDefiCctp: hasSolanaSigner || bridgePreference === 'cctp',
+        consolidateMultiInputDust: true,
       }),
     });
+
+    if (batch.dustConsolidation?.consolidated) {
+      showToast(
+        `${batch.chainName}: consolidated ${safeInt(batch.dustConsolidation.consolidatedTokenCount)} dust tokens into 1 multi-input swap (${safeInt(batch.dustConsolidation.swapPopupsEliminated)} prompt(s) eliminated).`
+      );
+    }
 
     if (!batch.calls.length) {
       const skipReason =
@@ -3044,7 +3417,11 @@ async function handleEvmConnected({ address, walletName, capabilities }) {
   const batchNote = capabilities?.anySupported
     ? '1-Click EIP-5792 Batch armed'
     : 'Sequential signing ready';
-  showToast(`Connected ${walletName} (${shortAddr(address)}) · ${batchNote}`);
+  showToast(
+    isProMode()
+      ? `Connected ${walletName} (${shortAddr(address)}) · ${batchNote}`
+      : `Connected ${walletName} (${shortAddr(address)})`
+  );
   await runScan({ address, autoOpen: true });
 }
 
@@ -3164,7 +3541,7 @@ function renderWalletModalContent() {
     rows.push(`
       <div class="wallet-section-label">Or inspect any ${escapeHtml(famShort)} address</div>
       <form class="wallet-manual-form" id="modalFamilyManualForm">
-        <input type="text" id="modalFamilyAddrInput" class="field-input mono" value="${escapeHtml(meta?.sampleAddress || '')}" placeholder="${escapeHtml(meta?.addressHint || '')}" aria-label="${escapeHtml(famShort)} source address" />
+        <input type="text" id="modalFamilyAddrInput" class="field-input mono" value="" placeholder="${escapeHtml(meta?.addressHint || '')}" aria-label="${escapeHtml(famShort)} source address" />
         <button type="submit" class="btn-outline-dark">Scan</button>
       </form>
     `);
@@ -3180,7 +3557,7 @@ function renderWalletModalContent() {
               ${getWalletBrandBadge(w.name, w.icon, w.rdns)}
               <div>
                 <div class="wallet-option-name">${escapeHtml(w.name)}</div>
-                <div class="wallet-option-meta mono">Detected · ${escapeHtml(w.standard)}</div>
+                <div class="wallet-option-meta mono">${isProMode() ? `Detected · ${escapeHtml(w.standard)}` : 'Installed'}</div>
               </div>
             </div>
             <span class="mono wallet-option-action">${isBusy ? 'Connecting…' : activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
@@ -3198,7 +3575,7 @@ function renderWalletModalContent() {
             ${getWalletBrandBadge('Coinbase Smart Wallet', null)}
             <div>
               <div class="wallet-option-name">Coinbase Smart Wallet</div>
-              <div class="wallet-option-meta mono">Passkey / Popup · Native EIP-5792</div>
+              <div class="wallet-option-meta mono">${isProMode() ? 'Passkey / Popup · Native EIP-5792' : 'Passkey / Popup · Smart Wallet'}</div>
             </div>
           </div>
           <span class="mono wallet-option-action">${isBusy ? 'Opening…' : activeName === 'Coinbase Wallet' && activeAddr ? 'Connected' : 'Connect →'}</span>
@@ -3308,8 +3685,9 @@ function renderWalletModalContent() {
     );
   });
   if (isSourceEvm) {
-    footEl.textContent =
-      'Supports EIP-6963 extensions, Coinbase Smart Wallet, WalletConnect v2, and EIP-5792 batch signing.';
+    footEl.textContent = isProMode()
+      ? 'Supports EIP-6963 extensions, Coinbase Smart Wallet, WalletConnect v2, and EIP-5792 batch signing.'
+      : 'Connect a browser extension, Coinbase Smart Wallet, or mobile wallet via WalletConnect.';
   } else if (isEvm) {
     const familyFooters = {
       cosmos: 'Supports Keplr, Leap, Cosmostation, and OKX Cosmos extensions across 6 IBC chains.',
@@ -3553,6 +3931,10 @@ function wireEvents() {
     btn.addEventListener('click', () => switchView(btn.dataset.view));
   });
 
+  document.querySelectorAll('.ui-mode-btn[data-ui-mode]').forEach((btn) => {
+    btn.addEventListener('click', () => setUiMode(btn.dataset.uiMode));
+  });
+
   document.getElementById('bgAgentDock')?.addEventListener('click', () => openApp('scanner'));
 
   document.getElementById('walletModalCloseBtn')?.addEventListener('click', closeWalletModal);
@@ -3589,27 +3971,32 @@ function wireEvents() {
 
   document.querySelectorAll('.family-pill[data-family]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      selectFamily(btn.dataset.family, { autoScanSample: true });
+      selectFamily(btn.dataset.family);
     });
   });
 
   document.getElementById('heroScanForm').addEventListener('submit', (e) => {
     e.preventDefault();
-    const addr = document.getElementById('heroWalletInput').value.trim();
-    if (addr) runScan({ address: addr, autoOpen: true });
-    else runScan({ presetId: 'vitalik_live', autoOpen: true });
+    const input = document.getElementById('heroWalletInput');
+    const addr = input?.value.trim();
+    if (addr) {
+      runScan({ address: addr, autoOpen: true });
+    } else {
+      showToast('Enter a wallet address to scan.');
+      input?.focus();
+    }
   });
 
   document.getElementById('appScanForm').addEventListener('submit', (e) => {
     e.preventDefault();
-    const addr = document.getElementById('appEvmInput').value.trim();
-    if (addr) runScan({ address: addr, family: activeFamily, autoOpen: false });
-  });
-
-  document.querySelectorAll('[data-preset]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      runScan({ presetId: btn.dataset.preset, autoOpen: true });
-    });
+    const input = document.getElementById('appEvmInput');
+    const addr = input?.value.trim();
+    if (addr) {
+      runScan({ address: addr, family: activeFamily, autoOpen: false });
+    } else {
+      showToast('Enter a wallet address to scan.');
+      input?.focus();
+    }
   });
 
   const solInputEl = document.getElementById('solanaDestInput');
@@ -3700,6 +4087,7 @@ function wireEvents() {
     btn.addEventListener('click', () => {
       activeFilter = btn.dataset.filter;
       document.querySelectorAll('.filter-pill').forEach((b) => b.classList.toggle('active', b === btn));
+      renderDustStrategyBanner();
       renderAssetList();
     });
   });
@@ -3774,45 +4162,34 @@ function wireEvents() {
     }
   });
 
-  document.getElementById('simulateAiProposalBtn')?.addEventListener('click', async () => {
-    const solDest = requireVerifiedSolanaDestination('queue an AI permission proposal');
-    if (!solDest) return;
-    const activeMandate = agentMandates.find((m) => m.active);
-    const gross = currentPlan?.totals?.grossUsd || 180;
-    const net = currentPlan?.totals?.netSolanaUsdc || 162;
-    const chains = currentPlan?.legs?.map((l) => l.chain) || ['base', 'arbitrum'];
-    try {
-      const req = await api('/api/agents/approvals', {
-        method: 'POST',
-        body: JSON.stringify({
-          client: 'claude_mcp',
-          mandateId: activeMandate?.mandateId,
-          actionType: 'dust_convert',
-          summary: `Claude MCP proposed batched dust & DeFi sweep across ${chains.length} chain(s) → Solana`,
-          sourceWallets: unifiedWallets.length ? unifiedWallets.map((w) => w.address) : [currentScan?.walletAddress || 'vitalik.eth'],
-          chains,
-          solanaDestination: solDest,
-          grossUsd: gross,
-          estimatedNetUsdc: net,
-          protocolFeeBps: getActiveProtocolFeeBps(),
-          assetIds: Array.from(selectedAssetIds),
-        }),
-      });
-      showToast(
-        req.status === 'auto_approved_by_mandate'
-          ? `Auto-approved within mandate (${req.approvalId})`
-          : `Permission request queued (${req.approvalId}) — approve or reject below`
-      );
-      await loadAgentsAndPlugins();
-    } catch (err) {
-      showToast(err.message);
-    }
+  document.getElementById('mandateConnectSolBtn')?.addEventListener('click', () => openWalletModal('solana'));
+
+  document.getElementById('copyIssuedTokenBtn')?.addEventListener('click', async () => {
+    if (!latestIssuedToken?.token) return;
+    await navigator.clipboard?.writeText(latestIssuedToken.token).catch(() => {});
+    showToast('Copied API token.');
   });
 
   document.getElementById('copyClaudeMcpBtn')?.addEventListener('click', async () => {
-    if (!pluginSetupData?.claudeDesktopConfig) return;
-    await navigator.clipboard?.writeText(JSON.stringify(pluginSetupData.claudeDesktopConfig, null, 2)).catch(() => {});
-    showToast('Copied Claude Desktop MCP config JSON.');
+    const cfg = buildRenderedClaudeDesktopConfig();
+    if (!cfg) return;
+    await navigator.clipboard?.writeText(JSON.stringify(cfg, null, 2)).catch(() => {});
+    showToast(
+      lastIssuedTokens.claude_mcp
+        ? 'Copied Claude Desktop MCP config (with your token).'
+        : 'Copied Claude Desktop MCP config JSON.'
+    );
+  });
+
+  document.getElementById('copyClaudeCliBtn')?.addEventListener('click', async () => {
+    const cmd = buildRenderedClaudeCliCommand();
+    if (!cmd) return;
+    await navigator.clipboard?.writeText(cmd).catch(() => {});
+    showToast(
+      lastIssuedTokens.claude_mcp
+        ? 'Copied Claude Code CLI command (with your token).'
+        : 'Copied Claude Code CLI command.'
+    );
   });
 
   document.getElementById('copyChatgptUrlBtn')?.addEventListener('click', async () => {
@@ -3827,6 +4204,8 @@ function wireEvents() {
         method: 'POST',
         body: JSON.stringify({ label: 'ChatGPT Custom GPT Action', client: 'chatgpt_action' }),
       });
+      lastIssuedTokens.chatgpt_action = issued.token;
+      latestIssuedToken = { client: 'chatgpt_action', label: 'ChatGPT Token', token: issued.token };
       await navigator.clipboard?.writeText(issued.token).catch(() => {});
       showToast(`Generated & copied ChatGPT token (${issued.record.tokenPreview})`);
       await loadAgentsAndPlugins();
@@ -3841,8 +4220,10 @@ function wireEvents() {
         method: 'POST',
         body: JSON.stringify({ label: 'Claude MCP HTTP Bearer', client: 'claude_mcp' }),
       });
+      lastIssuedTokens.claude_mcp = issued.token;
+      latestIssuedToken = { client: 'claude_mcp', label: 'Claude MCP Token', token: issued.token };
       await navigator.clipboard?.writeText(issued.token).catch(() => {});
-      showToast(`Generated & copied Claude MCP token (${issued.record.tokenPreview})`);
+      showToast(`Generated & copied Claude token (${issued.record.tokenPreview}) — filled into config below.`);
       await loadAgentsAndPlugins();
     } catch (err) {
       showToast(err.message);
@@ -3906,6 +4287,7 @@ function wireEvents() {
   });
 }
 
+initUiMode();
 wireEvents();
 api('/api/families')
   .then((res) => {
@@ -3938,7 +4320,7 @@ loadWalletConnectorConfig().then((cfg) => {
 });
 heroScene = mountSiphonFunnelScene(document.getElementById('siphonHeroCanvas'));
 window.__siphonHeroScene = heroScene;
-runScan({ presetId: 'vitalik_live', autoOpen: false });
+renderEmptyScanState();
 
 async function runUnifiedScan() {
   if (!unifiedWallets.length) return;
@@ -4004,6 +4386,86 @@ function renderUnifiedWalletsBar() {
   });
 }
 
+function renderDustStrategyBanner() {
+  const host = document.getElementById('dustStrategyBanner');
+  if (!host) return;
+  if (!lastDustPlan || !lastDustPlan.convertibleCount || activeFilter !== 'dust') {
+    host.classList.add('hidden');
+    host.innerHTML = '';
+    return;
+  }
+
+  const instantCount = safeInt(lastDustPlan.instantSingleSigCount);
+  const legacyCount = safeInt(lastDustPlan.multiInputSwapCount);
+  const naiveSigs = safeInt(lastDustPlan.totalNaiveLegacySignatures);
+  const optSigs = safeInt(lastDustPlan.totalOptimizedLegacySignatures);
+  const savedSigs = safeInt(lastDustPlan.totalSignaturesEliminated);
+  const eip5792Sigs = safeInt(lastDustPlan.totalEip5792Signatures);
+
+  const lanePills = [];
+  if (instantCount > 0) {
+    lanePills.push(
+      `<span class="dust-lane-pill is-instant">1-Sig Gasless: ${instantCount} (Permit2 / EIP-2612)</span>`
+    );
+  }
+  if (legacyCount > 0) {
+    lanePills.push(
+      `<span class="dust-lane-pill is-multi">Consolidated Swap: ${legacyCount} legacy ERC-20</span>`
+    );
+  }
+  if (savedSigs > 0) {
+    lanePills.push(
+      `<span class="dust-lane-pill is-saved">${naiveSigs} → ${optSigs} EOA prompts (−${savedSigs}) · ${eip5792Sigs} on EIP-5792</span>`
+    );
+  }
+
+  const showInstantOnlyBtn = instantCount > 0 && legacyCount > 0;
+  const showAllDustBtn =
+    instantCount > 0 &&
+    legacyCount > 0 &&
+    selectedAssetIds.size !== lastDustPlan.convertibleAssetIds.length;
+
+  host.innerHTML = `
+    <div class="dust-strategy-row">
+      <div class="dust-strategy-pills">${lanePills.join('')}</div>
+      <div class="dust-strategy-actions">
+        ${
+          showInstantOnlyBtn
+            ? `<button type="button" class="text-action" id="dustInstantLaneBtn">1-Sig lane only (${instantCount})</button>`
+            : ''
+        }
+        ${
+          showAllDustBtn
+            ? `<button type="button" class="text-action muted" id="dustAllLaneBtn">All dust (${safeInt(lastDustPlan.convertibleCount)})</button>`
+            : ''
+        }
+      </div>
+    </div>
+  `;
+  host.classList.remove('hidden');
+
+  const instantBtn = document.getElementById('dustInstantLaneBtn');
+  if (instantBtn) {
+    instantBtn.addEventListener('click', async () => {
+      selectedAssetIds = new Set(lastDustPlan.instantSingleSigAssetIds || []);
+      setExecutionMode('gasless');
+      await recomputePlan();
+      renderDustStrategyBanner();
+      showToast(
+        `Selected ${instantCount} Permit2/EIP-2612 dust token(s) in 1-Signature Gasless mode (0 per-token approvals).`
+      );
+    });
+  }
+  const allBtn = document.getElementById('dustAllLaneBtn');
+  if (allBtn) {
+    allBtn.addEventListener('click', async () => {
+      selectedAssetIds = new Set(lastDustPlan.convertibleAssetIds || []);
+      await recomputePlan();
+      renderDustStrategyBanner();
+    });
+  }
+}
+
 async function selectConvertibleDust() {
   if (!currentScan) return;
   const seq = scanSeq;
@@ -4018,7 +4480,9 @@ async function selectConvertibleDust() {
       }),
     });
     if (seq !== scanSeq) return;
+    lastDustPlan = dustPlan;
     if (!dustPlan.convertibleAssetIds?.length) {
+      renderDustStrategyBanner();
       showToast(`Found ${safeInt(dustPlan.totalDustAssetsFound)} dust tokens — none are net-positive after fees/gas (negative-ROI protected).`);
       return;
     }
@@ -4028,8 +4492,13 @@ async function selectConvertibleDust() {
     activeFilter = 'dust';
     document.querySelectorAll('.filter-pill').forEach((b) => b.classList.toggle('active', b.dataset.filter === 'dust'));
     await recomputePlan();
+    renderDustStrategyBanner();
+    const sigPart =
+      dustPlan.totalSignaturesEliminated > 0
+        ? ` · ${safeInt(dustPlan.totalNaiveLegacySignatures)}→${safeInt(dustPlan.totalOptimizedLegacySignatures)} EOA prompts`
+        : '';
     showToast(
-      `Selected ${safeInt(dustPlan.convertibleCount)} convertible dust tokens (est. $${safeNum(dustPlan.estimatedNetSolanaUsdc).toFixed(2)} USDC · +$${safeNum(dustPlan.totalBatchRescueGainUsd).toFixed(2)} batch rescue gain).`
+      `Selected ${safeInt(dustPlan.convertibleCount)} convertible dust tokens (est. $${safeNum(dustPlan.estimatedNetSolanaUsdc).toFixed(2)} USDC · +$${safeNum(dustPlan.totalBatchRescueGainUsd).toFixed(2)} batch rescue gain${sigPart}).`
     );
   } catch (err) {
     showToast(err.message);
@@ -4052,6 +4521,23 @@ async function loadAgentsAndPlugins() {
   }
 }
 
+function buildRenderedClaudeDesktopConfig() {
+  if (!pluginSetupData?.claudeDesktopConfig) return null;
+  const cloned = JSON.parse(JSON.stringify(pluginSetupData.claudeDesktopConfig));
+  if (lastIssuedTokens.claude_mcp && cloned?.mcpServers?.siphon?.env) {
+    cloned.mcpServers.siphon.env.SIPHON_API_TOKEN = lastIssuedTokens.claude_mcp;
+  }
+  return cloned;
+}
+
+function buildRenderedClaudeCliCommand() {
+  if (!pluginSetupData?.claudeCodeCommand) return '';
+  if (lastIssuedTokens.claude_mcp) {
+    return pluginSetupData.claudeCodeCommand.replace('<SIPHON_API_TOKEN>', lastIssuedTokens.claude_mcp);
+  }
+  return pluginSetupData.claudeCodeCommand;
+}
+
 function renderAgentsAndPlugins() {
   const pendingCount = agentApprovals.filter((a) => a.status === 'pending_approval').length;
   const tabCountEl = document.getElementById('tabApprovalCount');
@@ -4067,7 +4553,7 @@ function renderAgentsAndPlugins() {
   const approvalsHost = document.getElementById('agentApprovalsHost');
   if (approvalsHost) {
     if (!agentApprovals.length) {
-      approvalsHost.innerHTML = `<div class="muted-xs" style="padding:10px 0;">No permission requests yet. Connect Claude MCP or ChatGPT Actions — or click "Test AI Permission Request" above to preview the approval flow.</div>`;
+      approvalsHost.innerHTML = `<div class="muted-xs" style="padding:10px 0;">No permission requests yet. Connect Claude MCP or ChatGPT Actions to queue permission-gated sweeps.</div>`;
     } else {
       approvalsHost.innerHTML = agentApprovals
         .map((req) => {
@@ -4168,10 +4654,26 @@ function renderAgentsAndPlugins() {
   }
 
   if (pluginSetupData) {
+    const banner = document.getElementById('issuedTokenBanner');
+    const bannerTitle = document.getElementById('issuedTokenBannerTitle');
+    const bannerVal = document.getElementById('issuedTokenBannerValue');
+    if (banner && bannerTitle && bannerVal) {
+      if (latestIssuedToken?.token) {
+        banner.classList.remove('hidden');
+        bannerTitle.textContent = `${latestIssuedToken.label} ready`;
+        bannerVal.textContent = latestIssuedToken.token;
+      } else {
+        banner.classList.add('hidden');
+      }
+    }
+
+    const claudeFilledBadge = document.getElementById('claudeTokenFilledBadge');
+    claudeFilledBadge?.classList.toggle('hidden', !lastIssuedTokens.claude_mcp);
+
     const claudeHost = document.getElementById('claudeMcpConfigHost');
-    if (claudeHost) claudeHost.textContent = JSON.stringify(pluginSetupData.claudeDesktopConfig, null, 2);
+    if (claudeHost) claudeHost.textContent = JSON.stringify(buildRenderedClaudeDesktopConfig(), null, 2);
     const cmdHost = document.getElementById('claudeCodeCmdHost');
-    if (cmdHost) cmdHost.textContent = `Claude Code CLI: ${pluginSetupData.claudeCodeCommand}`;
+    if (cmdHost) cmdHost.textContent = buildRenderedClaudeCliCommand();
     const gptHost = document.getElementById('chatgptPluginHost');
     if (gptHost) {
       gptHost.textContent = JSON.stringify(
@@ -4179,7 +4681,9 @@ function renderAgentsAndPlugins() {
           manifest: pluginSetupData.chatgptPluginManifestUrl,
           openApiSpec: pluginSetupData.chatgptOpenApiUrl,
           mcpHttp: pluginSetupData.mcpHttpEndpoint,
-          auth: 'Bearer <generated token>',
+          auth: lastIssuedTokens.chatgpt_action
+            ? `Bearer ${lastIssuedTokens.chatgpt_action}`
+            : 'Bearer <generate ChatGPT token above>',
         },
         null,
         2
@@ -4202,14 +4706,14 @@ function renderAgentsAndPlugins() {
                   ${
                     t.revoked
                       ? `<span class="roi-pill roi-neg">Revoked</span>`
-                      : `<button type="button" class="btn-outline-sm" data-revoke-token="${escapeHtml(t.tokenId)}">Revoke</button>`
+                      : `<button type="button" class="btn-outline-sm" data-revoke-token="${escapeHtml(t.tokenId)}" data-token-client="${escapeHtml(t.client || '')}">Revoke</button>`
                   }
                 </div>
               </div>
             `
             )
             .join('')
-        : `<div class="muted-xs">No scoped AI plugin tokens issued yet.</div>`;
+        : `<div class="muted-xs">No API tokens generated yet. Click a button above to mint one.</div>`;
 
       tokHost.querySelectorAll('[data-revoke-token]').forEach((btn) => {
         btn.addEventListener('click', async () => {
@@ -4218,6 +4722,9 @@ function renderAgentsAndPlugins() {
             await api(`/api/plugin/tokens/${encodeURIComponent(btn.dataset.revokeToken)}/revoke`, {
               method: 'POST',
             });
+            const client = btn.dataset.tokenClient;
+            if (client && lastIssuedTokens[client]) lastIssuedTokens[client] = null;
+            if (latestIssuedToken && latestIssuedToken.client === client) latestIssuedToken = null;
             showToast('AI plugin token revoked.');
             await loadAgentsAndPlugins();
           } catch (err) {

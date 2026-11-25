@@ -1620,10 +1620,11 @@ export async function connectFamilyWallet(family, opts = {}) {
       const payment = accs?.find((a) => a.purpose === 'payment') || accs?.[0];
       address = payment?.address || (typeof payment === 'string' ? payment : null);
     } else if (typeof chosen.provider.request === 'function') {
-      const res = await chosen.provider.request('getAccounts', { purposes: ['payment', 'ordinals'] });
+      // Request strictly `payment` accounts (never `ordinals`) to avoid sweeping inscribed Taproot UTXOs
+      const res = await chosen.provider.request('getAccounts', { purposes: ['payment'] });
       const accs = res?.result || res || [];
       const payment = Array.isArray(accs)
-        ? accs.find((a) => a?.purpose === 'payment') || accs[0]
+        ? accs.find((a) => a?.purpose === 'payment') || null
         : null;
       address = payment?.address || null;
     }
@@ -1722,4 +1723,241 @@ export async function signFamilyGaslessIntent(family, intent, opts = {}) {
     throw new Error('Connected Bitcoin wallet does not expose message/PSBT signing.');
   }
   throw new Error(`Unsupported signing family: ${family}`);
+}
+
+/**
+ * Executes a prepared direct non-EVM conversion batch (`PreparedNonEvmBatch`) using each
+ * ecosystem's real native wallet signing & broadcast standard — mirroring EVM/Rabby's
+ * direct 1-click / sequential execution flow without arbitrary off-chain text signing.
+ */
+export async function executeNonEvmDirectBatch(family, batch, opts = {}) {
+  const session = familyWalletSessions[family];
+  if (!session) {
+    throw new Error(`Connect your ${family.toUpperCase()} wallet first to execute conversion.`);
+  }
+  if (!batch || !Array.isArray(batch.calls) || !batch.calls.length) {
+    throw new Error(`No executable conversion steps prepared for ${family.toUpperCase()}.`);
+  }
+  if (
+    opts?.expectedSolanaDestination &&
+    batch.solanaDestination &&
+    String(batch.solanaDestination).trim() !== String(opts.expectedSolanaDestination).trim()
+  ) {
+    throw new Error('Pre-sign check failed: batch Solana destination does not match your UI destination.');
+  }
+
+  const txHashes = [];
+  const onStep = typeof opts?.onStep === 'function' ? opts.onStep : () => {};
+
+  if (family === 'btc') {
+    for (let i = 0; i < batch.calls.length; i += 1) {
+      const call = batch.calls[i];
+      onStep(i, batch.calls.length, call);
+      const psbtHex = call.nativePayload?.psbtHex;
+      if (!psbtHex) {
+        throw new Error(
+          `Bitcoin step "${call.label}" does not include a live BIP-174 PSBT payload from Relay.`
+        );
+      }
+      if (session.walletId === 'unisat' && typeof session.provider.signPsbt === 'function') {
+        const signedPsbt = await session.provider.signPsbt(psbtHex, { autoFinalized: true });
+        if (typeof session.provider.pushPsbt === 'function') {
+          const txid = await session.provider.pushPsbt(signedPsbt);
+          if (txid) txHashes.push(String(txid));
+        } else {
+          txHashes.push(String(signedPsbt).slice(0, 64));
+        }
+        continue;
+      }
+      if (session.walletId === 'xverse' && typeof session.provider.request === 'function') {
+        const psbtBytes = new Uint8Array(psbtHex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
+        const psbtBase64 = btoa(String.fromCharCode(...psbtBytes));
+        const res = await session.provider.request('signPsbt', {
+          psbt: psbtBase64,
+          broadcast: true,
+        });
+        const txid = res?.result?.txid || res?.txid;
+        if (txid) txHashes.push(String(txid));
+        continue;
+      }
+      if (session.walletId === 'phantom-btc' && typeof session.provider.signPSBT === 'function') {
+        const psbtBytes = new Uint8Array(psbtHex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
+        const signed = await session.provider.signPSBT(psbtBytes, { inputsToSign: [] });
+        if (signed) txHashes.push(String(signed).slice(0, 64));
+        continue;
+      }
+      throw new Error(`Connected Bitcoin wallet (${session.walletName}) does not expose BIP-174 signPsbt.`);
+    }
+    return { txHashes, mode: 'btc_psbt' };
+  }
+
+  if (family === 'ton') {
+    const allMessages = batch.calls.flatMap((c) =>
+      Array.isArray(c.nativePayload?.messages) ? c.nativePayload.messages : []
+    );
+    if (!allMessages.length) {
+      throw new Error('No structured TonConnect 2 transfer messages available in this TON batch.');
+    }
+    onStep(0, 1, batch.calls[0]);
+    const txPayload = {
+      validUntil: Math.floor(Date.now() / 1000) + 600,
+      messages: allMessages.map((m) => ({
+        address: m.address,
+        amount: String(m.amount),
+        ...(m.payload ? { payload: m.payload } : {}),
+      })),
+    };
+    if (typeof session.provider.sendTransaction === 'function') {
+      const res = await session.provider.sendTransaction(txPayload);
+      const hash = res?.boc || res?.hash || res?.txHash || 'ton_boc_submitted';
+      txHashes.push(String(hash));
+      return { txHashes, mode: 'ton_tonconnect_batch' };
+    }
+    if (typeof session.provider.send === 'function') {
+      const res = await session.provider.send('ton_sendTransaction', [txPayload]);
+      if (res) txHashes.push(String(res?.boc || res?.hash || res));
+      return { txHashes, mode: 'ton_tonconnect_batch' };
+    }
+    throw new Error(
+      'Connected TON wallet does not expose structured TonConnect 2 sendTransaction. Update Tonkeeper to approve exact messages safely.'
+    );
+  }
+
+  if (family === 'tron') {
+    const tw = window.tronWeb || window.tronLink?.tronWeb;
+    if (!tw?.trx?.sign || !tw?.trx?.sendRawTransaction) {
+      throw new Error('TronLink tronWeb signer is unavailable. Unlock TronLink and reconnect.');
+    }
+    for (let i = 0; i < batch.calls.length; i += 1) {
+      const call = batch.calls[i];
+      onStep(i, batch.calls.length, call);
+      const tvmStep = call.nativePayload?.tvmStep;
+      let unsignedTx = null;
+      if (tvmStep?.parameter?.contract_address && tvmStep?.parameter?.data) {
+        const res = await fetch('https://api.trongrid.io/wallet/triggersmartcontract', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            owner_address: tvmStep.parameter.owner_address,
+            contract_address: tvmStep.parameter.contract_address,
+            data: tvmStep.parameter.data,
+            call_value: Number(tvmStep.parameter.call_value || 0),
+            fee_limit: Number(tvmStep.fee_limit || 150_000_000),
+          }),
+        });
+        const built = await res.json();
+        unsignedTx = built?.transaction || null;
+      } else if (call.nativePayload?.transactionRequest) {
+        unsignedTx = call.nativePayload.transactionRequest;
+      }
+      if (!unsignedTx) {
+        throw new Error(`Could not construct Tron TVM transaction for step "${call.label}".`);
+      }
+      const signed = await tw.trx.sign(unsignedTx);
+      const receipt = await tw.trx.sendRawTransaction(signed);
+      const txid = receipt?.txid || receipt?.transaction?.txID || signed?.txID;
+      if (!txid || receipt?.result === false) {
+        throw new Error(receipt?.message || `Tron broadcast failed for "${call.label}".`);
+      }
+      txHashes.push(String(txid));
+    }
+    return { txHashes, mode: 'tron_tvm_tx' };
+  }
+
+  if (family === 'aptos') {
+    if (typeof session.provider.signAndSubmitTransaction !== 'function') {
+      throw new Error(`${session.walletName} does not expose signAndSubmitTransaction.`);
+    }
+    for (let i = 0; i < batch.calls.length; i += 1) {
+      const call = batch.calls[i];
+      onStep(i, batch.calls.length, call);
+      const payload = call.nativePayload;
+      if (!payload?.function) {
+        throw new Error(`Aptos step "${call.label}" is missing Move entry function payload.`);
+      }
+      const res = await session.provider.signAndSubmitTransaction(payload);
+      const hash = res?.hash || res?.txHash || (typeof res === 'string' ? res : null);
+      if (hash) txHashes.push(String(hash));
+    }
+    return { txHashes, mode: 'aptos_entry_fn' };
+  }
+
+  if (family === 'sui') {
+    for (let i = 0; i < batch.calls.length; i += 1) {
+      const call = batch.calls[i];
+      onStep(i, batch.calls.length, call);
+      const txReq = call.nativePayload?.transactionRequest;
+      const txData = txReq?.data || txReq?.transactionBlock;
+      if (!txData) {
+        throw new Error(
+          `Sui step "${call.label}" requires live PTB bytes from a funded Sui wallet balance.`
+        );
+      }
+      if (session.kind === 'standard' && session.provider.features?.['sui:signAndExecuteTransaction']) {
+        const account =
+          session.provider.accounts?.find((a) => a.address === session.address) ||
+          session.provider.accounts?.[0];
+        const res = await session.provider.features['sui:signAndExecuteTransaction'].signAndExecuteTransaction({
+          transaction: txData,
+          account,
+          chain: 'sui:mainnet',
+        });
+        const digest = res?.digest;
+        if (digest) txHashes.push(String(digest));
+        continue;
+      }
+      if (typeof session.provider.signAndExecuteTransactionBlock === 'function') {
+        const res = await session.provider.signAndExecuteTransactionBlock({ transactionBlock: txData });
+        if (res?.digest) txHashes.push(String(res.digest));
+        continue;
+      }
+      throw new Error(`${session.walletName} does not expose sui:signAndExecuteTransaction.`);
+    }
+    return { txHashes, mode: 'sui_ptb' };
+  }
+
+  if (family === 'cosmos') {
+    const prov = session.provider;
+    const chainId = String(batch.chainId || 'cosmoshub-4');
+    if (typeof prov.enable === 'function') {
+      await prov.enable(chainId);
+    }
+    for (let i = 0; i < batch.calls.length; i += 1) {
+      const call = batch.calls[i];
+      onStep(i, batch.calls.length, call);
+      const cosmosTx = call.nativePayload?.cosmosTx;
+      const msgs = cosmosTx?.msgs || call.nativePayload?.msgs;
+      if (!Array.isArray(msgs) || !msgs.length) {
+        throw new Error(`Cosmos step "${call.label}" did not receive executable Skip Go messages.`);
+      }
+      const signerAddr =
+        call.nativePayload?.signerAddress ||
+        session.addressesByChain?.[batch.chain] ||
+        session.address;
+      if (typeof prov.signAmino === 'function') {
+        const aminoMsgs = msgs.map((m) => ({
+          type: m.msg_type_url,
+          value: typeof m.msg === 'string' ? JSON.parse(m.msg) : m.msg,
+        }));
+        const feeDenom = call.nativePayload?.feeDenom || 'uatom';
+        const signDoc = {
+          chain_id: chainId,
+          account_number: '0',
+          sequence: '0',
+          fee: { amount: [{ denom: feeDenom, amount: '5000' }], gas: String(250_000 + aminoMsgs.length * 80_000) },
+          msgs: aminoMsgs,
+          memo: `Siphon Skip Go → Solana`,
+        };
+        const signed = await prov.signAmino(chainId, signerAddr, signDoc);
+        if (signed?.signature?.signature) {
+          txHashes.push(`cosmos_signed_${signed.signature.signature.slice(0, 24)}`);
+        }
+        continue;
+      }
+      throw new Error(`${session.walletName} does not expose Cosmos transaction signing (signAmino).`);
+    }
+    return { txHashes, mode: 'cosmos_skip_tx' };
+  }
+
+  throw new Error(`Unsupported direct execution family: ${family}`);
 }

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-ui-mode="lite">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -15,7 +15,7 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=7" />
+    <link rel="stylesheet" href="/styles.css?v=8" />
   </head>
   <body>
     <!-- =============================================================== -->
@@ -71,10 +71,6 @@
               />
               <button type="submit" class="hero-inspect-btn" id="heroScanBtn">Scan →</button>
             </form>
-
-            <div class="hero-sample-row">
-              <button type="button" class="text-action muted" data-preset="vitalik_live">Inspect vitalik.eth live →</button>
-            </div>
           </div>
 
           <div class="hero-visual-col">
@@ -156,7 +152,11 @@
               </svg>
               <span>Siphon</span>
             </button>
-            <span class="mode-badge mono" id="scanModeBadge">Live RPC</span>
+            <div class="ui-mode-switch" id="uiModeSwitch" role="group" aria-label="Interface mode">
+              <button type="button" class="ui-mode-btn active" data-ui-mode="lite" aria-pressed="true">Lite</button>
+              <button type="button" class="ui-mode-btn" data-ui-mode="pro" aria-pressed="false">Pro</button>
+            </div>
+            <span class="mode-badge mono pro-only" id="scanModeBadge">Live RPC</span>
           </div>
 
           <nav class="app-tabs" role="tablist" aria-label="Migrator views">
@@ -168,11 +168,11 @@
               Activity
               <span class="tab-count muted" id="tabBurnCount">0</span>
             </button>
-            <button type="button" class="app-tab" data-view="agents" role="tab">
+            <button type="button" class="app-tab pro-only" data-view="agents" role="tab">
               Agents &amp; AI
               <span class="tab-count muted" id="tabApprovalCount">0</span>
             </button>
-            <button type="button" class="app-tab" data-view="contract" role="tab">Contracts</button>
+            <button type="button" class="app-tab pro-only" data-view="contract" role="tab">Contracts</button>
           </nav>
 
           <div class="app-top-right">
@@ -198,12 +198,12 @@
             <button type="button" class="family-pill active" data-family="evm" role="tab">
               <img src="/logos/ethereum.svg" alt="" class="chain-logo-xs" />
               <span>EVM</span>
-              <span class="family-count mono">14</span>
+              <span class="family-count mono pro-only">14</span>
             </button>
             <button type="button" class="family-pill" data-family="cosmos" role="tab">
               <img src="/logos/cosmos.svg" alt="" class="chain-logo-xs" />
               <span>Cosmos</span>
-              <span class="family-count mono">6</span>
+              <span class="family-count mono pro-only">6</span>
             </button>
             <button type="button" class="family-pill" data-family="sui" role="tab">
               <img src="/logos/sui.svg" alt="" class="chain-logo-xs" />
@@ -241,18 +241,13 @@
                 />
               </div>
               <button type="submit" class="btn-outline-sm" id="appScanBtn">Scan</button>
-              <button type="button" class="btn-outline-sm" id="toggleUnifyBarBtn">+ Unify Wallet</button>
-              <div class="source-presets" id="sourcePresetsBar">
-                <button type="button" class="text-action" data-preset="vitalik_live">vitalik.eth</button>
-                <span class="sep-dot">·</span>
-                <button type="button" class="text-action muted" data-preset="veteran_defi">Sample DeFi</button>
-              </div>
+              <button type="button" class="btn-outline-sm pro-only" id="toggleUnifyBarBtn">+ Unify Wallet</button>
             </form>
-            <div class="source-strip-summary mono" id="sourceSummaryText">Scanning 14 EVM chains…</div>
+            <div class="source-strip-summary mono" id="sourceSummaryText">Connect a wallet or enter an address to scan</div>
           </div>
 
           <!-- Multi-Wallet Unification Strip (Combine multiple EVM + Cosmos + Sui + BTC wallets into 1 sweep) -->
-          <div class="unified-wallets-bar hidden" id="unifiedWalletsBar">
+          <div class="unified-wallets-bar hidden pro-only" id="unifiedWalletsBar">
             <div class="unified-pills-row" id="unifiedWalletPills"></div>
             <form class="unified-add-form" id="unifiedAddForm">
               <input
@@ -311,10 +306,10 @@
                     <button type="button" class="filter-pill active" data-filter="all">All</button>
                     <button type="button" class="filter-pill" data-filter="liquid">Worth It</button>
                     <button type="button" class="filter-pill" data-filter="dust">Dust Rescue</button>
-                    <button type="button" class="filter-pill" data-filter="low_efficiency">High Cost</button>
+                    <button type="button" class="filter-pill pro-only" data-filter="low_efficiency">High Cost</button>
                     <button type="button" class="filter-pill" data-filter="defi">DeFi</button>
-                    <button type="button" class="filter-pill" data-filter="burn">Dead Burns</button>
-                    <button type="button" class="filter-pill" data-filter="skipped">Blocked / Neg ROI</button>
+                    <button type="button" class="filter-pill pro-only" data-filter="burn">Dead Burns</button>
+                    <button type="button" class="filter-pill pro-only" data-filter="skipped">Blocked / Neg ROI</button>
                   </div>
                   <div class="btn-row">
                     <button type="button" class="text-action" id="selectDustBtn">Convert dust</button>
@@ -325,7 +320,13 @@
                   </div>
                 </div>
 
-                <div class="asset-list-body" id="assetListBody"></div>
+                <div class="dust-strategy-banner hidden" id="dustStrategyBanner" aria-live="polite"></div>
+
+                <div class="asset-list-body" id="assetListBody">
+                  <div style="text-align:center; padding:42px 16px; color:var(--ink-3); font-size:13px;">
+                    Connect a wallet or enter an address above to scan balances across chains.
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -381,13 +382,17 @@
                   </div>
                 </div>
 
-                <!-- Clean 4-Row Receipt Summary -->
+                <!-- Clean Receipt Summary (Minimal in Lite, Full Routing/Fees/EIP in Pro) -->
                 <div class="receipt-rows">
                   <div class="receipt-row">
                     <span>Selected</span>
-                    <strong class="mono" id="summarySelectedText">0 assets · 0 chains</strong>
+                    <strong class="mono" id="summarySelectedText">0 assets (0 chains)</strong>
                   </div>
-                  <div class="receipt-row">
+                  <div class="receipt-row lite-only">
+                    <span>Est. Fees</span>
+                    <span class="mono" id="summaryLiteCostText">~$0.00</span>
+                  </div>
+                  <div class="receipt-row pro-only">
                     <span>Bridge Route</span>
                     <div class="inline-logo-row">
                       <span id="summaryRouteLogos" class="inline-logo-row">
@@ -402,11 +407,11 @@
                       </select>
                     </div>
                   </div>
-                  <div class="receipt-row">
+                  <div class="receipt-row pro-only">
                     <span>Est. Gas &amp; Signing</span>
                     <span class="mono" id="summaryGasText">$0.00 · 1 click / chain</span>
                   </div>
-                  <div class="receipt-row">
+                  <div class="receipt-row pro-only">
                     <span>Protocol Fee</span>
                     <button type="button" class="receipt-fee-btn mono" id="toggleFeeDrawerBtn">
                       <span id="summaryFeeText">7.0% · $0.00</span>
@@ -415,8 +420,8 @@
                   </div>
                 </div>
 
-                <!-- Collapsible Fee, Treasury & Options Drawer (Zero Clutter by Default) -->
-                <div class="options-drawer hidden" id="feeOptionsDrawer">
+                <!-- Collapsible Fee, Treasury & Options Drawer (Pro Mode Only) -->
+                <div class="options-drawer hidden pro-only" id="feeOptionsDrawer">
                   <div class="options-drawer-row">
                     <label class="muted-xs" for="protocolFeeSelect">Fee Tier (5–10%)</label>
                     <select id="protocolFeeSelect" class="field-select-xs mono" aria-label="Protocol fee percentage">
@@ -448,8 +453,8 @@
                   </div>
                 </div>
 
-                <!-- Signing & Gas Mode Selector (Solves Per-Tx Signing & Zero Gas!) -->
-                <div class="mode-switch-bar" role="group" aria-label="Execution signing mode">
+                <!-- Signing & Gas Mode Selector (Pro Mode Only: EIP-5792 / Permit2 / EIP-7702) -->
+                <div class="mode-switch-bar pro-only" role="group" aria-label="Execution signing mode">
                   <button type="button" class="mode-opt active" data-exec-mode="direct">
                     <strong>Direct Batch</strong>
                     <span>EIP-5792 · 1 click/chain</span>
@@ -460,24 +465,24 @@
                   </button>
                 </div>
 
-                <!-- Real-Time Pre-Sign Proof Panel -->
-                <div class="proof-card hidden" id="preSignProofCard"></div>
+                <!-- Real-Time Pre-Sign Proof Panel (Pro Mode Only) -->
+                <div class="proof-card hidden pro-only" id="preSignProofCard"></div>
 
                 <!-- Primary Action + Real-Time Proof Check -->
                 <div class="cta-action-stack">
                   <button type="button" class="sweep-cta-btn" id="runLiveQueueBtn">
                     Sweep to Solana →
                   </button>
-                  <button type="button" class="proof-trigger-btn mono" id="verifyProofBtn">
+                  <button type="button" class="proof-trigger-btn mono pro-only" id="verifyProofBtn">
                     Prove Swap &amp; Gas Before Signing (Live eth_call)
                   </button>
                 </div>
                 <div class="sweep-cta-note mono" id="sweepCtaNote">
-                  1 confirmation per chain · settles automatically in the background
+                  Sweeps directly to your Solana wallet
                 </div>
 
-                <!-- Compact Per-Chain Quick Queue (1-Click Individual Chain Trigger) -->
-                <div class="chain-queue-list" id="chainQueueList"></div>
+                <!-- Compact Per-Chain Quick Queue (Pro Mode Only) -->
+                <div class="chain-queue-list pro-only" id="chainQueueList"></div>
               </div>
 
               <!-- Live Background Agent Card (Visible whenever a sweep is running or just finished) -->
@@ -505,9 +510,10 @@
           <div class="view-header">
             <div>
               <h1>Background Activity &amp; Receipts</h1>
-              <p>Live settlement tracking for autonomous multi-chain sweeps, convergence topology, and zero-liquidity burn receipts.</p>
+              <p class="lite-only">Live settlement tracking for your sweeps to Solana.</p>
+              <p class="pro-only">Live settlement tracking for autonomous multi-chain sweeps, convergence topology, and zero-liquidity burn receipts.</p>
             </div>
-            <div class="btn-row">
+            <div class="btn-row pro-only">
               <button type="button" class="btn-outline-sm" id="downloadBurnCsvBtn">Export Burn CSV</button>
               <button type="button" class="btn-pill-dark btn-sm" id="copyBurnJsonBtn">Copy Burn JSON</button>
             </div>
@@ -541,8 +547,8 @@
             </div>
           </div>
 
-          <!-- Multi-Chain Convergence Topology SVG -->
-          <div class="card flow-card" style="margin-bottom: 18px;">
+          <!-- Multi-Chain Convergence Topology SVG (Pro Mode Only) -->
+          <div class="card flow-card pro-only" style="margin-bottom: 18px;">
             <div class="card-head">
               <h2>Route Topology</h2>
               <span class="mono muted-xs" id="flowSummaryMeta">Multi-chain → Solana</span>
@@ -550,8 +556,8 @@
             <div class="flow-svg-host" id="convergenceSvgHost"></div>
           </div>
 
-          <!-- Burn & Honeypot Isolation Manifest -->
-          <div class="card table-card">
+          <!-- Burn & Honeypot Isolation Manifest (Pro Mode Only) -->
+          <div class="card table-card pro-only">
             <div class="card-head">
               <h2>Burn &amp; Honeypot Receipts</h2>
               <span class="mono muted-xs" id="burnManifestCount">0 tokens</span>
@@ -574,83 +580,180 @@
         </section>
 
         <!-- ======================================================= -->
-        <!-- VIEW 3: SMART-CONTRACT AGENTS & AI PLUGINS (CLAUDE/GPT) -->
+        <!-- VIEW 3: AI ASSISTANTS & SPENDING RULES (CLAUDE / GPT)   -->
         <!-- ======================================================= -->
         <section class="view-pane" id="view-agents">
           <div class="view-header">
             <div>
-              <h1>Smart-Contract Agents &amp; AI Plugins</h1>
-              <p>Authorize policy-bounded autonomous dust &amp; DeFi agents (SiphonAgentVault.sol) and connect Claude (MCP) or ChatGPT (Actions) with human-in-the-loop permission approvals.</p>
+              <h1>AI Assistants &amp; Spending Rules</h1>
+              <p>Connect Claude or ChatGPT to scan wallets and draft sweeps to your Solana address. Funds never move unless a request is under your auto-approve limit or you approve it manually.</p>
             </div>
-            <div class="btn-row">
-              <button type="button" class="btn-outline-sm" id="simulateAiProposalBtn">Test AI Permission Request</button>
+          </div>
+
+          <div class="agents-flow-strip" aria-label="How AI assistants work in Siphon">
+            <div class="agents-flow-step">
+              <span class="agents-step-num mono">1</span>
+              <div>
+                <strong>Set a spending rule</strong>
+                <p>Lock your Solana address, max sweep size, daily cap, and optional auto-approve limit.</p>
+              </div>
+            </div>
+            <div class="agents-flow-step">
+              <span class="agents-step-num mono">2</span>
+              <div>
+                <strong>Connect Claude or ChatGPT</strong>
+                <p>Generate a scoped API token and paste the ready-to-use config into your assistant.</p>
+              </div>
+            </div>
+            <div class="agents-flow-step">
+              <span class="agents-step-num mono">3</span>
+              <div>
+                <strong>Review &amp; approve</strong>
+                <p>Any sweep above your auto-approve threshold pauses in the Approval Queue for your click.</p>
+              </div>
             </div>
           </div>
 
           <div class="agents-grid">
-            <!-- LEFT: Permission Gate Approvals + Smart-Contract Mandates -->
+            <!-- LEFT: Approval Queue + Spending Rules (Mandates) -->
             <div class="agents-col">
               <div class="card agents-card">
                 <div class="card-head">
-                  <h2>Pending AI &amp; Agent Approvals</h2>
-                  <span class="mono muted-xs" id="approvalsCountMeta">0 pending</span>
+                  <div>
+                    <h2>Approval Queue</h2>
+                    <span class="mono muted-xs" id="approvalsCountMeta">0 pending · 0 total</span>
+                  </div>
                 </div>
                 <div class="agents-list" id="agentApprovalsHost">
-                  <div class="muted-xs" style="padding:14px 0;">No permission requests yet. When Claude, ChatGPT, or an autonomous agent proposes a sweep above your auto-approve tier, it appears here for explicit confirmation.</div>
+                  <div class="muted-xs" style="padding:10px 0;">No permission requests yet. When Claude or ChatGPT proposes a sweep above your auto-approve limit, it appears here for your approval.</div>
                 </div>
               </div>
 
               <div class="card agents-card">
                 <div class="card-head">
-                  <h2>Smart-Contract Agent Mandates</h2>
-                  <span class="mono muted-xs">SiphonAgentVault.sol</span>
+                  <div>
+                    <h2>Spending Rules (Mandates)</h2>
+                    <p class="muted-xs" style="margin:2px 0 0;">Caps and allowed actions enforced before any AI-proposed sweep executes.</p>
+                  </div>
+                  <span class="mono muted-xs contract-chip" title="Policy mirrors contracts/SiphonAgentVault.sol">SiphonAgentVault.sol</span>
                 </div>
+
                 <form class="mandate-form" id="createMandateForm">
-                  <div class="mandate-form-row">
-                    <input type="text" id="mandateNameInput" class="field-input-xs" value="Dust &amp; DeFi Auto-Sweep Agent" placeholder="Agent name" aria-label="Agent mandate name" />
-                    <input type="number" id="mandateMaxTxInput" class="field-input-xs mono" value="250" min="5" max="100000" placeholder="Max $/tx" aria-label="Max USD per transaction" />
-                    <input type="number" id="mandateDailyCapInput" class="field-input-xs mono" value="1000" min="5" max="500000" placeholder="Daily $ cap" aria-label="Daily USD cap" />
-                    <input type="number" id="mandateAutoTierInput" class="field-input-xs mono" value="50" min="0" max="10000" placeholder="Auto <= $" aria-label="Auto-approve USD threshold" />
+                  <label class="mandate-field">
+                    <span class="mandate-label">Rule name</span>
+                    <input type="text" id="mandateNameInput" class="mandate-input" value="Dust &amp; DeFi Auto-Sweep Agent" placeholder="e.g. Daily Dust Sweeper" />
+                  </label>
+
+                  <div class="mandate-caps-grid">
+                    <label class="mandate-field">
+                      <span class="mandate-label">Max per sweep</span>
+                      <div class="mandate-input-prefix">
+                        <span class="mono">$</span>
+                        <input type="number" id="mandateMaxTxInput" class="mono" value="250" min="5" max="100000" step="1" />
+                      </div>
+                      <span class="mandate-hint">Hard ceiling per tx</span>
+                    </label>
+
+                    <label class="mandate-field">
+                      <span class="mandate-label">Daily cap (24h)</span>
+                      <div class="mandate-input-prefix">
+                        <span class="mono">$</span>
+                        <input type="number" id="mandateDailyCapInput" class="mono" value="1000" min="5" max="500000" step="1" />
+                      </div>
+                      <span class="mandate-hint">Rolling 24h limit</span>
+                    </label>
+
+                    <label class="mandate-field">
+                      <span class="mandate-label">Auto-approve under</span>
+                      <div class="mandate-input-prefix">
+                        <span class="mono">$</span>
+                        <input type="number" id="mandateAutoTierInput" class="mono" value="50" min="0" max="10000" step="1" />
+                      </div>
+                      <span class="mandate-hint">0 = always ask you</span>
+                    </label>
                   </div>
-                  <div class="mandate-checks">
-                    <label class="inline-check"><input type="checkbox" name="mandateAction" value="dust_convert" checked /><span>Dust Conversion</span></label>
-                    <label class="inline-check"><input type="checkbox" name="mandateAction" value="defi_withdraw" checked /><span>DeFi Withdraw</span></label>
-                    <label class="inline-check"><input type="checkbox" name="mandateAction" value="bridge_solana" checked /><span>Bridge → Locked Solana</span></label>
-                    <label class="inline-check"><input type="checkbox" name="mandateAction" value="burn_zero_liq" /><span>Burn $0 Spam</span></label>
+
+                  <div class="mandate-actions-block">
+                    <span class="mandate-label">Allowed actions</span>
+                    <div class="mandate-checks">
+                      <label class="inline-check"><input type="checkbox" name="mandateAction" value="dust_convert" checked /><span>Dust Conversion</span></label>
+                      <label class="inline-check"><input type="checkbox" name="mandateAction" value="defi_withdraw" checked /><span>DeFi Withdraw</span></label>
+                      <label class="inline-check"><input type="checkbox" name="mandateAction" value="bridge_solana" checked /><span>Bridge → Locked Solana</span></label>
+                      <label class="inline-check"><input type="checkbox" name="mandateAction" value="burn_zero_liq" /><span>Burn $0 Spam</span></label>
+                    </div>
                   </div>
+
                   <div class="mandate-form-foot">
-                    <span class="muted-xs mono" id="mandateLockedDestNote">Locks destination to your Solana wallet</span>
-                    <button type="submit" class="btn-pill-dark btn-sm">Grant Agent Mandate</button>
+                    <div class="mandate-dest-status">
+                      <span class="mandate-dest-dot" id="mandateDestDot"></span>
+                      <span class="muted-xs mono" id="mandateLockedDestNote">Connect Solana or confirm a destination address first</span>
+                    </div>
+                    <div class="btn-row">
+                      <button type="button" class="btn-outline-sm" id="mandateConnectSolBtn">Connect Solana</button>
+                      <button type="submit" class="btn-pill-dark btn-sm">Grant Agent Mandate</button>
+                    </div>
                   </div>
                 </form>
-                <div class="agents-list" id="agentMandatesHost" style="margin-top:12px;"></div>
+
+                <div class="agents-list" id="agentMandatesHost" style="margin-top:14px;"></div>
               </div>
             </div>
 
-            <!-- RIGHT: Claude MCP + ChatGPT Action Plugin Setup & Scoped Tokens -->
+            <!-- RIGHT: API Access Tokens -> Claude MCP -> ChatGPT Action -->
             <div class="agents-col">
               <div class="card agents-card">
                 <div class="card-head">
-                  <h2>Claude Plugin (MCP Server)</h2>
-                  <button type="button" class="btn-outline-sm" id="copyClaudeMcpBtn">Copy Config</button>
+                  <div>
+                    <h2>API Access Tokens</h2>
+                    <p class="muted-xs" style="margin:2px 0 0;">Mint a scoped bearer token first — it auto-fills into the setup snippets below.</p>
+                  </div>
                 </div>
-                <p class="muted-xs" style="margin:0 0 8px;">Connect Claude Desktop or Claude Code via stdio or HTTP MCP (`POST /mcp`). Claude can scan unified wallets, plan batch dust conversions, and queue permission-gated sweeps.</p>
-                <pre class="plugin-code-box mono" id="claudeMcpConfigHost">Loading…</pre>
-                <div class="muted-xs mono" id="claudeCodeCmdHost" style="margin-top:6px; word-break:break-all;"></div>
+                <div class="btn-row" style="margin-bottom:10px;">
+                  <button type="button" class="btn-pill-dark btn-sm" id="issueMcpTokenBtn">Generate Claude Token</button>
+                  <button type="button" class="btn-outline-sm" id="issueGptTokenBtn">Generate ChatGPT Token</button>
+                </div>
+                <div class="issued-token-banner hidden" id="issuedTokenBanner">
+                  <div class="issued-token-head">
+                    <strong id="issuedTokenBannerTitle">New token generated</strong>
+                    <button type="button" class="btn-outline-sm" id="copyIssuedTokenBtn">Copy Token</button>
+                  </div>
+                  <code class="mono issued-token-val" id="issuedTokenBannerValue"></code>
+                  <span class="muted-xs">Shown once. Also inserted into the config snippet below until you refresh.</span>
+                </div>
+                <div class="agents-list" id="pluginTokensHost"></div>
               </div>
 
               <div class="card agents-card">
                 <div class="card-head">
-                  <h2>ChatGPT Plugin (Custom GPT Action)</h2>
+                  <div>
+                    <h2>Claude (MCP)</h2>
+                    <p class="muted-xs" style="margin:2px 0 0;">Works with Claude Desktop (stdio) or Claude Code (<code class="code-inline">POST /mcp</code>).</p>
+                  </div>
+                  <button type="button" class="btn-outline-sm" id="copyClaudeMcpBtn">Copy JSON</button>
+                </div>
+
+                <div class="snippet-label-row">
+                  <span class="mandate-label">Claude Desktop · <code class="code-inline">claude_desktop_config.json</code></span>
+                  <span class="token-filled-pill hidden" id="claudeTokenFilledBadge">Token filled</span>
+                </div>
+                <pre class="plugin-code-box mono" id="claudeMcpConfigHost">Loading…</pre>
+
+                <div class="snippet-label-row" style="margin-top:12px;">
+                  <span class="mandate-label">Claude Code CLI</span>
+                  <button type="button" class="btn-ghost-xs" id="copyClaudeCliBtn">Copy command</button>
+                </div>
+                <pre class="plugin-code-box plugin-code-single mono" id="claudeCodeCmdHost">Loading…</pre>
+              </div>
+
+              <div class="card agents-card">
+                <div class="card-head">
+                  <div>
+                    <h2>ChatGPT (Custom GPT)</h2>
+                    <p class="muted-xs" style="margin:2px 0 0;">Import <code class="code-inline">/openapi.json</code> or <code class="code-inline">/.well-known/ai-plugin.json</code> with a Bearer token.</p>
+                  </div>
                   <button type="button" class="btn-outline-sm" id="copyChatgptUrlBtn">Copy OpenAPI URL</button>
                 </div>
-                <p class="muted-xs" style="margin:0 0 8px;">Import Siphon's OpenAPI 3.1 schema in ChatGPT Custom GPT Actions (`/.well-known/ai-plugin.json` &amp; `/openapi.json`) with a scoped Bearer token below.</p>
                 <pre class="plugin-code-box mono" id="chatgptPluginHost">Loading…</pre>
-                <div class="btn-row" style="margin-top:10px;">
-                  <button type="button" class="btn-pill-dark btn-sm" id="issueGptTokenBtn">Generate ChatGPT Token</button>
-                  <button type="button" class="btn-outline-sm" id="issueMcpTokenBtn">Generate Claude Token</button>
-                </div>
-                <div class="agents-list" id="pluginTokensHost" style="margin-top:10px;"></div>
               </div>
             </div>
           </div>
@@ -721,6 +824,6 @@
 
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>
 
-    <script type="module" src="/app.js?v=7"></script>
+    <script type="module" src="/app.js?v=8"></script>
   </body>
 </html>

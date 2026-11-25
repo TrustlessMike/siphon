@@ -1,5 +1,15 @@
 import crypto from 'node:crypto';
 import { solanaAddressToBytes32 } from '../bridge/cctp.js';
+import {
+  checkQuoteHaircutPass,
+  evaluateNonEvmGaslessBreakEven,
+  fetchTonGaslessConfig,
+  filterChainSweepableAssets,
+  getNonEvmFeeRecipient,
+  quoteRelayNonEvm,
+  RELAY_TON_CHAIN_ID,
+  RELAY_TON_NATIVE_CURRENCY,
+} from '../execution/non-evm-converter.js';
 import { getProtocolFeeConfig } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
@@ -9,6 +19,8 @@ import type { ChainScanSummary, ScannedAsset, ScanReport } from '../scanner/type
 import type {
   ChainFamilyAdapter,
   ChainFamilyMeta,
+  PreparedNonEvmBatch,
+  PreparedNonEvmCall,
   UniversalExecutionProof,
   UniversalGaslessIntent,
   UniversalPreSignProof,
@@ -17,15 +29,76 @@ import type {
 const TONAPI_BASE = 'https://tonapi.io/v2';
 const TONCENTER_BASE = 'https://toncenter.com/api/v2';
 
+// Canonical TON Jetton Master addresses (raw 0:... AND friendly EQ... forms) — prevents fake "USDT" symbol spoofing!
+interface CanonicalJettonMeta {
+  symbol: string;
+  name: string;
+  decimals: number;
+  coingeckoKey: string;
+  isStable?: boolean;
+  isLst?: boolean;
+  protocol?: string;
+}
+
+const CANONICAL_TON_JETTONS: Record<string, CanonicalJettonMeta> = {
+  // Tether USDt on TON
+  '0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe': {
+    symbol: 'USDT',
+    name: 'Tether USD (TON)',
+    decimals: 6,
+    coingeckoKey: 'coingecko:tether',
+    isStable: true,
+  },
+  eqcxe6mutqjkfngfarotkot1lzbdiix1kcixrv7nw2id_sds: {
+    symbol: 'USDT',
+    name: 'Tether USD (TON)',
+    decimals: 6,
+    coingeckoKey: 'coingecko:tether',
+    isStable: true,
+  },
+  // Notcoin (NOT)
+  '0:2f956143c461769579baef2e32cc2d7bc18283f40d20bb03e432cd603ac33ffc': {
+    symbol: 'NOT',
+    name: 'Notcoin',
+    decimals: 9,
+    coingeckoKey: 'coingecko:notcoin',
+  },
+  // DOGS
+  '0:afc49cb8786f21c87045b19ede78fc6b46c51048513f8e9a6d44060199c1bf0c': {
+    symbol: 'DOGS',
+    name: 'DOGS',
+    decimals: 9,
+    coingeckoKey: 'coingecko:dogs-2',
+  },
+  // Tonstakers Liquid Staked TON (tsTON)
+  '0:bdf3fa8098d129b54b4f73b5bac5d1e1fd91eb054169c3916dfc8ccd536d1000': {
+    symbol: 'tsTON',
+    name: 'Tonstakers Staked TON',
+    decimals: 9,
+    coingeckoKey: 'coingecko:the-open-network',
+    isLst: true,
+    protocol: 'Tonstakers LST',
+  },
+  // Bemo Staked TON (stTON)
+  '0:cd872fa7c5816052acdf5332260443faec9aacc8c21cca4d92e7f47034d11892': {
+    symbol: 'stTON',
+    name: 'Bemo Staked TON',
+    decimals: 9,
+    coingeckoKey: 'coingecko:the-open-network',
+    isLst: true,
+    protocol: 'Bemo LST',
+  },
+};
+
 export const TON_FAMILY_META: ChainFamilyMeta = {
   family: 'ton',
   label: 'TON',
   shortLabel: 'TON',
   chains: [{ id: 'ton', name: 'TON', nativeSymbol: 'TON', logo: '/logos/ton.svg', cctpDomain: null }],
-  signingMechanism: '1-Sig Wallet W5 (v5r1) Gasless Batch (up to 255 messages in 1 external signature)',
-  gasSponsorshipMechanism: 'Wallet W5 Gasless Relayer — $0 user TON needed (relayer reimbursed in Jettons)',
-  preSignProofMechanism: '/v2/traces/emulate + TonAPI account/jetton state + Solana snapshot',
-  bridgeProviders: ['deBridge DLN', 'Allbridge Core'],
+  signingMechanism: '1-Sig TonConnect 2 / Wallet W5 Batch (up to 255 messages in 1 signature)',
+  gasSponsorshipMechanism: 'Direct TonConnect 2 or TonAPI W5 Gasless Relayer ($0 TON, paid in Jettons)',
+  preSignProofMechanism: '/v2/traces/emulate + TonAPI masterchain seqno & verified Jettons + Solana snapshot',
+  bridgeProviders: ['Relay (TON → Solana)', 'STON.fi / deBridge DLN'],
   wallets: [
     { id: 'tonkeeper', name: 'Tonkeeper', logo: '/logos/tonkeeper.svg', installUrl: 'https://tonkeeper.com' },
   ],
@@ -38,7 +111,15 @@ async function fetchJson<T>(url: string, init?: RequestInit, timeoutMs = 4200): 
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const res = await fetch(url, { ...init, signal: controller.signal });
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (process.env.TONAPI_KEY?.trim() && url.startsWith(TONAPI_BASE)) {
+      headers.Authorization = `Bearer ${process.env.TONAPI_KEY.trim()}`;
+    }
+    const res = await fetch(url, {
+      ...init,
+      headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
+      signal: controller.signal,
+    });
     clearTimeout(timer);
     if (res.ok) return (await res.json()) as T;
   } catch {
@@ -63,7 +144,11 @@ export const tonAdapter: ChainFamilyAdapter = {
 
   matchesAddress(address: string): boolean {
     const c = address.trim();
-    return /^(EQ|UQ|kQ|0Q)[A-Za-z0-9_-]{46}$/.test(c) || /^-?0:[0-9a-fA-F]{64}$/.test(c);
+    // Mainnet bounceable/non-bounceable (EQ/UQ/Ef/Uf, base64url or standard base64) OR raw masterchain (-1:) / basechain (0:)
+    return (
+      /^(EQ|UQ|Ef|Uf)[A-Za-z0-9_+/-]{46}$/.test(c) ||
+      /^(-1|0):[0-9a-fA-F]{64}$/.test(c)
+    );
   },
 
   async scanWallet(address: string, label?: string): Promise<ScanReport> {
@@ -72,17 +157,24 @@ export const tonAdapter: ChainFamilyAdapter = {
     const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
 
-    const [account, jettons, priceMap] = await Promise.all([
+    const [account, jettons, head, priceMap] = await Promise.all([
       fetchJson<{ balance?: number; last_activity?: number; interfaces?: string[] }>(
         `${TONAPI_BASE}/accounts/${encodeURIComponent(cleanAddr)}`
       ),
       fetchJson<{
         balances?: Array<{
           balance: string;
-          jetton?: { address?: string; symbol?: string; name?: string; decimals?: number };
+          jetton?: {
+            address?: string;
+            symbol?: string;
+            name?: string;
+            decimals?: number;
+            verification?: 'whitelist' | 'blacklist' | 'none';
+          };
           price?: { prices?: { USD?: number } };
         }>;
       }>(`${TONAPI_BASE}/accounts/${encodeURIComponent(cleanAddr)}/jettons?currencies=usd`),
+      fetchJson<{ seqno?: number }>(`${TONAPI_BASE}/blockchain/masterchain-head`),
       fetchLiveUsdPrices([
         'coingecko:the-open-network',
         'coingecko:tether',
@@ -93,14 +185,20 @@ export const tonAdapter: ChainFamilyAdapter = {
     ]);
 
     let tonNano = account?.balance !== undefined ? String(account.balance) : null;
+    let rpcReachable = Boolean(account || head);
     if (tonNano === null) {
       const tc = await fetchJson<{ ok?: boolean; result?: string }>(
         `${TONCENTER_BASE}/getAddressBalance?address=${encodeURIComponent(cleanAddr)}`
       );
-      if (tc?.ok && tc.result) tonNano = tc.result;
-      else warnings.push('TonAPI & Toncenter public endpoints did not respond within 4.2s.');
+      if (tc?.ok && tc.result) {
+        tonNano = tc.result;
+        rpcReachable = true;
+      } else {
+        warnings.push('TonAPI & Toncenter public endpoints did not respond within 4.2s.');
+      }
     }
 
+    const isWalletW5 = Boolean(account?.interfaces?.some((i) => i.toLowerCase().includes('wallet_v5')));
     const tonPrice = priceMap.get('coingecko:the-open-network') ?? 3.8;
     const solPrice = priceMap.get('coingecko:solana') ?? 70;
     const assets: ScannedAsset[] = [];
@@ -114,6 +212,7 @@ export const tonAdapter: ChainFamilyAdapter = {
       assets.push({
         id: 'ton:native',
         family: 'ton',
+        sourceWallet: cleanAddr,
         chain: 'ton',
         chainName: 'TON',
         address: 'native',
@@ -134,46 +233,83 @@ export const tonAdapter: ChainFamilyAdapter = {
         action: isDust ? 'SKIP_GAS_NEGATIVE' : 'SELL_AND_BRIDGE',
         actionReason: isDust
           ? 'Sub-$0.50 TON dust'
-          : 'Wallet W5 batched swap (STON.fi/DeDust) → deBridge/Allbridge → Solana',
+          : 'TonConnect 2 / Wallet W5 conversion via Relay (TON → Solana)',
         selectedByDefault: !isDust,
         honeypotSafe: true,
       });
     }
 
     for (const j of jettons?.balances ?? []) {
-      const sym = sanitizeTokenSymbol(j.jetton?.symbol, 'JETTON').toUpperCase();
-      const dec = Math.min(36, Math.max(0, Number(j.jetton?.decimals ?? 9) || 9));
+      const masterAddr = (j.jetton?.address || '').trim();
+      const masterKey = masterAddr.toLowerCase();
+      const canonical = CANONICAL_TON_JETTONS[masterKey];
+      const verification = j.jetton?.verification ?? 'none';
+
+      const sym = canonical?.symbol ?? sanitizeTokenSymbol(j.jetton?.symbol, 'JETTON').toUpperCase();
+      const dec = canonical?.decimals ?? Math.min(36, Math.max(0, Number(j.jetton?.decimals ?? 9) || 9));
       const uiBal = unitsToUi(j.balance || '0', dec);
       if (uiBal <= 0) continue;
 
-      const priceUsd =
-        j.price?.prices?.USD ??
-        (sym === 'USDT' || sym === 'JUSDC'
-          ? 1.0
-          : sym === 'NOT'
-          ? priceMap.get('coingecko:notcoin') ?? 0.0032
-          : sym === 'DOGS'
-          ? priceMap.get('coingecko:dogs-2') ?? 0.00028
-          : 0);
-      const grossUsd = Number((uiBal * priceUsd).toFixed(2));
-      if (priceUsd <= 0 && grossUsd === 0) continue;
+      // Reject blacklisted / scam Jettons explicitly as SKIP_HONEYPOT
+      if (verification === 'blacklist') {
+        assets.push({
+          id: `ton:${masterAddr || sym}`,
+          family: 'ton',
+          sourceWallet: cleanAddr,
+          chain: 'ton',
+          chainName: 'TON',
+          address: masterAddr || sym,
+          symbol: sym,
+          name: sanitizeTokenName(j.jetton?.name, `${sym} Jetton`),
+          decimals: dec,
+          kind: 'dead_token',
+          rawBalance: j.balance,
+          uiBalance: Number(uiBal.toFixed(6)),
+          priceUsd: 0,
+          grossUsd: 0,
+          liquidityUsd: 0,
+          estimatedGasUsd: 0.05,
+          batchedGasUsd: 0.015,
+          estimatedSlippageUsd: 0,
+          netUsdcSingle: 0,
+          netUsdcBatched: 0,
+          action: 'SKIP_HONEYPOT',
+          actionReason: 'Blacklisted/unverified scam Jetton on TonAPI — safely skipped.',
+          selectedByDefault: false,
+          honeypotSafe: false,
+        });
+        continue;
+      }
 
-      const isStable = sym === 'USDT' || sym === 'JUSDC';
+      // Only trust canonical Jetton Master allowlist OR TonAPI whitelist + live TonAPI USD price (never symbol-only $1!)
+      const tonApiUsd = Number(j.price?.prices?.USD ?? 0);
+      const priceUsd = canonical
+        ? priceMap.get(canonical.coingeckoKey) ?? (canonical.isStable ? 1.0 : tonApiUsd)
+        : verification === 'whitelist' && Number.isFinite(tonApiUsd) && tonApiUsd > 0
+        ? tonApiUsd
+        : 0;
+      const grossUsd = Number((uiBal * priceUsd).toFixed(2));
+      if (priceUsd <= 0 || grossUsd === 0) continue;
+
+      const isStable = Boolean(canonical?.isStable);
       const gasUsd = 0.05;
       const slippageUsd = isStable ? Number((grossUsd * 0.001).toFixed(2)) : Number((grossUsd * 0.005).toFixed(2));
       const isDust = grossUsd < 0.5;
-      const safeName = sanitizeTokenName(j.jetton?.name, `${sym} Jetton`);
+      const safeName = canonical?.name ?? sanitizeTokenName(j.jetton?.name, `${sym} Jetton`);
 
       assets.push({
-        id: `ton:${j.jetton?.address || sym}`,
+        id: `ton:${masterAddr || sym}`,
         family: 'ton',
+        sourceWallet: cleanAddr,
         chain: 'ton',
         chainName: 'TON',
-        address: j.jetton?.address || sym,
+        address: masterAddr || sym,
         symbol: sym,
         name: safeName,
         decimals: dec,
-        kind: 'erc20',
+        kind: canonical?.isLst ? 'defi_position' : 'erc20',
+        protocol: canonical?.protocol,
+        underlyingSymbol: canonical?.isLst ? 'TON' : undefined,
         rawBalance: j.balance,
         uiBalance: Number(uiBal.toFixed(6)),
         priceUsd,
@@ -187,13 +323,18 @@ export const tonAdapter: ChainFamilyAdapter = {
         action: isDust ? 'SKIP_GAS_NEGATIVE' : isStable ? 'BRIDGE_DIRECT_USDC' : 'SELL_AND_BRIDGE',
         actionReason: isDust
           ? `Sub-$0.50 ${sym} Jetton dust`
-          : 'Wallet W5 Gasless Jetton batch (up to 255 msgs, relayer paid in Jettons) → deBridge/Allbridge → Solana',
+          : isWalletW5
+          ? 'Wallet W5 1-sig batch (up to 255 msgs; Gasless Jetton fee supported) → Relay/deBridge → Solana'
+          : 'TonConnect 2 batch → Relay / STON.fi → Solana',
         selectedByDefault: !isDust,
         honeypotSafe: true,
       });
     }
 
     const grossUsd = Number(assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const defiGrossUsd = Number(
+      assets.filter((a) => a.kind === 'defi_position').reduce((s, a) => s + a.grossUsd, 0).toFixed(2)
+    );
     const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const batchedGasUsd = Number(assets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(2));
     const singleTxGasUsd = Number(assets.reduce((s, a) => s + a.estimatedGasUsd, 0).toFixed(2));
@@ -204,28 +345,31 @@ export const tonAdapter: ChainFamilyAdapter = {
 
     const summary: ChainScanSummary = {
       family: 'ton',
+      sourceWallet: cleanAddr,
       chain: 'ton',
       chainName: 'TON',
       chainId: '-239',
       cctpDomain: null,
-      rpcStatus: 'live',
-      blockNumber: account?.last_activity ?? 0,
+      rpcStatus: rpcReachable ? 'live' : 'degraded',
+      blockNumber: Number(head?.seqno ?? 0),
       gasPriceGwei: 0.01,
       nativeBalance: Number(nativeBalance.toFixed(6)),
       nativeSymbol: 'TON',
       nativePriceUsd: tonPrice,
       assetCount: assets.length,
-      defiCount: 0,
+      defiCount: assets.filter((a) => a.kind === 'defi_position').length,
       liquidCount: assets.filter((a) => a.action === 'SELL_AND_BRIDGE' || a.action === 'BRIDGE_DIRECT_USDC').length,
       burnCount: 0,
-      skippedCount: assets.filter((a) => a.action === 'SKIP_GAS_NEGATIVE').length,
+      skippedCount: assets.filter((a) => a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_HONEYPOT').length,
       grossUsd,
       netUsdcBridged: netSolanaUsdc,
       totalGasUsd: batchedGasUsd,
       gasSavedByBatchUsd: Number(Math.max(0, singleTxGasUsd - batchedGasUsd).toFixed(2)),
       cctpAttestationSec: 25,
       needsGasSponsorship: nativeBalance < 0.25,
-      sponsorshipMechanism: 'Wallet W5 Gasless (up to 255 batched msgs, relayer reimbursed in Jettons)',
+      sponsorshipMechanism: isWalletW5
+        ? 'Wallet W5 Detected (255-msg batch + TonAPI Jetton Gasless ready)'
+        : 'TonConnect 2 Direct Batch (upgrade to Wallet W5 for $0 TON Gasless)',
     };
 
     return applyTwoLevelRoiToReport({
@@ -241,8 +385,8 @@ export const tonAdapter: ChainFamilyAdapter = {
       assets,
       totals: {
         grossUsd,
-        defiGrossUsd: 0,
-        liquidGrossUsd: grossUsd,
+        defiGrossUsd,
+        liquidGrossUsd: Number((grossUsd - defiGrossUsd).toFixed(2)),
         protocolFeeBps: feeCfg.feeBps,
         protocolFeeUsd,
         singleTxGasUsd,
@@ -252,25 +396,158 @@ export const tonAdapter: ChainFamilyAdapter = {
         netSolanaUsdc,
         solEquivalent: Number((netSolanaUsdc / solPrice).toFixed(4)),
         solPriceUsd: solPrice,
-        defiPositionCount: 0,
+        defiPositionCount: summary.defiCount,
         liquidDustCount: summary.liquidCount,
         burnCandidateCount: 0,
-        honeypotSkippedCount: 0,
-        gasNegativeCount: summary.skippedCount,
+        honeypotSkippedCount: assets.filter((a) => a.action === 'SKIP_HONEYPOT').length,
+        gasNegativeCount: assets.filter((a) => a.action === 'SKIP_GAS_NEGATIVE').length,
       },
       warnings,
     });
   },
 
+  async prepareDirectBatch(params): Promise<PreparedNonEvmBatch> {
+    const outputAsset = params.outputAsset ?? 'USDC';
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const feeRecipient = getNonEvmFeeRecipient('ton');
+    const solanaUsdcAtaBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const sweepable = filterChainSweepableAssets('ton', params.assets);
+
+    const [gaslessCfg] = await Promise.all([fetchTonGaslessConfig()]);
+
+    const calls: PreparedNonEvmCall[] = [];
+    const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
+    const skippedAssets: PreparedNonEvmBatch['skippedAssets'] = [];
+    const notes: string[] = [];
+    let maxSeconds = 25;
+    let liveExecutable = false;
+
+    for (const asset of sweepable) {
+      const originCurrency =
+        asset.address === 'native' ? RELAY_TON_NATIVE_CURRENCY : asset.address;
+      const relayQuote = await quoteRelayNonEvm({
+        originChainId: RELAY_TON_CHAIN_ID,
+        originCurrency,
+        amountRaw: asset.rawBalance,
+        userAddress: params.userAddress,
+        solanaDestination: params.solanaDestination,
+        outputAsset,
+        protocolFeeBps: feeCfg.feeBps,
+      });
+
+      if (!relayQuote) {
+        skippedAssets.push({
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          reason: `No live Relay TON → Solana route found for ${asset.symbol} (swap via STON.fi to TON/USDT first or check bridge minimum).`,
+        });
+        continue;
+      }
+
+      const haircut = checkQuoteHaircutPass({
+        grossUsd: asset.grossUsd,
+        quotedOutUsd: relayQuote.quotedOutUsd,
+        estimatedGasUsd: relayQuote.estimatedGasUsd,
+        allowHighCost: params.allowHighCost,
+      });
+      if (!haircut.passed) {
+        skippedAssets.push({ assetId: asset.id, assetSymbol: asset.symbol, reason: haircut.reason });
+        continue;
+      }
+
+      maxSeconds = Math.max(maxSeconds, relayQuote.estimatedSeconds);
+      for (const step of relayQuote.steps) {
+        const rawMsgs = Array.isArray(step.data.messages)
+          ? (step.data.messages as Array<{ to?: string; address?: string; value?: string; amount?: string; body?: string; payload?: string }>)
+          : [];
+        const tonConnectMessages = rawMsgs
+          .filter((m) => (m.to || m.address) && (m.value || m.amount))
+          .map((m) => ({
+            address: String(m.to || m.address),
+            amount: String(m.value || m.amount),
+            payload: m.body || m.payload || undefined,
+          }));
+        if (tonConnectMessages.length > 0) liveExecutable = true;
+
+        calls.push({
+          stepId: `ton_relay_${step.id}`,
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          action: asset.action,
+          provider: 'relay',
+          label: `Convert ${asset.uiBalance} ${asset.symbol} → ${relayQuote.estimatedOutputUi} (Relay)`,
+          description: step.description,
+          nativePayload: {
+            network: '-239',
+            validUntil: Math.floor(Date.now() / 1000) + 600,
+            messages: tonConnectMessages,
+            requestId: relayQuote.requestId,
+            gaslessRelayAddress: gaslessCfg?.relayAddress ?? null,
+          },
+        });
+      }
+      bridgeTrackers.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        provider: 'relay',
+        requestId: relayQuote.requestId,
+        estimatedOutput: relayQuote.estimatedOutputUi,
+        estimatedSeconds: relayQuote.estimatedSeconds,
+      });
+    }
+
+    if (gaslessCfg?.relayAddress) {
+      notes.push(`TonAPI W5 Gasless relayer active (${gaslessCfg.relayAddress.slice(0, 14)}…) — supports $0 TON Jetton-paid batching.`);
+    }
+
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+
+    return {
+      family: 'ton',
+      chain: 'ton',
+      chainId: '-239',
+      chainName: 'TON',
+      explorerUrl: 'https://tonviewer.com',
+      userAddress: params.userAddress,
+      solanaDestination: params.solanaDestination,
+      solanaUsdcAtaBytes32,
+      outputAsset,
+      executionKind: 'ton_tonconnect_batch',
+      signingStandard: 'TonConnect 2 sendTransaction (Wallet W5 up to 255 msgs / v4r2 up to 4 msgs)',
+      liveExecutable,
+      calls,
+      bridgeTrackers,
+      skippedAssets,
+      savings: {
+        totalCalls: calls.length,
+        walletPopupsBatched: calls.length ? 1 : 0,
+        walletPopupsLegacy: calls.length,
+        popupsSaved: Math.max(0, calls.length - 1),
+      },
+      feeBreakdown: {
+        feeBps: feeCfg.feeBps,
+        feePercent: feeCfg.feePercent,
+        feeRecipient,
+        collectionMethod: feeRecipient ? 'ton_w5_jetton_transfer' : 'relay_quote_only',
+        estimatedFeeUsd,
+      },
+      estimatedSeconds: maxSeconds,
+      gaslessAvailable: Boolean(gaslessCfg?.relayAddress),
+      gaslessMechanism: 'TonAPI Wallet W5 Gasless (/v2/gasless/estimate + signMessage + /v2/gasless/send)',
+      notes,
+    };
+  },
+
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {
-    const feeCfg = getProtocolFeeConfig({
-      feeBps: params.protocolFeeBps,
-      feeRecipientEvm: params.feeRecipient,
-    });
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const mintRecipientBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const gaslessCfg = await fetchTonGaslessConfig();
     const relayerTonAddr =
-      process.env.SIPHON_TON_RELAYER_ADDRESS?.trim() || 'EQCsiphonRelayerW5GaslessBattery0000000000000000';
-    const chainAssets = params.assets.filter((a) => a.action !== 'SKIP_HONEYPOT' && a.action !== 'SKIP_GAS_NEGATIVE');
+      getNonEvmFeeRecipient('ton') ||
+      gaslessCfg?.relayAddress ||
+      'EQCsiphonRelayerW5GaslessBattery0000000000000000';
+    const chainAssets = filterChainSweepableAssets('ton', params.assets);
     const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
     const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const sponsoredGasEstUsd = Number(Math.max(0.03, chainAssets.length * 0.015).toFixed(2));
@@ -279,13 +556,20 @@ export const tonAdapter: ChainFamilyAdapter = {
     const deadline = Math.floor(Date.now() / 1000) + 1800;
     const nonce = BigInt('0x' + crypto.randomBytes(8).toString('hex')).toString();
 
+    const breakEven = evaluateNonEvmGaslessBreakEven({
+      grossUsd,
+      sponsoredGasEstUsd,
+      protocolFeeBps: feeCfg.feeBps,
+      estimatedNetUsd,
+    });
+
     const messages = [
       ...chainAssets.slice(0, 252).map((a) => ({
         op: a.address === 'native' ? 'ton_swap_and_bridge' : 'jetton_transfer_to_router',
         asset: a.symbol,
         jettonMaster: a.address,
         amountRaw: a.rawBalance,
-        bridge: 'deBridge / Allbridge Core → Solana',
+        bridge: 'Relay / deBridge → Solana',
       })),
       {
         op: 'jetton_relayer_gas_reimbursement',
@@ -331,7 +615,7 @@ export const tonAdapter: ChainFamilyAdapter = {
       protocolFeeBps: feeCfg.feeBps,
       protocolFeePercent: feeCfg.feePercent,
       protocolFeeUsd,
-      feeRecipient: relayerTonAddr,
+      feeRecipient: getNonEvmFeeRecipient('ton'),
       minNetUsdcOut,
       estimatedNetUsd,
       coveredAssets: chainAssets.map((a) => ({
@@ -342,36 +626,39 @@ export const tonAdapter: ChainFamilyAdapter = {
         grossUsd: a.grossUsd,
       })),
       signPayload,
-      relayerConfigured: Boolean(process.env.SIPHON_TON_RELAYER_KEY?.trim()),
+      relayerConfigured: Boolean(process.env.SIPHON_TON_RELAYER_KEY?.trim() || gaslessCfg?.relayAddress),
+      sponsorEligible: breakEven.eligible,
+      sponsorRejectionReason: breakEven.rejectionReason,
       intentDigestSha256,
-      explanation: `1 Tonkeeper W5 signature batches ${messages.length}/255 internal messages ($0 TON gas — relayer paid in Jettons) → deBridge/Allbridge → Solana.`,
+      explanation: `1 Tonkeeper W5 signature batches ${messages.length}/255 internal messages ($0 TON gas — relayer paid in Jettons) → Relay/deBridge → Solana.`,
     };
   },
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
-    const feeCfg = getProtocolFeeConfig({
-      feeBps: params.protocolFeeBps,
-      feeRecipientEvm: params.feeRecipient,
-    });
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const expectedBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const sweepable = filterChainSweepableAssets('ton', params.assets);
 
-    const [account, solSnap, priceMap] = await Promise.all([
-      fetchJson<{ balance?: number; last_activity?: number }>(
+    const [account, head, solSnap, priceMap] = await Promise.all([
+      fetchJson<{ balance?: number; interfaces?: string[] }>(
         `${TONAPI_BASE}/accounts/${encodeURIComponent(params.userAddress)}`
       ),
+      fetchJson<{ seqno?: number }>(`${TONAPI_BASE}/blockchain/masterchain-head`),
       fetchSolanaWalletBalances(params.solanaDestination).catch(() => null),
       fetchLiveUsdPrices(['coingecko:the-open-network']),
     ]);
 
+    const seqno = Number(head?.seqno ?? 0);
     const nativeBalanceUi = Number(unitsToUi(String(account?.balance ?? 0), 9).toFixed(5));
     const nativePriceUsd = params.nativePriceUsd ?? priceMap.get('coingecko:the-open-network') ?? 3.8;
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
-    const estimatedGasUsd = Number(Math.max(0.03, params.assets.length * 0.015).toFixed(2));
+    const estimatedGasUsd = Number(Math.max(0.03, sweepable.length * 0.015).toFixed(2));
     const hasEnoughNativeGas = nativeBalanceUi >= 0.25;
-    const grossUsd = Number(params.assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
     const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.98).toFixed(2));
+    const tonVerified = Boolean(account && seqno > 0);
 
     const proofDigestSha256 =
       '0x' +
@@ -380,12 +667,22 @@ export const tonAdapter: ChainFamilyAdapter = {
         .update(
           JSON.stringify({
             family: 'ton',
+            seqno,
             userAddress: params.userAddress,
             solanaDestination: params.solanaDestination,
+            outflows: sweepable.map((a) => ({ id: a.id, raw: a.rawBalance })),
             guaranteedMinNetUsd,
           })
         )
         .digest('hex');
+
+    const warnings: string[] = [];
+    if (!hasEnoughNativeGas) {
+      warnings.push(`Low TON balance (${nativeBalanceUi} TON). Wallet W5 Gasless reimburses relayer in Jettons ($0 user TON).`);
+    }
+    if (!tonVerified) {
+      warnings.push('TonAPI account/masterchain state could not be reached for live verification.');
+    }
 
     return {
       proofId: `prf_ton_${crypto.randomBytes(4).toString('hex')}`,
@@ -395,7 +692,7 @@ export const tonAdapter: ChainFamilyAdapter = {
       chain: 'ton',
       chainId: '-239',
       chainName: 'TON',
-      blockNumber: account?.last_activity ?? 0,
+      blockNumber: seqno,
       userAddress: params.userAddress,
       solanaDestination: params.solanaDestination,
       solanaMintRecipientBytes32: expectedBytes32,
@@ -405,9 +702,9 @@ export const tonAdapter: ChainFamilyAdapter = {
       nativeSymbol: 'TON',
       nativeBalanceUsd,
       estimatedGasUsd,
-      recommendedMode: 'sponsored_gasless',
+      recommendedMode: hasEnoughNativeGas ? 'eip5792_batch' : 'sponsored_gasless',
       simulationEndpoint: '/v2/traces/emulate',
-      outflows: params.assets.map((a) => ({
+      outflows: sweepable.map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
         usd: a.grossUsd,
@@ -417,7 +714,7 @@ export const tonAdapter: ChainFamilyAdapter = {
         feeBps: feeCfg.feeBps,
         feePercent: feeCfg.feePercent,
         estimatedFeeUsd: feeUsd,
-        feeRecipientEvm: feeCfg.feeRecipientEvm,
+        feeRecipientEvm: null,
         collectionMethod: 'ton_w5_jetton_fee_5_to_10_pct',
       },
       guaranteedMinNetUsd,
@@ -437,45 +734,57 @@ export const tonAdapter: ChainFamilyAdapter = {
           assetSymbol: 'TON',
           actionType: 'ton_w5_emulate',
           target: 'tonapi.io/v2/traces/emulate',
-          summary: `Wallet W5 Gasless batch emulation (${params.assets.length} asset(s))`,
-          preflightStatus: account ? 'verified' : 'rpc_skipped',
-          preflightDetail: account
-            ? `Live TonAPI state verified (${nativeBalanceUi} TON) · W5 Jetton gasless ready`
-            : 'TonAPI rate-limited',
+          summary: tonVerified
+            ? `TON Masterchain seqno #${seqno.toLocaleString()} & account state verified (${sweepable.length} asset(s))`
+            : 'TonAPI state unreachable',
+          preflightStatus: tonVerified ? 'verified' : 'rpc_skipped',
+          preflightDetail: tonVerified
+            ? `Live TonAPI state verified (${nativeBalanceUi} TON · seqno #${seqno.toLocaleString()})`
+            : 'TonAPI rate-limited or unreachable',
         },
         {
           stepId: 'ton_bridge_solana',
           assetSymbol: 'USDT',
           actionType: 'bridge_or_swap',
-          target: 'deBridge / Allbridge Core → Solana',
+          target: 'Relay / deBridge → Solana',
           summary: `Solana recipient ${params.solanaDestination.slice(0, 6)}… verified`,
           preflightStatus: 'verified',
           preflightDetail: 'Solana base58 & bytes32 recipient verified',
         },
       ],
-      allChecksSafe: true,
-      warnings: hasEnoughNativeGas
-        ? []
-        : [`Low TON balance (${nativeBalanceUi} TON). Wallet W5 Gasless reimburses relayer in Jettons ($0 user TON).`],
+      allChecksSafe: tonVerified,
+      warnings,
     };
   },
 
   async relayAndProve(params) {
     const out: {
-      submitted?: { accepted: boolean; mode: string; signatureFingerprint?: string; nextStep: string };
+      submitted?: {
+        accepted: boolean;
+        mode: string;
+        broadcasted?: boolean;
+        settlementStatus?: string;
+        signatureFingerprint?: string;
+        nextStep: string;
+      };
       proof?: UniversalExecutionProof;
     } = {};
 
     if (params.signature && params.intentId) {
+      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
+        throw new Error('Signed TON W5 batch intent expired. Re-sign a fresh intent.');
+      }
       const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
       const configured = Boolean(process.env.SIPHON_TON_RELAYER_KEY?.trim());
       out.submitted = {
         accepted: true,
-        mode: configured ? 'relayer_submitted' : 'intent_verified_awaiting_deployment',
+        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        broadcasted: false,
+        settlementStatus: configured ? 'queued_for_relayer' : 'awaiting_relayer',
         signatureFingerprint: fp,
         nextStep: configured
-          ? `TON W5 Gasless relayer queued BOC ${params.intentId}.`
-          : `TON W5 1-Sig batch verified (${fp}) with $0 user TON. Set SIPHON_TON_RELAYER_KEY to broadcast sponsored W5 BOCs live.`,
+          ? `TON W5 Gasless relayer queued BOC ${params.intentId} (${fp}).`
+          : `TON W5 1-Sig batch verified (${fp}). Use Direct Mode (TonConnect 2 sendTransaction) to execute live Relay messages immediately.`,
       };
     }
 
@@ -508,8 +817,16 @@ export const tonAdapter: ChainFamilyAdapter = {
           }
         : undefined;
 
+      const positiveSolanaDelta =
+        params.outputAsset === 'SOL'
+          ? Boolean(solanaDeltaProof?.deltaSol && solanaDeltaProof.deltaSol > 0)
+          : Boolean(
+              (solanaDeltaProof?.deltaUsdc && solanaDeltaProof.deltaUsdc > 0) ||
+                (solanaDeltaProof?.deltaSol && solanaDeltaProof.deltaSol > 0)
+            );
+
       out.proof = {
-        verified: Boolean(succeeded && solanaDeltaProof?.deltaUsdc && solanaDeltaProof.deltaUsdc > 0),
+        verified: Boolean(succeeded && positiveSolanaDelta),
         family: 'ton',
         proofDigestSha256:
           '0x' +
@@ -531,14 +848,14 @@ export const tonAdapter: ChainFamilyAdapter = {
         },
         decodedTransfers: [],
         bridgeProof: {
-          provider: 'deBridge / Allbridge Core → Solana',
-          status: succeeded ? 'relaying' : found ? 'failed' : 'pending',
+          provider: params.provider === 'relay' ? 'Relay (TON → Solana)' : 'deBridge / Relay → Solana',
+          status: positiveSolanaDelta ? 'success' : succeeded ? 'relaying' : found ? 'failed' : 'pending',
         },
         solanaDeltaProof,
         summary: !found
           ? 'TON transaction not yet indexed on TonAPI.'
           : succeeded
-          ? `Confirmed on TON (lt ${txInfo?.lt ?? '—'}) · deBridge/Allbridge → Solana tracked.`
+          ? `Confirmed on TON (lt ${txInfo?.lt ?? '—'}) · Solana settlement tracked.`
           : 'TON transaction failed.',
       };
     }

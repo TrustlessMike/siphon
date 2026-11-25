@@ -619,20 +619,33 @@ async function discoverRoutescanTokens(
         tokenDecimals?: number | string;
         tokenQuantity?: string;
         tokenPrice?: number | string;
+        holderBalance?: string;
+        token?: {
+          symbol?: string;
+          name?: string;
+          decimals?: number | string;
+          price?: number | string;
+        };
       }>;
     };
     const out: DiscoveredEthToken[] = [];
     for (const item of json.items ?? []) {
-      if (!item.tokenAddress || !/^0x[0-9a-fA-F]{40}$/.test(item.tokenAddress) || !item.tokenQuantity) continue;
+      const qty = item.holderBalance ?? item.tokenQuantity;
+      if (!item.tokenAddress || !/^0x[0-9a-fA-F]{40}$/.test(item.tokenAddress) || !qty) continue;
       try {
-        const rawBalance = BigInt(item.tokenQuantity);
+        const rawBalance = BigInt(qty);
         if (rawBalance <= 0n) continue;
-        const decimals = Math.min(36, Math.max(0, Number(item.tokenDecimals ?? 18) || 18));
-        const price = Number(item.tokenPrice ?? 0);
+        const decimals = Math.min(
+          36,
+          Math.max(0, Number(item.token?.decimals ?? item.tokenDecimals ?? 18) || 18)
+        );
+        const price = Number(item.token?.price ?? item.tokenPrice ?? 0);
+        const rawSym = item.token?.symbol ?? item.tokenSymbol;
+        const rawName = item.token?.name ?? item.tokenName ?? rawSym;
         out.push({
           address: item.tokenAddress,
-          symbol: sanitizeTokenSymbol(item.tokenSymbol, 'UNKNOWN'),
-          name: sanitizeTokenName(item.tokenName || item.tokenSymbol, 'ERC-20 Token'),
+          symbol: sanitizeTokenSymbol(rawSym, 'UNKNOWN'),
+          name: sanitizeTokenName(rawName, 'ERC-20 Token'),
           decimals,
           rawBalance,
           ethplorerPriceUsd: Number.isFinite(price) && price > 0 ? price : 0,
@@ -642,6 +655,254 @@ async function discoverRoutescanTokens(
       }
     }
     return out.slice(0, maxTokens);
+  } catch {
+    clearTimeout(timer);
+    return [];
+  }
+}
+
+const RABBY_CHAIN_TO_EVM: Record<string, EvmChainId> = {
+  eth: 'ethereum',
+  ethereum: 'ethereum',
+  base: 'base',
+  arb: 'arbitrum',
+  arbitrum: 'arbitrum',
+  op: 'optimism',
+  optimism: 'optimism',
+  matic: 'polygon',
+  polygon: 'polygon',
+  avax: 'avalanche',
+  avalanche: 'avalanche',
+  bsc: 'bnb',
+  bnb: 'bnb',
+  sonic: 'sonic',
+  uni: 'unichain',
+  unichain: 'unichain',
+  linea: 'linea',
+  scrl: 'scroll',
+  scroll: 'scroll',
+  mnt: 'mantle',
+  mantle: 'mantle',
+  blast: 'blast',
+  world: 'worldchain',
+  worldchain: 'worldchain',
+};
+
+function sanitizeHttpsUrl(raw?: string | null): string | undefined {
+  if (!raw || typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:') return parsed.toString();
+  } catch {
+    // ignore malformed URL
+  }
+  return undefined;
+}
+
+export interface DiscoveredProtocolToken {
+  address: string;
+  symbol: string;
+  name: string;
+  decimals: number;
+  amount: number;
+  priceUsd: number;
+}
+
+export interface DiscoveredProtocolPosition {
+  chain: EvmChainId;
+  protocolId: string;
+  protocolName: string;
+  protocolLogoUrl?: string;
+  protocolSiteUrl?: string;
+  positionType: string;
+  detailTypes: string[];
+  poolAddress: string;
+  positionIndex?: string;
+  description?: string;
+  supplyTokens: DiscoveredProtocolToken[];
+  borrowTokens: DiscoveredProtocolToken[];
+  rewardTokens: DiscoveredProtocolToken[];
+  assetUsdValue: number;
+  debtUsdValue: number;
+  netUsdValue: number;
+  healthRate?: number;
+  unlockAt?: number;
+  hasWithdrawAction: boolean;
+}
+
+/**
+ * Discovers live protocol-level DeFi positions across ALL 14 supported EVM chains
+ * (lending markets, locked/veNFT staking, margin deposits, yield vaults, LP positions, etc.)
+ * via Rabby's public multi-chain protocol indexer so non-ERC20 / custom-contract DeFi
+ * (e.g. 40 Acres, Wayfinder, Velodrome veNFT, Carbon/IntentX, Yearn, Pendle, GMX) is always surfaced.
+ */
+export async function discoverDefiProtocolPositions(
+  walletAddress: string
+): Promise<DiscoveredProtocolPosition[]> {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(walletAddress)) return [];
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4500);
+  try {
+    const res = await fetch(
+      `https://api.rabby.io/v1/user/complex_protocol_list?id=${encodeURIComponent(walletAddress)}`,
+      {
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timer);
+    if (!res.ok) return [];
+
+    type RawRabbyToken = {
+      id?: string;
+      symbol?: string;
+      optimized_symbol?: string;
+      display_symbol?: string | null;
+      name?: string;
+      decimals?: number;
+      price?: number;
+      amount?: number;
+    };
+
+    type RawRabbyProtocol = {
+      id?: string;
+      chain?: string;
+      name?: string;
+      site_url?: string;
+      logo_url?: string;
+      portfolio_item_list?: Array<{
+        name?: string;
+        detail_types?: string[];
+        position_index?: string;
+        stats?: {
+          asset_usd_value?: number;
+          debt_usd_value?: number;
+          net_usd_value?: number;
+        };
+        asset_token_list?: RawRabbyToken[];
+        withdraw_actions?: Array<{ type?: string }>;
+        detail?: {
+          supply_token_list?: RawRabbyToken[];
+          borrow_token_list?: RawRabbyToken[];
+          reward_token_list?: RawRabbyToken[];
+          health_rate?: number;
+          unlock_at?: number;
+          description?: string;
+        };
+        pool?: {
+          id?: string;
+          controller?: string;
+        };
+      }>;
+    };
+
+    const protocols = (await res.json()) as RawRabbyProtocol[];
+    if (!Array.isArray(protocols)) return [];
+
+    const mapToken = (t: RawRabbyToken): DiscoveredProtocolToken | null => {
+      const amount = Math.abs(Number(t.amount ?? 0));
+      if (!Number.isFinite(amount) || amount <= 0) return null;
+      const priceUsd = Number(t.price ?? 0);
+      const rawAddr = String(t.id ?? '').trim();
+      const address = /^0x[0-9a-fA-F]{40}$/.test(rawAddr) ? rawAddr : 'native';
+      const decimals = Math.min(36, Math.max(0, Number(t.decimals ?? 18) || 18));
+      const sym = sanitizeTokenSymbol(t.optimized_symbol || t.display_symbol || t.symbol, 'TOKEN');
+      const name = sanitizeTokenName(t.name || sym, sym);
+      return {
+        address,
+        symbol: sym,
+        name,
+        decimals,
+        amount,
+        priceUsd: Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : 0,
+      };
+    };
+
+    const out: DiscoveredProtocolPosition[] = [];
+    for (const proto of protocols) {
+      const chain = RABBY_CHAIN_TO_EVM[String(proto.chain ?? '').toLowerCase()];
+      if (!chain) continue;
+
+      const protocolName = sanitizeTokenName(proto.name || proto.id, 'DeFi Protocol');
+      const protocolLogoUrl = sanitizeHttpsUrl(proto.logo_url);
+      const protocolSiteUrl = sanitizeHttpsUrl(proto.site_url);
+
+      for (const item of proto.portfolio_item_list ?? []) {
+        const assetUsdValue = Number(item.stats?.asset_usd_value ?? 0);
+        const debtUsdValue = Number(item.stats?.debt_usd_value ?? 0);
+        const netUsdValue = Number(item.stats?.net_usd_value ?? assetUsdValue - debtUsdValue);
+
+        // Skip microscopic sub-cent dust leftovers
+        if (assetUsdValue < 0.01 && debtUsdValue < 0.01) continue;
+
+        const supplyTokens = (
+          item.detail?.supply_token_list?.length
+            ? item.detail.supply_token_list
+            : (item.asset_token_list ?? []).filter((t) => Number(t.amount ?? 0) > 0)
+        )
+          .map(mapToken)
+          .filter((t): t is DiscoveredProtocolToken => Boolean(t));
+
+        const borrowTokens = (
+          item.detail?.borrow_token_list?.length
+            ? item.detail.borrow_token_list
+            : (item.asset_token_list ?? []).filter((t) => Number(t.amount ?? 0) < 0)
+        )
+          .map(mapToken)
+          .filter((t): t is DiscoveredProtocolToken => Boolean(t));
+
+        const rewardTokens = (item.detail?.reward_token_list ?? [])
+          .map(mapToken)
+          .filter((t): t is DiscoveredProtocolToken => Boolean(t));
+
+        if (!supplyTokens.length && !rewardTokens.length) continue;
+
+        const rawPool = item.pool?.controller || item.pool?.id || supplyTokens[0]?.address || '0x0000000000000000000000000000000000000000';
+        const poolAddress = /^0x[0-9a-fA-F]{40}$/.test(rawPool)
+          ? rawPool
+          : supplyTokens[0]?.address || '0x0000000000000000000000000000000000000000';
+
+        const healthRate =
+          typeof item.detail?.health_rate === 'number' && Number.isFinite(item.detail.health_rate)
+            ? Number(item.detail.health_rate.toFixed(2))
+            : undefined;
+        const unlockAt =
+          typeof item.detail?.unlock_at === 'number' && Number.isFinite(item.detail.unlock_at) && item.detail.unlock_at > 0
+            ? Math.round(item.detail.unlock_at)
+            : undefined;
+
+        out.push({
+          chain,
+          protocolId: String(proto.id ?? protocolName.toLowerCase().replace(/\s+/g, '_')),
+          protocolName,
+          protocolLogoUrl,
+          protocolSiteUrl,
+          positionType: sanitizeTokenName(item.name || 'Position', 'Position'),
+          detailTypes: Array.isArray(item.detail_types) ? item.detail_types.map(String) : [],
+          poolAddress,
+          positionIndex: item.position_index ? String(item.position_index) : undefined,
+          description: item.detail?.description
+            ? sanitizeTokenName(item.detail.description, '')
+            : undefined,
+          supplyTokens,
+          borrowTokens,
+          rewardTokens,
+          assetUsdValue: Number(assetUsdValue.toFixed(2)),
+          debtUsdValue: Number(debtUsdValue.toFixed(2)),
+          netUsdValue: Number(netUsdValue.toFixed(2)),
+          healthRate,
+          unlockAt,
+          hasWithdrawAction: Boolean(
+            item.withdraw_actions?.some((a) => a.type === 'withdraw')
+          ),
+        });
+      }
+    }
+
+    return out;
   } catch {
     clearTimeout(timer);
     return [];

@@ -1234,7 +1234,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
 
       if (method === 'POST' && pathname === '/api/tx/prepare-chain-batch') {
         const body = await readJsonBody<{
-          chain?: EvmChainId;
+          chain?: AnyChainId;
           assets?: ScannedAsset[];
           userAddress?: string;
           solanaDestination?: string;
@@ -1244,6 +1244,8 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           protocolFeeBps?: number;
           feeRecipientEvm?: string | null;
           allowHighCost?: boolean;
+          consolidateMultiInputDust?: boolean;
+          addressesByChain?: Record<string, string>;
         }>(req);
 
         if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
@@ -1255,29 +1257,52 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         assertNoFeeRecipientOverride(body.feeRecipientEvm);
 
         try {
-          const batch = await prepareChainBatchExecution({
+          if (isEvmChain(body.chain)) {
+            const batch = await prepareChainBatchExecution({
+              chain: body.chain,
+              assets: body.assets,
+              userAddress: body.userAddress,
+              solanaDestination: body.solanaDestination,
+              outputAsset: body.outputAsset ?? 'USDC',
+              bridgePreference: body.bridgePreference ?? 'auto',
+              bundleDefiCctp: body.bundleDefiCctp ?? true,
+              protocolFeeBps: body.protocolFeeBps,
+              feeRecipientEvm: undefined,
+              allowHighCost: body.allowHighCost ?? false,
+              consolidateMultiInputDust: body.consolidateMultiInputDust ?? true,
+            });
+            return reply(200, batch);
+          }
+
+          const adapter = getAdapterForChain(body.chain);
+          if (!adapter.prepareDirectBatch) {
+            return reply(400, {
+              error: `Direct conversion batching is not supported for ${body.chain}.`,
+            });
+          }
+          const nonEvmBatch = await adapter.prepareDirectBatch({
             chain: body.chain,
             assets: body.assets,
             userAddress: body.userAddress,
             solanaDestination: body.solanaDestination,
             outputAsset: body.outputAsset ?? 'USDC',
             bridgePreference: body.bridgePreference ?? 'auto',
-            bundleDefiCctp: body.bundleDefiCctp ?? true,
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipientEvm: undefined,
+            feeRecipient: undefined,
             allowHighCost: body.allowHighCost ?? false,
+            addressesByChain: body.addressesByChain,
           });
-          return reply(200, batch);
+          return reply(200, nonEvmBatch);
         } catch (err) {
           return reply(400, {
-            error: err instanceof Error ? err.message : 'Could not prepare EIP-5792 chain batch',
+            error: err instanceof Error ? err.message : 'Could not prepare chain conversion batch',
           });
         }
       }
 
       if (method === 'POST' && pathname === '/api/tx/status') {
         const body = await readJsonBody<{
-          chain?: EvmChainId;
+          chain?: AnyChainId;
           txHash?: string;
           requestId?: string;
           provider?: string;
@@ -1392,6 +1417,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           txHash?: string;
           userAddress?: string;
           solanaDestination?: string;
+          outputAsset?: 'USDC' | 'SOL';
           requestId?: string;
           provider?: string;
           feeRecipientEvm?: string | null;
@@ -1434,6 +1460,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
             txHash: body.txHash.trim(),
             userAddress: body.userAddress || '',
             solanaDestination: body.solanaDestination.trim(),
+            outputAsset: body.outputAsset ?? 'USDC',
             requestId: body.requestId,
             provider: body.provider,
             feeRecipient: undefined,
@@ -1458,6 +1485,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           protocolFeeBps?: number;
           feeRecipientEvm?: string | null;
           preferredMode?: 'permit2_batch' | 'eip7702_delegate';
+          filterToInstantSingleSig?: boolean;
         }>(req);
 
         if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
@@ -1479,6 +1507,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
               protocolFeeBps: body.protocolFeeBps,
               feeRecipientEvm: undefined,
               preferredMode: body.preferredMode,
+              filterToInstantSingleSig: body.filterToInstantSingleSig,
             });
             if (!plan.sponsorEligible) {
               return reply(400, {
@@ -1500,6 +1529,12 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
             protocolFeeBps: body.protocolFeeBps,
             feeRecipient: undefined,
           });
+          if (intent.sponsorEligible === false) {
+            return reply(400, {
+              ...intent,
+              error: intent.sponsorRejectionReason || 'Below gasless sponsorship break-even.',
+            });
+          }
           return reply(200, intent);
         } catch (err) {
           return reply(400, {

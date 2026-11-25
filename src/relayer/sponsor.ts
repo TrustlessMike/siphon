@@ -3,6 +3,7 @@ import { keccak_256 } from '@noble/hashes/sha3';
 import { secp256k1 } from '@noble/curves/secp256k1';
 import { deriveSolanaUsdcAta, solanaOwnerToUsdcAtaBytes32 } from '../bridge/cctp.js';
 import { EVM_CHAINS, getProtocolFeeConfig } from '../scanner/chains.js';
+import { isEip2612Token } from '../scanner/discovery.js';
 import { computeRelayerBreakEven, RELAYER_BREAK_EVEN_MULTIPLIER } from '../scanner/roi.js';
 import type { EvmChainId, ScannedAsset } from '../scanner/types.js';
 
@@ -276,6 +277,14 @@ export interface GaslessSweepIntentPlan {
   relayerExpectedCoverageUsd: number;
   coveredAssets: Array<{ id: string; symbol: string; address: string; rawBalance: string; grossUsd: number }>;
   uncoveredNativeAssets: Array<{ id: string; symbol: string; reason: string }>;
+  instantSingleSigBreakdown: {
+    permit2ApprovedIds: string[];
+    eip2612SupportedIds: string[];
+    instantEligibleIds: string[];
+    requiresOnchainApprovalIds: string[];
+    zeroPopupReadyCount: number;
+    requiresApprovalCount: number;
+  };
   routerConfigured: boolean;
   previewOnly: boolean;
   relayerConfigured: boolean;
@@ -365,6 +374,7 @@ export function buildGaslessSweepIntent(params: {
   protocolFeeBps?: number;
   feeRecipientEvm?: string | null;
   preferredMode?: 'permit2_batch' | 'eip7702_delegate';
+  filterToInstantSingleSig?: boolean;
   callsHash?: string;
   swapsHash?: string;
 }): GaslessSweepIntentPlan {
@@ -391,12 +401,33 @@ export function buildGaslessSweepIntent(params: {
       a.action !== 'SKIP_NEGATIVE_ROI'
   );
   // MED-05: Permit2 batch strictly covers liquid swappable/bridgeable ERC-20s (never dead burns or DeFi receipts)
-  const permit2Erc20Assets = chainAssets.filter(
+  const allLiquidErc20Assets = chainAssets.filter(
     (a) =>
       a.address !== 'native' &&
       a.kind !== 'defi_position' &&
       (a.action === 'SELL_AND_BRIDGE' || a.action === 'BRIDGE_DIRECT_USDC')
   );
+  const permit2ApprovedIds: string[] = [];
+  const eip2612SupportedIds: string[] = [];
+  const instantEligibleIds: string[] = [];
+  const requiresOnchainApprovalIds: string[] = [];
+  for (const asset of allLiquidErc20Assets) {
+    const hasPermit2 = Boolean(asset.permit2Approved);
+    const hasEip2612 = Boolean(
+      asset.eip2612Supported ?? isEip2612Token(params.chain, asset.address, asset.symbol)
+    );
+    if (hasPermit2) permit2ApprovedIds.push(asset.id);
+    if (hasEip2612) eip2612SupportedIds.push(asset.id);
+    if (hasPermit2 || hasEip2612) {
+      instantEligibleIds.push(asset.id);
+    } else {
+      requiresOnchainApprovalIds.push(asset.id);
+    }
+  }
+  const instantEligibleSet = new Set(instantEligibleIds);
+  const permit2Erc20Assets = params.filterToInstantSingleSig
+    ? allLiquidErc20Assets.filter((a) => instantEligibleSet.has(a.id))
+    : allLiquidErc20Assets;
   const nativeAssets = chainAssets.filter((a) => a.address === 'native');
 
   const mode: 'permit2_batch' | 'eip7702_delegate' =
@@ -700,6 +731,14 @@ export function buildGaslessSweepIntent(params: {
             reason: `Native ${a.symbol} requires EIP-7702 delegate execution (Permit2 covers liquid ERC-20s).`,
           }))
         : [],
+    instantSingleSigBreakdown: {
+      permit2ApprovedIds,
+      eip2612SupportedIds,
+      instantEligibleIds,
+      requiresOnchainApprovalIds,
+      zeroPopupReadyCount: instantEligibleIds.length,
+      requiresApprovalCount: requiresOnchainApprovalIds.length,
+    },
     routerConfigured,
     previewOnly,
     relayerConfigured: isSponsorRelayerConfigured(params.chain),
