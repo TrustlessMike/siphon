@@ -946,8 +946,22 @@ test('HIGH-09, HIGH-10, MED-07, CRIT-07: poller concurrency guard, ETH 780s CCTP
       requestId: 'req_race_1',
     });
 
-    // Wait until tick #1 enters statusChecker, then wait ~60ms (> 3 intervals) while tick #1 is still pending
-    await firstTickStarted;
+    // Wait until tick #1 enters statusChecker, then wait ~60ms (> 3 intervals) while tick #1 is still pending.
+    // Keep a ref'd timeout guard alive because BackgroundJobStore calls timer.unref() on poll intervals.
+    let firstTickGuard: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        firstTickStarted,
+        new Promise<never>((_, reject) => {
+          firstTickGuard = setTimeout(
+            () => reject(new Error('Timed out waiting for first background poller tick')),
+            2000
+          );
+        }),
+      ]);
+    } finally {
+      if (firstTickGuard) clearTimeout(firstTickGuard);
+    }
     await new Promise((r) => setTimeout(r, 65));
     assert.equal(maxConcurrentCalls, 1, 'Poller must NEVER run overlapping async ticks');
 
