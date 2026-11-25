@@ -1,5 +1,5 @@
-import { mountSiphonFunnelScene } from './siphon-3d.js?v=5';
-import { renderConvergenceSvg } from './siphon-svg.js?v=5';
+import { mountSiphonFunnelScene } from './siphon-3d.js?v=7';
+import { renderConvergenceSvg } from './siphon-svg.js?v=7';
 import {
   connectCoinbaseSmartWallet,
   connectEvmWallet,
@@ -18,6 +18,8 @@ import {
   getWalletBatchCapabilities,
   getWalletConnectorConfig,
   isChainBatchSupported,
+  isUserRejectedError,
+  isValidSolanaBase58,
   listAvailableEvmWallets,
   listAvailableFamilyWallets,
   listAvailableSolanaWallets,
@@ -31,11 +33,12 @@ import {
   signGaslessTypedData,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
-} from './wallets.js?v=5';
+} from './wallets.js?v=7';
 
 let currentScan = null;
 let currentPlan = null;
 let selectedAssetIds = new Set();
+let batchRescuedDustIds = new Set();
 let activeFamily = 'evm';
 let familyMetas = {};
 let activeFilter = 'all';
@@ -55,15 +58,191 @@ let unifiedWallets = []; // [{ address, label, family }]
 let agentMandates = [];
 let agentApprovals = [];
 let pluginSetupData = null;
+let defiStepperState = null;
+let manualDestConfirmedAddress = null;
+let isSweepQueueRunning = false;
+const executingChains = new Set();
+let planSeq = 0;
+let solBalSeq = 0;
 
 const FEE_RECIPIENT_STORAGE_KEY = 'siphon_fee_recipient_evm';
+// Neutral all-zero Solana System Program address used strictly for read-only /api/plan previews
+// when the user has not yet connected or entered a Solana destination. Never used for execution.
+const PREVIEW_SOLANA_PLACEHOLDER = '11111111111111111111111111111111';
 
 function escapeHtml(str) {
   return String(str ?? '')
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+const escHtml = escapeHtml;
+
+function safeInt(val) {
+  const n = Number(val);
+  return Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : 0;
+}
+
+function safeNum(val) {
+  const n = Number(val);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function safeHttpUrl(url) {
+  const raw = String(url || '').trim();
+  if (/^https?:\/\//i.test(raw)) return escHtml(raw);
+  return '#';
+}
+
+function safeTxHash(hash) {
+  const s = String(hash || '').trim();
+  if (/^0x[0-9a-fA-F]{64}$/.test(s)) return s;
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,128}$/.test(s)) return s;
+  if (/^[0-9a-fA-F]{64}$/.test(s)) return s;
+  return null;
+}
+
+function safeExplorerTxUrl(explorerBase, txHash) {
+  const cleanHash = safeTxHash(txHash);
+  const base = String(explorerBase || '').trim().replace(/\/+$/, '');
+  if (!cleanHash || !/^https:\/\//i.test(base)) return null;
+  return `${base}/tx/${encodeURIComponent(cleanHash)}`;
+}
+
+function safeWalletIconUrl(iconUrl, fallbackLocal) {
+  const raw = String(iconUrl || '').trim();
+  if (!raw) return fallbackLocal;
+  if (/^\/logos\/[a-z0-9._-]+\.(svg|png|webp)$/i.test(raw)) return raw;
+  if (/^data:image\/(png|jpeg|webp|gif|svg\+xml)(;charset=[^;,]+)?(;base64)?,/i.test(raw)) return raw;
+  return fallbackLocal;
+}
+
+function csvCell(val) {
+  let s = String(val ?? '');
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return `"${s.replaceAll('"', '""')}"`;
+}
+
+function needsDarkLogoBacking(str) {
+  const s = String(str || '').toLowerCase();
+  return s.includes('mantle') || s.includes('blast') || s.includes('solflare');
+}
+
+function getVerifiedSolanaDestination() {
+  const raw = document.getElementById('solanaDestInput')?.value?.trim() || '';
+  if (!raw || !isValidSolanaBase58(raw)) return null;
+  const connectedSol = getConnectedSolanaAddress();
+  if (connectedSol && connectedSol === raw) return raw;
+  const chk = document.getElementById('manualDestConfirmChk');
+  if (chk?.checked && manualDestConfirmedAddress === raw) return raw;
+  return null;
+}
+
+function syncDestinationUiState() {
+  const input = document.getElementById('solanaDestInput');
+  const summaryEl = document.getElementById('destAddrSummary');
+  const confirmWrap = document.getElementById('manualDestConfirmWrap');
+  const confirmChk = document.getElementById('manualDestConfirmChk');
+  const mandateNote = document.getElementById('mandateLockedDestNote');
+
+  const raw = input?.value?.trim() || '';
+  const connectedSol = getConnectedSolanaAddress();
+  const solWalletName = getConnectedSolanaWalletName();
+  const isConnectedMatch = Boolean(connectedSol && connectedSol === raw);
+  const isValid = Boolean(raw && isValidSolanaBase58(raw));
+
+  if (confirmWrap) {
+    const showManualConfirm = Boolean(raw && !isConnectedMatch);
+    confirmWrap.classList.toggle('hidden', !showManualConfirm);
+    if (!showManualConfirm && confirmChk) {
+      confirmChk.checked = false;
+      manualDestConfirmedAddress = null;
+    }
+  }
+
+  if (summaryEl) {
+    if (!raw) {
+      summaryEl.textContent = 'Connect Solana or enter destination';
+    } else if (!isValid) {
+      summaryEl.textContent = 'Invalid Solana address';
+    } else if (isConnectedMatch) {
+      summaryEl.textContent = solWalletName
+        ? `${solWalletName} · ${shortAddr(raw)}`
+        : shortAddr(raw);
+    } else if (confirmChk?.checked && manualDestConfirmedAddress === raw) {
+      summaryEl.textContent = `Manual (Verified) · ${shortAddr(raw)}`;
+    } else {
+      summaryEl.textContent = `Unconfirmed · ${shortAddr(raw)}`;
+    }
+  }
+
+  if (mandateNote) {
+    const verified = getVerifiedSolanaDestination();
+    mandateNote.textContent = verified
+      ? `Immutably locks destination → ${shortAddr(verified)}`
+      : 'Connect Solana or confirm a destination address first';
+  }
+}
+
+function requireVerifiedSolanaDestination(actionLabel = 'sweep') {
+  const verified = getVerifiedSolanaDestination();
+  if (verified) return verified;
+
+  const wrap = document.getElementById('destEditWrap');
+  const input = document.getElementById('solanaDestInput');
+  const chk = document.getElementById('manualDestConfirmChk');
+  wrap?.classList.remove('hidden');
+  syncDestinationUiState();
+
+  const raw = input?.value?.trim() || '';
+  if (!raw) {
+    showToast(`Connect a Solana wallet or enter & confirm a Solana destination before you ${actionLabel}.`);
+    input?.focus();
+  } else if (!isValidSolanaBase58(raw)) {
+    showToast('Enter a valid Base58 Solana destination address before proceeding.');
+    input?.focus();
+  } else {
+    showToast('Check "I verified this Solana destination address" (or connect Solana) before proceeding.');
+    chk?.focus();
+  }
+  return null;
+}
+
+function clearSolanaDestinationUi() {
+  const input = document.getElementById('solanaDestInput');
+  const chk = document.getElementById('manualDestConfirmChk');
+  const badge = document.getElementById('solanaLiveBalanceBadge');
+  if (input) input.value = '';
+  if (chk) chk.checked = false;
+  manualDestConfirmedAddress = null;
+  solanaBalances = null;
+  if (badge) badge.textContent = 'Connect a Solana wallet or enter a destination address';
+  syncDestinationUiState();
+}
+
+function buildEffectiveScanForPlan() {
+  if (!currentScan) return null;
+  if (!batchRescuedDustIds.size) return currentScan;
+  return {
+    ...currentScan,
+    assets: currentScan.assets.map((a) => {
+      if (
+        batchRescuedDustIds.has(a.id) &&
+        selectedAssetIds.has(a.id) &&
+        (a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_NEGATIVE_ROI')
+      ) {
+        return {
+          ...a,
+          action: 'SELL_AND_BRIDGE',
+          actionReason: 'Batch-rescued dust token promoted into single chain swap & bridge',
+        };
+      }
+      return a;
+    }),
+  };
 }
 
 function shortAddr(addr) {
@@ -171,10 +350,21 @@ function getChainLogoPath(chain) {
 
 function getProtocolLogoPath(protocol) {
   const p = String(protocol || '').toLowerCase();
+  if (!p) return null;
   if (p.includes('aave')) return '/logos/aave.svg';
   if (p.includes('lido')) return '/logos/lido.svg';
   if (p.includes('compound')) return '/logos/compound.svg';
-  return null;
+  if (p.includes('morpho')) return '/logos/morpho.svg';
+  if (p.includes('uniswap')) return '/logos/uniswap.svg';
+  if (p.includes('curve')) return '/logos/curve.svg';
+  if (p.includes('spark')) return '/logos/spark.svg';
+  if (p.includes('osmosis')) return '/logos/osmosis.svg';
+  if (p.includes('cosmos')) return '/logos/cosmos.svg';
+  if (p.includes('sui')) return '/logos/sui.svg';
+  if (p.includes('vault') || p.includes('4626') || p.includes('sky') || p.includes('ethena') || p.includes('yearn')) {
+    return '/logos/vault.svg';
+  }
+  return '/logos/vault.svg';
 }
 
 function getBridgeProviderLogosHtml(pref) {
@@ -203,6 +393,7 @@ function getActiveFeeRecipientEvm() {
 function showWebsite() {
   document.getElementById('siteShell').classList.remove('hidden');
   document.getElementById('appShell').classList.add('hidden');
+  heroScene?.setPaused(false);
   window.scrollTo({ top: 0, behavior: 'instant' });
   window.dispatchEvent(new Event('resize'));
   renderBackgroundAgentUI();
@@ -212,6 +403,7 @@ function openApp(viewName = 'scanner') {
   const mapped = viewName === 'burns' || viewName === 'pipeline' ? 'activity' : viewName;
   document.getElementById('siteShell').classList.add('hidden');
   document.getElementById('appShell').classList.remove('hidden');
+  heroScene?.setPaused(true);
   switchView(mapped);
   window.scrollTo({ top: 0, behavior: 'instant' });
 }
@@ -234,22 +426,31 @@ window.openApp = openApp;
 window.switchView = switchView;
 
 async function refreshSolanaBalance() {
-  const solDest = document.getElementById('solanaDestInput')?.value.trim();
+  const seq = ++solBalSeq;
+  const solDest = document.getElementById('solanaDestInput')?.value.trim() || '';
   const badge = document.getElementById('solanaLiveBalanceBadge');
-  const summaryEl = document.getElementById('destAddrSummary');
-  if (summaryEl && solDest) {
-    const solWalletName = getConnectedSolanaWalletName();
-    summaryEl.textContent = solWalletName
-      ? `${solWalletName} · ${shortAddr(solDest)}`
-      : shortAddr(solDest);
+  syncDestinationUiState();
+
+  if (!solDest) {
+    solanaBalances = null;
+    if (badge) badge.textContent = 'Connect a Solana wallet or enter a destination address';
+    return;
   }
-  if (!solDest) return;
+  if (!isValidSolanaBase58(solDest)) {
+    solanaBalances = null;
+    if (badge) badge.textContent = 'Invalid Solana address';
+    return;
+  }
+
   try {
-    solanaBalances = await api(`/api/solana/balance?address=${encodeURIComponent(solDest)}`);
+    const res = await api(`/api/solana/balance?address=${encodeURIComponent(solDest)}`);
+    if (seq !== solBalSeq) return;
+    solanaBalances = res;
     if (badge) {
-      badge.textContent = `${solanaBalances.usdcBalance.toFixed(2)} USDC · ${solanaBalances.solBalance.toFixed(3)} SOL on Solana`;
+      badge.textContent = `${safeNum(solanaBalances.usdcBalance).toFixed(2)} USDC · ${safeNum(solanaBalances.solBalance).toFixed(3)} SOL on Solana`;
     }
   } catch (err) {
+    if (seq !== solBalSeq) return;
     const isInvalid = String(err?.message || '').toLowerCase().includes('invalid');
     if (badge) {
       badge.textContent = isInvalid
@@ -373,24 +574,28 @@ function updateWalletButtons() {
   if (evmBtn) {
     const shortName = walletName ? walletName.split(' ')[0] : famShort;
     const logo = srcAddr ? getWalletLogoPath(walletName) : getFamilyLogoPath(activeFamily);
-    evmBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(srcAddr ? `${shortName}: ${shortAddr(srcAddr)}` : `Connect ${famShort}`)}</span>`;
+    const darkCls = needsDarkLogoBacking(logo) ? ' logo-dark-backing' : '';
+    evmBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo${darkCls}" /><span>${escapeHtml(srcAddr ? `${shortName}: ${shortAddr(srcAddr)}` : `Connect ${famShort}`)}</span>`;
     evmBtn.classList.toggle('connected', Boolean(srcAddr));
   }
   if (solBtn) {
     const solFull = getConnectedSolanaWalletName();
     const solName = solFull?.split(' ')[0] || 'SOL';
     const logo = solAddr ? getWalletLogoPath(solFull || 'Phantom') : '/logos/solana.svg';
-    solBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(solAddr ? `${solName}: ${shortAddr(solAddr)}` : 'Connect Solana')}</span>`;
+    const darkCls = needsDarkLogoBacking(logo) ? ' logo-dark-backing' : '';
+    solBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo${darkCls}" /><span>${escapeHtml(solAddr ? `${solName}: ${shortAddr(solAddr)}` : 'Connect Solana')}</span>`;
     solBtn.classList.toggle('connected', Boolean(solAddr));
   }
   if (siteBtn) {
     const shortName = walletName ? walletName.split(' ')[0] : null;
     if (srcAddr) {
       const logo = getWalletLogoPath(walletName);
-      siteBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(`${shortName ? `${shortName} · ` : ''}${shortAddr(srcAddr)}`)}</span>`;
+      const darkCls = needsDarkLogoBacking(logo) ? ' logo-dark-backing' : '';
+      siteBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo${darkCls}" /><span class="site-connect-label">${escapeHtml(`${shortName ? `${shortName} · ` : ''}${shortAddr(srcAddr)}`)}</span>`;
     } else if (solAddr) {
       const logo = getWalletLogoPath(getConnectedSolanaWalletName() || 'Phantom');
-      siteBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(`SOL · ${shortAddr(solAddr)}`)}</span>`;
+      const darkCls = needsDarkLogoBacking(logo) ? ' logo-dark-backing' : '';
+      siteBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo${darkCls}" /><span class="site-connect-label">${escapeHtml(`SOL · ${shortAddr(solAddr)}`)}</span>`;
     } else {
       siteBtn.textContent = 'Connect Wallet';
     }
@@ -404,9 +609,12 @@ function updateWalletButtons() {
   }
 
   if (ctaBtn) {
-    const n = stats.totalChains;
+    const n = currentPlan ? currentPlan.legs.length : 0;
     if (n === 0) {
       ctaBtn.textContent = 'Select assets to sweep';
+      ctaBtn.disabled = true;
+    } else if (isSweepQueueRunning) {
+      ctaBtn.textContent = 'Sweep in progress…';
       ctaBtn.disabled = true;
     } else if (!srcAddr) {
       ctaBtn.textContent = `Connect ${famShort} Wallet to Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`;
@@ -456,12 +664,19 @@ async function runScan({ address = null, family = null, presetId = null, autoOpe
     });
     if (seq !== scanSeq) return;
     currentScan = scan;
+    batchRescuedDustIds.clear();
     if (scan.family && scan.family !== activeFamily) {
       activeFamily = scan.family;
-      if (activeFamily !== 'evm') executionMode = 'gasless';
+      if (activeFamily !== 'evm') {
+        executionMode = 'gasless';
+        document.querySelectorAll('.mode-opt[data-exec-mode]').forEach((b) => {
+          b.classList.toggle('active', b.dataset.execMode === executionMode);
+        });
+      }
     }
     updateFamilyChrome();
     activeChainFilter = 'all';
+    defiStepperState = null;
     renderPreSignProofCard(null);
 
     selectedAssetIds = new Set(
@@ -513,20 +728,24 @@ function getActiveBridgePreference() {
 
 async function recomputePlan() {
   if (!currentScan) return;
-  const solDest = document.getElementById('solanaDestInput').value.trim();
+  const seq = ++planSeq;
+  const rawSolDest = document.getElementById('solanaDestInput')?.value.trim() || '';
+  const hasValidDest = Boolean(rawSolDest && isValidSolanaBase58(rawSolDest));
+  const previewSolDest = hasValidDest ? rawSolDest : PREVIEW_SOLANA_PLACEHOLDER;
   const usePermit2Batch = document.getElementById('permit2Toggle').checked;
   const includeBurns = document.getElementById('burnToggle').checked;
   const bridgePreference = getActiveBridgePreference();
   const protocolFeeBps = getActiveProtocolFeeBps();
   const feeRecipientEvm = getActiveFeeRecipientEvm();
+  const effectiveScan = buildEffectiveScanForPlan();
 
   try {
-    currentPlan = await api('/api/plan', {
+    const plan = await api('/api/plan', {
       method: 'POST',
       body: JSON.stringify({
-        scan: currentScan,
+        scan: effectiveScan,
         selectedAssetIds: Array.from(selectedAssetIds),
-        solanaDestination: solDest,
+        solanaDestination: previewSolDest,
         usePermit2Batch,
         includeBurns,
         outputAsset,
@@ -536,9 +755,14 @@ async function recomputePlan() {
         hasSolanaUsdcAta: solanaBalances ? Boolean(solanaBalances.hasUsdcAta) : undefined,
       }),
     });
+    if (seq !== planSeq) return;
+    currentPlan = {
+      ...plan,
+      solanaDestination: hasValidDest ? rawSolDest : '',
+    };
     renderAll();
   } catch (err) {
-    showToast(err.message);
+    if (seq === planSeq) showToast(err.message);
   }
 }
 
@@ -616,6 +840,7 @@ function renderAll() {
   const svgHost = document.getElementById('convergenceSvgHost');
   if (svgHost) svgHost.innerHTML = renderConvergenceSvg(currentPlan, currentScan);
 
+  renderDefiUnwindPanel();
   renderChainFilterBar();
   renderAssetList();
   renderChainQueueList();
@@ -638,9 +863,11 @@ function renderChainFilterBar() {
     if (c.assetCount === 0) continue;
     const leg = currentPlan.legs.find((l) => l.chain === c.chain);
     const val = leg ? leg.bridgedUsdc : 0;
+    const logoPath = getChainLogoPath(c.chain);
+    const darkCls = needsDarkLogoBacking(c.chain) ? ' logo-dark-backing' : '';
     chips.push(`
       <button type="button" class="chain-chip ${activeChainFilter === c.chain ? 'active' : ''}" data-chain-filter="${escapeHtml(c.chain)}">
-        <img src="${escapeHtml(getChainLogoPath(c.chain))}" alt="" class="chain-logo-xs" />
+        <img src="${escapeHtml(logoPath)}" alt="" class="chain-logo-xs${darkCls}" />
         <span>${escapeHtml(c.chainName)}</span>
         <span class="chain-chip-val">${escapeHtml(fmtUsd(val))}</span>
       </button>
@@ -693,12 +920,642 @@ function renderRoiVerdictBadge(a) {
 }
 
 function compactActionTag(action) {
-  if (action === 'WITHDRAW_AND_BRIDGE') return `<span class="action-tag tag-defi">DeFi Exit</span>`;
+  if (action === 'WITHDRAW_AND_BRIDGE') return `<span class="action-tag tag-defi">1-Click Exit</span>`;
   if (action === 'BRIDGE_DIRECT_USDC') return `<span class="action-tag tag-direct">USDC</span>`;
   if (action === 'SELL_AND_BRIDGE') return `<span class="action-tag tag-sell">Swap</span>`;
   if (action === 'BURN_ZERO_LIQUIDITY') return `<span class="action-tag tag-burn">Burn</span>`;
   if (action === 'SKIP_HONEYPOT') return `<span class="action-tag tag-skip">Honeypot</span>`;
   return `<span class="action-tag tag-skip">Dust</span>`;
+}
+
+// =====================================================================
+// DEDICATED DEFI QUICK-UNWIND PANEL & AUTOMATIC GUIDED STEPPER
+// =====================================================================
+
+function isDefiAsset(a) {
+  return Boolean(a && (a.kind === 'defi_position' || a.action === 'WITHDRAW_AND_BRIDGE' || a.defiExitPlan));
+}
+
+function sanitizePlainDefiText(raw) {
+  if (!raw) return '';
+  return String(raw)
+    .replace(/\bWITHDRAW_AND_BRIDGE\b/g, 'protocol withdrawal')
+    .replace(/\bSELL_AND_BRIDGE\b/g, 'instant swap')
+    .replace(/\bBRIDGE_DIRECT_USDC\b/g, 'direct bridge')
+    .replace(/\bComet\.withdraw\([^)]*\)/gi, 'Compound withdrawal')
+    .replace(/\bPool\.withdraw\([^)]*\)/gi, 'Aave withdrawal')
+    .replace(/\bERC4626\.redeem\([^)]*\)/gi, 'Vault withdrawal')
+    .replace(/\b0x[0-9a-fA-F]{8,}\b/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function getProtocolGroupName(asset) {
+  const raw = String(
+    asset?.defiExitPlan?.protocolName || asset?.defiExitPlan?.protocol || asset?.protocol || ''
+  ).trim();
+  const low = raw.toLowerCase();
+  if (low.includes('aave')) return 'Aave v3';
+  if (low.includes('compound')) return 'Compound v3';
+  if (low.includes('morpho')) return 'Morpho / Vaults';
+  if (low.includes('lido')) return 'Lido';
+  if (low.includes('uniswap')) return 'Uniswap LP';
+  if (low.includes('curve')) return 'Curve';
+  if (low.includes('spark')) return 'Spark Vaults';
+  if (low.includes('sky')) return 'Sky Vaults';
+  if (low.includes('ethena')) return 'Ethena Vaults';
+  if (low.includes('erc-4626') || low.includes('erc4626') || low === 'vault') return 'Morpho / Vaults';
+  if (low.includes('cosmos')) return 'Cosmos Staking';
+  if (low.includes('sui')) return 'Sui Staking';
+  return raw || 'DeFi Vaults';
+}
+
+function getPlainDisplayToken(asset, plan) {
+  const sym = String(asset?.symbol || '').trim();
+  const underlying = String(plan?.underlyingSymbol || asset?.underlyingSymbol || '').trim();
+  if (!underlying) return sym || 'Token';
+  const lowSym = sym.toLowerCase();
+  const isReceiptToken =
+    lowSym.startsWith('aeth') ||
+    lowSym.startsWith('aarb') ||
+    lowSym.startsWith('apol') ||
+    lowSym.startsWith('abas') ||
+    lowSym.startsWith('aopt') ||
+    lowSym.startsWith('aava') ||
+    lowSym.startsWith('cusdc') ||
+    lowSym.startsWith('cweth') ||
+    lowSym.startsWith('sdai') ||
+    lowSym.startsWith('susds') ||
+    lowSym.startsWith('susde') ||
+    lowSym.startsWith('gt') ||
+    lowSym.startsWith('mw') ||
+    lowSym.includes('vault');
+  if (isReceiptToken) return underlying;
+  return sym || underlying;
+}
+
+function normalizeDefiPosition(asset, targetOut = outputAsset) {
+  const plan = asset?.defiExitPlan && typeof asset.defiExitPlan === 'object' ? asset.defiExitPlan : null;
+  const protocolGroup = getProtocolGroupName(asset);
+  const protocolLogo = getProtocolLogoPath(protocolGroup) || getProtocolLogoPath(asset?.protocol) || '/logos/vault.svg';
+  const chainLogo = getChainLogoPath(asset?.chain);
+  const modeRaw = String(plan?.mode || plan?.exitMode || plan?.strategy || '').toLowerCase();
+  const statusRaw = String(plan?.preflightStatus || plan?.status || plan?.healthStatus || '').toLowerCase();
+  const protoLow = protocolGroup.toLowerCase();
+
+  const hasDebt = Boolean(
+    plan?.debtGuardActive ||
+      modeRaw.includes('debt') ||
+      modeRaw.includes('partial') ||
+      (typeof asset?.aaveDebtUsd === 'number' && asset.aaveDebtUsd > 0)
+  );
+  const hasCooldown = Boolean(
+    modeRaw.includes('cooldown') ||
+      modeRaw.includes('lock') ||
+      modeRaw.includes('unstake') ||
+      statusRaw === 'cooldown' ||
+      statusRaw === 'locked' ||
+      asset?.stakedExitMode === 'native_unstake' ||
+      asset?.stakedExitMode === 'scheduled_authz_autosweep'
+  );
+  const isInstantSwap = Boolean(
+    modeRaw.includes('instant') ||
+      modeRaw.includes('swap') ||
+      asset?.stakedExitMode === 'instant_liquid_stake' ||
+      protoLow.includes('lido')
+  );
+
+  let category = 'one_click';
+  if (hasCooldown) category = 'cooldown';
+  else if (hasDebt) category = 'debt_guard';
+  else if (isInstantSwap) category = 'instant_swap';
+
+  const defaultBadges = {
+    one_click: '⚡ 1-Click Extract → Solana',
+    instant_swap: '🔄 Instant Swap (Skips Cooldown)',
+    debt_guard: '🛡️ Safe Partial (Debt Guard)',
+    cooldown: '⏳ Cooldown / Locked',
+  };
+  const badgeText =
+    plan?.badgeLabel || plan?.humanBadge
+      ? sanitizePlainDefiText(plan.badgeLabel || plan.humanBadge)
+      : defaultBadges[category];
+
+  const underlyingSym = String(plan?.underlyingSymbol || asset?.underlyingSymbol || asset?.symbol || 'USDC');
+  const displayToken = getPlainDisplayToken(asset, plan);
+  const withdrawableUi =
+    typeof plan?.withdrawableUi === 'number'
+      ? plan.withdrawableUi
+      : typeof plan?.maxSafeWithdrawUi === 'number'
+      ? plan.maxSafeWithdrawUi
+      : Number(asset?.uiBalance || 0);
+  const amountFmt = withdrawableUi.toLocaleString(undefined, { maximumFractionDigits: 4 });
+
+  const isNonUsdcContractExit =
+    category === 'one_click' &&
+    !isInstantSwap &&
+    underlyingSym.toUpperCase() !== 'USDC' &&
+    asset?.family !== 'cosmos' &&
+    asset?.family !== 'sui';
+  const requiresTwoStep = Boolean(
+    plan?.requiresSecondStep || plan?.twoStep || plan?.requiresFollowUpBridge || isNonUsdcContractExit
+  );
+  const sigCount =
+    typeof plan?.signaturesRequired === 'number'
+      ? plan.signaturesRequired
+      : typeof plan?.signatureCount === 'number'
+      ? plan.signatureCount
+      : requiresTwoStep || category === 'cooldown'
+      ? 2
+      : 1;
+  const sigLabel = sigCount <= 1 ? '1 signature' : `${sigCount} guided steps`;
+
+  const customRoute = plan?.routeLine || plan?.routeSummary || plan?.plainRoute;
+  const routeLine = customRoute
+    ? sanitizePlainDefiText(customRoute)
+    : `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken} → Solana ${targetOut} · ${sigLabel}`;
+
+  // Pre-flight status pill & plain-English warning reason
+  let preflightLevel = 'verified'; // 'verified' | 'warn' | 'blocked'
+  let preflightLabel = '✓ Verified withdrawable';
+  let warningReason = '';
+
+  const explicitlyBlocked = Boolean(
+    plan?.blocked ||
+      statusRaw === 'blocked' ||
+      statusRaw === 'reverted' ||
+      statusRaw === 'failed' ||
+      asset?.action === 'SKIP_HONEYPOT'
+  );
+
+  if (explicitlyBlocked) {
+    preflightLevel = 'blocked';
+    preflightLabel = '✕ Cannot withdraw';
+    warningReason =
+      sanitizePlainDefiText(plan?.blockReason || plan?.preflightMessage || plan?.warning || plan?.reason) ||
+      'Pre-flight check detected a restriction on this position.';
+  } else if (hasCooldown) {
+    preflightLevel = 'warn';
+    preflightLabel = '⏳ Cooldown required';
+    warningReason =
+      sanitizePlainDefiText(plan?.preflightMessage || plan?.cooldownLabel || plan?.warning || plan?.reason) ||
+      'This protocol requires an unbonding cooldown period before tokens can be bridged to Solana.';
+  } else if (hasDebt) {
+    const safePartialReady = Boolean(plan?.safePartialSupported || (typeof plan?.maxSafeWithdrawUi === 'number' && plan.maxSafeWithdrawUi > 0));
+    preflightLevel = safePartialReady ? 'warn' : 'blocked';
+    preflightLabel = safePartialReady ? '🛡️ Safe partial ready' : '🛡️ Debt guard active';
+    const debtStr = typeof asset?.aaveDebtUsd === 'number' ? `$${asset.aaveDebtUsd.toFixed(2)}` : 'active';
+    const hfStr = typeof asset?.aaveHealthFactor === 'number' ? ` (health factor ${asset.aaveHealthFactor.toFixed(2)})` : '';
+    warningReason =
+      sanitizePlainDefiText(plan?.preflightMessage || plan?.warning || plan?.reason) ||
+      (safePartialReady
+        ? `Active borrow of ${debtStr}${hfStr}. Siphon withdraws only the safe excess collateral.`
+        : `Active borrow of ${debtStr}${hfStr}. Repay borrow before full withdrawal to protect your position.`);
+  } else if (asset?.roiVerdict === 'negative_roi') {
+    preflightLevel = 'blocked';
+    preflightLabel = '✕ Fees exceed value';
+    warningReason =
+      sanitizePlainDefiText(plan?.preflightMessage || asset?.actionReason) ||
+      'Estimated network and bridge costs exceed the withdrawable value.';
+  } else if (asset?.roiVerdict === 'low_efficiency') {
+    preflightLevel = 'warn';
+    preflightLabel = '⚠ High network cost';
+    const pct = typeof asset?.effectiveCostPct === 'number' ? `${asset.effectiveCostPct.toFixed(0)}%` : 'elevated';
+    warningReason = `Verified withdrawable, though total fees are ${pct} of position value.`;
+  } else if (statusRaw === 'warn' || statusRaw === 'warning' || statusRaw === 'caution') {
+    preflightLevel = 'warn';
+    preflightLabel = sanitizePlainDefiText(plan?.preflightLabel) || '⚠ Review before exit';
+    warningReason = sanitizePlainDefiText(plan?.preflightMessage || plan?.warning || plan?.reason) || '';
+  }
+
+  const isReady =
+    preflightLevel === 'verified' ||
+    (preflightLevel === 'warn' && !hasCooldown && (!hasDebt || Boolean(plan?.safePartialSupported || (typeof plan?.maxSafeWithdrawUi === 'number' && plan.maxSafeWithdrawUi > 0))));
+
+  const contractAddress =
+    plan?.contractAddress || plan?.targetContract || plan?.poolAddress || asset?.protocolAddress || asset?.address || '—';
+  const calldataPreview = plan?.calldataPreview || plan?.calldata || asset?.calldataPreview || '';
+  const methodLabel = plan?.methodName || plan?.methodSignature || '';
+
+  return {
+    asset,
+    protocolGroup,
+    protocolLogo,
+    chainLogo,
+    category,
+    badgeText,
+    routeLine,
+    preflightLevel,
+    preflightLabel,
+    warningReason,
+    isReady,
+    requiresTwoStep,
+    sigCount,
+    underlyingSym,
+    displayToken,
+    contractAddress,
+    calldataPreview,
+    methodLabel,
+  };
+}
+
+function renderDefiGuidedStepper() {
+  const host = document.getElementById('defiGuidedStepper');
+  if (!host) return;
+  if (!defiStepperState) {
+    host.classList.add('hidden');
+    host.innerHTML = '';
+    return;
+  }
+
+  host.classList.remove('hidden');
+  const st = defiStepperState;
+  const stepsHtml = st.steps
+    .map((step, idx) => {
+      const icon =
+        step.status === 'done'
+          ? '✓'
+          : step.status === 'failed'
+          ? '!'
+          : step.status === 'active'
+          ? '◉'
+          : String(idx + 1);
+      const txHtml = step.txUrl
+        ? ` <a class="explorer-link" href="${safeHttpUrl(step.txUrl)}" target="_blank" rel="noreferrer">${escHtml(step.txLabel || 'View tx ↗')}</a>`
+        : '';
+      return `
+        <div class="defi-step is-${escHtml(step.status)}" data-stepper-step="${escHtml(step.id)}">
+          <div class="defi-step-top">
+            <span class="defi-step-dot mono">${escHtml(icon)}</span>
+            <strong class="defi-step-title">${escHtml(step.title)}</strong>
+          </div>
+          <div class="defi-step-detail">${escHtml(step.detail || '')}${txHtml}</div>
+        </div>
+      `;
+    })
+    .join('');
+
+  host.innerHTML = `
+    <div class="defi-stepper-head">
+      <div class="inline-logo-row">
+        <span class="agent-pulse-dot ${st.active ? '' : 'is-idle'}"></span>
+        <strong>${escHtml(st.title)}</strong>
+        <span class="mono muted-xs">${escHtml(st.mode === 'two_stage' ? 'Guided 2-Stage Auto-Bridge' : '1-Click Atomic Extract')}</span>
+      </div>
+      ${
+        st.dismissible
+          ? `<button type="button" class="text-action muted" id="dismissDefiStepperBtn">Dismiss</button>`
+          : `<span class="mono muted-xs">Auto-continuing…</span>`
+      }
+    </div>
+    <div class="defi-stepper-rail">${stepsHtml}</div>
+  `;
+
+  document.getElementById('dismissDefiStepperBtn')?.addEventListener('click', () => {
+    defiStepperState = null;
+    renderDefiGuidedStepper();
+    renderDefiUnwindPanel();
+  });
+}
+
+function initDefiStepper({ title, mode = 'atomic', jobId = null }) {
+  defiStepperState = {
+    active: true,
+    dismissible: false,
+    jobId,
+    title,
+    mode,
+    steps: [
+      {
+        id: 'withdraw',
+        title: 'Step 1: Withdraw from Protocol',
+        status: 'active',
+        detail: 'Preparing protocol withdrawal…',
+      },
+      {
+        id: 'bridge',
+        title: 'Step 2: Bridge Unlocked Asset to Solana',
+        status: 'pending',
+        detail: mode === 'two_stage' ? 'Starts automatically once Step 1 confirms' : `Bundled into Solana ${outputAsset} route`,
+      },
+      {
+        id: 'confirm',
+        title: 'Step 3: Confirmed on Solana',
+        status: 'pending',
+        detail: `Waiting for ${outputAsset} arrival on Solana`,
+      },
+    ],
+  };
+  renderDefiGuidedStepper();
+}
+
+function updateDefiStepperStep(stepId, patch, metaPatch = {}) {
+  if (!defiStepperState) return;
+  const target = defiStepperState.steps.find((s) => s.id === stepId);
+  if (target) Object.assign(target, patch);
+  Object.assign(defiStepperState, metaPatch);
+  renderDefiGuidedStepper();
+}
+
+function renderDefiUnwindPanel() {
+  const panel = document.getElementById('defiUnwindPanel');
+  const groupsHost = document.getElementById('defiProtocolGroups');
+  const countBadge = document.getElementById('defiCountBadge');
+  const subEl = document.getElementById('defiUnwindSub');
+  const extractAllBtn = document.getElementById('extractAllDefiBtn');
+  if (!panel || !groupsHost || !currentScan) return;
+
+  const defiRaw = currentScan.assets.filter(isDefiAsset);
+  if (!defiRaw.length && !defiStepperState) {
+    panel.classList.add('hidden');
+    groupsHost.innerHTML = '';
+    return;
+  }
+
+  panel.classList.remove('hidden');
+  renderDefiGuidedStepper();
+
+  const normalized = defiRaw.map((a) => normalizeDefiPosition(a, outputAsset));
+  const readyPositions = normalized.filter((n) => n.isReady);
+  const totalDefiUsd = normalized.reduce((s, n) => s + Number(n.asset.grossUsd || 0), 0);
+  const readyUsd = readyPositions.reduce((s, n) => s + Number(n.asset.grossUsd || 0), 0);
+  const uniqueChains = new Set(normalized.map((n) => n.asset.chain)).size;
+
+  if (countBadge) countBadge.textContent = String(normalized.length);
+  if (subEl) {
+    const readyPart =
+      readyPositions.length === normalized.length
+        ? `${readyPositions.length} ready ${readyPositions.length === 1 ? 'position' : 'positions'}`
+        : `${readyPositions.length} of ${normalized.length} ready`;
+    subEl.textContent = `${readyPart} · $${totalDefiUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} across ${uniqueChains} ${uniqueChains === 1 ? 'chain' : 'chains'} → Solana ${outputAsset}`;
+  }
+
+  if (extractAllBtn) {
+    extractAllBtn.disabled = readyPositions.length === 0;
+    extractAllBtn.textContent =
+      readyPositions.length > 0
+        ? `Extract All Ready DeFi → Solana (${fmtUsd(readyUsd)})`
+        : 'No Ready DeFi Positions';
+  }
+
+  // Group by normalized protocol name, sorted by descending USD value
+  const groupMap = new Map();
+  for (const pos of normalized) {
+    const key = pos.protocolGroup;
+    if (!groupMap.has(key)) {
+      groupMap.set(key, {
+        name: key,
+        logo: pos.protocolLogo,
+        positions: [],
+        totalUsd: 0,
+        readyCount: 0,
+      });
+    }
+    const grp = groupMap.get(key);
+    grp.positions.push(pos);
+    grp.totalUsd += Number(pos.asset.grossUsd || 0);
+    if (pos.isReady) grp.readyCount += 1;
+  }
+  const groups = Array.from(groupMap.values()).sort((a, b) => b.totalUsd - a.totalUsd);
+
+  groupsHost.innerHTML = groups
+    .map((grp) => {
+      const posRowsHtml = grp.positions
+        .map((pos) => {
+          const a = pos.asset;
+          const checked = selectedAssetIds.has(a.id);
+          const badgeClass =
+            pos.category === 'one_click'
+              ? 'defi-badge-oneclick'
+              : pos.category === 'instant_swap'
+              ? 'defi-badge-swap'
+              : pos.category === 'debt_guard'
+              ? 'defi-badge-guard'
+              : 'defi-badge-cooldown';
+          const statusClass =
+            pos.preflightLevel === 'verified'
+              ? 'defi-status-verified'
+              : pos.preflightLevel === 'warn'
+              ? 'defi-status-warn'
+              : 'defi-status-blocked';
+          const usdStr = `$${Number(a.grossUsd || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+
+          const techDetailsRows = [
+            `<div class="defi-tech-kv"><span>Protocol contract</span><code class="mono">${escHtml(pos.contractAddress)}</code></div>`,
+            `<div class="defi-tech-kv"><span>Position token</span><code class="mono">${escHtml(a.symbol)} (${escHtml(a.address)})</code></div>`,
+            `<div class="defi-tech-kv"><span>Raw balance</span><code class="mono">${escHtml(String(a.rawBalance || '0'))} (${escHtml(String(a.decimals ?? 18))} dec)</code></div>`,
+            pos.methodLabel
+              ? `<div class="defi-tech-kv"><span>Method</span><code class="mono">${escHtml(pos.methodLabel)}</code></div>`
+              : '',
+            pos.calldataPreview
+              ? `<div class="defi-tech-kv"><span>Calldata preview</span><code class="mono">${escHtml(pos.calldataPreview)}</code></div>`
+              : '',
+          ]
+            .filter(Boolean)
+            .join('');
+
+          return `
+            <div class="defi-pos-row ${checked ? 'is-checked' : ''} ${pos.isReady ? '' : 'is-restricted'}" data-defi-asset-id="${escHtml(a.id)}">
+              <div class="defi-pos-main">
+                <label class="defi-pos-check-wrap" title="Include in Sweep">
+                  <input type="checkbox" class="defi-pos-chk" data-defi-chk="${escHtml(a.id)}" ${checked ? 'checked' : ''} ${pos.preflightLevel === 'blocked' ? 'disabled' : ''} aria-label="Select ${escHtml(pos.routeLine)}" />
+                </label>
+                <div class="defi-pos-body">
+                  <div class="defi-pos-route-line">
+                    <img src="${escHtml(pos.chainLogo)}" alt="" class="chain-logo-xs" />
+                    <span class="defi-route-text">${escHtml(pos.routeLine)}</span>
+                  </div>
+                  <div class="defi-pos-badges">
+                    <span class="defi-exit-badge ${badgeClass}">${escHtml(pos.badgeText)}</span>
+                    <span class="defi-status-pill ${statusClass}">${escHtml(pos.preflightLabel)}</span>
+                  </div>
+                  ${
+                    pos.warningReason
+                      ? `<div class="defi-pos-warning is-${escHtml(pos.preflightLevel)}">${escHtml(pos.warningReason)}</div>`
+                      : ''
+                  }
+                  <details class="defi-tech-details">
+                    <summary>Technical details</summary>
+                    <div class="defi-tech-grid">${techDetailsRows}</div>
+                  </details>
+                </div>
+                <div class="defi-pos-right">
+                  <strong class="mono defi-pos-usd">${escHtml(usdStr)}</strong>
+                  <span class="mono muted-xs">${escHtml(a.chainName)}</span>
+                </div>
+              </div>
+            </div>
+          `;
+        })
+        .join('');
+
+      return `
+        <div class="defi-protocol-group" data-protocol-group="${escHtml(grp.name)}">
+          <div class="defi-proto-head">
+            <div class="defi-proto-id">
+              <span class="defi-proto-logo-tile">
+                <img src="${escHtml(grp.logo)}" alt="" class="defi-proto-logo-img" />
+              </span>
+              <div class="defi-proto-meta">
+                <strong>${escHtml(grp.name)}</strong>
+                <span class="mono muted-xs">${grp.positions.length} ${grp.positions.length === 1 ? 'position' : 'positions'} · $${grp.totalUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+              </div>
+            </div>
+            <button
+              type="button"
+              class="btn-outline-sm defi-proto-extract-btn"
+              data-extract-protocol="${escHtml(grp.name)}"
+              ${grp.readyCount === 0 ? 'disabled' : ''}
+            >
+              ${grp.readyCount > 0 ? `Extract ${escHtml(grp.name)} →` : 'Locked / Guarded'}
+            </button>
+          </div>
+          <div class="defi-pos-list">${posRowsHtml}</div>
+        </div>
+      `;
+    })
+    .join('');
+
+  // Wire checkboxes inside DeFi panel to stay 100% synced with selectedAssetIds & plan
+  groupsHost.querySelectorAll('.defi-pos-chk').forEach((chk) => {
+    chk.addEventListener('change', () => {
+      const id = chk.dataset.defiChk;
+      if (chk.checked) selectedAssetIds.add(id);
+      else selectedAssetIds.delete(id);
+      recomputePlan();
+    });
+  });
+
+  // Wire per-protocol 1-click Extract buttons
+  groupsHost.querySelectorAll('[data-extract-protocol]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const protoName = btn.dataset.extractProtocol;
+      const protoReady = normalized
+        .filter((n) => n.protocolGroup === protoName && n.isReady)
+        .map((n) => n.asset);
+      extractDefiAssets(protoReady, protoName);
+    });
+  });
+}
+
+function buildUnlockedUnderlyingAssets(chain, withdrawnDefiAssets) {
+  const chainUsdcMap = {
+    ethereum: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+    base: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    arbitrum: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+    optimism: '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85',
+    polygon: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
+    avalanche: '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E',
+  };
+
+  const unlocked = [];
+  for (const a of withdrawnDefiAssets) {
+    const plan = a.defiExitPlan || {};
+    const sym = String(plan.underlyingSymbol || a.underlyingSymbol || 'USDC');
+    const addr =
+      plan.underlyingAddress ||
+      a.underlyingAddress ||
+      (sym.toUpperCase() === 'USDC' ? chainUsdcMap[chain] : null);
+    if (!addr) continue;
+    const isUsdc = sym.toUpperCase() === 'USDC';
+    unlocked.push({
+      ...a,
+      id: `${a.id}:unlocked`,
+      kind: 'erc20',
+      address: addr,
+      symbol: sym,
+      name: `${sym} (Unlocked from ${a.protocol || 'DeFi'})`,
+      protocol: undefined,
+      protocolAddress: undefined,
+      defiExitPlan: undefined,
+      action: isUsdc ? 'BRIDGE_DIRECT_USDC' : 'SELL_AND_BRIDGE',
+      actionReason: `Automatically bridging unlocked ${sym} to Solana ${outputAsset}`,
+      selectedByDefault: true,
+    });
+  }
+  return unlocked;
+}
+
+async function extractDefiAssets(assetsToExtract, scopeTitle = 'DeFi Positions') {
+  if (!currentScan || !assetsToExtract?.length) {
+    showToast('No ready DeFi positions to extract.');
+    return;
+  }
+  if (isSweepQueueRunning) {
+    showToast('A sweep is already in progress.');
+    return;
+  }
+
+  const srcSession = getActiveSourceWallet();
+  const connectedSrc = srcSession?.address || null;
+  if (!connectedSrc) {
+    showToast('Connect your wallet to extract DeFi positions to Solana.');
+    openWalletModal('evm');
+    return;
+  }
+
+  const solDest = requireVerifiedSolanaDestination('extract DeFi positions');
+  if (!solDest) return;
+
+  const byChain = new Map();
+  for (const a of assetsToExtract) {
+    const list = byChain.get(a.chain) || [];
+    list.push(a);
+    byChain.set(a.chain, list);
+  }
+
+  const chains = Array.from(byChain.keys());
+  const hasTwoStage = assetsToExtract.some((a) => normalizeDefiPosition(a, outputAsset).requiresTwoStep);
+
+  isSweepQueueRunning = true;
+  updateWalletButtons();
+  try {
+    const job = await api('/api/jobs', {
+      method: 'POST',
+      body: JSON.stringify({
+        sourceWallet: connectedSrc,
+        solanaDestination: solDest,
+        outputAsset,
+        bridgePreference: getActiveBridgePreference(),
+        protocolFeeBps: getActiveProtocolFeeBps(),
+        feeRecipientEvm: getActiveFeeRecipientEvm(),
+        legs: chains.map((c) => {
+          const list = byChain.get(c);
+          const gross = list.reduce((s, x) => s + safeNum(x.grossUsd), 0);
+          const feePct = getActiveProtocolFeeBps() / 10000;
+          return {
+            chain: c,
+            chainName: list[0]?.chainName || c,
+            assetCount: list.length,
+            estimatedNetUsd: Math.max(0, Number((gross * (1 - feePct)).toFixed(2))),
+            estimatedFeeUsd: Number((gross * feePct).toFixed(2)),
+          };
+        }),
+      }),
+    });
+    activeJobId = job.jobId;
+    backgroundJobs.unshift(job);
+    renderBackgroundAgentUI();
+
+    initDefiStepper({
+      title: `${scopeTitle} (${chains.length} ${chains.length === 1 ? 'chain' : 'chains'})`,
+      mode: hasTwoStage ? 'two_stage' : 'atomic',
+      jobId: job.jobId,
+    });
+
+    for (const chain of chains) {
+      await executeChainBatchLive(chain, job.jobId, {
+        overrideAssets: byChain.get(chain),
+        defiGuided: true,
+        scopeTitle,
+      });
+    }
+  } catch (err) {
+    showToast(err?.message || 'Failed to start DeFi extraction.');
+  } finally {
+    isSweepQueueRunning = false;
+    updateWalletButtons();
+  }
 }
 
 function renderAssetList() {
@@ -753,37 +1610,45 @@ function renderAssetList() {
           ? 'Blocked'
           : `$${a.grossUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
       const balStr = `${a.uiBalance.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${a.symbol}`;
+      const defiNorm = isDefiAsset(a) ? normalizeDefiPosition(a, outputAsset) : null;
       const debtBadge =
-        a.aaveDebtUsd > 0
+        defiNorm && defiNorm.category === 'debt_guard'
+          ? `<span class="micro-pill" style="background:var(--hold-bg);border-color:#fde68a;color:#92400e;">Debt Guard</span>`
+          : defiNorm && defiNorm.category === 'cooldown'
+          ? `<span class="micro-pill" style="background:var(--hold-bg);border-color:#fde68a;color:#92400e;">Cooldown</span>`
+          : a.aaveDebtUsd > 0
           ? `<span class="micro-pill" style="background:var(--block-bg);border-color:#fecaca;color:#991b1b;">Debt Guard</span>`
           : '';
       const walletTag =
         currentScan?.unifiedWallets?.length > 1 && a.sourceWalletLabel
-          ? `<span class="micro-pill">${escapeHtml(a.sourceWalletLabel)}</span>`
+          ? `<span class="micro-pill">${escHtml(a.sourceWalletLabel)}</span>`
           : '';
 
-      const rowTip = escapeHtml(formatRoiTooltip(a));
+      const rowTip = escHtml(formatRoiTooltip(a));
+      const subMeta = defiNorm
+        ? `${defiNorm.protocolGroup} · ${a.chainName} · ${defiNorm.preflightLabel}`
+        : `${a.name} · ${a.chainName}`;
       return `
-        <div class="asset-row ${checked ? 'is-checked' : ''} ${disabled ? 'is-blocked' : ''}" data-row-asset="${escapeHtml(a.id)}" title="${rowTip}">
-          <input type="checkbox" class="asset-chk" data-asset-id="${escapeHtml(a.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="Select ${escapeHtml(a.symbol)} on ${escapeHtml(a.chainName)}" />
+        <div class="asset-row ${checked ? 'is-checked' : ''} ${disabled ? 'is-blocked' : ''}" data-row-asset="${escHtml(a.id)}" title="${rowTip}">
+          <input type="checkbox" class="asset-chk" data-asset-id="${escHtml(a.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="Select ${escHtml(a.symbol)} on ${escHtml(a.chainName)}" />
           <div class="asset-row-id">
             <span class="asset-logo-wrap">
-              <img src="${escapeHtml(mainLogo)}" alt="" class="asset-logo-main" />
-              ${showSubLogo ? `<img src="${escapeHtml(chainLogo)}" alt="" class="asset-logo-sub" />` : ''}
+              <img src="${escHtml(mainLogo)}" alt="" class="asset-logo-main" />
+              ${showSubLogo ? `<img src="${escHtml(chainLogo)}" alt="" class="asset-logo-sub" />` : ''}
             </span>
             <div class="asset-row-name-col">
               <div class="asset-row-sym">
-                <span>${escapeHtml(a.symbol)}</span>
-                ${a.protocol ? `<span class="muted-xs" style="font-weight:400;">${escapeHtml(a.protocol)}</span>` : ''}
+                <span>${escHtml(a.symbol)}</span>
+                ${a.protocol ? `<span class="muted-xs" style="font-weight:400;">${escHtml(defiNorm ? defiNorm.protocolGroup : a.protocol)}</span>` : ''}
                 ${walletTag}
                 ${debtBadge}
               </div>
-              <div class="asset-row-meta">${escapeHtml(a.name)} · ${escapeHtml(a.chainName)}</div>
+              <div class="asset-row-meta">${escHtml(subMeta)}</div>
             </div>
           </div>
           <div class="asset-row-val-col">
-            <div class="asset-row-usd">${escapeHtml(usdStr)}</div>
-            <div class="asset-row-bal">${escapeHtml(balStr)}</div>
+            <div class="asset-row-usd">${escHtml(usdStr)}</div>
+            <div class="asset-row-bal">${escHtml(balStr)}</div>
           </div>
           <div class="asset-row-tag">${renderRoiVerdictBadge(a)}</div>
         </div>
@@ -795,8 +1660,16 @@ function renderAssetList() {
     chk.addEventListener('click', (e) => e.stopPropagation());
     chk.addEventListener('change', () => {
       const id = chk.dataset.assetId;
-      if (chk.checked) selectedAssetIds.add(id);
-      else selectedAssetIds.delete(id);
+      if (chk.checked) {
+        selectedAssetIds.add(id);
+        const matched = currentScan?.assets?.find((a) => a.id === id);
+        if (matched?.action === 'BURN_ZERO_LIQUIDITY') {
+          const burnEl = document.getElementById('burnToggle');
+          if (burnEl && !burnEl.checked) burnEl.checked = true;
+        }
+      } else {
+        selectedAssetIds.delete(id);
+      }
       recomputePlan();
     });
   });
@@ -807,8 +1680,16 @@ function renderAssetList() {
       const chk = row.querySelector('.asset-chk');
       if (!chk || chk.disabled) return;
       chk.checked = !chk.checked;
-      if (chk.checked) selectedAssetIds.add(id);
-      else selectedAssetIds.delete(id);
+      if (chk.checked) {
+        selectedAssetIds.add(id);
+        const matched = currentScan?.assets?.find((a) => a.id === id);
+        if (matched?.action === 'BURN_ZERO_LIQUIDITY') {
+          const burnEl = document.getElementById('burnToggle');
+          if (burnEl && !burnEl.checked) burnEl.checked = true;
+        }
+      } else {
+        selectedAssetIds.delete(id);
+      }
       recomputePlan();
     });
   });
@@ -832,25 +1713,28 @@ function renderChainQueueList() {
         leg.roiVerdict === 'negative_roi'
           ? `<span class="roi-pill roi-neg" title="${escapeHtml(leg.breakEvenHint || '')}">Neg ROI</span>`
           : leg.roiVerdict === 'low_efficiency'
-          ? `<span class="roi-pill roi-low">${Number(leg.effectiveCostPct || 0).toFixed(0)}% fees</span>`
+          ? `<span class="roi-pill roi-low">${safeNum(leg.effectiveCostPct).toFixed(0)}% fees</span>`
           : `<span class="roi-pill roi-worth">Worth It</span>`;
       const breakEvenHtml =
         leg.skippedNegativeRoi && leg.breakEvenHint
           ? `<div class="breakeven-banner mono">${escapeHtml(leg.breakEvenHint)}</div>`
           : '';
+      const itemCount = safeInt(leg.defiExits) + safeInt(leg.swaps) + safeInt(leg.burns);
+      const bridgedStr = safeNum(leg.bridgedUsdc).toLocaleString(undefined, { minimumFractionDigits: 2 });
+      const darkCls = needsDarkLogoBacking(leg.chain) ? ' logo-dark-backing' : '';
       return `
       <div>
         <div class="chain-queue-item">
           <span class="inline-logo-row">
-            <img src="${escapeHtml(getChainLogoPath(leg.chain))}" alt="" class="chain-logo-xs" />
+            <img src="${escapeHtml(getChainLogoPath(leg.chain))}" alt="" class="chain-logo-xs${darkCls}" />
             <strong>${escapeHtml(leg.chainName)}</strong>
-            <span class="mono muted-xs">${leg.defiExits + leg.swaps + leg.burns} items</span>
+            <span class="mono muted-xs">${itemCount} items</span>
             ${legRoiPill}
             ${noGasBadge}
           </span>
           <span class="inline-logo-row">
-            <span class="mono" style="font-weight:600;">$${leg.bridgedUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-            <button type="button" class="chain-queue-run" data-exec-chain-batch="${escapeHtml(leg.chain)}">${executionMode === 'gasless' ? '1-Sig' : 'Run'}</button>
+            <span class="mono" style="font-weight:600;">$${escapeHtml(bridgedStr)}</span>
+            <button type="button" class="chain-queue-run" data-exec-chain-batch="${escapeHtml(leg.chain)}" ${executingChains.has(leg.chain) ? 'disabled' : ''}>${executionMode === 'gasless' ? '1-Sig' : 'Run'}</button>
           </span>
         </div>
         ${breakEvenHtml}
@@ -878,7 +1762,7 @@ function renderPreSignProofCard(proof) {
   card.classList.toggle('is-warn', !proof.allChecksSafe || !proof.hasEnoughNativeGas);
 
   const gasLabel = proof.hasEnoughNativeGas
-    ? `✓ ${proof.nativeBalanceUi} ${proof.nativeSymbol} (~$${proof.nativeBalanceUsd.toFixed(2)})`
+    ? `✓ ${proof.nativeBalanceUi} ${proof.nativeSymbol} (~$${safeNum(proof.nativeBalanceUsd).toFixed(2)})`
     : `! Low gas (${proof.nativeBalanceUi} ${proof.nativeSymbol}) → Switch to Gasless 1-Sig`;
   const checkRows = (proof.checks || [])
     .slice(0, 6)
@@ -893,27 +1777,33 @@ function renderPreSignProofCard(proof) {
     })
     .join('');
 
+  const blockStr = proof.blockNumber ? safeInt(proof.blockNumber).toLocaleString() : 'live';
+  const minNetStr = safeNum(proof.guaranteedMinNetUsd).toLocaleString(undefined, { minimumFractionDigits: 2 });
+  const feePctStr = safeNum(proof.protocolFee?.feePercent).toString();
+  const feeEstStr = safeNum(proof.protocolFee?.estimatedFeeUsd).toFixed(2);
+  const haircutCount = safeInt(proof.haircutDroppedAssets?.length);
+
   card.innerHTML = `
     <div class="proof-head">
-      <span>${proof.allChecksSafe ? '✓ Real-Time Pre-Sign Proof' : '! Simulation Warning'} (${escapeHtml(proof.chainName)} #${proof.blockNumber ? proof.blockNumber.toLocaleString() : 'live'})</span>
+      <span>${proof.allChecksSafe ? '✓ Real-Time Pre-Sign Proof' : '! Simulation Warning'} (${escapeHtml(proof.chainName)} #${escapeHtml(blockStr)})</span>
       <span class="mono muted-xs">${escapeHtml(shortAddr(proof.proofDigestSha256))}</span>
     </div>
     <div class="proof-kv"><span>Wallet Proven</span><strong class="mono">${escapeHtml(shortAddr(proof.userAddress))}</strong></div>
     <div class="proof-kv"><span>Gas Check</span><span class="mono">${escapeHtml(gasLabel)}</span></div>
     <div class="proof-kv"><span>Solana Recipient bytes32</span><span class="mono">${proof.mintRecipientVerified ? '✓ Matched bit-for-bit' : '✕ Mismatch'}</span></div>
-    <div class="proof-kv"><span>Guaranteed Min Output</span><strong class="mono">≥ $${proof.guaranteedMinNetUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} ${escapeHtml(proof.outputAsset)}</strong></div>
-    <div class="proof-kv"><span>Protocol Fee (${proof.protocolFee.feePercent}%)</span><span class="mono">$${proof.protocolFee.estimatedFeeUsd.toFixed(2)} (${escapeHtml(proof.protocolFee.collectionMethod)})</span></div>
+    <div class="proof-kv"><span>Guaranteed Min Output</span><strong class="mono">≥ $${escapeHtml(minNetStr)} ${escapeHtml(proof.outputAsset)}</strong></div>
+    <div class="proof-kv"><span>Protocol Fee (${escapeHtml(feePctStr)}%)</span><span class="mono">$${escapeHtml(feeEstStr)} (${escapeHtml(proof.protocolFee?.collectionMethod)})</span></div>
     ${
       proof.quotedCostBreakdown
-        ? `<div class="proof-kv"><span>All-In Quoted Cost</span><span class="mono">${proof.quotedCostBreakdown.effectiveCostPct.toFixed(1)}% · gas $${proof.quotedCostBreakdown.estimatedGasUsd.toFixed(2)} + bridge/slip $${proof.quotedCostBreakdown.bridgeAndSlippageUsd.toFixed(2)}${proof.quotedCostBreakdown.solanaAtaRentUsd > 0 ? ` + ATA $${proof.quotedCostBreakdown.solanaAtaRentUsd.toFixed(2)}` : ''}</span></div>`
+        ? `<div class="proof-kv"><span>All-In Quoted Cost</span><span class="mono">${safeNum(proof.quotedCostBreakdown.effectiveCostPct).toFixed(1)}% · gas $${safeNum(proof.quotedCostBreakdown.estimatedGasUsd).toFixed(2)} + bridge/slip $${safeNum(proof.quotedCostBreakdown.bridgeAndSlippageUsd).toFixed(2)}${safeNum(proof.quotedCostBreakdown.solanaAtaRentUsd) > 0 ? ` + ATA $${safeNum(proof.quotedCostBreakdown.solanaAtaRentUsd).toFixed(2)}` : ''}</span></div>`
         : ''
     }
     ${
-      proof.haircutDroppedAssets?.length
-        ? `<div class="breakeven-banner mono">Haircut Gate dropped ${proof.haircutDroppedAssets.length} high-cost asset(s) (&gt;50% fee).</div>`
+      haircutCount > 0
+        ? `<div class="breakeven-banner mono">Haircut Gate dropped ${haircutCount} high-cost asset(s) (&gt;50% fee).</div>`
         : ''
     }
-    ${proof.preSolanaSnapshot ? `<div class="proof-kv"><span>Pre-Sweep Solana Snapshot</span><span class="mono">${proof.preSolanaSnapshot.usdcBalance.toFixed(2)} USDC · slot #${proof.preSolanaSnapshot.slot.toLocaleString()}</span></div>` : ''}
+    ${proof.preSolanaSnapshot ? `<div class="proof-kv"><span>Pre-Sweep Solana Snapshot</span><span class="mono">${safeNum(proof.preSolanaSnapshot.usdcBalance).toFixed(2)} USDC · slot #${safeInt(proof.preSolanaSnapshot.slot).toLocaleString()}</span></div>` : ''}
     ${checkRows ? `<div class="proof-checks">${checkRows}</div>` : ''}
     <div style="display:flex; justify-content:flex-end; padding-top:4px;">
       <button type="button" class="text-action mono" id="downloadProofCertBtn">Download Proof Certificate (JSON) ↓</button>
@@ -936,11 +1826,15 @@ async function runPreSignProof() {
     showToast('Select at least one asset to prove.');
     return;
   }
+  const solDest = requireVerifiedSolanaDestination('run a pre-sign proof');
+  if (!solDest) return;
+
   const targetChain =
     activeChainFilter !== 'all' && currentPlan.legs.some((l) => l.chain === activeChainFilter)
       ? activeChainFilter
       : currentPlan.legs[0].chain;
-  const chainAssets = currentScan.assets.filter(
+  const effectiveScan = buildEffectiveScanForPlan();
+  const chainAssets = effectiveScan.assets.filter(
     (a) => a.chain === targetChain && selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
   );
   if (!chainAssets.length) return;
@@ -951,7 +1845,6 @@ async function runPreSignProof() {
     btn.textContent = `Simulating ${targetChain} on live RPC…`;
   }
   try {
-    const solDest = document.getElementById('solanaDestInput').value.trim();
     const srcSession = getActiveSourceWallet();
     const userAddress = srcSession?.address || currentScan.walletAddress;
     const chainMeta = currentScan.chains.find((c) => c.chain === targetChain);
@@ -983,8 +1876,8 @@ async function runPreSignProof() {
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = 'Prove Swap & Gas Before Signing (Live eth_call)';
     }
+    updateFamilyChrome();
   }
 }
 
@@ -1018,15 +1911,26 @@ function renderBackgroundAgentUI() {
   const activeJob =
     backgroundJobs.find((j) => j.jobId === activeJobId) || backgroundJobs[0] || null;
 
+  const makeExplorerLink = (href, label) => {
+    const a = document.createElement('a');
+    a.className = 'explorer-link';
+    a.href = href;
+    a.target = '_blank';
+    a.rel = 'noreferrer';
+    a.textContent = label;
+    return a;
+  };
+
   if (card && feed) {
     if (!activeJob) {
       card.classList.add('hidden');
     } else {
       card.classList.remove('hidden');
-      const doneCount = activeJob.legs.filter(
+      const legs = Array.isArray(activeJob.legs) ? activeJob.legs : [];
+      const doneCount = legs.filter(
         (l) => l.status === 'landed' || l.status === 'attested'
       ).length;
-      const total = Math.max(1, activeJob.legs.length);
+      const total = Math.max(1, legs.length);
       const pct = Math.round((doneCount / total) * 100);
       if (meta) {
         meta.textContent =
@@ -1037,44 +1941,66 @@ function renderBackgroundAgentUI() {
       if (fill) fill.style.width = `${Math.max(activeJob.status === 'active' ? 12 : 0, pct)}%`;
       if (pulse) pulse.classList.toggle('is-idle', activeJob.status !== 'active');
 
-      feed.innerHTML = activeJob.legs
-        .map((leg) => {
-          const b = legStatusBadge(leg.status);
-          const links = [
-            leg.evmTxHash
-              ? `<a class="explorer-link" href="${escapeHtml(leg.explorerUrl)}/tx/${escapeHtml(leg.evmTxHash)}" target="_blank" rel="noreferrer">EVM ↗</a>`
-              : '',
-            leg.solanaTxHash
-              ? `<a class="explorer-link" href="https://solscan.io/tx/${escapeHtml(leg.solanaTxHash)}" target="_blank" rel="noreferrer">Solscan ↗</a>`
-              : '',
-            leg.evmTxHash
-              ? `<button type="button" class="text-action" data-prove-leg="${escapeHtml(activeJob.jobId)}:${escapeHtml(leg.chain)}">Prove ✓</button>`
-              : '',
-          ]
-            .filter(Boolean)
-            .join(' · ');
-          return `
-            <div class="agent-leg-row">
-              <div style="min-width:0;">
-                <div class="inline-logo-row">
-                  <img src="${escapeHtml(getChainLogoPath(leg.chain))}" alt="" class="chain-logo-xs" />
-                  <strong>${escapeHtml(leg.chainName)}</strong>
-                  <span class="mono muted-xs">$${leg.estimatedNetUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-                </div>
-                <div class="agent-leg-status">${escapeHtml(leg.statusText)}${links ? ` · ${links}` : ''}</div>
-              </div>
-              <span class="action-tag ${b.cls}">${b.icon} ${escapeHtml(leg.status)}</span>
-            </div>
-          `;
-        })
-        .join('');
+      feed.replaceChildren();
+      for (const leg of legs) {
+        const b = legStatusBadge(leg.status);
+        const row = document.createElement('div');
+        row.className = 'agent-leg-row';
 
-      feed.querySelectorAll('[data-prove-leg]').forEach((btn) => {
-        btn.addEventListener('click', () => {
-          const [jId, chain] = String(btn.dataset.proveLeg).split(':');
-          proveLegOnchain(jId, chain, btn);
-        });
-      });
+        const left = document.createElement('div');
+        left.style.minWidth = '0';
+
+        const top = document.createElement('div');
+        top.className = 'inline-logo-row';
+        const img = document.createElement('img');
+        img.src = getChainLogoPath(leg.chain);
+        img.alt = '';
+        img.className = `chain-logo-xs${needsDarkLogoBacking(leg.chain) ? ' logo-dark-backing' : ''}`;
+        const chainStrong = document.createElement('strong');
+        chainStrong.textContent = String(leg.chainName || leg.chain || '');
+        const usdSpan = document.createElement('span');
+        usdSpan.className = 'mono muted-xs';
+        usdSpan.textContent = `$${safeNum(leg.estimatedNetUsd).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+        top.append(img, chainStrong, usdSpan);
+
+        const statusLine = document.createElement('div');
+        statusLine.className = 'agent-leg-status';
+        statusLine.append(document.createTextNode(String(leg.statusText || '')));
+
+        const linkEls = [];
+        const evmUrl = safeExplorerTxUrl(leg.explorerUrl, leg.evmTxHash);
+        const solUrl = safeExplorerTxUrl('https://solscan.io', leg.solanaTxHash);
+        if (evmUrl) linkEls.push(makeExplorerLink(evmUrl, 'EVM ↗'));
+        if (solUrl) linkEls.push(makeExplorerLink(solUrl, 'Solscan ↗'));
+        if (safeTxHash(leg.evmTxHash)) {
+          const proveBtn = document.createElement('button');
+          proveBtn.type = 'button';
+          proveBtn.className = 'text-action';
+          proveBtn.dataset.proveJobId = String(activeJob.jobId || '');
+          proveBtn.dataset.proveChain = String(leg.chain || '');
+          proveBtn.textContent = 'Prove ✓';
+          proveBtn.addEventListener('click', () => {
+            proveLegOnchain(activeJob.jobId, leg.chain, proveBtn);
+          });
+          linkEls.push(proveBtn);
+        }
+        if (linkEls.length) {
+          statusLine.append(document.createTextNode(' · '));
+          linkEls.forEach((el, idx) => {
+            if (idx > 0) statusLine.append(document.createTextNode(' · '));
+            statusLine.append(el);
+          });
+        }
+
+        left.append(top, statusLine);
+
+        const badge = document.createElement('span');
+        badge.className = `action-tag ${b.cls}`;
+        badge.textContent = `${b.icon} ${String(leg.status || '')}`;
+
+        row.append(left, badge);
+        feed.append(row);
+      }
     }
   }
 
@@ -1085,77 +2011,118 @@ function renderBackgroundAgentUI() {
     const showDock = Boolean(runningJob) && (siteVisible || activeView !== 'scanner');
     dock.classList.toggle('hidden', !showDock);
     if (runningJob) {
-      const done = runningJob.legs.filter(
+      const legs = Array.isArray(runningJob.legs) ? runningJob.legs : [];
+      const done = legs.filter(
         (l) => l.status === 'landed' || l.status === 'attested'
       ).length;
-      dockText.textContent = `Siphon Agent · ${done}/${runningJob.legs.length} chains settled`;
+      dockText.textContent = `Siphon Agent · ${done}/${legs.length} chains settled`;
     }
   }
 
-  // Activity Table
+  // Activity Table (pure DOM construction — zero innerHTML injection sinks)
   const body = document.getElementById('liveExecLogBody');
   const statusMeta = document.getElementById('liveExecStatusMeta');
   if (body) {
-    const rows = [];
+    const trNodes = [];
     for (const job of backgroundJobs) {
-      for (const leg of job.legs) {
+      const legs = Array.isArray(job.legs) ? job.legs : [];
+      for (const leg of legs) {
         const b = legStatusBadge(leg.status);
-        rows.push(`
-          <tr>
-            <td>
-              <div class="asset-title inline-logo-row">
-                <img src="${escapeHtml(getChainLogoPath(leg.chain))}" alt="" class="chain-logo-xs" />
-                <span>${escapeHtml(leg.chainName)} (${leg.assetCount} assets)</span>
-              </div>
-              <div class="asset-sub mono">${escapeHtml(leg.statusText)}</div>
-            </td>
-            <td class="mono">${escapeHtml(leg.provider || job.bridgePreference)}</td>
-            <td class="mono">$${leg.estimatedNetUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} ${escapeHtml(job.outputAsset)}</td>
-            <td><span class="action-tag ${b.cls}">${escapeHtml(leg.status)}</span></td>
-            <td class="mono" style="font-size:11.5px;">
-              ${leg.evmTxHash ? `<a class="explorer-link" href="${escapeHtml(leg.explorerUrl)}/tx/${escapeHtml(leg.evmTxHash)}" target="_blank" rel="noreferrer">EVM Tx ↗</a>` : '—'}
-              ${leg.solanaTxHash ? ` · <a class="explorer-link" href="https://solscan.io/tx/${escapeHtml(leg.solanaTxHash)}" target="_blank" rel="noreferrer">Solscan ↗</a>` : ''}
-              ${leg.requiresSolanaClaim && leg.evmTxHash ? ` · <button type="button" class="text-action" data-check-cctp="${escapeHtml(job.jobId)}:${escapeHtml(leg.chain)}">Check CCTP Iris</button>` : ''}
-            </td>
-          </tr>
-        `);
+        const safeAssetCount = safeInt(leg.assetCount);
+        const tr = document.createElement('tr');
+
+        const tdChain = document.createElement('td');
+        const titleDiv = document.createElement('div');
+        titleDiv.className = 'asset-title inline-logo-row';
+        const chainImg = document.createElement('img');
+        chainImg.src = getChainLogoPath(leg.chain);
+        chainImg.alt = '';
+        chainImg.className = `chain-logo-xs${needsDarkLogoBacking(leg.chain) ? ' logo-dark-backing' : ''}`;
+        const chainLabel = document.createElement('span');
+        chainLabel.textContent = `${String(leg.chainName || leg.chain || '')} (${safeAssetCount} assets)`;
+        titleDiv.append(chainImg, chainLabel);
+        const subDiv = document.createElement('div');
+        subDiv.className = 'asset-sub mono';
+        subDiv.textContent = String(leg.statusText || '');
+        tdChain.append(titleDiv, subDiv);
+
+        const tdProv = document.createElement('td');
+        tdProv.className = 'mono';
+        tdProv.textContent = String(leg.provider || job.bridgePreference || '');
+
+        const tdOut = document.createElement('td');
+        tdOut.className = 'mono';
+        tdOut.textContent = `$${safeNum(leg.estimatedNetUsd).toLocaleString(undefined, { minimumFractionDigits: 2 })} ${String(job.outputAsset || 'USDC')}`;
+
+        const tdStat = document.createElement('td');
+        const statBadge = document.createElement('span');
+        statBadge.className = `action-tag ${b.cls}`;
+        statBadge.textContent = String(leg.status || '');
+        tdStat.append(statBadge);
+
+        const tdLinks = document.createElement('td');
+        tdLinks.className = 'mono';
+        tdLinks.style.fontSize = '11.5px';
+        const evmUrl = safeExplorerTxUrl(leg.explorerUrl, leg.evmTxHash);
+        const solUrl = safeExplorerTxUrl('https://solscan.io', leg.solanaTxHash);
+        let hasAny = false;
+        if (evmUrl) {
+          tdLinks.append(makeExplorerLink(evmUrl, 'EVM Tx ↗'));
+          hasAny = true;
+        } else {
+          tdLinks.append(document.createTextNode('—'));
+        }
+        if (solUrl) {
+          tdLinks.append(document.createTextNode(' · '), makeExplorerLink(solUrl, 'Solscan ↗'));
+          hasAny = true;
+        }
+        if (leg.requiresSolanaClaim && safeTxHash(leg.evmTxHash)) {
+          const cctpBtn = document.createElement('button');
+          cctpBtn.type = 'button';
+          cctpBtn.className = 'text-action';
+          cctpBtn.dataset.checkCctpJob = String(job.jobId || '');
+          cctpBtn.dataset.checkCctpChain = String(leg.chain || '');
+          cctpBtn.textContent = 'Check CCTP Iris';
+          cctpBtn.addEventListener('click', async () => {
+            try {
+              cctpBtn.textContent = 'Checking Iris…';
+              const att = await api('/api/cctp/attestation', {
+                method: 'POST',
+                body: JSON.stringify({
+                  chain: leg.chain,
+                  txHash: leg.evmTxHash,
+                  solanaDestination: job.solanaDestination,
+                }),
+              });
+              await api(`/api/jobs/${encodeURIComponent(job.jobId)}/leg`, {
+                method: 'POST',
+                body: JSON.stringify({
+                  chain: leg.chain,
+                  status: att.attestationStatus === 'complete' ? 'attested' : 'relaying',
+                  statusText: att.nextStep,
+                  attestationStatus: att.attestationStatus,
+                }),
+              });
+              await syncBackgroundJobs();
+              showToast(att.nextStep);
+            } catch (err) {
+              showToast(err.message);
+            } finally {
+              cctpBtn.textContent = 'Check CCTP Iris';
+            }
+          });
+          tdLinks.append(document.createTextNode(' · '), cctpBtn);
+          hasAny = true;
+        }
+        void hasAny;
+
+        tr.append(tdChain, tdProv, tdOut, tdStat, tdLinks);
+        trNodes.push(tr);
       }
     }
-    if (rows.length) {
-      body.innerHTML = rows.join('');
-      if (statusMeta) statusMeta.textContent = `${backgroundJobs.length} job(s) · ${rows.length} chain leg(s)`;
-      body.querySelectorAll('[data-check-cctp]').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          const [jId, chain] = String(btn.dataset.checkCctp).split(':');
-          const job = backgroundJobs.find((j) => j.jobId === jId);
-          const leg = job?.legs.find((l) => l.chain === chain);
-          if (!leg?.evmTxHash) return;
-          try {
-            btn.textContent = 'Checking Iris…';
-            const att = await api('/api/cctp/attestation', {
-              method: 'POST',
-              body: JSON.stringify({
-                chain,
-                txHash: leg.evmTxHash,
-                solanaDestination: job.solanaDestination,
-              }),
-            });
-            await api(`/api/jobs/${encodeURIComponent(jId)}/leg`, {
-              method: 'POST',
-              body: JSON.stringify({
-                chain,
-                status: att.attestationStatus === 'complete' ? 'attested' : 'relaying',
-                statusText: att.nextStep,
-                attestationStatus: att.attestationStatus,
-              }),
-            });
-            await syncBackgroundJobs();
-            showToast(att.nextStep);
-          } catch (err) {
-            showToast(err.message);
-          }
-        });
-      });
+    if (trNodes.length) {
+      body.replaceChildren(...trNodes);
+      if (statusMeta) statusMeta.textContent = `${backgroundJobs.length} job(s) · ${trNodes.length} chain leg(s)`;
     } else if (statusMeta) {
       statusMeta.textContent = 'No active jobs yet';
     }
@@ -1167,6 +2134,32 @@ async function syncBackgroundJobs() {
     const res = await api('/api/jobs');
     backgroundJobs = Array.isArray(res.jobs) ? res.jobs : [];
     renderBackgroundAgentUI();
+
+    if (defiStepperState?.jobId) {
+      const tracked = backgroundJobs.find((j) => j.jobId === defiStepperState.jobId);
+      if (tracked) {
+        const allSettled =
+          tracked.legs.length > 0 &&
+          tracked.legs.every((l) => l.status === 'landed' || l.status === 'attested');
+        const anyFailed = tracked.legs.some((l) => l.status === 'failed');
+        const solLeg = tracked.legs.find((l) => l.solanaTxHash);
+        if (allSettled) {
+          updateDefiStepperStep(
+            'confirm',
+            {
+              status: 'done',
+              detail: `Settled on Solana (${tracked.legs.length}/${tracked.legs.length} chains confirmed)`,
+              txUrl: solLeg?.solanaTxHash ? `https://solscan.io/tx/${solLeg.solanaTxHash}` : undefined,
+              txLabel: 'Solscan ↗',
+            },
+            { active: false, dismissible: true }
+          );
+        } else if (anyFailed && !defiStepperState.dismissible) {
+          updateDefiStepperStep('confirm', { status: 'failed', detail: 'Check Background Agent for leg status' }, { active: false, dismissible: true });
+        }
+      }
+    }
+
     const hasActive = backgroundJobs.some((j) => j.status === 'active');
     if (hasActive && !bgPollTimer) {
       bgPollTimer = setInterval(syncBackgroundJobs, 3000);
@@ -1274,9 +2267,13 @@ async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress,
     provider: intent.mode,
     statusText: `Sign 1 gasless message ($0 gas · ${intent.coveredAssets.length} asset(s))…`,
   });
+  const signOpts = {
+    expectedFrom: userAddress,
+    expectedSolanaDestination: solDest,
+  };
   const signature = isNonEvm
-    ? await signFamilyGaslessIntent(currentScan.family || activeFamily, intent)
-    : await signGaslessTypedData(intent.typedData || intent.signPayload, intent.chainId);
+    ? await signFamilyGaslessIntent(currentScan.family || activeFamily, intent, signOpts)
+    : await signGaslessTypedData(intent.typedData || intent.signPayload, intent.chainId, signOpts);
   const receipt = await api('/api/relayer/submit', {
     method: 'POST',
     body: JSON.stringify({
@@ -1297,60 +2294,207 @@ async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress,
   showToast(receipt.nextStep);
 }
 
-async function executeChainBatchLive(chain, existingJobId = null) {
+async function sendCallsWithFallback({
+  chainId,
+  chain,
+  chainName,
+  calls,
+  jobId,
+  primaryProvider,
+  stepLabelPrefix = '',
+  expectedFrom,
+  expectedSolanaDestination,
+}) {
+  const chainCap = isChainBatchSupported(chainId);
+  let submittedHashes = [];
+  let usedEip5792 = false;
+
+  if (chainCap.supported || calls.length > 1) {
+    try {
+      await patchJobLeg(jobId, chain, {
+        status: 'signing',
+        provider: primaryProvider,
+        callsBatched: calls.length,
+        statusText: `${stepLabelPrefix}Confirm 1 batch (${calls.length} calls) in your wallet…`,
+      });
+
+      const { batchId } = await sendEip5792Batch({
+        chainId,
+        calls,
+        expectedFrom,
+        expectedSolanaDestination,
+      });
+      usedEip5792 = true;
+
+      await patchJobLeg(jobId, chain, {
+        status: 'confirming',
+        statusText: `${stepLabelPrefix}Batch submitted (${shortAddr(batchId)}) · confirming…`,
+      });
+
+      const settled = await waitForEip5792Batch(batchId, (upd) => {
+        patchJobLeg(jobId, chain, {
+          status: 'confirming',
+          evmTxHash: upd.txHashes?.[0],
+          statusText: `${stepLabelPrefix}Confirming on ${chainName}…`,
+        });
+      });
+
+      submittedHashes = settled.txHashes || [];
+      if (settled.failed) {
+        return {
+          failed: true,
+          failedReason: `Batch ${settled.status || 'reverted'} onchain`,
+          submittedHashes,
+          usedEip5792,
+        };
+      }
+      if (settled.status === 'TIMEOUT' || !settled.confirmed) {
+        return {
+          failed: false,
+          timedOut: true,
+          submittedHashes,
+          usedEip5792,
+        };
+      }
+    } catch (err) {
+      if (isUserRejectedError(err)) throw err;
+      if (!err?.unsupportedEip5792) throw err;
+      showToast(`${chainName}: wallet lacks EIP-5792 — using sequential signing.`);
+    }
+  }
+
+  if (!usedEip5792) {
+    for (let i = 0; i < calls.length; i++) {
+      const call = calls[i];
+      await patchJobLeg(jobId, chain, {
+        status: 'signing',
+        provider: primaryProvider,
+        statusText: `${stepLabelPrefix}Sign step ${i + 1}/${calls.length}: ${call.label}`,
+      });
+      const txHash = await sendRealEvmTransaction(
+        {
+          chainId,
+          to: call.to,
+          data: call.data,
+          value: call.value,
+          gas: call.gas,
+          stepId: call.stepId,
+        },
+        {
+          expectedFrom,
+          expectedSolanaDestination,
+        }
+      );
+      submittedHashes.push(txHash);
+      const needsMining = i < calls.length - 1;
+      if (needsMining) {
+        await patchJobLeg(jobId, chain, {
+          status: 'confirming',
+          evmTxHash: txHash,
+          statusText: `${stepLabelPrefix}Waiting for step ${i + 1}/${calls.length} confirmation…`,
+        });
+        const receipt = await waitForEvmReceipt(chain, txHash);
+        if (!receipt?.evmConfirmed || receipt.evmFailed) {
+          const reason = receipt?.evmFailed
+            ? `${stepLabelPrefix}Step ${i + 1}/${calls.length} (${call.label}) reverted onchain — aborted remaining steps.`
+            : `${stepLabelPrefix}Step ${i + 1}/${calls.length} (${call.label}) did not confirm in time — aborted remaining steps.`;
+          return {
+            failed: true,
+            failedReason: reason,
+            submittedHashes,
+            usedEip5792,
+          };
+        }
+      }
+    }
+  }
+
+  return { failed: false, timedOut: false, submittedHashes, usedEip5792 };
+}
+
+async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
   if (!currentScan || !currentPlan) return;
-  const chainAssets = currentScan.assets.filter(
-    (a) => a.chain === chain && selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
-  );
+  if (executingChains.has(chain)) {
+    showToast(`${chain}: execution already in progress.`);
+    return;
+  }
+  const effectiveScan = buildEffectiveScanForPlan();
+  const overrideAssets = Array.isArray(opts?.overrideAssets) ? opts.overrideAssets : null;
+  const chainAssets = overrideAssets
+    ? overrideAssets.filter((a) => a.chain === chain && a.action !== 'SKIP_HONEYPOT')
+    : effectiveScan.assets.filter(
+        (a) => a.chain === chain && selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
+      );
   if (!chainAssets.length) {
     showToast(`No selected assets on ${chain}.`);
     return;
   }
 
-  const solDest = document.getElementById('solanaDestInput').value.trim();
+  const solDest = requireVerifiedSolanaDestination('sweep to Solana');
+  if (!solDest) return;
+
+  const isDefiGuided = Boolean(opts?.defiGuided || chainAssets.some(isDefiAsset));
   const bridgePreference = getActiveBridgePreference();
   const protocolFeeBps = getActiveProtocolFeeBps();
   const feeRecipientEvm = getActiveFeeRecipientEvm();
   const connectedEvm = getConnectedEvmAddress();
-  const userAddress = connectedEvm || currentScan.walletAddress;
+  const srcSession = getActiveSourceWallet();
+  const userAddress = srcSession?.address || currentScan.walletAddress;
   const legSummary = currentPlan.legs.find((l) => l.chain === chain);
 
+  executingChains.add(chain);
+  renderChainQueueList();
+
   let jobId = existingJobId;
-  if (!jobId) {
-    const job = await api('/api/jobs', {
-      method: 'POST',
-      body: JSON.stringify({
-        sourceWallet: userAddress,
-        solanaDestination: solDest,
-        outputAsset,
-        bridgePreference,
-        protocolFeeBps,
-        feeRecipientEvm,
-        legs: [
-          {
-            chain,
-            chainName: legSummary?.chainName || chain,
-            assetCount: chainAssets.length,
-            estimatedNetUsd: legSummary?.bridgedUsdc ?? 0,
-            estimatedFeeUsd: legSummary?.feeUsdc ?? 0,
-          },
-        ],
-      }),
-    });
-    jobId = job.jobId;
-    activeJobId = jobId;
-    backgroundJobs.unshift(job);
-    renderBackgroundAgentUI();
-  }
-
-  await patchJobLeg(jobId, chain, {
-    status: 'preparing',
-    statusText: `Preparing ${chainAssets.length} asset(s) & live routes…`,
-  });
-
   try {
+    if (!jobId) {
+      const job = await api('/api/jobs', {
+        method: 'POST',
+        body: JSON.stringify({
+          sourceWallet: userAddress,
+          solanaDestination: solDest,
+          outputAsset,
+          bridgePreference,
+          protocolFeeBps,
+          feeRecipientEvm,
+          legs: [
+            {
+              chain,
+              chainName: legSummary?.chainName || chainAssets[0]?.chainName || chain,
+              assetCount: chainAssets.length,
+              estimatedNetUsd: legSummary?.bridgedUsdc ?? 0,
+              estimatedFeeUsd: legSummary?.feeUsdc ?? 0,
+            },
+          ],
+        }),
+      });
+      jobId = job.jobId;
+      activeJobId = jobId;
+      backgroundJobs.unshift(job);
+      renderBackgroundAgentUI();
+    }
+
+    if (isDefiGuided && !defiStepperState) {
+      const hasTwoStage = chainAssets.some((a) => isDefiAsset(a) && normalizeDefiPosition(a, outputAsset).requiresTwoStep);
+      initDefiStepper({
+        title: opts?.scopeTitle || `${legSummary?.chainName || chainAssets[0]?.chainName || chain} DeFi Exit`,
+        mode: hasTwoStage ? 'two_stage' : 'atomic',
+        jobId,
+      });
+    }
+
+    await patchJobLeg(jobId, chain, {
+      status: 'preparing',
+      statusText: `Preparing ${chainAssets.length} asset(s) & live routes…`,
+    });
+    if (isDefiGuided) {
+      updateDefiStepperStep('withdraw', {
+        status: 'active',
+        detail: `Preparing protocol withdrawal on ${legSummary?.chainName || chainAssets[0]?.chainName || chain}…`,
+      });
+    }
+
     const isNonEvm = (currentScan.family || activeFamily) !== 'evm';
-    const srcSession = getActiveSourceWallet();
     const connectedSrc = srcSession?.address || null;
     if (isNonEvm) {
       if (!connectedSrc) {
@@ -1362,6 +2506,11 @@ async function executeChainBatchLive(chain, existingJobId = null) {
         return;
       }
       await executeGaslessIntentChain(chain, jobId, chainAssets, connectedSrc, solDest);
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'done', detail: 'Signed 1-click withdrawal & bridge intent' });
+        updateDefiStepperStep('bridge', { status: 'done', detail: `Relaying to Solana ${outputAsset}` });
+        updateDefiStepperStep('confirm', { status: 'active', detail: 'Confirming arrival on Solana…' }, { dismissible: true });
+      }
       return;
     }
 
@@ -1382,10 +2531,16 @@ async function executeChainBatchLive(chain, existingJobId = null) {
     });
 
     if (!batch.calls.length) {
+      const skipReason =
+        batch.skippedAssets.map((s) => `${s.assetSymbol}: ${sanitizePlainDefiText(s.reason)}`).join(' · ') ||
+        'No executable calls';
       await patchJobLeg(jobId, chain, {
         status: 'skipped',
-        statusText: batch.skippedAssets.map((s) => `${s.assetSymbol}: ${s.reason}`).join(' · ') || 'No executable calls',
+        statusText: skipReason,
       });
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'failed', detail: skipReason }, { active: false, dismissible: true });
+      }
       return;
     }
 
@@ -1396,6 +2551,9 @@ async function executeChainBatchLive(chain, existingJobId = null) {
         popupsSaved: batch.savings.popupsSaved,
         statusText: `${batch.calls.length} calls ready in 1 click — connect EVM wallet to sign`,
       });
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'active', detail: 'Connect your EVM wallet to sign withdrawal' }, { dismissible: true });
+      }
       openWalletModal('evm');
       return;
     }
@@ -1419,140 +2577,326 @@ async function executeChainBatchLive(chain, existingJobId = null) {
 
     if (executionMode === 'gasless' && !hasDefiContractExits) {
       await executeGaslessIntentChain(chain, jobId, chainAssets, connectedEvm, solDest);
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'done', detail: `Signed instant swap on ${batch.chainName}` });
+        updateDefiStepperStep('bridge', { status: 'done', detail: `Relaying to Solana ${outputAsset}` });
+        updateDefiStepperStep('confirm', { status: 'active', detail: 'Tracking confirmation on Solana…' }, { dismissible: true });
+      }
       return;
     }
     if (executionMode === 'gasless' && hasDefiContractExits) {
       showToast(
-        `${batch.chainName}: executing smart-contract DeFi withdrawal directly via wallet batch (Permit2 cannot call Pool.withdraw/ERC-4626 redeem directly).`
+        `${batch.chainName}: withdrawing from DeFi protocol directly via wallet batch so funds unlock cleanly.`
       );
     }
 
-    const chainCap = isChainBatchSupported(batch.chainId);
     const requiresSolanaClaim = batch.bridgeTrackers.some((t) => t.requiresSolanaClaim);
     const primaryRelay = batch.bridgeTrackers.find((t) => t.provider === 'relay' && t.requestId);
     const primaryProvider = primaryRelay?.provider || batch.bridgeTrackers[0]?.provider || 'eip5792_batch';
-    let submittedHashes = [];
-    let usedEip5792 = false;
 
-    if (chainCap.supported || batch.calls.length > 1) {
-      try {
-        await patchJobLeg(jobId, chain, {
-          status: 'signing',
-          provider: primaryProvider,
-          callsBatched: batch.calls.length,
-          popupsSaved: batch.savings.popupsSaved,
-          statusText: `Confirm 1 batch (${batch.calls.length} calls) in your wallet…`,
-        });
-
-        const { batchId } = await sendEip5792Batch({
-          chainId: batch.chainId,
-          calls: batch.calls,
-        });
-        usedEip5792 = true;
-
-        await patchJobLeg(jobId, chain, {
-          status: 'confirming',
-          statusText: `Batch submitted (${shortAddr(batchId)}) · confirming…`,
-        });
-
-        const settled = await waitForEip5792Batch(batchId, (upd) => {
-          patchJobLeg(jobId, chain, {
-            status: 'confirming',
-            evmTxHash: upd.txHashes?.[0],
-            statusText: `Confirming on ${batch.chainName}…`,
-          });
-        });
-
-        submittedHashes = settled.txHashes || [];
-        if (settled.failed) {
-          await patchJobLeg(jobId, chain, {
-            status: 'failed',
-            evmTxHash: submittedHashes[0],
-            statusText: 'Batch reverted onchain',
-          });
-          return;
-        }
-      } catch (err) {
-        if (err?.code === 4001) throw err;
-        if (!err?.unsupportedEip5792) throw err;
-        showToast(`${batch.chainName}: wallet lacks EIP-5792 — using sequential signing.`);
-      }
+    if (isDefiGuided) {
+      updateDefiStepperStep('withdraw', {
+        status: 'active',
+        detail: `Confirm withdrawal on ${batch.chainName} (${batch.calls.length} ${batch.calls.length === 1 ? 'call' : 'calls'})…`,
+      });
     }
 
-    if (!usedEip5792) {
-      for (let i = 0; i < batch.calls.length; i++) {
-        const call = batch.calls[i];
-        await patchJobLeg(jobId, chain, {
-          status: 'signing',
-          provider: primaryProvider,
-          statusText: `Sign step ${i + 1}/${batch.calls.length}: ${call.label}`,
-        });
-        const txHash = await sendRealEvmTransaction({
-          chainId: batch.chainId,
-          to: call.to,
-          data: call.data,
-          value: call.value,
-          gas: call.gas,
-        });
-        submittedHashes.push(txHash);
-        const needsMining =
-          i < batch.calls.length - 1 &&
-          (call.stepId.includes('withdraw') ||
-            call.stepId.includes('redeem') ||
-            call.stepId.includes('approve'));
-        if (needsMining) {
-          await patchJobLeg(jobId, chain, {
-            status: 'confirming',
-            evmTxHash: txHash,
-            statusText: `Waiting for step ${i + 1}/${batch.calls.length} confirmation…`,
-          });
-          await waitForEvmReceipt(batch.chain, txHash);
-        }
+    const stage1 = await sendCallsWithFallback({
+      chainId: batch.chainId,
+      chain,
+      chainName: batch.chainName,
+      calls: batch.calls,
+      jobId,
+      primaryProvider,
+      expectedFrom: connectedEvm,
+      expectedSolanaDestination: solDest,
+    });
+
+    if (stage1.failed) {
+      const failText = stage1.failedReason || 'Batch reverted onchain';
+      await patchJobLeg(jobId, chain, {
+        status: 'failed',
+        evmTxHash: stage1.submittedHashes[0],
+        statusText: failText,
+      });
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'failed', detail: failText }, { active: false, dismissible: true });
       }
+      showToast(failText);
+      return;
     }
 
+    if (stage1.timedOut) {
+      await patchJobLeg(jobId, chain, {
+        status: 'confirming',
+        evmTxHash: stage1.submittedHashes[0],
+        statusText: `Still confirming on ${batch.chainName} — check wallet or explorer before retrying.`,
+      });
+      showToast(`${batch.chainName} batch confirmation timed out — still pending onchain.`);
+      return;
+    }
+
+    const stage1TxHash = stage1.submittedHashes[stage1.submittedHashes.length - 1];
     const hasDefiExitCall = batch.calls.some(
       (c) =>
         c.stepId === 'aave_withdraw' ||
         c.stepId === 'compound_withdraw' ||
-        c.stepId === 'erc4626_redeem'
+        c.stepId === 'erc4626_redeem' ||
+        c.stepId.includes('withdraw') ||
+        c.stepId.includes('redeem')
     );
     const hasCctpAfterDefi = batch.calls.some((c) => c.stepId === 'cctp_deposit_for_burn_after_defi');
+    const needsAutoStage2Bridge = hasDefiExitCall && !hasCctpAfterDefi && !batch.bridgeTrackers.length;
+    const explorerBase = currentScan.chains.find((c) => c.chain === chain)?.explorerUrl || '';
+    const stage1TxUrl = safeExplorerTxUrl(explorerBase, stage1TxHash) || undefined;
 
-    // Hand off to Siphon's server-side background settlement watcher!
+    if (needsAutoStage2Bridge) {
+      // Wait for Stage 1 withdrawal confirmation, then AUTOMATICALLY launch Stage 2 Bridge!
+      if (!stage1.usedEip5792 && stage1TxHash) {
+        await patchJobLeg(jobId, chain, {
+          status: 'confirming',
+          evmTxHash: stage1TxHash,
+          statusText: `Step 1/2: Confirming protocol withdrawal on ${batch.chainName}…`,
+        });
+        if (isDefiGuided) {
+          updateDefiStepperStep(
+            'withdraw',
+            {
+              status: 'active',
+              detail: `Waiting for withdrawal confirmation on ${batch.chainName}…`,
+              txUrl: stage1TxUrl,
+              txLabel: 'EVM ↗',
+            },
+            { mode: 'two_stage' }
+          );
+        }
+        const receipt1 = await waitForEvmReceipt(batch.chain, stage1TxHash);
+        if (!receipt1?.evmConfirmed || receipt1.evmFailed) {
+          const reason1 = receipt1?.evmFailed
+            ? 'Step 1 protocol withdrawal failed onchain'
+            : 'Step 1 protocol withdrawal did not confirm in time — aborted bridge step';
+          await patchJobLeg(jobId, chain, {
+            status: 'failed',
+            evmTxHash: stage1TxHash,
+            statusText: reason1,
+          });
+          if (isDefiGuided) {
+            updateDefiStepperStep('withdraw', { status: 'failed', detail: reason1 }, { active: false, dismissible: true });
+          }
+          showToast(reason1);
+          return;
+        }
+      }
+
+      if (isDefiGuided) {
+        updateDefiStepperStep(
+          'withdraw',
+          {
+            status: 'done',
+            detail: `Withdrawn on ${batch.chainName}`,
+            txUrl: stage1TxUrl,
+            txLabel: 'EVM ↗',
+          },
+          { mode: 'two_stage' }
+        );
+        updateDefiStepperStep('bridge', {
+          status: 'active',
+          detail: `Withdrawal confirmed — auto-preparing bridge to Solana ${outputAsset}…`,
+        });
+      }
+
+      await patchJobLeg(jobId, chain, {
+        status: 'preparing',
+        evmTxHash: stage1TxHash,
+        statusText: `Step 2/2: Unlocked on ${batch.chainName} — auto-preparing bridge to Solana…`,
+      });
+
+      const unlockedAssets = buildUnlockedUnderlyingAssets(chain, chainAssets.filter(isDefiAsset));
+      if (unlockedAssets.length > 0) {
+        const stage2Batch = await api('/api/tx/prepare-chain-batch', {
+          method: 'POST',
+          body: JSON.stringify({
+            chain,
+            assets: unlockedAssets,
+            userAddress: connectedEvm,
+            solanaDestination: solDest,
+            outputAsset,
+            bridgePreference,
+            protocolFeeBps,
+            feeRecipientEvm,
+            bundleDefiCctp: false,
+          }),
+        });
+
+        if (stage2Batch.calls.length > 0) {
+          const s2Relay = stage2Batch.bridgeTrackers.find((t) => t.provider === 'relay' && t.requestId);
+          const s2Provider = s2Relay?.provider || stage2Batch.bridgeTrackers[0]?.provider || primaryProvider;
+          const s2NeedsClaim = stage2Batch.bridgeTrackers.some((t) => t.requiresSolanaClaim);
+
+          if (isDefiGuided) {
+            updateDefiStepperStep('bridge', {
+              status: 'active',
+              detail: `Confirm bridge to Solana ${outputAsset} (${stage2Batch.calls.length} ${stage2Batch.calls.length === 1 ? 'call' : 'calls'})…`,
+            });
+          }
+
+          const stage2 = await sendCallsWithFallback({
+            chainId: stage2Batch.chainId,
+            chain,
+            chainName: stage2Batch.chainName,
+            calls: stage2Batch.calls,
+            jobId,
+            primaryProvider: s2Provider,
+            stepLabelPrefix: 'Step 2/2: ',
+            expectedFrom: connectedEvm,
+            expectedSolanaDestination: solDest,
+          });
+
+          if (stage2.failed) {
+            const failMsg = stage2.failedReason || 'Step 2 bridge transaction reverted — unlocked tokens remain safely in your wallet.';
+            await patchJobLeg(jobId, chain, {
+              status: 'failed',
+              evmTxHash: stage2.submittedHashes[0] || stage1TxHash,
+              statusText: failMsg,
+            });
+            if (isDefiGuided) {
+              updateDefiStepperStep(
+                'bridge',
+                { status: 'failed', detail: failMsg },
+                { active: false, dismissible: true }
+              );
+            }
+            showToast(failMsg);
+            return;
+          }
+
+          if (stage2.timedOut) {
+            await patchJobLeg(jobId, chain, {
+              status: 'confirming',
+              evmTxHash: stage2.submittedHashes[0] || stage1TxHash,
+              statusText: `Step 2 bridge still confirming on ${batch.chainName}…`,
+            });
+            return;
+          }
+
+          const stage2TxHash = stage2.submittedHashes[stage2.submittedHashes.length - 1];
+          const stage2TxUrl = safeExplorerTxUrl(explorerBase, stage2TxHash) || undefined;
+
+          await patchJobLeg(jobId, chain, {
+            status: stage2Batch.bridgeTrackers.length ? 'relaying' : 'landed',
+            provider: s2Provider,
+            evmTxHash: stage2TxHash || stage1TxHash,
+            requestId: s2Relay?.requestId,
+            requiresSolanaClaim: s2NeedsClaim,
+            statusText: `Withdrawn & bridging unlocked funds on ${batch.chainName} → Solana ${outputAsset}…`,
+          });
+
+          if (isDefiGuided) {
+            updateDefiStepperStep('bridge', {
+              status: 'done',
+              detail: `Bridge submitted on ${batch.chainName}`,
+              txUrl: stage2TxUrl,
+              txLabel: 'Bridge Tx ↗',
+            });
+            updateDefiStepperStep(
+              'confirm',
+              { status: 'active', detail: `Relaying ${outputAsset} to your Solana wallet…` },
+              { dismissible: true }
+            );
+          }
+
+          showToast(`${batch.chainName}: withdrawal confirmed and bridge to Solana ${outputAsset} submitted automatically!`);
+          syncBackgroundJobs();
+          return;
+        }
+      }
+
+      // Graceful fallback if Stage 2 bridge calls weren't available (e.g., unsupported underlying)
+      await patchJobLeg(jobId, chain, {
+        status: 'landed',
+        provider: primaryProvider,
+        evmTxHash: stage1TxHash,
+        statusText: `Withdrawn from protocol on ${batch.chainName} — unlocked tokens are in your wallet.`,
+      });
+      if (isDefiGuided) {
+        updateDefiStepperStep(
+          'bridge',
+          { status: 'done', detail: 'Unlocked tokens delivered to your wallet — ready for Solana sweep' },
+          { active: false, dismissible: true }
+        );
+      }
+      showToast(`${batch.chainName}: protocol withdrawal confirmed! Refreshing balances…`);
+      syncBackgroundJobs();
+      setTimeout(() => runScan({ address: connectedEvm, family: 'evm', autoOpen: false }), 2200);
+      return;
+    }
+
+    // Atomic 1-Click path (Instant swap or Atomic Withdraw + CCTP/Relay)
     await patchJobLeg(jobId, chain, {
       status: batch.bridgeTrackers.length ? 'relaying' : 'landed',
       provider: primaryProvider,
-      evmTxHash: submittedHashes[submittedHashes.length - 1],
+      evmTxHash: stage1TxHash,
       requestId: primaryRelay?.requestId,
       requiresSolanaClaim,
       statusText: batch.bridgeTrackers.length
         ? `Confirmed on ${batch.chainName} · relaying to Solana in background…`
-        : hasDefiExitCall && !hasCctpAfterDefi
-        ? `Withdrawn from DeFi contract on ${batch.chainName} — rescanning unlocked balance…`
         : `Confirmed on ${batch.chainName}`,
     });
 
-    showToast(
-      hasDefiExitCall && !hasCctpAfterDefi
-        ? `${batch.chainName} smart-contract withdrawal confirmed! Rescanning wallet so you can bridge unlocked tokens.`
-        : `${batch.chainName} submitted — Siphon Background Agent is tracking Solana settlement.`
-    );
-    syncBackgroundJobs();
-    if (hasDefiExitCall && !hasCctpAfterDefi) {
-      setTimeout(() => runScan({ address: connectedEvm, family: 'evm', autoOpen: false }), 2500);
+    if (isDefiGuided) {
+      updateDefiStepperStep('withdraw', {
+        status: 'done',
+        detail: `Confirmed on ${batch.chainName}`,
+        txUrl: stage1TxUrl,
+        txLabel: 'EVM ↗',
+      });
+      updateDefiStepperStep('bridge', {
+        status: 'done',
+        detail: batch.bridgeTrackers.length
+          ? `Routed atomically to Solana ${outputAsset}`
+          : `Settled on ${batch.chainName}`,
+      });
+      updateDefiStepperStep(
+        'confirm',
+        {
+          status: batch.bridgeTrackers.length ? 'active' : 'done',
+          detail: batch.bridgeTrackers.length
+            ? `Tracking ${outputAsset} confirmation on Solana…`
+            : 'Confirmed onchain',
+        },
+        { active: Boolean(batch.bridgeTrackers.length), dismissible: true }
+      );
     }
+
+    showToast(`${batch.chainName} submitted — Siphon Background Agent is tracking Solana settlement.`);
+    syncBackgroundJobs();
   } catch (err) {
-    await patchJobLeg(jobId, chain, {
-      status: 'failed',
-      statusText: err?.message || 'Cancelled or failed',
-    });
+    if (jobId) {
+      await patchJobLeg(jobId, chain, {
+        status: 'failed',
+        statusText: err?.message || 'Cancelled or failed',
+      });
+    }
+    if (isDefiGuided) {
+      updateDefiStepperStep(
+        'withdraw',
+        { status: 'failed', detail: err?.message || 'Cancelled or failed' },
+        { active: false, dismissible: true }
+      );
+    }
     showToast(err?.message || 'Execution failed');
+  } finally {
+    executingChains.delete(chain);
+    renderChainQueueList();
   }
 }
 
 async function executeSelectedLiveQueue() {
   if (!currentScan || !currentPlan) return;
+  if (isSweepQueueRunning) {
+    showToast('A sweep queue is already running.');
+    return;
+  }
   const activeChains = currentPlan.legs.map((l) => l.chain);
   if (!activeChains.length) {
     showToast('Select at least one asset to sweep.');
@@ -1566,31 +2910,42 @@ async function executeSelectedLiveQueue() {
     return;
   }
 
-  const solDest = document.getElementById('solanaDestInput').value.trim();
-  const job = await api('/api/jobs', {
-    method: 'POST',
-    body: JSON.stringify({
-      sourceWallet: connectedSrc,
-      solanaDestination: solDest,
-      outputAsset,
-      bridgePreference: getActiveBridgePreference(),
-      protocolFeeBps: getActiveProtocolFeeBps(),
-      feeRecipientEvm: getActiveFeeRecipientEvm(),
-      legs: currentPlan.legs.map((l) => ({
-        chain: l.chain,
-        chainName: l.chainName,
-        assetCount: l.defiExits + l.swaps + l.burns,
-        estimatedNetUsd: l.bridgedUsdc,
-        estimatedFeeUsd: l.feeUsdc,
-      })),
-    }),
-  });
-  activeJobId = job.jobId;
-  backgroundJobs.unshift(job);
-  renderBackgroundAgentUI();
+  const solDest = requireVerifiedSolanaDestination('sweep to Solana');
+  if (!solDest) return;
 
-  for (const chain of activeChains) {
-    await executeChainBatchLive(chain, job.jobId);
+  isSweepQueueRunning = true;
+  updateWalletButtons();
+  try {
+    const job = await api('/api/jobs', {
+      method: 'POST',
+      body: JSON.stringify({
+        sourceWallet: connectedSrc,
+        solanaDestination: solDest,
+        outputAsset,
+        bridgePreference: getActiveBridgePreference(),
+        protocolFeeBps: getActiveProtocolFeeBps(),
+        feeRecipientEvm: getActiveFeeRecipientEvm(),
+        legs: currentPlan.legs.map((l) => ({
+          chain: l.chain,
+          chainName: l.chainName,
+          assetCount: safeInt(l.defiExits) + safeInt(l.swaps) + safeInt(l.burns),
+          estimatedNetUsd: l.bridgedUsdc,
+          estimatedFeeUsd: l.feeUsdc,
+        })),
+      }),
+    });
+    activeJobId = job.jobId;
+    backgroundJobs.unshift(job);
+    renderBackgroundAgentUI();
+
+    for (const chain of activeChains) {
+      await executeChainBatchLive(chain, job.jobId);
+    }
+  } catch (err) {
+    showToast(err?.message || 'Failed to start sweep queue.');
+  } finally {
+    isSweepQueueRunning = false;
+    updateWalletButtons();
   }
 }
 
@@ -1680,9 +3035,9 @@ async function handleEvmConnected({ address, walletName, capabilities }) {
 
 function getWalletBrandBadge(name, iconUrl, rdns = '') {
   const localLogo = getWalletLogoPath(name, rdns);
-  const src = iconUrl || localLogo;
-  const isDark = String(name || '').toLowerCase().includes('solflare');
-  return `<span class="wallet-logo-tile${isDark ? ' is-dark' : ''}"><img src="${escapeHtml(src)}" alt="" class="wallet-logo-img" onerror="this.onerror=null;this.src='${escapeHtml(localLogo)}';" /></span>`;
+  const src = safeWalletIconUrl(iconUrl, localLogo);
+  const isDark = needsDarkLogoBacking(name) || needsDarkLogoBacking(localLogo);
+  return `<span class="wallet-logo-tile${isDark ? ' is-dark' : ''}"><img src="${escapeHtml(src)}" data-fallback-logo="${escapeHtml(localLogo)}" alt="" class="wallet-logo-img" /></span>`;
 }
 
 function renderWalletModalContent() {
@@ -1786,7 +3141,7 @@ function renderWalletModalContent() {
         `<div class="wallet-install-strip">${meta.wallets
           .map(
             (w) =>
-              `<a class="wallet-install-chip" href="${escapeHtml(w.installUrl)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(w.logo)}" alt="" class="chain-logo-xs" />${escapeHtml(w.name)} ↗</a>`
+              `<a class="wallet-install-chip" href="${safeHttpUrl(w.installUrl)}" target="_blank" rel="noreferrer"><img src="${escHtml(w.logo)}" alt="" class="chain-logo-xs" />${escHtml(w.name)} ↗</a>`
           )
           .join('')}</div>`
       );
@@ -1927,9 +3282,35 @@ function renderWalletModalContent() {
   }
 
   listEl.innerHTML = rows.join('');
-  footEl.textContent = isEvm
-    ? 'Supports EIP-6963 extensions, Coinbase Smart Wallet, WalletConnect v2, and EIP-5792 batch signing.'
-    : 'Supports Solana Wallet Standard or direct destination address paste.';
+  listEl.querySelectorAll('img[data-fallback-logo]').forEach((img) => {
+    img.addEventListener(
+      'error',
+      () => {
+        const fb = img.dataset.fallbackLogo;
+        if (fb && img.getAttribute('src') !== fb) img.setAttribute('src', fb);
+      },
+      { once: true }
+    );
+  });
+  if (isSourceEvm) {
+    footEl.textContent =
+      'Supports EIP-6963 extensions, Coinbase Smart Wallet, WalletConnect v2, and EIP-5792 batch signing.';
+  } else if (isEvm) {
+    const familyFooters = {
+      cosmos: 'Supports Keplr, Leap, Cosmostation, and OKX Cosmos extensions across 6 IBC chains.',
+      sui: 'Supports Sui Wallet Standard (Slush, Phantom Sui) or read-only Sui address inspection.',
+      aptos: 'Supports Petra and Phantom Aptos extensions or read-only Aptos address inspection.',
+      ton: 'Supports TonConnect 2 wallets (Tonkeeper) or read-only TON address inspection.',
+      tron: 'Supports TronLink extension or read-only Tron address inspection.',
+      btc: 'Supports UniSat, Xverse (payment address), and Phantom Bitcoin wallets.',
+    };
+    footEl.textContent =
+      familyFooters[activeFamily] ||
+      meta?.signingMechanism ||
+      `Supports native ${famShort} browser extensions or address inspection.`;
+  } else {
+    footEl.textContent = 'Supports Solana Wallet Standard or direct destination address paste.';
+  }
 
   const evmCallbacks = {
     onAccountsChanged: (next) => {
@@ -2030,13 +3411,25 @@ function renderWalletModalContent() {
         const { address, walletName } = await connectSolanaWallet({
           walletId,
           onAccountChanged: (nextAddr) => {
-            if (nextAddr) document.getElementById('solanaDestInput').value = nextAddr;
+            if (nextAddr) {
+              document.getElementById('solanaDestInput').value = nextAddr;
+              manualDestConfirmedAddress = null;
+              const chk = document.getElementById('manualDestConfirmChk');
+              if (chk) chk.checked = false;
+              syncDestinationUiState();
+            } else {
+              clearSolanaDestinationUi();
+            }
             updateWalletButtons();
             recomputePlan();
             refreshSolanaBalance();
           },
         });
         document.getElementById('solanaDestInput').value = address;
+        manualDestConfirmedAddress = null;
+        const confirmChk = document.getElementById('manualDestConfirmChk');
+        if (confirmChk) confirmChk.checked = false;
+        syncDestinationUiState();
         closeWalletModal();
         updateWalletButtons();
         showToast(`Connected ${walletName}: ${shortAddr(address)}`);
@@ -2054,18 +3447,32 @@ function renderWalletModalContent() {
     e.preventDefault();
     const addr = document.getElementById('modalSolanaInput')?.value.trim();
     if (!addr) return;
+    if (!isValidSolanaBase58(addr)) {
+      walletModalError = 'Invalid Solana base58 destination address.';
+      renderWalletModalContent();
+      return;
+    }
     document.getElementById('solanaDestInput').value = addr;
+    manualDestConfirmedAddress = addr;
+    const chk = document.getElementById('manualDestConfirmChk');
+    if (chk) chk.checked = true;
+    syncDestinationUiState();
     closeWalletModal();
-    showToast(`Destination set to ${shortAddr(addr)}`);
+    showToast(`Destination confirmed: ${shortAddr(addr)}`);
     await Promise.all([recomputePlan(), refreshSolanaBalance()]);
   });
 
   document.getElementById('walletModalDisconnectBtn')?.addEventListener('click', () => {
-    if (isEvm) disconnectFamilyWallet(activeFamily);
-    else disconnectSolanaWallet();
+    if (isEvm) {
+      disconnectFamilyWallet(activeFamily);
+    } else {
+      disconnectSolanaWallet();
+      clearSolanaDestinationUi();
+      recomputePlan();
+    }
     updateWalletButtons();
     renderWalletModalContent();
-    showToast(isEvm ? `Disconnected ${famShort} wallet.` : 'Disconnected Solana wallet.');
+    showToast(isEvm ? `Disconnected ${famShort} wallet.` : 'Disconnected Solana wallet and cleared destination.');
   });
 
   listEl.querySelectorAll('[data-pick-family-wallet]').forEach((btn) => {
@@ -2190,12 +3597,50 @@ function wireEvents() {
     });
   });
 
-  document.getElementById('solanaDestInput').addEventListener('change', () => {
+  const solInputEl = document.getElementById('solanaDestInput');
+  const onSolDestEdited = () => {
+    const val = solInputEl?.value?.trim() || '';
+    const connectedSol = getConnectedSolanaAddress();
+    if (!connectedSol || val !== connectedSol) {
+      manualDestConfirmedAddress = null;
+      const chk = document.getElementById('manualDestConfirmChk');
+      if (chk) chk.checked = false;
+    }
+    syncDestinationUiState();
+  };
+  solInputEl?.addEventListener('input', onSolDestEdited);
+  solInputEl?.addEventListener('change', () => {
+    onSolDestEdited();
     recomputePlan();
     refreshSolanaBalance();
   });
+  document.getElementById('manualDestConfirmChk')?.addEventListener('change', (e) => {
+    const val = solInputEl?.value?.trim() || '';
+    if (e.target.checked) {
+      if (!isValidSolanaBase58(val)) {
+        e.target.checked = false;
+        manualDestConfirmedAddress = null;
+        showToast('Enter a valid Base58 Solana address before confirming.');
+      } else {
+        manualDestConfirmedAddress = val;
+      }
+    } else {
+      manualDestConfirmedAddress = null;
+    }
+    syncDestinationUiState();
+  });
   document.getElementById('permit2Toggle').addEventListener('change', recomputePlan);
-  document.getElementById('burnToggle').addEventListener('change', recomputePlan);
+  document.getElementById('burnToggle').addEventListener('change', (e) => {
+    if (currentScan?.assets) {
+      for (const a of currentScan.assets) {
+        if (a.action === 'BURN_ZERO_LIQUIDITY') {
+          if (e.target.checked) selectedAssetIds.add(a.id);
+          else selectedAssetIds.delete(a.id);
+        }
+      }
+    }
+    recomputePlan();
+  });
   document.getElementById('bridgePrefSelect')?.addEventListener('change', recomputePlan);
   document.getElementById('protocolFeeSelect')?.addEventListener('change', recomputePlan);
   document.getElementById('feeRecipientInput')?.addEventListener('change', (e) => {
@@ -2286,7 +3731,8 @@ function wireEvents() {
 
   document.getElementById('createMandateForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const solDest = document.getElementById('solanaDestInput')?.value.trim();
+    const solDest = requireVerifiedSolanaDestination('create an agent mandate');
+    if (!solDest) return;
     const owner = getActiveSourceWallet()?.address || currentScan?.walletAddress?.split(',')[0] || '0x0000000000000000000000000000000000000001';
     const actions = Array.from(document.querySelectorAll('input[name="mandateAction"]:checked')).map((el) => el.value);
     if (!actions.length) {
@@ -2314,7 +3760,8 @@ function wireEvents() {
   });
 
   document.getElementById('simulateAiProposalBtn')?.addEventListener('click', async () => {
-    const solDest = document.getElementById('solanaDestInput')?.value.trim();
+    const solDest = requireVerifiedSolanaDestination('queue an AI permission proposal');
+    if (!solDest) return;
     const activeMandate = agentMandates.find((m) => m.active);
     const gross = currentPlan?.totals?.grossUsd || 180;
     const net = currentPlan?.totals?.netSolanaUsdc || 162;
@@ -2388,6 +3835,7 @@ function wireEvents() {
   });
 
   document.getElementById('selectProfitableBtn').addEventListener('click', () => {
+    if (!currentScan || !Array.isArray(currentScan.assets)) return;
     selectedAssetIds = new Set(currentScan.assets.filter((a) => a.selectedByDefault).map((a) => a.id));
     recomputePlan();
   });
@@ -2395,6 +3843,14 @@ function wireEvents() {
   document.getElementById('clearSelectionBtn').addEventListener('click', () => {
     selectedAssetIds.clear();
     recomputePlan();
+  });
+
+  document.getElementById('extractAllDefiBtn')?.addEventListener('click', () => {
+    if (!currentScan) return;
+    const readyDefi = currentScan.assets
+      .filter(isDefiAsset)
+      .filter((a) => normalizeDefiPosition(a, outputAsset).isReady);
+    extractDefiAssets(readyDefi, 'All Ready DeFi');
   });
 
   document.getElementById('runLiveQueueBtn').addEventListener('click', executeSelectedLiveQueue);
@@ -2406,8 +3862,8 @@ function wireEvents() {
   document.getElementById('downloadBurnCsvBtn').addEventListener('click', () => {
     if (!currentPlan) return;
     const header = 'chain,symbol,token_address,amount,status,burn_sink,reason';
-    const lines = currentPlan.burnManifest.map((b) =>
-      [b.chain, b.symbol, b.tokenAddress, `"${b.amount}"`, b.status, b.burnSink, `"${b.reason}"`].join(',')
+    const lines = (currentPlan.burnManifest || []).map((b) =>
+      [b.chain, b.symbol, b.tokenAddress, b.amount, b.status, b.burnSink, b.reason].map(csvCell).join(',')
     );
     const blob = new Blob([[header, ...lines].join('\n')], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -2461,11 +3917,12 @@ loadWalletConnectorConfig().then((cfg) => {
     const initial = cfg?.protocolFee?.feeRecipientEvm || saved || '';
     if (initial && !feeInput.value) feeInput.value = initial;
   }
-  setTimeout(() => preloadWalletSdks(), 600);
+  syncDestinationUiState();
   syncBackgroundJobs();
   loadAgentsAndPlugins();
 });
 heroScene = mountSiphonFunnelScene(document.getElementById('siphonHeroCanvas'));
+window.__siphonHeroScene = heroScene;
 runScan({ presetId: 'vitalik_live', autoOpen: false });
 
 async function runUnifiedScan() {
@@ -2534,6 +3991,7 @@ function renderUnifiedWalletsBar() {
 
 async function selectConvertibleDust() {
   if (!currentScan) return;
+  const seq = scanSeq;
   try {
     const dustPlan = await api('/api/dust/plan', {
       method: 'POST',
@@ -2544,16 +4002,19 @@ async function selectConvertibleDust() {
         hasSolanaUsdcAta: solanaBalances ? Boolean(solanaBalances.hasUsdcAta) : undefined,
       }),
     });
-    if (!dustPlan.convertibleAssetIds.length) {
-      showToast(`Found ${dustPlan.totalDustAssetsFound} dust tokens — none are net-positive after fees/gas (negative-ROI protected).`);
+    if (seq !== scanSeq) return;
+    if (!dustPlan.convertibleAssetIds?.length) {
+      showToast(`Found ${safeInt(dustPlan.totalDustAssetsFound)} dust tokens — none are net-positive after fees/gas (negative-ROI protected).`);
       return;
     }
+    batchRescuedDustIds = new Set(dustPlan.convertibleAssetIds);
     selectedAssetIds = new Set(dustPlan.convertibleAssetIds);
+    activeChainFilter = 'all';
     activeFilter = 'dust';
     document.querySelectorAll('.filter-pill').forEach((b) => b.classList.toggle('active', b.dataset.filter === 'dust'));
     await recomputePlan();
     showToast(
-      `Selected ${dustPlan.convertibleCount} convertible dust tokens (est. $${dustPlan.estimatedNetSolanaUsdc.toFixed(2)} USDC · +$${dustPlan.totalBatchRescueGainUsd.toFixed(2)} batch rescue gain).`
+      `Selected ${safeInt(dustPlan.convertibleCount)} convertible dust tokens (est. $${safeNum(dustPlan.estimatedNetSolanaUsdc).toFixed(2)} USDC · +$${safeNum(dustPlan.totalBatchRescueGainUsd).toFixed(2)} batch rescue gain).`
     );
   } catch (err) {
     showToast(err.message);
@@ -2586,11 +4047,7 @@ function renderAgentsAndPlugins() {
   const metaEl = document.getElementById('approvalsCountMeta');
   if (metaEl) metaEl.textContent = `${pendingCount} pending · ${agentApprovals.length} total`;
 
-  const destNote = document.getElementById('mandateLockedDestNote');
-  const solDest = document.getElementById('solanaDestInput')?.value.trim();
-  if (destNote && solDest) {
-    destNote.textContent = `Immutably locks destination → ${shortAddr(solDest)}`;
-  }
+  syncDestinationUiState();
 
   const approvalsHost = document.getElementById('agentApprovalsHost');
   if (approvalsHost) {
@@ -2665,7 +4122,7 @@ function renderAgentsAndPlugins() {
               </div>
               <span class="roi-pill ${m.active ? 'roi-worth' : 'roi-neg'}">${m.active ? 'Active' : 'Revoked'}</span>
             </div>
-            <div class="muted-xs mono">Caps: $${m.maxPerTxUsd}/tx · $${m.remainingDailyUsd}/$${m.dailyCapUsd} daily left · Auto <= $${m.autoApproveUnderUsd} · Actions: ${escapeHtml(m.allowedActions.join(', '))}</div>
+            <div class="muted-xs mono">Caps: $${safeNum(m.maxPerTxUsd)}/tx · $${safeNum(m.remainingDailyUsd)}/$${safeNum(m.dailyCapUsd)} daily left · Auto <= $${safeNum(m.autoApproveUnderUsd)} · Actions: ${escapeHtml((m.allowedActions || []).join(', '))}</div>
             ${
               m.active
                 ? `<div><button type="button" class="btn-outline-sm" data-revoke-mandate="${escapeHtml(m.mandateId)}">Revoke Mandate</button></div>`
@@ -2678,11 +4135,18 @@ function renderAgentsAndPlugins() {
 
       mandatesHost.querySelectorAll('[data-revoke-mandate]').forEach((btn) => {
         btn.addEventListener('click', async () => {
-          await api(`/api/agents/mandates/${encodeURIComponent(btn.dataset.revokeMandate)}/revoke`, {
-            method: 'POST',
-          });
-          showToast('Mandate revoked immediately.');
-          await loadAgentsAndPlugins();
+          btn.disabled = true;
+          try {
+            await api(`/api/agents/mandates/${encodeURIComponent(btn.dataset.revokeMandate)}/revoke`, {
+              method: 'POST',
+            });
+            showToast('Mandate revoked immediately.');
+            await loadAgentsAndPlugins();
+          } catch (err) {
+            showToast(err?.message || 'Failed to revoke mandate.');
+          } finally {
+            btn.disabled = false;
+          }
         });
       });
     }
@@ -2734,11 +4198,18 @@ function renderAgentsAndPlugins() {
 
       tokHost.querySelectorAll('[data-revoke-token]').forEach((btn) => {
         btn.addEventListener('click', async () => {
-          await api(`/api/plugin/tokens/${encodeURIComponent(btn.dataset.revokeToken)}/revoke`, {
-            method: 'POST',
-          });
-          showToast('AI plugin token revoked.');
-          await loadAgentsAndPlugins();
+          btn.disabled = true;
+          try {
+            await api(`/api/plugin/tokens/${encodeURIComponent(btn.dataset.revokeToken)}/revoke`, {
+              method: 'POST',
+            });
+            showToast('AI plugin token revoked.');
+            await loadAgentsAndPlugins();
+          } catch (err) {
+            showToast(err?.message || 'Failed to revoke AI plugin token.');
+          } finally {
+            btn.disabled = false;
+          }
         });
       });
     }

@@ -15,7 +15,7 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=5" />
+    <link rel="stylesheet" href="/styles.css?v=7" />
   </head>
   <body>
     <!-- =============================================================== -->
@@ -265,10 +265,9 @@
               <input
                 type="text"
                 id="unifiedWalletLabelInput"
-                class="field-input-xs"
+                class="field-input-xs unified-label-input"
                 placeholder="Label (e.g. Hardware, Keplr)"
                 aria-label="Wallet label"
-                style="max-width:165px;"
               />
               <button type="submit" class="btn-pill-dark btn-sm" id="unifiedAddSubmitBtn">Add &amp; Unify</button>
             </form>
@@ -276,8 +275,32 @@
 
           <!-- 2-Column Calm Workspace -->
           <div class="sweep-workspace">
-            <!-- LEFT COLUMN: Chain Filter Pills + Clean Selectable Asset List -->
+            <!-- LEFT COLUMN: Dedicated DeFi Quick-Unwind + Chain Filter Pills + Clean Selectable Asset List -->
             <div class="sweep-left">
+              <!-- Dedicated DeFi Positions Quick-Unwind Panel (Shown when DeFi assets are detected) -->
+              <section class="card defi-unwind-panel hidden" id="defiUnwindPanel" aria-label="DeFi Positions Quick-Unwind">
+                <div class="defi-unwind-head">
+                  <div class="defi-unwind-title-wrap">
+                    <div class="defi-unwind-title-row">
+                      <h2>DeFi Positions</h2>
+                      <span class="defi-count-badge mono" id="defiCountBadge">0</span>
+                    </div>
+                    <p class="defi-unwind-sub" id="defiUnwindSub">Withdraw protocol deposits and settle cleanly on Solana.</p>
+                  </div>
+                  <div class="defi-unwind-actions">
+                    <button type="button" class="btn-pill-dark btn-sm defi-extract-all-btn" id="extractAllDefiBtn">
+                      Extract All Ready DeFi → Solana
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Automatic Guided Stepper (Visible during and after DeFi extraction) -->
+                <div class="defi-stepper hidden" id="defiGuidedStepper" aria-live="polite"></div>
+
+                <!-- Protocol-Grouped DeFi Positions -->
+                <div class="defi-protocol-groups" id="defiProtocolGroups"></div>
+              </section>
+
               <!-- Chain Filter Chips with Official Logos -->
               <div class="chain-filter-bar" id="chainFilterBar" role="group" aria-label="Filter by source chain"></div>
 
@@ -340,17 +363,21 @@
                     </span>
                     <button type="button" class="text-action muted" id="toggleDestEditBtn">Edit</button>
                   </div>
-                  <div class="dest-addr-line mono" id="destAddrSummary">AK9C…az2n</div>
-                  <div class="dest-bal-line mono" id="solanaLiveBalanceBadge">Checking Solana balance…</div>
+                  <div class="dest-addr-line mono" id="destAddrSummary">Connect Solana or enter destination</div>
+                  <div class="dest-bal-line mono" id="solanaLiveBalanceBadge">Connect a Solana wallet or enter a destination address</div>
                   <div class="dest-edit-wrap hidden" id="destEditWrap">
                     <input
                       type="text"
                       id="solanaDestInput"
                       class="field-input mono"
-                      value="AK9CKqppArTVRrmd4rQKzvjcmNUHnx5LBFx1HXoYaz2n"
-                      placeholder="Paste Solana base58 address"
+                      value=""
+                      placeholder="Connect Solana or enter destination"
                       aria-label="Solana destination address"
                     />
+                    <label class="inline-check dest-confirm-check hidden" id="manualDestConfirmWrap">
+                      <input type="checkbox" id="manualDestConfirmChk" />
+                      <span>I verified this Solana destination address</span>
+                    </label>
                   </div>
                 </div>
 
@@ -518,7 +545,7 @@
           <div class="card flow-card" style="margin-bottom: 18px;">
             <div class="card-head">
               <h2>Route Topology</h2>
-              <span class="mono muted-xs" id="flowSummaryMeta">6 EVM chains → Solana</span>
+              <span class="mono muted-xs" id="flowSummaryMeta">Multi-chain → Solana</span>
             </div>
             <div class="flow-svg-host" id="convergenceSvgHost"></div>
           </div>
@@ -694,6 +721,6 @@
 
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>
 
-    <script type="module" src="/app.js?v=5"></script>
+    <script type="module" src="/app.js?v=7"></script>
   </body>
 </html>
