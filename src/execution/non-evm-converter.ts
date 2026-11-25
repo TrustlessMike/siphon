@@ -7,6 +7,13 @@ import {
   evaluateLiveQuoteHaircut,
 } from '../scanner/roi.js';
 import type { AnyChainId, ChainFamily, ScannedAsset } from '../scanner/types.js';
+import {
+  computeTierScaledSlippageBps,
+  type RouteAuctionFetcher,
+  type TierScaledSlippageResult,
+} from './route-auction.js';
+
+export { computeTierScaledSlippageBps, type TierScaledSlippageResult };
 
 export const SOLANA_NATIVE_MINT = '11111111111111111111111111111111';
 export const RELAY_SOLANA_CHAIN_ID = 792703809;
@@ -211,13 +218,14 @@ export function deriveNonEvmCctpRecipientBytes32(solanaDestination: string): str
 export async function fetchWithRetry(
   url: string,
   init?: RequestInit,
-  timeoutMs = 5500
+  timeoutMs = 5500,
+  fetcher: RouteAuctionFetcher = globalThis.fetch.bind(globalThis)
 ): Promise<Response | null> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { ...init, signal: controller.signal });
+      const res = await fetcher(url, { ...init, signal: controller.signal });
       clearTimeout(timer);
       if (res.status !== 429 && res.status < 500) return res;
     } catch {
@@ -362,6 +370,7 @@ export interface LifiNonEvmQuoteResult {
   estimatedGasUsd: number;
   estimatedSeconds: number;
   liveExecutable: boolean;
+  appliedSlippageBps?: number;
   transactionRequest: Record<string, unknown> | null;
   routeSummary?: Record<string, unknown>;
 }
@@ -373,8 +382,19 @@ export async function quoteLifiNonEvm(params: {
   fromAddress: string;
   solanaDestination: string;
   outputAsset: 'USDC' | 'SOL';
+  tradeUsd?: number;
+  liquidityUsd?: number;
+  symbol?: string;
+  slippageBps?: number;
+  fetcher?: RouteAuctionFetcher;
 }): Promise<LifiNonEvmQuoteResult | null> {
   const toToken = params.outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
+  const slippagePlan = computeTierScaledSlippageBps({
+    tradeUsd: params.tradeUsd,
+    liquidityUsd: params.liquidityUsd,
+    symbol: params.symbol,
+    overrideBps: params.slippageBps,
+  });
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (process.env.LIFI_API_KEY?.trim()) {
     headers['x-lifi-api-key'] = process.env.LIFI_API_KEY.trim();
@@ -389,9 +409,14 @@ export async function quoteLifiNonEvm(params: {
     fromAmount: params.fromAmount,
     fromAddress: params.fromAddress,
     toAddress: params.solanaDestination,
-    slippage: '0.02',
+    slippage: slippagePlan.slippageFraction.toFixed(4),
   });
-  const directRes = await fetchWithRetry(`https://li.quest/v1/quote?${qs.toString()}`, { headers });
+  const directRes = await fetchWithRetry(
+    `https://li.quest/v1/quote?${qs.toString()}`,
+    { headers },
+    5500,
+    params.fetcher
+  );
   if (directRes && directRes.ok) {
     const q = (await directRes.json()) as {
       id?: string;
@@ -419,26 +444,32 @@ export async function quoteLifiNonEvm(params: {
         estimatedGasUsd: Number.isFinite(gasUsd) ? Number(gasUsd.toFixed(4)) : 0,
         estimatedSeconds: Math.max(10, Number(q.estimate?.executionDuration ?? 45)),
         liveExecutable: Boolean(q.transactionRequest && Object.keys(q.transactionRequest).length > 0),
+        appliedSlippageBps: slippagePlan.slippageBps,
         transactionRequest: q.transactionRequest ?? null,
       };
     }
   }
 
   // 2. Fallback to /v1/advanced/routes (works for Sui even when simulating / previewing before funding)
-  const routeRes = await fetchWithRetry('https://li.quest/v1/advanced/routes', {
-    method: 'POST',
-    headers: { ...headers, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      fromChainId: params.fromChainId,
-      toChainId: LIFI_SOLANA_CHAIN_ID,
-      fromTokenAddress: params.fromToken,
-      toTokenAddress: toToken,
-      fromAmount: params.fromAmount,
-      fromAddress: params.fromAddress,
-      toAddress: params.solanaDestination,
-      options: { slippage: 0.02 },
-    }),
-  });
+  const routeRes = await fetchWithRetry(
+    'https://li.quest/v1/advanced/routes',
+    {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fromChainId: params.fromChainId,
+        toChainId: LIFI_SOLANA_CHAIN_ID,
+        fromTokenAddress: params.fromToken,
+        toTokenAddress: toToken,
+        fromAmount: params.fromAmount,
+        fromAddress: params.fromAddress,
+        toAddress: params.solanaDestination,
+        options: { slippage: slippagePlan.slippageFraction },
+      }),
+    },
+    5500,
+    params.fetcher
+  );
   if (!routeRes || !routeRes.ok) return null;
   const rj = (await routeRes.json()) as {
     routes?: Array<{
@@ -459,11 +490,16 @@ export async function quoteLifiNonEvm(params: {
   // Attempt stepTransaction on step 0 to get real serialized tx bytes
   let txReq: Record<string, unknown> | null = null;
   if (best.steps?.[0]) {
-    const stepRes = await fetchWithRetry('https://li.quest/v1/advanced/stepTransaction', {
-      method: 'POST',
-      headers: { ...headers, 'Content-Type': 'application/json' },
-      body: JSON.stringify(best.steps[0]),
-    });
+    const stepRes = await fetchWithRetry(
+      'https://li.quest/v1/advanced/stepTransaction',
+      {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify(best.steps[0]),
+      },
+      5500,
+      params.fetcher
+    );
     if (stepRes && stepRes.ok) {
       const sj = (await stepRes.json()) as { transactionRequest?: Record<string, unknown> };
       if (sj.transactionRequest && Object.keys(sj.transactionRequest).length > 0) {
@@ -487,6 +523,7 @@ export async function quoteLifiNonEvm(params: {
     estimatedGasUsd: Number.isFinite(gasUsd) ? Number(gasUsd.toFixed(4)) : 0,
     estimatedSeconds: Math.max(10, Number(firstStep?.estimate?.executionDuration ?? 45)),
     liveExecutable: Boolean(txReq),
+    appliedSlippageBps: slippagePlan.slippageBps,
     transactionRequest: txReq,
     routeSummary: {
       routeId: best.id,
@@ -549,6 +586,7 @@ export interface SkipGoCosmosQuoteResult {
   estimatedSeconds: number;
   txsRequired: number;
   liveExecutable: boolean;
+  appliedSlippageBps?: number;
   cosmosTx: {
     chain_id: string;
     path?: string[];
@@ -566,21 +604,47 @@ export async function quoteSkipGoCosmos(params: {
   solanaDestination: string;
   outputAsset: 'USDC' | 'SOL';
   addressesByChain?: Record<string, string>;
+  tradeUsd?: number;
+  liquidityUsd?: number;
+  symbol?: string;
+  slippageBps?: number;
+  fetcher?: RouteAuctionFetcher;
 }): Promise<SkipGoCosmosQuoteResult | null> {
   const destDenom = params.outputAsset === 'SOL' ? 'solana-native' : SOLANA_USDC_MINT;
-  const routeRes = await fetchWithRetry('https://api.skip.build/v2/fungible/route', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({
-      source_asset_denom: params.sourceDenom,
-      source_asset_chain_id: params.sourceChainId,
-      dest_asset_denom: destDenom,
-      dest_asset_chain_id: 'solana',
-      amount_in: params.amountInRaw,
-      smart_relay: true,
-      allow_multi_tx: false,
-    }),
+  const inferredSymbol =
+    params.symbol ??
+    (params.sourceDenom === 'uusdc'
+      ? 'USDC'
+      : params.sourceDenom === 'uatom'
+      ? 'ATOM'
+      : params.sourceDenom === 'uosmo'
+      ? 'OSMO'
+      : undefined);
+  const slippagePlan = computeTierScaledSlippageBps({
+    tradeUsd: params.tradeUsd,
+    liquidityUsd: params.liquidityUsd,
+    symbol: inferredSymbol,
+    overrideBps: params.slippageBps,
   });
+
+  const routeRes = await fetchWithRetry(
+    'https://api.skip.build/v2/fungible/route',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        source_asset_denom: params.sourceDenom,
+        source_asset_chain_id: params.sourceChainId,
+        dest_asset_denom: destDenom,
+        dest_asset_chain_id: 'solana',
+        amount_in: params.amountInRaw,
+        smart_relay: true,
+        allow_multi_tx: false,
+      }),
+    },
+    5500,
+    params.fetcher
+  );
   if (!routeRes || !routeRes.ok) return null;
 
   const route = (await routeRes.json()) as {
@@ -637,21 +701,26 @@ export async function quoteSkipGoCosmos(params: {
 
   let cosmosTx: SkipGoCosmosQuoteResult['cosmosTx'] = null;
   if (canBuildMsgs && addressList.length === reqChains.length) {
-    const msgsRes = await fetchWithRetry('https://api.skip.build/v2/fungible/msgs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({
-        source_asset_denom: route.source_asset_denom,
-        source_asset_chain_id: route.source_asset_chain_id,
-        dest_asset_denom: route.dest_asset_denom,
-        dest_asset_chain_id: route.dest_asset_chain_id,
-        amount_in: route.amount_in,
-        amount_out: route.amount_out,
-        address_list: addressList,
-        operations: route.operations,
-        slippage_tolerance_percent: '2',
-      }),
-    });
+    const msgsRes = await fetchWithRetry(
+      'https://api.skip.build/v2/fungible/msgs',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          source_asset_denom: route.source_asset_denom,
+          source_asset_chain_id: route.source_asset_chain_id,
+          dest_asset_denom: route.dest_asset_denom,
+          dest_asset_chain_id: route.dest_asset_chain_id,
+          amount_in: route.amount_in,
+          amount_out: route.amount_out,
+          address_list: addressList,
+          operations: route.operations,
+          slippage_tolerance_percent: String(slippagePlan.slippagePercent),
+        }),
+      },
+      5500,
+      params.fetcher
+    );
     if (msgsRes && msgsRes.ok) {
       const mj = (await msgsRes.json()) as {
         txs?: Array<{
@@ -683,6 +752,7 @@ export async function quoteSkipGoCosmos(params: {
     estimatedSeconds: Math.max(15, Number(route.estimated_route_duration_seconds ?? 120)),
     txsRequired: Number(route.txs_required ?? 1),
     liveExecutable: Boolean(cosmosTx),
+    appliedSlippageBps: slippagePlan.slippageBps,
     cosmosTx,
     operations: route.operations,
   };
