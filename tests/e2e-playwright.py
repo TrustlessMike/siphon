@@ -188,40 +188,34 @@ def main():
             pgD.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=15000)
             pgD.wait_for_timeout(400)
 
-            # Verify SVG & Batch Execution leg cards match selected bridge provider + 5-10% protocol fee dynamically!
-            svgTextAuto = pgD.locator("#convergenceSvgHost").inner_text()
-            assert "Relay / LI.FI" in svgTextAuto, svgTextAuto
-            assert "Fee (7%)" in svgTextAuto, svgTextAuto
-            pgD.click(".app-tab[data-view='pipeline']")
+            # Verify Rabby Small-Swap 2-column workspace: chain filter chips, fee drawer, bridge route, & contracts!
+            pgD.click("#chainFilterBar [data-chain-filter='base']")
+            pgD.wait_for_timeout(120)
+            pgD.click("#chainFilterBar [data-chain-filter='all']")
+            pgD.wait_for_timeout(120)
+
+            # Open fee drawer -> switch 7% -> 10% + treasury -> back to 7%
+            pgD.click("#toggleFeeDrawerBtn")
+            pgD.wait_for_selector("#feeOptionsDrawer:not(.hidden)")
             pgD.select_option("#protocolFeeSelect", "1000")
             pgD.fill("#feeRecipientInput", "0x1111111111111111111111111111111111111111")
             pgD.locator("#feeRecipientInput").dispatch_event("change")
-            pgD.wait_for_function("() => (document.querySelector('#cctpLegsGrid')?.innerText || '').includes('Protocol Fee (10%)')", timeout=5000)
+            pgD.wait_for_function("() => (document.querySelector('#summaryFeeText')?.innerText || '').includes('10%')", timeout=5000)
             pgD.select_option("#protocolFeeSelect", "700")
             pgD.fill("#feeRecipientInput", "")
             pgD.locator("#feeRecipientInput").dispatch_event("change")
-            pgD.wait_for_function("() => (document.querySelector('#cctpLegsGrid')?.innerText || '').includes('Protocol Fee (7%)')", timeout=5000)
+            pgD.wait_for_function("() => (document.querySelector('#summaryFeeText')?.innerText || '').includes('7%')", timeout=5000)
+            pgD.click("#toggleFeeDrawerBtn")
 
+            # Bridge route selector updates logos & Activity SVG dynamically
             pgD.select_option("#bridgePrefSelect", "lifi")
-            pgD.wait_for_function("() => (document.querySelector('#execActiveProvider')?.innerText || '').includes('LI.FI')", timeout=5000)
-            assert "LI.FI /v1/quote" in pgD.locator("#cctpLegsGrid").inner_text()
+            pgD.wait_for_function("() => (document.querySelector('#convergenceSvgHost')?.innerText || '').includes('LI.FI')", timeout=5000)
             pgD.select_option("#bridgePrefSelect", "cctp")
-            pgD.wait_for_function("() => (document.querySelector('#execActiveProvider')?.innerText || '').includes('Circle CCTP')", timeout=5000)
-            assert "Circle CCTP depositForBurn" in pgD.locator("#cctpLegsGrid").inner_text()
+            pgD.wait_for_function("() => (document.querySelector('#convergenceSvgHost')?.innerText || '').includes('Circle CCTP')", timeout=5000)
             pgD.select_option("#bridgePrefSelect", "auto")
-            pgD.wait_for_function("() => (document.querySelector('#execActiveProvider')?.innerText || '').includes('Auto')", timeout=5000)
+            pgD.wait_for_function("() => (document.querySelector('#convergenceSvgHost')?.innerText || '').includes('Relay / LI.FI')", timeout=5000)
 
-            # Verify Contract switcher toggles between SiphonRouter.sol and SiphonFeeVault.sol
-            pgD.click(".app-tab[data-view='contract']")
-            pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonRouter')", timeout=5000)
-            pgD.click(".contract-tab[data-contract-id='vault']")
-            pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonFeeVault')", timeout=5000)
-            pgD.click(".contract-tab[data-contract-id='router']")
-
-            pgD.click(".app-tab[data-view='scanner']")
-            pgD.wait_for_timeout(200)
-
-            # Check live vitalik.eth headline USD isn't inflated by fake-price spam tokens!
+            # Check live vitalik.eth headline USD + SVG paths
             netUsdcText = pgD.locator("#kpiNetUsdc").inner_text()
             svgPaths = pgD.locator("#convergenceSvgHost svg path").count()
             assert svgPaths >= 10, f"Expected SVG convergence paths, got {svgPaths}"
@@ -233,26 +227,33 @@ def main():
             pgD.click("#selectProfitableBtn")
             pgD.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=5000)
 
-            # Sweep all console views & capture screenshots
-            for view in ["scanner", "pipeline", "burns", "contract"]:
-                pgD.click(f".app-tab[data-view='{view}']")
-                pgD.wait_for_timeout(250)
-                overflowD[view] = pgD.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
-                if view in ("pipeline", "burns", "contract"):
-                    maybe_shot(pgD, f"goal_desktop_{view}_1440.png", full_page=True)
-
-            # Execute Base 1-click EIP-5792 batch
-            pgD.click(".app-tab[data-view='pipeline']")
+            # Execute Base 1-click EIP-5792 batch -> verifies Background Agent card & server job!
             pgD.wait_for_selector("[data-exec-chain-batch='base']")
             pgD.click("[data-exec-chain-batch='base']")
+            pgD.wait_for_selector("#agentStatusCard:not(.hidden)", timeout=20000)
             pgD.wait_for_function(
-                "() => (document.querySelector('#liveExecLogBody')?.innerText || '').includes('EVM Tx')",
+                "() => (document.querySelector('#agentLegsFeed')?.innerText || '').includes('EVM ↗')",
                 timeout=20000,
             )
             rpcD = pgD.evaluate("() => window.__rpcD")
             sendCallsD = [c for c in rpcD if c["method"] == "wallet_sendCalls"]
             assert len(sendCallsD) == 1, f"Expected 1 wallet_sendCalls, got {len(sendCallsD)}"
             assert sendCallsD[0]["params"][0]["chainId"] == "0x2105"
+            maybe_shot(pgD, "goal_desktop_pipeline_1440.png", full_page=True)
+
+            # Verify Contract switcher toggles between SiphonRouter.sol and SiphonFeeVault.sol
+            for view in ["scanner", "activity", "contract"]:
+                pgD.click(f".app-tab[data-view='{view}']")
+                pgD.wait_for_timeout(250)
+                overflowD[view] = pgD.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
+                if view == "activity":
+                    maybe_shot(pgD, "goal_desktop_burns_1440.png", full_page=True)
+                elif view == "contract":
+                    pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonRouter')", timeout=5000)
+                    pgD.click(".contract-tab[data-contract-id='vault']")
+                    pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonFeeVault')", timeout=5000)
+                    pgD.click(".contract-tab[data-contract-id='router']")
+                    maybe_shot(pgD, "goal_desktop_contract_1440.png", full_page=True)
 
             assert all(v <= 0 for v in overflowD.values()), f"Desktop overflow: {overflowD}"
             assert not errsD, f"Desktop console errors: {errsD}"
@@ -331,7 +332,6 @@ def main():
             pgL.click("[data-pick-evm]")
             pgL.wait_for_selector("#appShell:not(.hidden)", timeout=15000)
             pgL.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent === '6'", timeout=15000)
-            pgL.click(".app-tab[data-view='pipeline']")
             pgL.select_option("#bridgePrefSelect", "cctp")
             pgL.click("[data-exec-chain-batch='polygon']")
             pgL.wait_for_function(
@@ -372,11 +372,12 @@ def main():
             pgM.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=15000)
             pgM.wait_for_timeout(300)
 
-            for view in ["scanner", "pipeline", "burns", "contract"]:
+            for view in ["scanner", "activity", "contract"]:
                 pgM.click(f".app-tab[data-view='{view}']")
                 pgM.wait_for_timeout(250)
                 overflowM[view] = pgM.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
-                maybe_shot(pgM, f"goal_mobile_{view}_390.png", full_page=True)
+                shot_name = "burns" if view == "activity" else view
+                maybe_shot(pgM, f"goal_mobile_{shot_name}_390.png", full_page=True)
 
             assert all(v <= 0 for v in overflowM.values()), f"Mobile overflow: {overflowM}"
             assert not errsM, f"Mobile console errors: {errsM}"

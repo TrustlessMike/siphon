@@ -134,16 +134,16 @@
             <span class="mono">6 EVM Chains → Solana</span>
           </div>
           <div class="footer-right">
-            <button type="button" class="link-btn" data-open-app="scanner">Migrator</button>
-            <button type="button" class="link-btn" data-open-app="burns">Burn Receipts</button>
-            <button type="button" class="link-btn" data-open-app="contract">SiphonRouter.sol</button>
+            <button type="button" class="link-btn" data-open-app="scanner">Sweep</button>
+            <button type="button" class="link-btn" data-open-app="activity">Activity</button>
+            <button type="button" class="link-btn" data-open-app="contract">Contracts</button>
           </div>
         </footer>
       </main>
     </div>
 
     <!-- =============================================================== -->
-    <!-- MODE 2: INTERACTIVE MIGRATOR CONSOLE (Kamino / Aave Daylight)   -->
+    <!-- MODE 2: AGENTIC SWEEP CONSOLE (Rabby Small-Swap Calm Layout)    -->
     <!-- =============================================================== -->
     <div class="app-shell hidden" id="appShell">
       <header class="app-topbar">
@@ -155,20 +155,19 @@
               </svg>
               <span>Siphon</span>
             </button>
-            <span class="mode-badge mono" id="scanModeBadge">Multi-Chain Preset</span>
+            <span class="mode-badge mono" id="scanModeBadge">Live RPC</span>
           </div>
 
           <nav class="app-tabs" role="tablist" aria-label="Migrator views">
-            <button type="button" class="app-tab active" data-view="scanner" role="tab">Scanner &amp; Plan</button>
-            <button type="button" class="app-tab" data-view="pipeline" role="tab">
-              Batch Execution
+            <button type="button" class="app-tab active" data-view="scanner" role="tab">
+              Sweep
               <span class="tab-count" id="tabLegCount">0</span>
             </button>
-            <button type="button" class="app-tab" data-view="burns" role="tab">
-              Burn Receipts
+            <button type="button" class="app-tab" data-view="activity" role="tab">
+              Activity
               <span class="tab-count muted" id="tabBurnCount">0</span>
             </button>
-            <button type="button" class="app-tab" data-view="contract" role="tab">SiphonRouter.sol</button>
+            <button type="button" class="app-tab" data-view="contract" role="tab">Contracts</button>
           </nav>
 
           <div class="app-top-right">
@@ -180,254 +179,267 @@
               <img src="/logos/solana.svg" alt="" class="btn-logo" />
               <span>Connect Solana</span>
             </button>
-            <button type="button" class="btn-pill-dark btn-sm" id="topExecuteLiveBtn">Batch Execute</button>
           </div>
         </div>
       </header>
 
       <main class="app-container">
-        <!-- UNIFIED WALLET & DESTINATION CONTROL BAR -->
-        <div class="card control-bar">
-          <form class="control-source" id="appScanForm">
-            <label class="ctrl-label mono">SOURCE EVM WALLET (LIVE RPC OR PRESET)</label>
-            <div class="ctrl-input-row">
-              <input type="text" id="appEvmInput" class="field-input mono" placeholder="0x… EVM address" />
-              <button type="submit" class="btn-outline-dark" id="appScanBtn">Scan Live</button>
-            </div>
-            <div class="ctrl-presets">
-              <button type="button" class="text-action" data-preset="vitalik_live">vitalik.eth (Live RPC)</button>
-              <span class="sep-dot">·</span>
-              <button type="button" class="text-action muted" data-preset="veteran_defi">Sample DeFi wallet</button>
-            </div>
-          </form>
-
-          <div class="control-arrow" aria-hidden="true">→</div>
-
-          <div class="control-dest">
-            <label class="ctrl-label mono">SOLANA DESTINATION WALLET</label>
-            <div class="ctrl-input-row">
-              <input
-                type="text"
-                id="solanaDestInput"
-                class="field-input mono"
-                value="AK9CKqppArTVRrmd4rQKzvjcmNUHnx5LBFx1HXoYaz2n"
-                placeholder="Solana base58 address"
-              />
-              <div class="seg-output" role="group" aria-label="Solana output asset">
-                <button type="button" class="seg-opt active" data-out-asset="USDC">
-                  <img src="/logos/usdc.svg" alt="" class="chain-logo-xs" />USDC
-                </button>
-                <button type="button" class="seg-opt" data-out-asset="SOL">
-                  <img src="/logos/solana.svg" alt="" class="chain-logo-xs" />SOL
-                </button>
-              </div>
-            </div>
-            <div class="ctrl-toggles">
-              <label class="inline-check">
-                <input type="checkbox" id="permit2Toggle" checked />
-                <span>Batch Gas Savings</span>
-              </label>
-              <label class="inline-check">
-                <input type="checkbox" id="burnToggle" checked />
-                <span>Include Zero-Liq Burns</span>
-              </label>
-              <span class="mono sol-live-bal" id="solanaLiveBalanceBadge">Solana balance: checking…</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- 4-COLUMN RECONCILED KPI STRIP -->
-        <div class="kpi-strip">
-          <div class="kpi-cell highlight-cell">
-            <strong class="kpi-val" id="kpiNetUsdc">$0.00</strong>
-            <span class="kpi-label" id="kpiNetLabel">Net Solana USDC</span>
-            <span class="kpi-sub mono" id="kpiNetSub">0.00 SOL eq · 0.35% fee</span>
-          </div>
-          <div class="kpi-cell">
-            <strong class="kpi-val" id="kpiDefiUsd">$0.00</strong>
-            <span class="kpi-label">DeFi Smart Contracts</span>
-            <span class="kpi-sub mono" id="kpiDefiSub">0 positions to withdraw</span>
-          </div>
-          <div class="kpi-cell">
-            <strong class="kpi-val" id="kpiDustUsd">$0.00</strong>
-            <span class="kpi-label">Liquid Dust &amp; Native</span>
-            <span class="kpi-sub mono" id="kpiDustSub">0 assets across 0 chains</span>
-          </div>
-          <div class="kpi-cell">
-            <strong class="kpi-val" id="kpiBurnCount">0</strong>
-            <span class="kpi-label">Zero-Liq Burns</span>
-            <span class="kpi-sub mono" id="kpiBurnSub">0 honeypots skipped · $0.00 gas saved</span>
-          </div>
-        </div>
-
         <!-- ======================================================= -->
-        <!-- VIEW 1: SCANNER & MIGRATION PLAN                        -->
+        <!-- VIEW 1: AGENTIC SWEEP WORKSPACE (2-Column Small-Swap)   -->
         <!-- ======================================================= -->
         <section class="view-pane active" id="view-scanner">
-          <!-- Swiss-Infographic Multi-Chain Convergence SVG -->
-          <div class="card flow-card">
+          <!-- Quiet Single-Row Source Wallet Bar -->
+          <div class="source-strip">
+            <form class="source-strip-form" id="appScanForm">
+              <div class="source-input-wrap">
+                <span class="source-input-dot"></span>
+                <input
+                  type="text"
+                  id="appEvmInput"
+                  class="source-input mono"
+                  placeholder="Scan any 0x… EVM wallet address"
+                  aria-label="Source EVM wallet address"
+                />
+              </div>
+              <button type="submit" class="btn-outline-sm" id="appScanBtn">Scan</button>
+              <div class="source-presets">
+                <button type="button" class="text-action" data-preset="vitalik_live">vitalik.eth</button>
+                <span class="sep-dot">·</span>
+                <button type="button" class="text-action muted" data-preset="veteran_defi">Sample DeFi</button>
+              </div>
+            </form>
+            <div class="source-strip-summary mono" id="sourceSummaryText">Scanning 6 EVM chains…</div>
+          </div>
+
+          <!-- 2-Column Calm Workspace -->
+          <div class="sweep-workspace">
+            <!-- LEFT COLUMN: Chain Filter Pills + Clean Selectable Asset List -->
+            <div class="sweep-left">
+              <!-- Chain Filter Chips with Official Logos -->
+              <div class="chain-filter-bar" id="chainFilterBar" role="group" aria-label="Filter by source chain"></div>
+
+              <!-- Asset List Card -->
+              <div class="card asset-list-card">
+                <div class="asset-list-head">
+                  <div class="filter-tabs" role="group" aria-label="Filter assets by type">
+                    <button type="button" class="filter-pill active" data-filter="all">All</button>
+                    <button type="button" class="filter-pill" data-filter="liquid">Sweepable</button>
+                    <button type="button" class="filter-pill" data-filter="defi">DeFi</button>
+                    <button type="button" class="filter-pill" data-filter="burn">Dead Burns</button>
+                    <button type="button" class="filter-pill" data-filter="skipped">Blocked</button>
+                  </div>
+                  <div class="btn-row">
+                    <button type="button" class="text-action" id="selectProfitableBtn">Select all</button>
+                    <span class="sep-dot">·</span>
+                    <button type="button" class="text-action muted" id="clearSelectionBtn">Clear</button>
+                  </div>
+                </div>
+
+                <div class="asset-list-body" id="assetListBody"></div>
+              </div>
+            </div>
+
+            <!-- RIGHT STICKY COLUMN: Agentic Sweep Card + Background Job Feed -->
+            <aside class="sweep-right">
+              <div class="card sweep-summary-card">
+                <!-- Receive Asset & Solana Destination -->
+                <div class="sweep-card-top">
+                  <span class="sweep-eyebrow mono">RECEIVE ON SOLANA</span>
+                  <div class="seg-output" role="group" aria-label="Solana output asset">
+                    <button type="button" class="seg-opt active" data-out-asset="USDC">
+                      <img src="/logos/usdc.svg" alt="" class="chain-logo-xs" />USDC
+                    </button>
+                    <button type="button" class="seg-opt" data-out-asset="SOL">
+                      <img src="/logos/solana.svg" alt="" class="chain-logo-xs" />SOL
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Big Unmistakable Payout Hero -->
+                <div class="payout-hero">
+                  <div class="payout-amount-row">
+                    <img src="/logos/usdc.svg" alt="" class="payout-asset-logo" id="payoutAssetLogo" />
+                    <strong class="payout-val" id="kpiNetUsdc">$0.00</strong>
+                  </div>
+                  <div class="payout-sub mono" id="kpiNetSub">0.00 SOL eq · ~2–15s auto-fill</div>
+                </div>
+
+                <!-- Solana Destination Pill (Inline Editable) -->
+                <div class="dest-box">
+                  <div class="dest-box-row">
+                    <span class="inline-logo-row">
+                      <img src="/logos/solana.svg" alt="" class="chain-logo-xs" />
+                      <span class="dest-label">Destination</span>
+                    </span>
+                    <button type="button" class="text-action muted" id="toggleDestEditBtn">Edit</button>
+                  </div>
+                  <div class="dest-addr-line mono" id="destAddrSummary">AK9C…az2n</div>
+                  <div class="dest-bal-line mono" id="solanaLiveBalanceBadge">Checking Solana balance…</div>
+                  <div class="dest-edit-wrap hidden" id="destEditWrap">
+                    <input
+                      type="text"
+                      id="solanaDestInput"
+                      class="field-input mono"
+                      value="AK9CKqppArTVRrmd4rQKzvjcmNUHnx5LBFx1HXoYaz2n"
+                      placeholder="Paste Solana base58 address"
+                      aria-label="Solana destination address"
+                    />
+                  </div>
+                </div>
+
+                <!-- Clean 4-Row Receipt Summary -->
+                <div class="receipt-rows">
+                  <div class="receipt-row">
+                    <span>Selected</span>
+                    <strong class="mono" id="summarySelectedText">0 assets · 0 chains</strong>
+                  </div>
+                  <div class="receipt-row">
+                    <span>Bridge Route</span>
+                    <div class="inline-logo-row">
+                      <span id="summaryRouteLogos" class="inline-logo-row">
+                        <img src="/logos/relay.svg" alt="" class="chain-logo-xs" />
+                        <img src="/logos/lifi.svg" alt="" class="chain-logo-xs" />
+                      </span>
+                      <select id="bridgePrefSelect" class="receipt-select mono" aria-label="Bridge route preference">
+                        <option value="auto" selected>Auto (Relay → LI.FI)</option>
+                        <option value="relay">Relay (~2s fill)</option>
+                        <option value="lifi">LI.FI Aggregator</option>
+                        <option value="cctp">Circle CCTP 1:1</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="receipt-row">
+                    <span>Est. Gas &amp; Signing</span>
+                    <span class="mono" id="summaryGasText">$0.00 · 1 click / chain</span>
+                  </div>
+                  <div class="receipt-row">
+                    <span>Protocol Fee</span>
+                    <button type="button" class="receipt-fee-btn mono" id="toggleFeeDrawerBtn">
+                      <span id="summaryFeeText">7.0% · $0.00</span>
+                      <span class="muted-xs">▾</span>
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Collapsible Fee, Treasury & Options Drawer (Zero Clutter by Default) -->
+                <div class="options-drawer hidden" id="feeOptionsDrawer">
+                  <div class="options-drawer-row">
+                    <label class="muted-xs" for="protocolFeeSelect">Fee Tier (5–10%)</label>
+                    <select id="protocolFeeSelect" class="field-select-xs mono" aria-label="Protocol fee percentage">
+                      <option value="500">5.0%</option>
+                      <option value="700" selected>7.0% (Default)</option>
+                      <option value="850">8.5%</option>
+                      <option value="1000">10.0%</option>
+                    </select>
+                  </div>
+                  <div class="options-drawer-col">
+                    <label class="muted-xs" for="feeRecipientInput">Fee Vault / Treasury Address (EVM)</label>
+                    <input
+                      type="text"
+                      id="feeRecipientInput"
+                      class="field-input-xs mono"
+                      placeholder="0x… SiphonFeeVault or Treasury wallet"
+                      aria-label="Protocol fee recipient EVM address"
+                    />
+                  </div>
+                  <div class="options-drawer-checks">
+                    <label class="inline-check">
+                      <input type="checkbox" id="permit2Toggle" checked />
+                      <span>EIP-5792 1-Click Batching</span>
+                    </label>
+                    <label class="inline-check">
+                      <input type="checkbox" id="burnToggle" checked />
+                      <span>Burn zero-liquidity dead coins</span>
+                    </label>
+                  </div>
+                </div>
+
+                <!-- ONE Primary Confident Action -->
+                <button type="button" class="sweep-cta-btn" id="runLiveQueueBtn">
+                  Sweep to Solana →
+                </button>
+                <div class="sweep-cta-note mono" id="sweepCtaNote">
+                  1 confirmation per chain · settles automatically in the background
+                </div>
+
+                <!-- Compact Per-Chain Quick Queue (1-Click Individual Chain Trigger) -->
+                <div class="chain-queue-list" id="chainQueueList"></div>
+              </div>
+
+              <!-- Live Background Agent Card (Visible whenever a sweep is running or just finished) -->
+              <div class="card agent-status-card hidden" id="agentStatusCard">
+                <div class="agent-card-head">
+                  <div class="inline-logo-row">
+                    <span class="agent-pulse-dot" id="agentPulseDot"></span>
+                    <strong>Background Agent</strong>
+                  </div>
+                  <span class="mono muted-xs" id="agentProgressMeta">Idle</span>
+                </div>
+                <div class="agent-progress-track">
+                  <div class="agent-progress-fill" id="agentProgressFill" style="width: 0%"></div>
+                </div>
+                <div class="agent-legs-feed" id="agentLegsFeed"></div>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <!-- ======================================================= -->
+        <!-- VIEW 2: BACKGROUND ACTIVITY, FLOW & BURN RECEIPTS       -->
+        <!-- ======================================================= -->
+        <section class="view-pane" id="view-activity">
+          <div class="view-header">
+            <div>
+              <h1>Background Activity &amp; Receipts</h1>
+              <p>Live settlement tracking for autonomous multi-chain sweeps, convergence topology, and zero-liquidity burn receipts.</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn-outline-sm" id="downloadBurnCsvBtn">Export Burn CSV</button>
+              <button type="button" class="btn-pill-dark btn-sm" id="copyBurnJsonBtn">Copy Burn JSON</button>
+            </div>
+          </div>
+
+          <!-- Background Jobs & Live Transactions -->
+          <div class="card table-card" style="margin-bottom: 18px;">
             <div class="card-head">
-              <h2>Multi-Chain Convergence Flow</h2>
-              <span class="mono muted-xs" id="flowSummaryMeta">6 EVM chains → Circle CCTP Domain 5 → Solana</span>
+              <h2>Background Sweep Jobs</h2>
+              <span class="mono muted-xs" id="liveExecStatusMeta">No active jobs yet</span>
+            </div>
+            <div class="table-scroll">
+              <table class="ledger-table">
+                <thead>
+                  <tr>
+                    <th>Chain / Job</th>
+                    <th>Provider</th>
+                    <th>Output</th>
+                    <th>Status</th>
+                    <th>Explorer Links</th>
+                  </tr>
+                </thead>
+                <tbody id="liveExecLogBody">
+                  <tr>
+                    <td colspan="5" style="text-align:center; padding:26px; color:var(--ink-3);">
+                      Start a sweep from the Sweep tab — Siphon tracks confirmations, Relay fills, and Circle CCTP attestations here in the background.
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Multi-Chain Convergence Topology SVG -->
+          <div class="card flow-card" style="margin-bottom: 18px;">
+            <div class="card-head">
+              <h2>Route Topology</h2>
+              <span class="mono muted-xs" id="flowSummaryMeta">6 EVM chains → Solana</span>
             </div>
             <div class="flow-svg-host" id="convergenceSvgHost"></div>
           </div>
 
-          <!-- Per-Chain Status Strip -->
-          <div class="chain-cards-grid" id="chainCardsGrid"></div>
-
-          <!-- Asset & Smart-Contract Position Ledger -->
+          <!-- Burn & Honeypot Isolation Manifest -->
           <div class="card table-card">
             <div class="card-head">
-              <div class="filter-tabs" role="group" aria-label="Filter assets by bucket">
-                <button type="button" class="filter-pill active" data-filter="all">All Assets</button>
-                <button type="button" class="filter-pill" data-filter="defi">DeFi Contracts</button>
-                <button type="button" class="filter-pill" data-filter="liquid">Liquid Dust</button>
-                <button type="button" class="filter-pill" data-filter="burn">Zero-Liq Burns</button>
-                <button type="button" class="filter-pill" data-filter="skipped">Skipped / Honeypots</button>
-              </div>
-              <div class="btn-row">
-                <button type="button" class="text-action" id="selectProfitableBtn">Select profitable</button>
-                <span class="sep-dot">·</span>
-                <button type="button" class="text-action muted" id="clearSelectionBtn">Clear</button>
-              </div>
-            </div>
-            <div class="table-scroll">
-              <table class="ledger-table">
-                <thead>
-                  <tr>
-                    <th style="width: 38px;"></th>
-                    <th>Asset / Contract</th>
-                    <th>Chain</th>
-                    <th>Balance</th>
-                    <th>Gross Value</th>
-                    <th>Gas</th>
-                    <th>Action</th>
-                    <th style="text-align: right;">Net Output</th>
-                    <th style="text-align: right; width: 120px;">Execute</th>
-                  </tr>
-                </thead>
-                <tbody id="assetTableBody"></tbody>
-              </table>
-            </div>
-          </div>
-        </section>
-
-        <!-- ======================================================= -->
-        <!-- VIEW 2: LIVE EXECUTION QUEUE & BRIDGE ROUTES            -->
-        <!-- ======================================================= -->
-        <section class="view-pane" id="view-pipeline">
-          <div class="view-header">
-            <div>
-              <h1>1-Click-Per-Chain Atomic Batch Execution</h1>
-              <p>Bundles DeFi withdrawals, approvals, <strong>Relay / LI.FI / Circle CCTP</strong> bridges, and safe burns into <strong>1 EIP-5792 wallet confirmation per chain</strong> (<code class="code-inline">wallet_sendCalls</code>) with automatic legacy fallback.</p>
-            </div>
-            <div class="btn-row">
-              <select id="bridgePrefSelect" class="field-select-sm mono" aria-label="Bridge route preference">
-                <option value="auto" selected>Auto (Relay → LI.FI → CCTP)</option>
-                <option value="relay">Relay (~2s auto-fill)</option>
-                <option value="lifi">LI.FI Aggregator</option>
-                <option value="cctp">Direct Circle CCTP (USDC)</option>
-              </select>
-              <button type="button" class="btn-pill-dark btn-sm" id="runLiveQueueBtn">Execute All Chains (1 Click / Chain)</button>
-            </div>
-          </div>
-
-          <div class="card pad-card recipient-card">
-            <div class="kv-clean">
-              <div class="kv-r">
-                <span>Connected EVM Signer</span>
-                <span class="mono" id="execConnectedEvm">Not connected (read-only live batch preview)</span>
-              </div>
-              <div class="kv-r">
-                <span>EIP-5792 Atomic Batch Engine</span>
-                <span class="mono" id="execBatchMode"><span class="batch-pill">EIP-5792 Ready</span> 1 Click / Chain (MetaMask · Rabby · Coinbase · Phantom)</span>
-              </div>
-              <div class="kv-r">
-                <span>Active Bridge Provider</span>
-                <span class="mono inline-logo-row" id="execActiveProvider">
-                  <img src="/logos/relay.svg" alt="" class="chain-logo-xs" />
-                  <img src="/logos/lifi.svg" alt="" class="chain-logo-xs" />
-                  <span>Auto (Relay → LI.FI → Circle CCTP)</span>
-                </span>
-              </div>
-              <div class="kv-r">
-                <span>Protocol Fee &amp; Treasury (5–10%)</span>
-                <div class="fee-config-row">
-                  <select id="protocolFeeSelect" class="field-select-xs mono" aria-label="Protocol fee percentage">
-                    <option value="500">5.0%</option>
-                    <option value="700" selected>7.0% (Default)</option>
-                    <option value="850">8.5%</option>
-                    <option value="1000">10.0%</option>
-                  </select>
-                  <input
-                    type="text"
-                    id="feeRecipientInput"
-                    class="field-input-xs mono"
-                    placeholder="0x… SiphonFeeVault or Treasury wallet"
-                    aria-label="Protocol fee recipient EVM address"
-                  />
-                  <span class="mono muted-xs" id="execFeeUsdSummary">$0.00</span>
-                </div>
-              </div>
-              <div class="kv-r">
-                <span>Solana Destination (Ed25519 Base58)</span>
-                <span class="mono" id="planSolAddr">—</span>
-              </div>
-              <div class="kv-r">
-                <span>Live Solana Mainnet Balance</span>
-                <span class="mono" id="execSolanaBalance">—</span>
-              </div>
-              <div class="kv-r">
-                <span>Circle CCTP <code class="code-inline">mintRecipient</code> (bytes32)</span>
-                <span class="mono" id="planSolBytes32">—</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- Real Onchain Execution Log -->
-          <div id="liveExecLogCard" class="card table-card hidden" style="margin-bottom: 18px;">
-            <div class="card-head">
-              <h2>Live Mainnet Transaction Log</h2>
-              <span class="mono muted-xs" id="liveExecStatusMeta">Ready</span>
-            </div>
-            <div class="table-scroll">
-              <table class="ledger-table">
-                <thead>
-                  <tr>
-                    <th>Asset / Step</th>
-                    <th>Provider</th>
-                    <th>Quote Output</th>
-                    <th>Status</th>
-                    <th>Onchain Explorer Links</th>
-                  </tr>
-                </thead>
-                <tbody id="liveExecLogBody"></tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="legs-grid" id="cctpLegsGrid"></div>
-        </section>
-
-        <!-- ======================================================= -->
-        <!-- VIEW 3: ZERO-LIQUIDITY BURN RECEIPTS                    -->
-        <!-- ======================================================= -->
-        <section class="view-pane" id="view-burns">
-          <div class="view-header">
-            <div>
-              <h1>Zero-Liquidity Burn Policy &amp; Hygiene Receipts</h1>
-              <p>Dead tokens with $0 DEX liquidity burn cleanly to <code class="code-inline">0x0000…dEaD</code> inside <code class="code-inline">try/catch</code>. Reverting honeypots are automatically skipped.</p>
-            </div>
-            <div class="btn-row">
-              <button type="button" class="btn-outline-sm" id="downloadBurnCsvBtn">Export CSV Receipt</button>
-              <button type="button" class="btn-pill-dark btn-sm" id="copyBurnJsonBtn">Copy JSON Manifest</button>
-            </div>
-          </div>
-
-          <div class="card table-card">
-            <div class="card-head">
-              <h2>Burn &amp; Honeypot Isolation Manifest</h2>
+              <h2>Burn &amp; Honeypot Receipts</h2>
               <span class="mono muted-xs" id="burnManifestCount">0 tokens</span>
             </div>
             <div class="table-scroll">
@@ -438,7 +450,7 @@
                     <th>Chain</th>
                     <th>Balance</th>
                     <th>Status</th>
-                    <th>Burn Sink / Reason</th>
+                    <th>Verification</th>
                   </tr>
                 </thead>
                 <tbody id="burnTableBody"></tbody>
@@ -448,7 +460,7 @@
         </section>
 
         <!-- ======================================================= -->
-        <!-- VIEW 4: SIPHONROUTER.SOL CONTRACT                       -->
+        <!-- VIEW 3: SMART CONTRACTS & TREASURY FEE VAULT            -->
         <!-- ======================================================= -->
         <section class="view-pane" id="view-contract">
           <div class="view-header">
@@ -475,6 +487,13 @@
         </section>
       </main>
     </div>
+
+    <!-- FLOATING BACKGROUND AGENT PILL (Minimized tracker visible across tabs) -->
+    <button type="button" class="bg-agent-dock hidden" id="bgAgentDock" aria-label="View active background sweep">
+      <span class="agent-pulse-dot"></span>
+      <span id="bgAgentDockText">Background Agent · Running</span>
+      <span class="mono muted-xs" style="color:#a1a1aa;">View →</span>
+    </button>
 
     <!-- UNIFIED DUAL-ECOSYSTEM WALLET MODAL (EVM + SOLANA) -->
     <div class="wallet-modal-backdrop hidden" id="walletModalBackdrop" role="dialog" aria-modal="true" aria-labelledby="walletModalTitle">

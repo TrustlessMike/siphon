@@ -426,6 +426,36 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
     assert.ok(c.source.includes('MAX_FEE_BPS = 1000'));
     assert.ok(c.feeVaultSource.includes('contract SiphonFeeVault'));
     assert.equal(c.contracts.length, 2);
+
+    // Background job lifecycle: POST /api/jobs -> POST /api/jobs/:id/leg -> GET /api/jobs
+    const job = await fetch(`http://127.0.0.1:${addr.port}/api/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sourceWallet: report.walletAddress,
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+        outputAsset: 'USDC',
+        bridgePreference: 'auto',
+        protocolFeeBps: 700,
+        feeRecipientEvm: treasury,
+        legs: [{ chain: 'base', assetCount: 4, estimatedNetUsd: 1200, estimatedFeeUsd: 90 }],
+      }),
+    }).then((r) => r.json());
+    assert.ok(job.jobId.startsWith('job_'));
+    assert.equal(job.status, 'active');
+
+    const updated = await fetch(`http://127.0.0.1:${addr.port}/api/jobs/${job.jobId}/leg`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chain: 'base',
+        status: 'landed',
+        statusText: 'Landed on Solana',
+        evmTxHash: '0x' + 'a'.repeat(64),
+      }),
+    }).then((r) => r.json());
+    assert.equal(updated.status, 'completed');
+    assert.equal(updated.settledNetUsd, 1200);
   } finally {
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));

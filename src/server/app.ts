@@ -23,6 +23,7 @@ import {
 import { scanLiveWallet, scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
 import { fetchSolanaWalletBalances, getL2IndexerProvider } from '../scanner/discovery.js';
 import type { EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
+import { BackgroundJobStore, type JobLegStatus } from './jobs.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -143,6 +144,7 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
 
 export function createSiphonServer() {
   const scanCache = new Map<string, ScanReport>();
+  const jobStore = new BackgroundJobStore();
 
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? 'GET';
@@ -428,6 +430,89 @@ export function createSiphonServer() {
         }
       }
 
+      if (method === 'GET' && pathname === '/api/jobs') {
+        return sendJson(res, 200, { jobs: jobStore.listJobs() });
+      }
+
+      if (method === 'POST' && pathname === '/api/jobs') {
+        const body = await readJsonBody<{
+          sourceWallet?: string;
+          solanaDestination?: string;
+          outputAsset?: 'USDC' | 'SOL';
+          bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+          protocolFeeBps?: number;
+          feeRecipientEvm?: string | null;
+          legs?: Array<{
+            chain: EvmChainId;
+            chainName?: string;
+            assetCount: number;
+            estimatedNetUsd: number;
+            estimatedFeeUsd?: number;
+          }>;
+        }>(req);
+
+        if (!body.sourceWallet || !body.solanaDestination || !Array.isArray(body.legs)) {
+          return sendJson(res, 400, {
+            error: 'sourceWallet, solanaDestination, and legs[] are required',
+          });
+        }
+
+        const feeCfg = getProtocolFeeConfig({
+          feeBps: body.protocolFeeBps,
+          feeRecipientEvm: body.feeRecipientEvm,
+        });
+        const job = jobStore.createJob({
+          sourceWallet: body.sourceWallet,
+          solanaDestination: body.solanaDestination,
+          outputAsset: body.outputAsset ?? 'USDC',
+          bridgePreference: body.bridgePreference ?? 'auto',
+          protocolFeeBps: feeCfg.feeBps,
+          feeRecipientEvm: feeCfg.feeRecipientEvm,
+          legs: body.legs,
+        });
+        return sendJson(res, 200, job);
+      }
+
+      if (method === 'GET' && pathname.startsWith('/api/jobs/')) {
+        const jobId = pathname.slice('/api/jobs/'.length);
+        const job = jobStore.getJob(jobId);
+        if (!job) return sendJson(res, 404, { error: 'Background job not found' });
+        return sendJson(res, 200, job);
+      }
+
+      if (method === 'POST' && pathname.startsWith('/api/jobs/') && pathname.endsWith('/leg')) {
+        const jobId = pathname.slice('/api/jobs/'.length, -'/leg'.length);
+        const body = await readJsonBody<{
+          chain?: EvmChainId;
+          status?: JobLegStatus;
+          statusText?: string;
+          provider?: string;
+          callsBatched?: number;
+          popupsSaved?: number;
+          evmTxHash?: string;
+          solanaTxHash?: string;
+          requestId?: string;
+          requiresSolanaClaim?: boolean;
+          attestationStatus?: string;
+        }>(req);
+
+        if (!body.chain) return sendJson(res, 400, { error: 'chain is required' });
+        const updated = jobStore.updateLeg(jobId, body.chain, {
+          status: body.status,
+          statusText: body.statusText,
+          provider: body.provider,
+          callsBatched: body.callsBatched,
+          popupsSaved: body.popupsSaved,
+          evmTxHash: body.evmTxHash,
+          solanaTxHash: body.solanaTxHash,
+          requestId: body.requestId,
+          requiresSolanaClaim: body.requiresSolanaClaim,
+          attestationStatus: body.attestationStatus,
+        });
+        if (!updated) return sendJson(res, 404, { error: 'Background job or chain leg not found' });
+        return sendJson(res, 200, updated);
+      }
+
       if (method === 'POST' && pathname === '/api/simulate') {
         const body = await readJsonBody<{
           scanId?: string;
@@ -488,6 +573,10 @@ export function createSiphonServer() {
         error: err instanceof Error ? err.message : 'Internal server error',
       });
     }
+  });
+
+  server.on('close', () => {
+    jobStore.dispose();
   });
 
   return { server };
