@@ -2,7 +2,25 @@ import crypto from 'node:crypto';
 import { fetchCctpAttestationForTx } from '../bridge/cctp.js';
 import { checkLiveExecutionStatus } from '../execution/tx-builder.js';
 import { EVM_CHAINS } from '../scanner/chains.js';
-import type { EvmChainId } from '../scanner/types.js';
+import type { AnyChainId, EvmChainId } from '../scanner/types.js';
+
+const NON_EVM_EXPLORERS: Record<string, string> = {
+  cosmoshub: 'https://www.mintscan.io/cosmos',
+  osmosis: 'https://www.mintscan.io/osmosis',
+  noble: 'https://www.mintscan.io/noble',
+  celestia: 'https://www.mintscan.io/celestia',
+  injective: 'https://www.mintscan.io/injective',
+  neutron: 'https://www.mintscan.io/neutron',
+  sui: 'https://suiscan.xyz/mainnet',
+  aptos: 'https://explorer.aptoslabs.com',
+  ton: 'https://tonviewer.com',
+  tron: 'https://tronscan.org/#',
+  btc: 'https://mempool.space',
+};
+
+function isEvmChainId(chain: AnyChainId): chain is EvmChainId {
+  return chain in EVM_CHAINS;
+}
 
 export type JobLegStatus =
   | 'queued'
@@ -16,7 +34,7 @@ export type JobLegStatus =
   | 'skipped';
 
 export interface BackgroundJobLeg {
-  chain: EvmChainId;
+  chain: AnyChainId;
   chainName: string;
   explorerUrl: string;
   assetCount: number;
@@ -63,7 +81,7 @@ export class BackgroundJobStore {
     protocolFeeBps: number;
     feeRecipientEvm: string | null;
     legs: Array<{
-      chain: EvmChainId;
+      chain: AnyChainId;
       chainName?: string;
       assetCount: number;
       estimatedNetUsd: number;
@@ -73,11 +91,11 @@ export class BackgroundJobStore {
     const now = new Date().toISOString();
     const jobId = `job_${crypto.randomBytes(5).toString('hex')}`;
     const legs: BackgroundJobLeg[] = input.legs.map((l) => {
-      const cfg = EVM_CHAINS[l.chain];
+      const cfg = isEvmChainId(l.chain) ? EVM_CHAINS[l.chain] : undefined;
       return {
         chain: l.chain,
         chainName: l.chainName || cfg?.name || l.chain,
-        explorerUrl: cfg?.explorerUrl || 'https://etherscan.io',
+        explorerUrl: cfg?.explorerUrl || NON_EVM_EXPLORERS[l.chain] || 'https://etherscan.io',
         assetCount: l.assetCount,
         estimatedNetUsd: Number(l.estimatedNetUsd.toFixed(2)),
         estimatedFeeUsd: Number((l.estimatedFeeUsd ?? 0).toFixed(2)),
@@ -124,7 +142,7 @@ export class BackgroundJobStore {
 
   updateLeg(
     jobId: string,
-    chain: EvmChainId,
+    chain: AnyChainId,
     patch: Partial<Omit<BackgroundJobLeg, 'chain' | 'chainName' | 'explorerUrl'>>
   ): BackgroundJob | null {
     const job = this.jobs.get(jobId);
@@ -137,6 +155,7 @@ export class BackgroundJobStore {
 
     // Start autonomous server-side background settlement watcher once an EVM tx or Relay intent exists
     if (
+      isEvmChainId(chain) &&
       (leg.status === 'confirming' || leg.status === 'relaying') &&
       (leg.evmTxHash || leg.requestId)
     ) {

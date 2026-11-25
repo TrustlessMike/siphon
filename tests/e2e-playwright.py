@@ -191,6 +191,40 @@ def main():
             pgD.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=15000)
             pgD.wait_for_timeout(400)
 
+            # Verify all 7 ecosystem family pills render with zero broken SVG logos!
+            famPills = pgD.locator("#familyBar .family-pill").count()
+            assert famPills == 7, f"Expected 7 ecosystem family pills, got {famPills}"
+            brokenFamLogos = pgD.evaluate("""() => {
+              const imgs = Array.from(document.querySelectorAll('#familyBar img'));
+              return imgs.filter(i => !i.complete || i.naturalWidth === 0).map(i => i.src);
+            }""")
+            assert not brokenFamLogos, f"Broken family logos: {brokenFamLogos}"
+
+            # Verify switching to Bitcoin & Cosmos updates wallet modal & source chrome cleanly
+            pgD.click("#familyBar [data-family='cosmos']")
+            pgD.wait_for_function("() => (document.querySelector('#connectEvmBtn')?.innerText || '').includes('Cosmos')", timeout=10000)
+            pgD.click("#connectEvmBtn")
+            pgD.wait_for_selector("#walletModalBackdrop:not(.hidden)")
+            cosmosModalText = pgD.locator("#walletModalBackdrop").inner_text()
+            assert "Keplr" in cosmosModalText and "Leap" in cosmosModalText, cosmosModalText
+            pgD.keyboard.press("Escape")
+            pgD.wait_for_selector("#walletModalBackdrop", state="hidden")
+
+            pgD.click("#familyBar [data-family='btc']")
+            pgD.wait_for_function("() => (document.querySelector('#connectEvmBtn')?.innerText || '').includes('Bitcoin')", timeout=10000)
+            pgD.click("#connectEvmBtn")
+            pgD.wait_for_selector("#walletModalBackdrop:not(.hidden)")
+            btcModalText = pgD.locator("#walletModalBackdrop").inner_text()
+            assert "UniSat" in btcModalText and "Xverse" in btcModalText, btcModalText
+            pgD.keyboard.press("Escape")
+            pgD.wait_for_selector("#walletModalBackdrop", state="hidden")
+
+            # Switch back to EVM for full EVM batch & proof assertions
+            pgD.click("#familyBar [data-family='evm']")
+            pgD.wait_for_function("() => document.querySelector('#connectEvmBtn')?.textContent?.includes('Rabby')", timeout=15000)
+            pgD.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=15000)
+            pgD.wait_for_timeout(300)
+
             # Verify Rabby Small-Swap 2-column workspace: chain filter chips, fee drawer, bridge route, & contracts!
             pgD.click("#chainFilterBar [data-chain-filter='base']")
             pgD.wait_for_timeout(120)

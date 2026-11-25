@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Siphon — Drain Every EVM Chain into Solana USDC</title>
+    <title>Siphon — Drain Every Chain into Solana USDC</title>
     <link
       rel="icon"
       type="image/svg+xml"
@@ -53,7 +53,7 @@
               Fresh start.
             </h1>
             <p class="hero-sub">
-              Crypto splintered into too many chains and failed coins. Pull your capital off six EVM networks and move cleanly to Solana.
+              Crypto splintered into too many chains and failed coins. Pull your capital off 25 networks across EVM, Cosmos, Sui, Aptos, TON, Tron, and Bitcoin — cleanly to Solana.
             </p>
 
             <div class="hero-cta-row">
@@ -66,8 +66,8 @@
                 type="text"
                 id="heroWalletInput"
                 class="hero-inspect-input mono"
-                placeholder="Or inspect any 0x… EVM address"
-                aria-label="Inspect any EVM wallet address"
+                placeholder="Inspect any 0x…, cosmos1…, bc1…, EQ…, T… address"
+                aria-label="Inspect any multi-chain wallet address"
               />
               <button type="submit" class="hero-inspect-btn" id="heroScanBtn">Scan →</button>
             </form>
@@ -84,13 +84,14 @@
               aria-label="3D porcelain, brushed titanium, and frosted ice-cyan Solana funnel sculpture"
             ></canvas>
             <div class="hero-stage-bar mono">
-              <div class="hero-chain-strip" aria-label="Supported EVM source chains">
-                <span class="hero-chain-chip"><img src="/logos/ethereum.svg" alt="" class="chain-logo-xs" />Ethereum</span>
-                <span class="hero-chain-chip"><img src="/logos/base.svg" alt="" class="chain-logo-xs" />Base</span>
-                <span class="hero-chain-chip"><img src="/logos/arbitrum.svg" alt="" class="chain-logo-xs" />Arbitrum</span>
-                <span class="hero-chain-chip"><img src="/logos/optimism.svg" alt="" class="chain-logo-xs" />Optimism</span>
-                <span class="hero-chain-chip"><img src="/logos/polygon.svg" alt="" class="chain-logo-xs" />Polygon</span>
-                <span class="hero-chain-chip"><img src="/logos/avalanche.svg" alt="" class="chain-logo-xs" />Avalanche</span>
+              <div class="hero-chain-strip" aria-label="Supported source ecosystems">
+                <span class="hero-chain-chip"><img src="/logos/ethereum.svg" alt="" class="chain-logo-xs" />14 EVMs</span>
+                <span class="hero-chain-chip"><img src="/logos/cosmos.svg" alt="" class="chain-logo-xs" />Cosmos</span>
+                <span class="hero-chain-chip"><img src="/logos/sui.svg" alt="" class="chain-logo-xs" />Sui</span>
+                <span class="hero-chain-chip"><img src="/logos/aptos.svg" alt="" class="chain-logo-xs" />Aptos</span>
+                <span class="hero-chain-chip"><img src="/logos/ton.svg" alt="" class="chain-logo-xs" />TON</span>
+                <span class="hero-chain-chip"><img src="/logos/tron.svg" alt="" class="chain-logo-xs" />Tron</span>
+                <span class="hero-chain-chip"><img src="/logos/btc.svg" alt="" class="chain-logo-xs" />Bitcoin</span>
               </div>
               <span class="stage-domain">→ <img src="/logos/solana.svg" alt="" class="chain-logo-xs" />SOLANA</span>
             </div>
@@ -131,7 +132,7 @@
         <footer class="site-footer">
           <div class="footer-left">
             <strong>Siphon</strong>
-            <span class="mono">6 EVM Chains → Solana</span>
+            <span class="mono">7 Ecosystems · 25 Chains → Solana</span>
           </div>
           <div class="footer-right">
             <button type="button" class="link-btn" data-open-app="scanner">Sweep</button>
@@ -188,6 +189,40 @@
         <!-- VIEW 1: AGENTIC SWEEP WORKSPACE (2-Column Small-Swap)   -->
         <!-- ======================================================= -->
         <section class="view-pane active" id="view-scanner">
+          <!-- Quiet Ecosystem / Chain Family Bar (7 Ecosystems -> Solana) -->
+          <div class="family-bar" id="familyBar" role="tablist" aria-label="Select source blockchain ecosystem">
+            <button type="button" class="family-pill active" data-family="evm" role="tab">
+              <img src="/logos/ethereum.svg" alt="" class="chain-logo-xs" />
+              <span>EVM</span>
+              <span class="family-count mono">14</span>
+            </button>
+            <button type="button" class="family-pill" data-family="cosmos" role="tab">
+              <img src="/logos/cosmos.svg" alt="" class="chain-logo-xs" />
+              <span>Cosmos</span>
+              <span class="family-count mono">6</span>
+            </button>
+            <button type="button" class="family-pill" data-family="sui" role="tab">
+              <img src="/logos/sui.svg" alt="" class="chain-logo-xs" />
+              <span>Sui</span>
+            </button>
+            <button type="button" class="family-pill" data-family="aptos" role="tab">
+              <img src="/logos/aptos.svg" alt="" class="chain-logo-xs" />
+              <span>Aptos</span>
+            </button>
+            <button type="button" class="family-pill" data-family="ton" role="tab">
+              <img src="/logos/ton.svg" alt="" class="chain-logo-xs" />
+              <span>TON</span>
+            </button>
+            <button type="button" class="family-pill" data-family="tron" role="tab">
+              <img src="/logos/tron.svg" alt="" class="chain-logo-xs" />
+              <span>Tron</span>
+            </button>
+            <button type="button" class="family-pill" data-family="btc" role="tab">
+              <img src="/logos/btc.svg" alt="" class="chain-logo-xs" />
+              <span>Bitcoin</span>
+            </button>
+          </div>
+
           <!-- Quiet Single-Row Source Wallet Bar -->
           <div class="source-strip">
             <form class="source-strip-form" id="appScanForm">
@@ -197,18 +232,18 @@
                   type="text"
                   id="appEvmInput"
                   class="source-input mono"
-                  placeholder="Scan any 0x… EVM wallet address"
-                  aria-label="Source EVM wallet address"
+                  placeholder="Scan any 0x… EVM, cosmos1…, bc1…, EQ…, T… address"
+                  aria-label="Source wallet address"
                 />
               </div>
               <button type="submit" class="btn-outline-sm" id="appScanBtn">Scan</button>
-              <div class="source-presets">
+              <div class="source-presets" id="sourcePresetsBar">
                 <button type="button" class="text-action" data-preset="vitalik_live">vitalik.eth</button>
                 <span class="sep-dot">·</span>
                 <button type="button" class="text-action muted" data-preset="veteran_defi">Sample DeFi</button>
               </div>
             </form>
-            <div class="source-strip-summary mono" id="sourceSummaryText">Scanning 6 EVM chains…</div>
+            <div class="source-strip-summary mono" id="sourceSummaryText">Scanning 14 EVM chains…</div>
           </div>
 
           <!-- 2-Column Calm Workspace -->

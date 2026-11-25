@@ -18,7 +18,34 @@ const CHAIN_ACCENTS = {
   optimism: '#DC2626',
   polygon: '#7C3AED',
   avalanche: '#E84142',
+  bnb: '#D97706',
+  sonic: '#0284C7',
+  unichain: '#EC4899',
+  linea: '#18181B',
+  scroll: '#B45309',
+  mantle: '#0F766E',
+  blast: '#CA8A04',
+  worldchain: '#111827',
+  cosmoshub: '#312E81',
+  osmosis: '#7E22CE',
+  noble: '#1D4ED8',
+  celestia: '#7C3AED',
+  injective: '#0284C7',
+  neutron: '#18181B',
+  sui: '#2563EB',
+  aptos: '#0F172A',
+  ton: '#0098EA',
+  tron: '#DC2626',
+  btc: '#F7931A',
 };
+
+function chainLogoForSvg(chain) {
+  const c = String(chain || '').toLowerCase();
+  if (['cosmoshub', 'noble', 'celestia', 'injective', 'neutron'].includes(c)) {
+    return '/logos/cosmos.svg';
+  }
+  return `/logos/${c}.svg`;
+}
 
 /**
  * Swiss-Infographic Daylight SVG Multi-Chain Convergence Flow with real official chain,
@@ -162,7 +189,7 @@ export function renderConvergenceSvg(plan, scan) {
         <g transform="translate(${col1X}, ${y})">
           <rect width="${col1W}" height="46" rx="8" fill="#FFFFFF" stroke="#D4D8E0" />
           <rect width="3.5" height="46" rx="1.75" fill="${bar}" />
-          <image href="/logos/${escapeXml(leg.chain)}.svg" x="13" y="13" width="20" height="20" />
+          <image href="${escapeXml(chainLogoForSvg(leg.chain))}" x="13" y="13" width="20" height="20" />
           <text x="41" y="20" font-family="Inter, sans-serif" font-size="12.5" font-weight="600" fill="#0A0A0A">${escapeXml(leg.chainName)}</text>
           <text x="41" y="36" font-family="JetBrains Mono, monospace" font-size="10.2" fill="#52525B">$${leg.bridgedUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })} · ${leg.defiExits + leg.swaps + leg.burns} items</text>
         </g>

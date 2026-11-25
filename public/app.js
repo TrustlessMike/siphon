@@ -3,11 +3,14 @@ import { renderConvergenceSvg } from './siphon-svg.js';
 import {
   connectCoinbaseSmartWallet,
   connectEvmWallet,
+  connectFamilyWallet,
   connectSolanaWallet,
   connectWalletConnect,
   disconnectEvmWallet,
+  disconnectFamilyWallet,
   disconnectSolanaWallet,
   getConnectedEvmAddress,
+  getConnectedFamilyWallet,
   getConnectedSolanaAddress,
   getConnectedSolanaWalletName,
   getConnectedWalletName,
@@ -16,6 +19,7 @@ import {
   getWalletConnectorConfig,
   isChainBatchSupported,
   listAvailableEvmWallets,
+  listAvailableFamilyWallets,
   listAvailableSolanaWallets,
   loadWalletConnectorConfig,
   preloadWalletSdks,
@@ -23,6 +27,7 @@ import {
   sendEip5792Batch,
   sendRealEvmTransaction,
   setSavedWalletConnectProjectId,
+  signFamilyGaslessIntent,
   signGaslessTypedData,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
@@ -31,6 +36,8 @@ import {
 let currentScan = null;
 let currentPlan = null;
 let selectedAssetIds = new Set();
+let activeFamily = 'evm';
+let familyMetas = {};
 let activeFilter = 'all';
 let activeChainFilter = 'all';
 let activeView = 'scanner';
@@ -105,12 +112,54 @@ function getWalletLogoPath(name, rdns = '') {
   if (s.includes('brave')) return '/logos/brave.svg';
   if (s.includes('rainbow')) return '/logos/rainbow.svg';
   if (s.includes('ledger')) return '/logos/ledger.svg';
+  if (s.includes('keplr')) return '/logos/keplr.svg';
+  if (s.includes('leap')) return '/logos/leap.svg';
+  if (s.includes('slush') || s.includes('sui')) return '/logos/slush.svg';
+  if (s.includes('petra')) return '/logos/petra.svg';
+  if (s.includes('tonkeeper') || s.includes('openmask')) return '/logos/tonkeeper.svg';
+  if (s.includes('tronlink')) return '/logos/tronlink.svg';
+  if (s.includes('unisat')) return '/logos/unisat.svg';
+  if (s.includes('xverse')) return '/logos/xverse.svg';
+  return '/logos/ethereum.svg';
+}
+
+function getFamilyLogoPath(family) {
+  const f = String(family || 'evm').toLowerCase();
+  if (f === 'evm') return '/logos/ethereum.svg';
+  if (['cosmos', 'sui', 'aptos', 'ton', 'tron', 'btc'].includes(f)) return `/logos/${f}.svg`;
   return '/logos/ethereum.svg';
 }
 
 function getChainLogoPath(chain) {
   const c = String(chain || '').toLowerCase();
-  if (['ethereum', 'base', 'arbitrum', 'optimism', 'polygon', 'avalanche', 'solana'].includes(c)) {
+  if (['cosmoshub', 'noble', 'celestia', 'injective', 'neutron'].includes(c)) {
+    return '/logos/cosmos.svg';
+  }
+  if (
+    [
+      'ethereum',
+      'base',
+      'arbitrum',
+      'optimism',
+      'polygon',
+      'avalanche',
+      'bnb',
+      'sonic',
+      'unichain',
+      'linea',
+      'scroll',
+      'mantle',
+      'blast',
+      'worldchain',
+      'osmosis',
+      'sui',
+      'aptos',
+      'ton',
+      'tron',
+      'btc',
+      'solana',
+    ].includes(c)
+  ) {
     return `/logos/${c}.svg`;
   }
   return '/logos/ethereum.svg';
@@ -232,12 +281,82 @@ function estimateChainCallCounts() {
   };
 }
 
+function getActiveSourceWallet() {
+  return getConnectedFamilyWallet(activeFamily);
+}
+
+function updateFamilyChrome() {
+  const meta = familyMetas[activeFamily];
+  document.querySelectorAll('.family-pill[data-family]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.family === activeFamily);
+  });
+  const appIn = document.getElementById('appEvmInput');
+  if (appIn && meta?.addressHint) {
+    appIn.placeholder = `Scan ${meta.addressHint}`;
+  }
+  const presetsBar = document.getElementById('sourcePresetsBar');
+  if (presetsBar) {
+    if (activeFamily === 'evm') {
+      presetsBar.innerHTML = `
+        <button type="button" class="text-action" data-preset="vitalik_live">vitalik.eth</button>
+        <span class="sep-dot">·</span>
+        <button type="button" class="text-action muted" data-preset="veteran_defi">Sample DeFi</button>
+      `;
+      presetsBar.querySelectorAll('[data-preset]').forEach((btn) => {
+        btn.addEventListener('click', () => runScan({ presetId: btn.dataset.preset, autoOpen: false }));
+      });
+    } else if (meta?.sampleAddress) {
+      presetsBar.innerHTML = `
+        <button type="button" class="text-action" id="familySampleBtn">${escapeHtml(meta.sampleLabel || `Sample ${meta.shortLabel}`)}</button>
+      `;
+      document.getElementById('familySampleBtn')?.addEventListener('click', () => {
+        runScan({ address: meta.sampleAddress, family: activeFamily, autoOpen: false });
+      });
+    }
+  }
+  const proofBtn = document.getElementById('verifyProofBtn');
+  if (proofBtn) {
+    proofBtn.textContent =
+      activeFamily === 'evm'
+        ? 'Prove Swap & Gas Before Signing (Live eth_call)'
+        : `Prove ${meta?.shortLabel || activeFamily.toUpperCase()} Sweep Before Signing`;
+  }
+  updateWalletButtons();
+}
+
+function selectFamily(family, { autoScanSample = true } = {}) {
+  activeFamily = family || 'evm';
+  if (activeFamily !== 'evm') {
+    executionMode = 'gasless';
+    document.querySelectorAll('.mode-opt[data-exec-mode]').forEach((b) => {
+      b.classList.toggle('active', b.dataset.execMode === executionMode);
+    });
+  }
+  updateFamilyChrome();
+  const meta = familyMetas[activeFamily];
+  const connected = getConnectedFamilyWallet(activeFamily);
+  if (autoScanSample) {
+    if (connected?.address) {
+      runScan({ address: connected.address, family: activeFamily, autoOpen: false });
+    } else if (activeFamily === 'evm') {
+      if (currentScan?.family && currentScan.family !== 'evm') {
+        runScan({ presetId: 'vitalik_live', autoOpen: false });
+      }
+    } else if (meta?.sampleAddress) {
+      runScan({ address: meta.sampleAddress, family: activeFamily, autoOpen: false });
+    }
+  }
+}
+
 function updateWalletButtons() {
-  const evmAddr = getConnectedEvmAddress();
+  const srcSession = getActiveSourceWallet();
+  const srcAddr = srcSession?.address || null;
+  const walletName = srcSession?.walletName || null;
   const solAddr = getConnectedSolanaAddress();
-  const walletName = getConnectedWalletName();
   const caps = getWalletBatchCapabilities();
   const stats = estimateChainCallCounts();
+  const meta = familyMetas[activeFamily];
+  const famShort = meta?.shortLabel || (activeFamily === 'evm' ? 'EVM' : activeFamily.toUpperCase());
 
   const evmBtn = document.getElementById('connectEvmBtn');
   const solBtn = document.getElementById('connectSolBtn');
@@ -247,10 +366,10 @@ function updateWalletButtons() {
   const ctaNote = document.getElementById('sweepCtaNote');
 
   if (evmBtn) {
-    const shortName = walletName ? walletName.split(' ')[0] : 'EVM';
-    const logo = evmAddr ? getWalletLogoPath(walletName) : '/logos/ethereum.svg';
-    evmBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(evmAddr ? `${shortName}: ${shortAddr(evmAddr)}` : 'Connect EVM')}</span>`;
-    evmBtn.classList.toggle('connected', Boolean(evmAddr));
+    const shortName = walletName ? walletName.split(' ')[0] : famShort;
+    const logo = srcAddr ? getWalletLogoPath(walletName) : getFamilyLogoPath(activeFamily);
+    evmBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(srcAddr ? `${shortName}: ${shortAddr(srcAddr)}` : `Connect ${famShort}`)}</span>`;
+    evmBtn.classList.toggle('connected', Boolean(srcAddr));
   }
   if (solBtn) {
     const solFull = getConnectedSolanaWalletName();
@@ -261,21 +380,21 @@ function updateWalletButtons() {
   }
   if (siteBtn) {
     const shortName = walletName ? walletName.split(' ')[0] : null;
-    if (evmAddr) {
+    if (srcAddr) {
       const logo = getWalletLogoPath(walletName);
-      siteBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(`${shortName ? `${shortName} · ` : ''}${shortAddr(evmAddr)}`)}</span>`;
+      siteBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(`${shortName ? `${shortName} · ` : ''}${shortAddr(srcAddr)}`)}</span>`;
     } else if (solAddr) {
       const logo = getWalletLogoPath(getConnectedSolanaWalletName() || 'Phantom');
       siteBtn.innerHTML = `<img src="${escapeHtml(logo)}" alt="" class="btn-logo" /><span>${escapeHtml(`SOL · ${shortAddr(solAddr)}`)}</span>`;
     } else {
       siteBtn.textContent = 'Connect Wallet';
     }
-    siteBtn.classList.toggle('connected', Boolean(evmAddr || solAddr));
-    siteBtn.classList.toggle('btn-with-logo', Boolean(evmAddr || solAddr));
+    siteBtn.classList.toggle('connected', Boolean(srcAddr || solAddr));
+    siteBtn.classList.toggle('btn-with-logo', Boolean(srcAddr || solAddr));
   }
   if (heroBtn) {
-    heroBtn.textContent = evmAddr
-      ? `${walletName || 'Wallet'} · ${shortAddr(evmAddr)}`
+    heroBtn.textContent = srcAddr
+      ? `${walletName || 'Wallet'} · ${shortAddr(srcAddr)}`
       : 'Connect Wallet';
   }
 
@@ -284,10 +403,10 @@ function updateWalletButtons() {
     if (n === 0) {
       ctaBtn.textContent = 'Select assets to sweep';
       ctaBtn.disabled = true;
-    } else if (!evmAddr) {
-      ctaBtn.textContent = `Connect Wallet to Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`;
+    } else if (!srcAddr) {
+      ctaBtn.textContent = `Connect ${famShort} Wallet to Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`;
       ctaBtn.disabled = false;
-    } else if (executionMode === 'gasless') {
+    } else if (executionMode === 'gasless' || activeFamily !== 'evm') {
       ctaBtn.textContent = `Gasless 1-Sig Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'}) →`;
       ctaBtn.disabled = false;
     } else {
@@ -296,11 +415,13 @@ function updateWalletButtons() {
     }
   }
   if (ctaNote) {
-    if (executionMode === 'gasless') {
+    if (activeFamily !== 'evm' && meta?.gasSponsorshipMechanism) {
+      ctaNote.textContent = meta.gasSponsorshipMechanism;
+    } else if (executionMode === 'gasless') {
       ctaNote.textContent = `$0 native gas required · 1 off-chain Permit2 / EIP-7702 signature · gas paid from fee`;
-    } else if (evmAddr && caps.probed && caps.anySupported) {
+    } else if (srcAddr && caps.probed && caps.anySupported) {
       ctaNote.textContent = `EIP-5792 armed · 1 click per chain (${stats.popupsSaved} popups saved) · settles in background`;
-    } else if (evmAddr && caps.probed && !caps.anySupported) {
+    } else if (srcAddr && caps.probed && !caps.anySupported) {
       ctaNote.textContent = `EOA detected · switch to Gasless 1-Sig for 1 signature & $0 gas, or sign sequentially`;
     } else {
       ctaNote.textContent = `1 confirmation per chain · settles automatically in the background`;
@@ -310,7 +431,7 @@ function updateWalletButtons() {
 
 let scanSeq = 0;
 
-async function runScan({ address = null, presetId = null, autoOpen = false } = {}) {
+async function runScan({ address = null, family = null, presetId = null, autoOpen = false } = {}) {
   const seq = ++scanSeq;
   heroScene?.setActive(true);
   const scanBtn = document.getElementById('appScanBtn');
@@ -319,14 +440,24 @@ async function runScan({ address = null, presetId = null, autoOpen = false } = {
     scanBtn.textContent = 'Scanning…';
   }
   try {
-    const payload = presetId ? { presetId } : address ? { address } : { presetId: 'vitalik_live' };
+    const payload = presetId
+      ? { presetId }
+      : address
+      ? { address, family: family || activeFamily }
+      : { presetId: 'vitalik_live' };
     const scan = await api('/api/scan', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
     if (seq !== scanSeq) return;
     currentScan = scan;
+    if (scan.family && scan.family !== activeFamily) {
+      activeFamily = scan.family;
+      if (activeFamily !== 'evm') executionMode = 'gasless';
+    }
+    updateFamilyChrome();
     activeChainFilter = 'all';
+    renderPreSignProofCard(null);
 
     selectedAssetIds = new Set(
       currentScan.assets.filter((a) => a.selectedByDefault).map((a) => a.id)
@@ -733,8 +864,8 @@ async function runPreSignProof() {
   }
   try {
     const solDest = document.getElementById('solanaDestInput').value.trim();
-    const connectedEvm = getConnectedEvmAddress();
-    const userAddress = connectedEvm || currentScan.walletAddress;
+    const srcSession = getActiveSourceWallet();
+    const userAddress = srcSession?.address || currentScan.walletAddress;
     const chainMeta = currentScan.chains.find((c) => c.chain === targetChain);
 
     const res = await api('/api/tx/simulate-proof', {
@@ -1031,10 +1162,12 @@ async function proveLegOnchain(jobId, chain, btnEl = null) {
 }
 
 async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress, solDest) {
+  const isNonEvm = (currentScan.family || activeFamily) !== 'evm';
+
   await patchJobLeg(jobId, chain, {
     status: 'preparing',
-    provider: 'permit2_gasless',
-    statusText: 'Preparing 1-signature gasless Permit2 / EIP-7702 intent ($0 gas)…',
+    provider: 'gasless_intent',
+    statusText: 'Preparing 1-signature gasless sweep intent ($0 user gas)…',
   });
   const intent = await api('/api/relayer/prepare-intent', {
     method: 'POST',
@@ -1051,15 +1184,18 @@ async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress,
   await patchJobLeg(jobId, chain, {
     status: 'signing',
     provider: intent.mode,
-    statusText: `Sign 1 gasless off-chain message ($0 gas · covers ${intent.coveredAssets.length} tokens)…`,
+    statusText: `Sign 1 gasless message ($0 gas · ${intent.coveredAssets.length} asset(s))…`,
   });
-  const signature = await signGaslessTypedData(intent.typedData, intent.chainId);
+  const signature = isNonEvm
+    ? await signFamilyGaslessIntent(currentScan.family || activeFamily, intent)
+    : await signGaslessTypedData(intent.typedData || intent.signPayload, intent.chainId);
   const receipt = await api('/api/relayer/submit', {
     method: 'POST',
     body: JSON.stringify({
       intentId: intent.intentId,
       chain,
       userAddress,
+      solanaDestination: solDest,
       signature,
       deadline: intent.deadline,
     }),
@@ -1125,6 +1261,22 @@ async function executeChainBatchLive(chain, existingJobId = null) {
   });
 
   try {
+    const isNonEvm = (currentScan.family || activeFamily) !== 'evm';
+    const srcSession = getActiveSourceWallet();
+    const connectedSrc = srcSession?.address || null;
+    if (isNonEvm) {
+      if (!connectedSrc) {
+        await patchJobLeg(jobId, chain, {
+          status: 'signing',
+          statusText: `Connect ${(currentScan.family || activeFamily).toUpperCase()} wallet to sign 1-sig gasless sweep`,
+        });
+        openWalletModal('evm');
+        return;
+      }
+      await executeGaslessIntentChain(chain, jobId, chainAssets, connectedSrc, solDest);
+      return;
+    }
+
     const hasSolanaSigner = Boolean(getConnectedSolanaAddress());
     const batch = await api('/api/tx/prepare-chain-batch', {
       method: 'POST',
@@ -1292,8 +1444,9 @@ async function executeSelectedLiveQueue() {
     return;
   }
 
-  const connectedEvm = getConnectedEvmAddress();
-  if (!connectedEvm) {
+  const srcSession = getActiveSourceWallet();
+  const connectedSrc = srcSession?.address || null;
+  if (!connectedSrc) {
     openWalletModal('evm');
     return;
   }
@@ -1302,7 +1455,7 @@ async function executeSelectedLiveQueue() {
   const job = await api('/api/jobs', {
     method: 'POST',
     body: JSON.stringify({
-      sourceWallet: connectedEvm,
+      sourceWallet: connectedSrc,
       solanaDestination: solDest,
       outputAsset,
       bridgePreference: getActiveBridgePreference(),
@@ -1426,24 +1579,35 @@ function renderWalletModalContent() {
   const solDot = document.getElementById('walletTabSolDot');
   if (!listEl) return;
 
-  const evmAddr = getConnectedEvmAddress();
+  const srcSession = getActiveSourceWallet();
+  const srcAddr = srcSession?.address || null;
   const solAddr = getConnectedSolanaAddress();
-  evmDot?.classList.toggle('hidden', !evmAddr);
+  evmDot?.classList.toggle('hidden', !srcAddr);
   solDot?.classList.toggle('hidden', !solAddr);
+
+  const meta = familyMetas[activeFamily];
+  const famShort = meta?.shortLabel || (activeFamily === 'evm' ? 'EVM' : activeFamily.toUpperCase());
+  const evmTabBtn = document.getElementById('walletTabEvm');
+  if (evmTabBtn) {
+    evmTabBtn.innerHTML = `${escapeHtml(famShort)} Source <span class="wallet-tab-dot ${srcAddr ? '' : 'hidden'}" id="walletTabEvmDot"></span>`;
+  }
 
   document.querySelectorAll('.wallet-tab').forEach((t) => {
     t.classList.toggle('active', t.dataset.walletTab === activeWalletModalTab);
   });
 
   const isEvm = activeWalletModalTab === 'evm';
-  const activeAddr = isEvm ? evmAddr : solAddr;
-  const activeName = isEvm ? getConnectedWalletName() : getConnectedSolanaWalletName();
+  const isSourceEvm = isEvm && activeFamily === 'evm';
+  const activeAddr = isEvm ? srcAddr : solAddr;
+  const activeName = isEvm ? srcSession?.walletName : getConnectedSolanaWalletName();
   const cfg = getWalletConnectorConfig();
   const effectiveWcId = getEffectiveWalletConnectProjectId();
 
-  titleEl.textContent = isEvm ? 'Connect EVM Wallet' : 'Connect Solana Wallet';
-  subEl.textContent = isEvm
-    ? 'Sign exits, swaps, burns, and bridges across six EVM chains.'
+  titleEl.textContent = isEvm ? `Connect ${famShort} Wallet` : 'Connect Solana Wallet';
+  subEl.textContent = isSourceEvm
+    ? 'Sign exits, swaps, burns, and bridges across 14 EVM chains.'
+    : isEvm
+    ? meta?.signingMechanism || `Connect your ${famShort} wallet to sign 1-sig gasless sweeps.`
     : 'Receive native USDC or SOL on Solana.';
 
   const rows = [];
@@ -1451,7 +1615,45 @@ function renderWalletModalContent() {
     rows.push(`<div class="wallet-modal-error">${escapeHtml(walletModalError)}</div>`);
   }
 
-  if (isEvm) {
+  if (isEvm && !isSourceEvm) {
+    const detectedFam = listAvailableFamilyWallets(activeFamily);
+    if (detectedFam.length) {
+      rows.push(`<div class="wallet-section-label">Installed ${escapeHtml(famShort)} wallets</div>`);
+      for (const w of detectedFam) {
+        const isBusy = walletModalConnecting === `fam:${w.id}`;
+        rows.push(`
+          <button type="button" class="wallet-option-row" data-pick-family-wallet="${escapeHtml(w.id)}" ${walletModalConnecting ? 'disabled' : ''}>
+            <div class="wallet-option-left">
+              ${getWalletBrandBadge(w.name, w.icon)}
+              <div>
+                <div class="wallet-option-name">${escapeHtml(w.name)}</div>
+                <div class="wallet-option-meta mono">Detected · ${escapeHtml(w.standard)}</div>
+              </div>
+            </div>
+            <span class="mono wallet-option-action">${isBusy ? 'Connecting…' : activeName === w.name && activeAddr ? 'Connected' : 'Connect →'}</span>
+          </button>
+        `);
+      }
+    }
+    if (meta?.wallets?.length) {
+      rows.push(`<div class="wallet-section-label">Supported ${escapeHtml(famShort)} wallets</div>`);
+      rows.push(
+        `<div class="wallet-install-strip">${meta.wallets
+          .map(
+            (w) =>
+              `<a class="wallet-install-chip" href="${escapeHtml(w.installUrl)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(w.logo)}" alt="" class="chain-logo-xs" />${escapeHtml(w.name)} ↗</a>`
+          )
+          .join('')}</div>`
+      );
+    }
+    rows.push(`
+      <div class="wallet-section-label">Or inspect any ${escapeHtml(famShort)} address</div>
+      <form class="wallet-manual-form" id="modalFamilyManualForm">
+        <input type="text" id="modalFamilyAddrInput" class="field-input mono" value="${escapeHtml(meta?.sampleAddress || '')}" placeholder="${escapeHtml(meta?.addressHint || '')}" aria-label="${escapeHtml(famShort)} source address" />
+        <button type="submit" class="btn-outline-dark">Scan</button>
+      </form>
+    `);
+  } else if (isEvm) {
     const detected = listAvailableEvmWallets();
     if (detected.length) {
       rows.push(`<div class="wallet-section-label">Installed in browser</div>`);
@@ -1714,11 +1916,40 @@ function renderWalletModalContent() {
   });
 
   document.getElementById('walletModalDisconnectBtn')?.addEventListener('click', () => {
-    if (isEvm) disconnectEvmWallet();
+    if (isEvm) disconnectFamilyWallet(activeFamily);
     else disconnectSolanaWallet();
     updateWalletButtons();
     renderWalletModalContent();
-    showToast(isEvm ? 'Disconnected EVM wallet.' : 'Disconnected Solana wallet.');
+    showToast(isEvm ? `Disconnected ${famShort} wallet.` : 'Disconnected Solana wallet.');
+  });
+
+  listEl.querySelectorAll('[data-pick-family-wallet]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const walletId = btn.dataset.pickFamilyWallet;
+      walletModalError = null;
+      walletModalConnecting = `fam:${walletId}`;
+      renderWalletModalContent();
+      try {
+        const res = await connectFamilyWallet(activeFamily, { walletId });
+        closeWalletModal();
+        updateWalletButtons();
+        showToast(`Connected ${res.walletName} (${shortAddr(res.address)})`);
+        await runScan({ address: res.address, family: activeFamily, autoOpen: true });
+      } catch (err) {
+        walletModalConnecting = null;
+        walletModalError = err?.message || 'Wallet connection cancelled.';
+        renderWalletModalContent();
+        showToast(walletModalError);
+      }
+    });
+  });
+
+  document.getElementById('modalFamilyManualForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const addr = document.getElementById('modalFamilyAddrInput')?.value.trim();
+    if (!addr) return;
+    closeWalletModal();
+    await runScan({ address: addr, family: activeFamily, autoOpen: true });
   });
 }
 
@@ -1779,6 +2010,12 @@ function wireEvents() {
     document.getElementById('feeOptionsDrawer')?.classList.toggle('hidden');
   });
 
+  document.querySelectorAll('.family-pill[data-family]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      selectFamily(btn.dataset.family, { autoScanSample: true });
+    });
+  });
+
   document.getElementById('heroScanForm').addEventListener('submit', (e) => {
     e.preventDefault();
     const addr = document.getElementById('heroWalletInput').value.trim();
@@ -1789,7 +2026,7 @@ function wireEvents() {
   document.getElementById('appScanForm').addEventListener('submit', (e) => {
     e.preventDefault();
     const addr = document.getElementById('appEvmInput').value.trim();
-    if (addr) runScan({ address: addr, autoOpen: false });
+    if (addr) runScan({ address: addr, family: activeFamily, autoOpen: false });
   });
 
   document.querySelectorAll('[data-preset]').forEach((btn) => {
@@ -1901,6 +2138,14 @@ function wireEvents() {
 }
 
 wireEvents();
+api('/api/families')
+  .then((res) => {
+    for (const f of res.families || []) {
+      familyMetas[f.family] = f;
+    }
+    updateFamilyChrome();
+  })
+  .catch(() => {});
 loadWalletConnectorConfig().then((cfg) => {
   const feeSel = document.getElementById('protocolFeeSelect');
   const feeInput = document.getElementById('feeRecipientInput');

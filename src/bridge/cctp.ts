@@ -9,7 +9,7 @@ import {
 } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { evmJsonRpcCall } from '../scanner/rpc.js';
-import type { CctpBridgeLeg, EvmChainId, MigrationPlan, ScanReport } from '../scanner/types.js';
+import type { AnyChainId, CctpBridgeLeg, EvmChainId, MigrationPlan, ScanReport } from '../scanner/types.js';
 
 // Circle CCTP TokenMessenger.depositForBurn(uint256,uint32,bytes32,address)
 const DEPOSIT_FOR_BURN_SELECTOR = '6fd3504e';
@@ -277,13 +277,37 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     : new Set(scan.assets.filter((a) => a.selectedByDefault).map((a) => a.id));
 
   const chosen = scan.assets.filter((a) => selectedSet.has(a.id));
-  const chainOrder: EvmChainId[] = [
+  const preferredOrder: AnyChainId[] = [
     'base',
     'arbitrum',
     'optimism',
     'avalanche',
     'polygon',
+    'bnb',
+    'sonic',
+    'unichain',
+    'linea',
+    'scroll',
+    'mantle',
+    'blast',
+    'worldchain',
     'ethereum',
+    'noble',
+    'osmosis',
+    'cosmoshub',
+    'celestia',
+    'injective',
+    'neutron',
+    'sui',
+    'aptos',
+    'ton',
+    'tron',
+    'btc',
+  ];
+  const dynamicChains = Array.from(new Set(chosen.map((a) => a.chain)));
+  const chainOrder: AnyChainId[] = [
+    ...preferredOrder.filter((id) => dynamicChains.includes(id)),
+    ...dynamicChains.filter((id) => !preferredOrder.includes(id)),
   ];
 
   const legs: CctpBridgeLeg[] = [];
@@ -315,8 +339,13 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     const chainAssets = chosen.filter((a) => a.chain === chainId);
     if (!chainAssets.length) continue;
 
-    const cfg = EVM_CHAINS[chainId];
+    const evmCfg = (EVM_CHAINS as Record<string, (typeof EVM_CHAINS)[EvmChainId] | undefined>)[chainId];
     const chainSummary = scan.chains.find((c) => c.chain === chainId);
+    const chainName = evmCfg?.name ?? chainSummary?.chainName ?? chainAssets[0]?.chainName ?? chainId;
+    const cctpDomain = evmCfg ? evmCfg.cctpDomain : chainSummary?.cctpDomain ?? null;
+    const tokenMessenger = evmCfg?.cctpTokenMessenger ?? 'Relayer / Bridge Router';
+    const usdcAddress = evmCfg?.usdcAddress ?? 'native_usdc';
+    const estSec = evmCfg?.cctpAttestationSec ?? chainSummary?.cctpAttestationSec ?? 20;
 
     const defiItems = chainAssets.filter((a) => a.action === 'WITHDRAW_AND_BRIDGE');
     const swapItems = chainAssets.filter((a) => a.action === 'SELL_AND_BRIDGE');
@@ -341,20 +370,27 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     const bridgedUsdc = round2(Math.max(0, grossUsdc - slippage - activeGas - feeUsdc));
     const rawUsdcAmount = BigInt(Math.round(bridgedUsdc * 1_000_000));
 
-    const cctpCalldata = encodeCctpDepositForBurn({
-      rawUsdcAmount,
-      destinationDomain: SOLANA_CCTP_DOMAIN,
-      solanaMintRecipientBytes32,
-      usdcAddress: cfg.usdcAddress,
-    });
+    const cctpCalldata =
+      evmCfg && evmCfg.cctpTokenMessenger
+        ? encodeCctpDepositForBurn({
+            rawUsdcAmount,
+            destinationDomain: SOLANA_CCTP_DOMAIN,
+            solanaMintRecipientBytes32,
+            usdcAddress: evmCfg.usdcAddress,
+          })
+        : '0x';
 
-    const providerMeta = getBridgeProviderMeta(bridgePreference, outputAsset, cfg.cctpAttestationSec);
+    const effectiveChainPref =
+      bridgePreference === 'cctp' && !evmCfg?.cctpTokenMessenger && cctpDomain === null
+        ? 'auto'
+        : bridgePreference;
+    const providerMeta = getBridgeProviderMeta(effectiveChainPref, outputAsset, estSec);
     const steps: CctpBridgeLeg['steps'] = [];
     if (usePermit2Batch) {
       steps.push({
-        step: 'EIP-5792 Atomic Batch',
-        detail: `Bundles ${chainAssets.length} asset(s) + deduplicated exact approvals into 1 confirmation on ${cfg.name}`,
-        target: 'wallet_sendCalls',
+        step: evmCfg ? 'EIP-5792 / Permit2 Atomic Batch' : chainSummary?.sponsorshipMechanism || '1-Sig Gasless Batch',
+        detail: `Bundles ${chainAssets.length} asset(s) into 1 confirmation on ${chainName}`,
+        target: evmCfg ? 'wallet_sendCalls' : chainName,
       });
     }
     for (const d of defiItems) {
@@ -368,7 +404,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
       steps.push({
         step: `Swap & Bridge → Solana ${outputAsset}`,
         detail: `Route ${swapItems.map((s) => s.symbol).join(', ')} via ${providerMeta.shortLabel} (${providerMeta.etaText})`,
-        target: cfg.usdcAddress,
+        target: usdcAddress,
       });
     }
     for (const b of burnItems) {
@@ -399,35 +435,37 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
         target: feeConfig.feeRecipientEvm ?? 'SiphonFeeVault',
       });
     }
-    if (bridgedUsdc > 0 && (bridgePreference === 'cctp' || directUsdcItems.length > 0 || swapItems.length === 0)) {
+    if (bridgedUsdc > 0 && (effectiveChainPref === 'cctp' || directUsdcItems.length > 0 || swapItems.length === 0)) {
       steps.push({
         step: providerMeta.stepTitle,
         detail:
-          bridgePreference === 'cctp'
-            ? `depositForBurn(${bridgedUsdc.toFixed(2)} USDC, Domain ${cfg.cctpDomain} → 5 Solana)`
+          effectiveChainPref === 'cctp' && cctpDomain !== null
+            ? `depositForBurn(${bridgedUsdc.toFixed(2)} USDC, Domain ${cctpDomain} → 5 Solana)`
             : `Settles ~$${bridgedUsdc.toFixed(2)} as native Solana ${outputAsset} (${providerMeta.etaText})`,
-        target: bridgePreference === 'cctp' ? cfg.cctpTokenMessenger : providerMeta.shortLabel,
+        target: effectiveChainPref === 'cctp' ? tokenMessenger : providerMeta.shortLabel,
       });
     }
 
     legs.push({
+      family: scan.family ?? 'evm',
       chain: chainId,
-      chainName: cfg.name,
-      sourceDomain: cfg.cctpDomain,
+      chainName,
+      sourceDomain: cctpDomain,
       destinationDomain: SOLANA_CCTP_DOMAIN,
-      tokenMessenger: cfg.cctpTokenMessenger,
-      usdcAddress: cfg.usdcAddress,
+      tokenMessenger,
+      usdcAddress,
       grossUsdc,
       feeUsdc,
       bridgedUsdc,
       rawUsdcAmount: rawUsdcAmount.toString(),
       gasUsd: round2(activeGas),
-      estimatedSeconds: cfg.cctpAttestationSec,
+      estimatedSeconds: estSec,
       defiExits: defiItems.length,
       swaps: swapItems.length + directUsdcItems.length,
       burns: burnItems.length,
       honeypotsSkipped: skippedOnChain,
       gasSponsored: Boolean(usePermit2Batch && chainSummary?.needsGasSponsorship),
+      sponsorshipMechanism: chainSummary?.sponsorshipMechanism,
       cctpCalldata,
       steps,
     });
@@ -448,6 +486,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
 
   return {
     planId: `plan_${crypto.randomBytes(5).toString('hex')}`,
+    family: scan.family ?? 'evm',
     createdAt: new Date().toISOString(),
     sourceWallet: scan.walletAddress,
     solanaDestination: solanaDestination.trim(),

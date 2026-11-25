@@ -1,10 +1,45 @@
+export type ChainFamily =
+  | 'evm'
+  | 'cosmos'
+  | 'sui'
+  | 'aptos'
+  | 'ton'
+  | 'tron'
+  | 'btc';
+
 export type EvmChainId =
   | 'ethereum'
   | 'base'
   | 'arbitrum'
   | 'optimism'
   | 'polygon'
-  | 'avalanche';
+  | 'avalanche'
+  | 'bnb'
+  | 'sonic'
+  | 'unichain'
+  | 'linea'
+  | 'scroll'
+  | 'mantle'
+  | 'blast'
+  | 'worldchain';
+
+export type CosmosChainId =
+  | 'cosmoshub'
+  | 'osmosis'
+  | 'noble'
+  | 'celestia'
+  | 'injective'
+  | 'neutron';
+
+export type NonEvmChainId =
+  | CosmosChainId
+  | 'sui'
+  | 'aptos'
+  | 'ton'
+  | 'tron'
+  | 'btc';
+
+export type AnyChainId = EvmChainId | NonEvmChainId;
 
 export type AssetAction =
   | 'WITHDRAW_AND_BRIDGE'
@@ -27,8 +62,8 @@ export interface ChainConfig {
   explorerUrl: string;
   multicall3: string;
   usdcAddress: string;
-  cctpDomain: number;
-  cctpTokenMessenger: string;
+  cctpDomain: number | null; // null when chain relies on Relay/LI.FI instead of native Circle CCTP
+  cctpTokenMessenger: string | null;
   cctpAttestationSec: number;
   swapGasUnits: number;
   defiWithdrawGasUnits: number;
@@ -56,7 +91,8 @@ export interface TokenDescriptor {
 
 export interface ScannedAsset {
   id: string;
-  chain: EvmChainId;
+  family?: ChainFamily;
+  chain: AnyChainId;
   chainName: string;
   address: string;
   symbol: string;
@@ -85,14 +121,16 @@ export interface ScannedAsset {
   aaveDebtUsd?: number;
   aaveHealthFactor?: number;
   dexLiquidityVerified?: boolean;
+  stakedExitMode?: 'instant_liquid_stake' | 'scheduled_authz_autosweep' | 'native_unstake';
   calldataPreview?: string;
 }
 
 export interface ChainScanSummary {
-  chain: EvmChainId;
+  family?: ChainFamily;
+  chain: AnyChainId;
   chainName: string;
-  chainId: number;
-  cctpDomain: number;
+  chainId: number | string;
+  cctpDomain: number | null;
   rpcStatus: 'live' | 'preset';
   blockNumber: number;
   gasPriceGwei: number;
@@ -110,10 +148,12 @@ export interface ChainScanSummary {
   gasSavedByBatchUsd: number;
   cctpAttestationSec: number;
   needsGasSponsorship: boolean;
+  sponsorshipMechanism?: string;
 }
 
 export interface ScanReport {
   scanId: string;
+  family?: ChainFamily;
   mode: 'live_rpc' | 'preset';
   walletAddress: string;
   walletLabel?: string;
@@ -145,9 +185,10 @@ export interface ScanReport {
 }
 
 export interface CctpBridgeLeg {
-  chain: EvmChainId;
+  family?: ChainFamily;
+  chain: AnyChainId;
   chainName: string;
-  sourceDomain: number;
+  sourceDomain: number | null;
   destinationDomain: number; // 5 = Solana
   tokenMessenger: string;
   usdcAddress: string;
@@ -162,6 +203,7 @@ export interface CctpBridgeLeg {
   burns: number;
   honeypotsSkipped: number;
   gasSponsored: boolean;
+  sponsorshipMechanism?: string;
   cctpCalldata: string;
   steps: Array<{
     step: string;
@@ -172,6 +214,7 @@ export interface CctpBridgeLeg {
 
 export interface MigrationPlan {
   planId: string;
+  family?: ChainFamily;
   createdAt: string;
   sourceWallet: string;
   solanaDestination: string;
@@ -202,7 +245,7 @@ export interface MigrationPlan {
     estimatedFullSec: number;
   };
   burnManifest: Array<{
-    chain: EvmChainId;
+    chain: AnyChainId;
     symbol: string;
     tokenAddress: string;
     amount: string;

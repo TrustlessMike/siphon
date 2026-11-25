@@ -47,12 +47,72 @@ const CHAIN_ADD_PARAMS = {
     rpcUrls: ['https://avalanche-c-chain-rpc.publicnode.com'],
     blockExplorerUrls: ['https://snowtrace.io'],
   },
+  56: {
+    chainId: '0x38',
+    chainName: 'BNB Smart Chain',
+    nativeCurrency: { name: 'BNB', symbol: 'BNB', decimals: 18 },
+    rpcUrls: ['https://bsc-rpc.publicnode.com'],
+    blockExplorerUrls: ['https://bscscan.com'],
+  },
+  146: {
+    chainId: '0x92',
+    chainName: 'Sonic',
+    nativeCurrency: { name: 'Sonic', symbol: 'S', decimals: 18 },
+    rpcUrls: ['https://rpc.soniclabs.com'],
+    blockExplorerUrls: ['https://sonicscan.org'],
+  },
+  130: {
+    chainId: '0x82',
+    chainName: 'Unichain',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    rpcUrls: ['https://mainnet.unichain.org'],
+    blockExplorerUrls: ['https://uniscan.xyz'],
+  },
+  59144: {
+    chainId: '0xe708',
+    chainName: 'Linea',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    rpcUrls: ['https://rpc.linea.build'],
+    blockExplorerUrls: ['https://lineascan.build'],
+  },
+  534352: {
+    chainId: '0x82750',
+    chainName: 'Scroll',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    rpcUrls: ['https://rpc.scroll.io'],
+    blockExplorerUrls: ['https://scrollscan.com'],
+  },
+  5000: {
+    chainId: '0x1388',
+    chainName: 'Mantle',
+    nativeCurrency: { name: 'Mantle', symbol: 'MNT', decimals: 18 },
+    rpcUrls: ['https://rpc.mantle.xyz'],
+    blockExplorerUrls: ['https://mantlescan.xyz'],
+  },
+  81457: {
+    chainId: '0x13e31',
+    chainName: 'Blast',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    rpcUrls: ['https://rpc.blast.io'],
+    blockExplorerUrls: ['https://blastscan.io'],
+  },
+  480: {
+    chainId: '0x1e0',
+    chainName: 'World Chain',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    rpcUrls: ['https://worldchain-mainnet.g.alchemy.com/public'],
+    blockExplorerUrls: ['https://worldscan.org'],
+  },
 };
 
-const SUPPORTED_CHAIN_IDS = [1, 8453, 42161, 10, 137, 43114];
+const SUPPORTED_CHAIN_IDS = [
+  1, 8453, 42161, 10, 137, 43114, 56, 146, 130, 59144, 534352, 5000, 81457, 480,
+];
 
 const discoveredEvmProviders = [];
 const discoveredSolanaStandardWallets = [];
+const discoveredSuiStandardWallets = [];
+const familyWalletSessions = {};
 const discoveryListeners = new Set();
 let activeEvmProvider = null;
 
@@ -178,19 +238,32 @@ export function getWalletConnectorConfig() {
 function registerStandardWallet(wallet) {
   if (!wallet || typeof wallet !== 'object') return;
   const chains = Array.isArray(wallet.chains) ? wallet.chains : [];
-  const isSolana = chains.some((c) => String(c).startsWith('solana:'));
   const hasConnect = Boolean(wallet.features?.['standard:connect']?.connect);
-  if (!isSolana || !hasConnect) return;
-  const key = wallet.name || 'Solana Wallet';
-  if (!discoveredSolanaStandardWallets.some((w) => w.name === key)) {
-    discoveredSolanaStandardWallets.push({
-      id: `std:${key.toLowerCase().replace(/\s+/g, '-')}`,
-      name: key,
-      icon: wallet.icon || null,
-      standard: true,
-      wallet,
-    });
-    notifyWalletDiscovery();
+  if (!hasConnect) return;
+  const key = wallet.name || 'Wallet';
+  if (chains.some((c) => String(c).startsWith('solana:'))) {
+    if (!discoveredSolanaStandardWallets.some((w) => w.name === key)) {
+      discoveredSolanaStandardWallets.push({
+        id: `std:${key.toLowerCase().replace(/\s+/g, '-')}`,
+        name: key,
+        icon: wallet.icon || null,
+        standard: true,
+        wallet,
+      });
+      notifyWalletDiscovery();
+    }
+  }
+  if (chains.some((c) => String(c).startsWith('sui:'))) {
+    if (!discoveredSuiStandardWallets.some((w) => w.name === key)) {
+      discoveredSuiStandardWallets.push({
+        id: `sui-std:${key.toLowerCase().replace(/\s+/g, '-')}`,
+        name: key,
+        icon: wallet.icon || null,
+        standard: 'Sui Wallet Standard',
+        wallet,
+      });
+      notifyWalletDiscovery();
+    }
   }
 }
 
@@ -898,4 +971,262 @@ export async function connectSolanaWallet(options = {}) {
   }
 
   return { address: pubkey, walletName: chosen.name };
+}
+
+// =====================================================================
+// MULTI-FAMILY WALLET CONNECTORS (Cosmos, Sui, Aptos, TON, Tron, Bitcoin)
+// =====================================================================
+
+export function getConnectedFamilyWallet(family) {
+  if (family === 'evm') {
+    const address = getConnectedEvmAddress();
+    return address ? { family: 'evm', address, walletName: getConnectedWalletName() } : null;
+  }
+  return familyWalletSessions[family] || null;
+}
+
+export function disconnectFamilyWallet(family) {
+  if (family === 'evm') {
+    disconnectEvmWallet();
+    return;
+  }
+  delete familyWalletSessions[family];
+}
+
+export function listAvailableFamilyWallets(family) {
+  if (typeof window === 'undefined') return [];
+  if (family === 'evm') return listAvailableEvmWallets();
+
+  if (family === 'cosmos') {
+    const out = [];
+    if (window.keplr) {
+      out.push({ id: 'keplr', name: 'Keplr', standard: 'Cosmos Extension', icon: '/logos/keplr.svg', provider: window.keplr });
+    }
+    if (window.leap) {
+      out.push({ id: 'leap', name: 'Leap Wallet', standard: 'Cosmos Extension', icon: '/logos/leap.svg', provider: window.leap });
+    }
+    return out;
+  }
+
+  if (family === 'sui') {
+    const out = [];
+    const seen = new Set();
+    for (const w of discoveredSuiStandardWallets) {
+      seen.add(w.name.toLowerCase());
+      out.push({
+        id: w.id,
+        name: w.name,
+        standard: w.standard,
+        icon: w.icon || '/logos/slush.svg',
+        kind: 'standard',
+        wallet: w.wallet,
+      });
+    }
+    if (window.suiWallet && !seen.has('sui wallet')) {
+      out.push({ id: 'sui-wallet', name: 'Slush / Sui Wallet', standard: 'Extension', icon: '/logos/slush.svg', kind: 'legacy', provider: window.suiWallet });
+    }
+    if (window.phantom?.sui && !seen.has('phantom')) {
+      out.push({ id: 'phantom-sui', name: 'Phantom (Sui)', standard: 'Extension', icon: '/logos/phantom.svg', kind: 'legacy', provider: window.phantom.sui });
+    }
+    return out;
+  }
+
+  if (family === 'aptos') {
+    const out = [];
+    if (window.aptos) {
+      out.push({ id: 'petra', name: 'Petra Wallet', standard: 'Aptos Extension', icon: '/logos/petra.svg', provider: window.aptos });
+    }
+    if (window.phantom?.aptos) {
+      out.push({ id: 'phantom-aptos', name: 'Phantom (Aptos)', standard: 'Aptos Extension', icon: '/logos/phantom.svg', provider: window.phantom.aptos });
+    }
+    return out;
+  }
+
+  if (family === 'ton') {
+    const out = [];
+    const tk = window.tonkeeper?.tonconnect || window.tonkeeper || window.ton;
+    if (tk) {
+      out.push({ id: 'tonkeeper', name: 'Tonkeeper', standard: 'TonConnect / Extension', icon: '/logos/tonkeeper.svg', provider: tk });
+    }
+    if (window.openmask) {
+      out.push({ id: 'openmask', name: 'OpenMask', standard: 'TON Extension', icon: '/logos/ton.svg', provider: window.openmask });
+    }
+    return out;
+  }
+
+  if (family === 'tron') {
+    const out = [];
+    if (window.tronLink || window.tronWeb) {
+      out.push({
+        id: 'tronlink',
+        name: 'TronLink',
+        standard: 'Tron Extension',
+        icon: '/logos/tronlink.svg',
+        provider: window.tronLink || window.tronWeb,
+      });
+    }
+    return out;
+  }
+
+  if (family === 'btc') {
+    const out = [];
+    if (window.unisat) {
+      out.push({ id: 'unisat', name: 'UniSat Wallet', standard: 'Bitcoin PSBT', icon: '/logos/unisat.svg', provider: window.unisat });
+    }
+    if (window.XverseProviders?.BitcoinProvider || window.BitcoinProvider) {
+      out.push({
+        id: 'xverse',
+        name: 'Xverse',
+        standard: 'Bitcoin PSBT',
+        icon: '/logos/xverse.svg',
+        provider: window.XverseProviders?.BitcoinProvider || window.BitcoinProvider,
+      });
+    }
+    if (window.phantom?.bitcoin) {
+      out.push({ id: 'phantom-btc', name: 'Phantom (Bitcoin)', standard: 'Bitcoin PSBT', icon: '/logos/phantom.svg', provider: window.phantom.bitcoin });
+    }
+    return out;
+  }
+
+  return [];
+}
+
+export async function connectFamilyWallet(family, opts = {}) {
+  if (family === 'evm') return connectEvmWallet(opts);
+  const wallets = listAvailableFamilyWallets(family);
+  if (!wallets.length) {
+    throw new Error(`No ${family.toUpperCase()} browser wallet detected. Install a supported wallet or paste an address to inspect.`);
+  }
+  const chosen = (opts.walletId ? wallets.find((w) => w.id === opts.walletId) : null) || wallets[0];
+  let address = null;
+
+  if (family === 'cosmos') {
+    const cosmosChainId = opts.chainId || 'cosmoshub-4';
+    await chosen.provider.enable(cosmosChainId);
+    const key = await chosen.provider.getKey(cosmosChainId);
+    address = key?.bech32Address || null;
+  } else if (family === 'sui') {
+    if (chosen.kind === 'standard') {
+      const res = await chosen.wallet.features['standard:connect'].connect();
+      address = res?.accounts?.[0]?.address || chosen.wallet.accounts?.[0]?.address || null;
+    } else if (typeof chosen.provider.requestPermissions === 'function') {
+      await chosen.provider.requestPermissions();
+      const accs = await chosen.provider.getAccounts();
+      address = accs?.[0] || null;
+    } else if (typeof chosen.provider.connect === 'function') {
+      const res = await chosen.provider.connect();
+      address = res?.address || res?.accounts?.[0]?.address || null;
+    }
+  } else if (family === 'aptos') {
+    const res = await chosen.provider.connect();
+    address = res?.address || (await chosen.provider.account?.())?.address || null;
+  } else if (family === 'ton') {
+    if (typeof chosen.provider.send === 'function') {
+      const accs = await chosen.provider.send('ton_requestAccounts');
+      address = Array.isArray(accs) ? accs[0] : accs?.address || null;
+    } else if (typeof chosen.provider.connect === 'function') {
+      const res = await chosen.provider.connect();
+      address = res?.account?.address || res?.address || null;
+    }
+  } else if (family === 'tron') {
+    if (window.tronLink?.request) {
+      const res = await window.tronLink.request({ method: 'tron_requestAccounts' });
+      if (res && res.code && res.code !== 200) {
+        throw new Error(res.message || 'TronLink connection rejected.');
+      }
+    }
+    address = window.tronWeb?.defaultAddress?.base58 || window.tronLink?.tronWeb?.defaultAddress?.base58 || null;
+  } else if (family === 'btc') {
+    if (chosen.id === 'unisat') {
+      const accs = await chosen.provider.requestAccounts();
+      address = accs?.[0] || null;
+    } else if (chosen.id === 'phantom-btc') {
+      const accs = await chosen.provider.requestAccounts();
+      const payment = accs?.find((a) => a.purpose === 'payment') || accs?.[0];
+      address = payment?.address || (typeof payment === 'string' ? payment : null);
+    } else if (typeof chosen.provider.request === 'function') {
+      const res = await chosen.provider.request('getAccounts', { purposes: ['payment', 'ordinals'] });
+      const accs = res?.result || res || [];
+      address = accs?.[0]?.address || null;
+    }
+  }
+
+  if (!address) {
+    throw new Error(`${chosen.name} connection was cancelled or returned no address.`);
+  }
+
+  const session = {
+    family,
+    address,
+    walletName: chosen.name,
+    walletId: chosen.id,
+    provider: chosen.provider || chosen.wallet,
+    kind: chosen.kind || 'extension',
+  };
+  familyWalletSessions[family] = session;
+  return session;
+}
+
+export async function signFamilyGaslessIntent(family, intent) {
+  if (family === 'evm') {
+    return signGaslessTypedData(intent.typedData || intent.signPayload, intent.chainId);
+  }
+  const session = familyWalletSessions[family];
+  if (!session) {
+    throw new Error(`Connect your ${family.toUpperCase()} wallet first to sign the 1-sig gasless sweep.`);
+  }
+  const msgText = JSON.stringify(intent.signPayload || intent);
+
+  if (family === 'cosmos') {
+    const chainId = String(intent.chainId || 'cosmoshub-4');
+    if (typeof session.provider.signArbitrary === 'function') {
+      const sig = await session.provider.signArbitrary(chainId, session.address, msgText);
+      return sig?.signature || JSON.stringify(sig);
+    }
+    throw new Error('Connected Cosmos wallet does not expose signArbitrary.');
+  }
+  if (family === 'sui') {
+    const bytes = new TextEncoder().encode(msgText);
+    if (session.kind === 'standard' && session.provider.features?.['sui:signPersonalMessage']) {
+      const res = await session.provider.features['sui:signPersonalMessage'].signPersonalMessage({
+        message: bytes,
+        account: session.provider.accounts?.[0],
+      });
+      return res?.signature || JSON.stringify(res);
+    }
+    if (typeof session.provider.signPersonalMessage === 'function') {
+      const res = await session.provider.signPersonalMessage({ message: bytes });
+      return res?.signature || JSON.stringify(res);
+    }
+    throw new Error('Connected Sui wallet does not expose signPersonalMessage.');
+  }
+  if (family === 'aptos') {
+    const res = await session.provider.signMessage({ message: msgText, nonce: String(intent.nonce) });
+    return res?.signature || JSON.stringify(res);
+  }
+  if (family === 'ton') {
+    if (typeof session.provider.send === 'function') {
+      const res = await session.provider.send('ton_rawSign', [{ data: intent.intentDigestSha256 }]);
+      return typeof res === 'string' ? res : JSON.stringify(res);
+    }
+    throw new Error('Tonkeeper extension signing unavailable — approve via TonConnect.');
+  }
+  if (family === 'tron') {
+    const tw = window.tronWeb || window.tronLink?.tronWeb;
+    if (tw?.trx?.signMessageV2) {
+      return await tw.trx.signMessageV2(msgText);
+    }
+    throw new Error('TronLink signMessageV2 unavailable.');
+  }
+  if (family === 'btc') {
+    if (session.walletId === 'unisat' && typeof session.provider.signMessage === 'function') {
+      return await session.provider.signMessage(msgText);
+    }
+    if (typeof session.provider.signMessage === 'function') {
+      const res = await session.provider.signMessage(session.address, msgText);
+      return typeof res === 'string' ? res : res?.signature || JSON.stringify(res);
+    }
+    throw new Error('Connected Bitcoin wallet does not expose message/PSBT signing.');
+  }
+  throw new Error(`Unsupported signing family: ${family}`);
 }

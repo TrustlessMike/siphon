@@ -1,5 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { aptosAdapter } from '../src/adapters/aptos.js';
+import { btcAdapter, classifyBtcUtxos } from '../src/adapters/btc.js';
+import { cosmosAdapter } from '../src/adapters/cosmos.js';
+import { detectAddressFamily, listAllFamilyMetas } from '../src/adapters/registry.js';
+import { suiAdapter } from '../src/adapters/sui.js';
+import { tonAdapter } from '../src/adapters/ton.js';
+import { tronAdapter } from '../src/adapters/tron.js';
 import {
   buildMigrationPlan,
   CCTP_MESSAGE_SENT_TOPIC,
@@ -8,14 +15,22 @@ import {
   solanaAddressToBytes32,
 } from '../src/bridge/cctp.js';
 import { prepareChainBatchExecution, prepareRealExecution } from '../src/execution/tx-builder.js';
-import { getProtocolFeeConfig, resolveProtocolFeeBps } from '../src/scanner/chains.js';
+import { CHAIN_LIST, EVM_CHAINS, getProtocolFeeConfig, resolveProtocolFeeBps } from '../src/scanner/chains.js';
 import { scanPresetWallet } from '../src/scanner/classifier.js';
 import { decodeAaveAccountData } from '../src/scanner/discovery.js';
+import {
+  computeRelayerBreakEven,
+  evaluateAssetRoi,
+  evaluateChainBatchRoi,
+  evaluatePortfolioRoi,
+  pruneNegativeRoiAssets,
+} from '../src/scanner/roi.js';
 import {
   decodeMulticall3Aggregate3,
   encodeMulticall3Aggregate3,
   formatUnits,
 } from '../src/scanner/rpc.js';
+import type { ScannedAsset } from '../src/scanner/types.js';
 import { createSiphonServer } from '../src/server/app.js';
 
 const SAMPLE_SOLANA_WALLET = 'AK9CKqppArTVRrmd4rQKzvjcmNUHnx5LBFx1HXoYaz2n';
@@ -64,7 +79,7 @@ test('Solana base58 pubkey converts to 32-byte Circle CCTP mintRecipient and val
 
 test('Preset multi-chain scan reconciles DeFi withdrawals, liquid dust, zero-liq burns, and honeypot skips', async () => {
   const report = await scanPresetWallet('veteran_defi');
-  assert.equal(report.chainsScanned, 6);
+  assert.equal(report.chainsScanned, 14);
   assert.ok(report.totals.defiPositionCount >= 5);
   assert.ok(report.totals.liquidDustCount >= 7);
   assert.ok(report.totals.burnCandidateCount >= 4);
@@ -529,4 +544,327 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test('Multi-chain expansion: 14 EVMs + 7 families registry + auto address detection', () => {
+  assert.equal(CHAIN_LIST.length, 14);
+  for (const id of ['bnb', 'sonic', 'unichain', 'linea', 'scroll', 'mantle', 'blast', 'worldchain'] as const) {
+    assert.ok(EVM_CHAINS[id], `Missing extended EVM chain ${id}`);
+    assert.ok(EVM_CHAINS[id].rpcUrls.length >= 2);
+    assert.match(EVM_CHAINS[id].usdcAddress, /^0x[0-9a-fA-F]{40}$/);
+  }
+  assert.equal(EVM_CHAINS.unichain.cctpDomain, 10);
+  assert.equal(EVM_CHAINS.linea.cctpDomain, 11);
+  assert.equal(EVM_CHAINS.sonic.cctpDomain, 13);
+  assert.equal(EVM_CHAINS.worldchain.cctpDomain, 14);
+  assert.equal(EVM_CHAINS.bnb.cctpDomain, null);
+
+  const metas = listAllFamilyMetas();
+  assert.equal(metas.length, 7);
+  assert.equal(
+    metas.reduce((s, m) => s + m.chains.length, 0),
+    25 // 14 EVMs + 6 Cosmos + Sui + Aptos + TON + Tron + Bitcoin
+  );
+
+  // Address auto-detection across all 7 families
+  assert.equal(detectAddressFamily('0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045'), 'evm');
+  assert.equal(detectAddressFamily('vitalik.eth'), 'evm');
+  assert.equal(detectAddressFamily('cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
+  assert.equal(detectAddressFamily('osmo1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
+  assert.equal(detectAddressFamily('noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
+  assert.equal(detectAddressFamily('celestia1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
+  assert.equal(detectAddressFamily('inj1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
+  assert.equal(detectAddressFamily('neutron1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
+  assert.equal(
+    detectAddressFamily('0x0000000000000000000000000000000000000000000000000000000000000006'),
+    'sui'
+  );
+  assert.equal(
+    detectAddressFamily('0x0000000000000000000000000000000000000000000000000000000000000001', 'aptos'),
+    'aptos'
+  );
+  assert.equal(detectAddressFamily('EQDtFpEwcFAEcRe5mLVh2N6C0x-_hJEM7W61_JLnSF74p4q2'), 'ton');
+  assert.equal(detectAddressFamily('TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL'), 'tron');
+  assert.equal(
+    detectAddressFamily('bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97'),
+    'btc'
+  );
+  assert.equal(detectAddressFamily('not-a-wallet-at-all'), null);
+});
+
+test('Wave 1-3 adapters build 1-sig gasless intents, pre-sign proofs, and Bitcoin UTXO dust skipping', async () => {
+  const mkAsset = (overrides: Partial<ScannedAsset>): ScannedAsset => ({
+    id: 'test:asset',
+    chain: 'cosmoshub',
+    chainName: 'Cosmos Hub',
+    address: 'uatom',
+    symbol: 'ATOM',
+    name: 'Cosmos ATOM',
+    decimals: 6,
+    kind: 'native',
+    rawBalance: '50000000',
+    uiBalance: 50,
+    priceUsd: 5,
+    grossUsd: 250,
+    liquidityUsd: 10_000_000,
+    estimatedGasUsd: 0.04,
+    batchedGasUsd: 0.02,
+    estimatedSlippageUsd: 0.5,
+    netUsdcSingle: 249.46,
+    netUsdcBatched: 249.48,
+    action: 'SELL_AND_BRIDGE',
+    actionReason: 'Test',
+    selectedByDefault: true,
+    honeypotSafe: true,
+    ...overrides,
+  });
+
+  // 1. Cosmos / IBC: 1-sig atomic multi-msg TxBody with x/feegrant + Noble CCTP Domain 4 -> 5
+  const cosmosIntent = await cosmosAdapter.buildGaslessIntent({
+    chain: 'cosmoshub',
+    assets: [
+      mkAsset({ id: 'cosmoshub:uatom:bank' }),
+      mkAsset({
+        id: 'cosmoshub:uatom:rewards',
+        address: 'rewards:uatom',
+        kind: 'defi_position',
+        action: 'WITHDRAW_AND_BRIDGE',
+        grossUsd: 25,
+      }),
+      mkAsset({
+        id: 'cosmoshub:uatom:staked',
+        address: 'staking:uatom',
+        kind: 'defi_position',
+        action: 'WITHDRAW_AND_BRIDGE',
+        stakedExitMode: 'instant_liquid_stake',
+        grossUsd: 500,
+      }),
+    ],
+    userAddress: 'cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh',
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+    protocolFeeBps: 700,
+  });
+  assert.equal(cosmosIntent.family, 'cosmos');
+  assert.equal(cosmosIntent.userGasCostUsd, 0);
+  assert.ok(cosmosIntent.gasSponsorshipMechanism.includes('x/feegrant'));
+  assert.match(cosmosIntent.intentDigestSha256, /^0x[0-9a-f]{64}$/);
+  const cosmosMsgs = (cosmosIntent.signPayload.txBody as { messages: Array<{ typeUrl: string }> }).messages;
+  assert.ok(cosmosMsgs.some((m) => m.typeUrl.includes('MsgWithdrawDelegatorReward')));
+  assert.ok(cosmosMsgs.some((m) => m.typeUrl.includes('MsgTokenizeShares')));
+  assert.ok(cosmosMsgs.some((m) => m.typeUrl.includes('MsgTransfer')));
+  assert.ok(cosmosMsgs.some((m) => m.typeUrl.includes('MsgSend')));
+  assert.ok(cosmosMsgs.some((m) => m.typeUrl.includes('MsgDepositForBurn')));
+
+  // 2. Sui: 1-sig Sponsored PTB (gasData.owner = Siphon Relayer) + Circle CCTP Domain 8 -> 5
+  const suiIntent = await suiAdapter.buildGaslessIntent({
+    chain: 'sui',
+    assets: [mkAsset({ chain: 'sui', chainName: 'Sui', symbol: 'SUI', address: '0x2::sui::SUI' })],
+    userAddress: '0x0000000000000000000000000000000000000000000000000000000000000006',
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+    protocolFeeBps: 700,
+  });
+  assert.equal(suiIntent.family, 'sui');
+  assert.equal(suiIntent.userGasCostUsd, 0);
+  assert.equal((suiIntent.signPayload.gasData as { sponsored: boolean }).sponsored, true);
+
+  // 3. Aptos: 1-sig Move FeePayerRawTransaction
+  const aptosIntent = await aptosAdapter.buildGaslessIntent({
+    chain: 'aptos',
+    assets: [mkAsset({ chain: 'aptos', chainName: 'Aptos', symbol: 'APT', address: '0x1::aptos_coin::AptosCoin' })],
+    userAddress: '0x0000000000000000000000000000000000000000000000000000000000000001',
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+  });
+  assert.equal(aptosIntent.family, 'aptos');
+  assert.equal(aptosIntent.signPayload.transactionType, 'FeePayerRawTransaction');
+  assert.equal(aptosIntent.userGasCostUsd, 0);
+
+  // 4. TON: Wallet W5 Gasless batch (up to 255 msgs)
+  const tonIntent = await tonAdapter.buildGaslessIntent({
+    chain: 'ton',
+    assets: [mkAsset({ chain: 'ton', chainName: 'TON', symbol: 'USDT', address: 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs' })],
+    userAddress: 'EQDtFpEwcFAEcRe5mLVh2N6C0x-_hJEM7W61_JLnSF74p4q2',
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+  });
+  assert.equal(tonIntent.family, 'ton');
+  assert.equal(tonIntent.signPayload.walletVersion, 'wallet_v5r1_gasless');
+  assert.equal(tonIntent.signPayload.maxBatchMessages, 255);
+
+  // 5. Tron: TIP-712 + DelegateResourceContract Energy Delegation ($0 TRX)
+  const tronIntent = await tronAdapter.buildGaslessIntent({
+    chain: 'tron',
+    assets: [mkAsset({ chain: 'tron', chainName: 'Tron', symbol: 'USDT', address: 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t' })],
+    userAddress: 'TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL',
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+  });
+  assert.equal(tronIntent.family, 'tron');
+  assert.equal(
+    (tronIntent.signPayload.relayerPreStep as { contractType: string }).contractType,
+    'DelegateResourceContract'
+  );
+  assert.equal(tronIntent.userGasCostUsd, 0);
+
+  // 6. Bitcoin: UTXO dust classification + single PSBT with Chainflip/THORChain OP_RETURN memo
+  const utxoClassified = classifyBtcUtxos({
+    address: 'bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97',
+    satPerVbyte: 20,
+    btcPriceUsd: 86_000,
+    utxos: [
+      { txid: 'a'.repeat(64), vout: 0, value: 1200 }, // sub-fee dust (68*20 + 546 = 1906 sats)
+      { txid: 'b'.repeat(64), vout: 1, value: 500_000 }, // spendable 0.005 BTC
+    ],
+  });
+  assert.equal(utxoClassified.dust.length, 1);
+  assert.equal(utxoClassified.spendable.length, 1);
+
+  const btcIntent = await btcAdapter.buildGaslessIntent({
+    chain: 'btc',
+    assets: [
+      mkAsset({
+        chain: 'btc',
+        chainName: 'Bitcoin',
+        symbol: 'BTC',
+        address: 'bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97',
+        rawBalance: '500000',
+        uiBalance: 0.005,
+        grossUsd: 430,
+      }),
+      mkAsset({
+        id: 'btc:dust_utxos',
+        chain: 'btc',
+        chainName: 'Bitcoin',
+        symbol: 'BTC Dust',
+        rawBalance: '1200',
+        uiBalance: 0.000012,
+        grossUsd: 1.03,
+        action: 'SKIP_GAS_NEGATIVE',
+        selectedByDefault: false,
+      }),
+    ],
+    userAddress: 'bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97',
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+    protocolFeeBps: 750,
+  });
+  assert.equal(btcIntent.family, 'btc');
+  assert.equal(btcIntent.coveredAssets.length, 1); // dust excluded!
+  const outputs = btcIntent.signPayload.outputs as Array<{ type: string; memo?: string }>;
+  const memoOut = outputs.find((o) => o.type === 'op_return_memo');
+  assert.ok(memoOut?.memo?.includes(SAMPLE_SOLANA_WALLET));
+  assert.ok(memoOut?.memo?.includes(':siphon:750'));
+
+  // HTTP /api/families & non-EVM /api/relayer/prepare-intent + /api/tx/simulate-proof
+  const { server } = createSiphonServer();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = server.address();
+  assert.ok(addr && typeof addr !== 'string');
+  const base = `http://127.0.0.1:${addr.port}`;
+  try {
+    const fams = await fetch(`${base}/api/families`).then((r) => r.json());
+    assert.equal(fams.totalFamilies, 7);
+    assert.equal(fams.totalChains, 25);
+
+    const httpBtcProof = await fetch(`${base}/api/tx/simulate-proof`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chain: 'btc',
+        assets: [
+          mkAsset({
+            chain: 'btc',
+            chainName: 'Bitcoin',
+            symbol: 'BTC',
+            rawBalance: '500000',
+            uiBalance: 0.005,
+            grossUsd: 430,
+          }),
+        ],
+        userAddress: 'bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97',
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+        protocolFeeBps: 700,
+      }),
+    }).then((r) => r.json());
+    assert.equal(httpBtcProof.proof.family, 'btc');
+    assert.equal(httpBtcProof.proof.mintRecipientVerified, true);
+    assert.match(httpBtcProof.proof.proofDigestSha256, /^0x[0-9a-f]{64}$/);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('Two-Level Signed Negative-ROI Engine & Relayer Break-Even math prunes negative dust cleanly', async () => {
+  const mk = (overrides: Partial<ScannedAsset>): ScannedAsset => ({
+    id: 'eth:tok',
+    chain: 'ethereum',
+    chainName: 'Ethereum',
+    address: '0x0000000000000000000000000000000000000001',
+    symbol: 'TOK',
+    name: 'Token',
+    decimals: 18,
+    kind: 'erc20',
+    rawBalance: '1000',
+    uiBalance: 1,
+    priceUsd: 1,
+    grossUsd: 1,
+    liquidityUsd: 100_000,
+    estimatedGasUsd: 4.5,
+    batchedGasUsd: 1.5,
+    estimatedSlippageUsd: 0.05,
+    netUsdcSingle: 0,
+    netUsdcBatched: 0,
+    action: 'SELL_AND_BRIDGE',
+    actionReason: 'Test',
+    selectedByDefault: true,
+    honeypotSafe: true,
+    ...overrides,
+  });
+
+  // Level 1: signed negative solo AND batched -> pruned
+  const badDust = mk({ id: 'eth:dust', symbol: 'DUST', grossUsd: 0.8, estimatedGasUsd: 4.0, batchedGasUsd: 1.5 });
+  const badEval = evaluateAssetRoi(badDust, { protocolFeeBps: 700 });
+  assert.equal(badEval.verdict, 'negative_roi_skip');
+  assert.ok(badEval.signedSoloNetUsd < 0, 'Must preserve signed negative solo net USD');
+  assert.ok(badEval.signedBatchedNetUsd < 0, 'Must preserve signed negative batched net USD');
+  assert.equal(badEval.shouldIncludeByDefault, false);
+
+  // Level 1: negative solo, positive batched -> profitable_batched_only
+  const marginal = mk({ id: 'eth:marg', symbol: 'MARG', grossUsd: 3.0, estimatedGasUsd: 4.0, batchedGasUsd: 1.2 });
+  const margEval = evaluateAssetRoi(marginal, { protocolFeeBps: 700 });
+  assert.equal(margEval.verdict, 'profitable_batched_only');
+  assert.ok(margEval.signedSoloNetUsd < 0);
+  assert.ok(margEval.signedBatchedNetUsd > 0);
+
+  // Relayer break-even math: at 7% fee (700 bps), $0.70 gas + $0.02 overhead = $0.72 -> break-even = $10.29 gross
+  const beLow = computeRelayerBreakEven({ sponsoredGasUsd: 0.7, protocolFeeBps: 700, grossUsd: 5.0 });
+  assert.equal(beLow.isRelayerProfitable, false);
+  assert.ok(beLow.relayerNetMarginUsd < 0);
+  assert.ok(beLow.breakEvenGrossUsd > 10 && beLow.breakEvenGrossUsd < 10.5);
+  assert.ok(beLow.shortfallToBreakEvenUsd > 5);
+
+  const beHigh = computeRelayerBreakEven({ sponsoredGasUsd: 0.7, protocolFeeBps: 700, grossUsd: 100.0 });
+  assert.equal(beHigh.isRelayerProfitable, true);
+  assert.ok(beHigh.relayerNetMarginUsd > 6);
+  assert.equal(beHigh.shortfallToBreakEvenUsd, 0);
+
+  // Level 2: pruning prevents bad dust from dragging down a profitable Ethereum bundle
+  const whale = mk({ id: 'eth:usdc', symbol: 'USDC', grossUsd: 200, estimatedGasUsd: 3.0, batchedGasUsd: 1.2, estimatedSlippageUsd: 0 });
+  const buckets = pruneNegativeRoiAssets([whale, marginal, badDust], { protocolFeeBps: 700 });
+  assert.equal(buckets.kept.length, 2);
+  assert.equal(buckets.prunedNegativeRoi.length, 1);
+
+  const chainRoi = evaluateChainBatchRoi({
+    chain: 'ethereum',
+    assets: [whale, marginal, badDust],
+    protocolFeeBps: 700,
+    gasSponsored: true,
+  });
+  assert.equal(chainRoi.prunedNegativeRoiCount, 1);
+  assert.ok(chainRoi.negativeBleedPreventedUsd > 0);
+  assert.equal(chainRoi.recommendedExecution, 'sponsored_gasless');
+  assert.equal(chainRoi.relayerBreakEven.isRelayerProfitable, true);
+
+  // Portfolio rollup on preset wallet
+  const report = await scanPresetWallet('veteran_defi');
+  const portfolioRoi = evaluatePortfolioRoi(report, { protocolFeeBps: 700 });
+  assert.equal(portfolioRoi.overallRelayerProfitable, true);
+  assert.ok(portfolioRoi.totalRelayerNetMarginUsd > 0);
 });

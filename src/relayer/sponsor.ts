@@ -204,7 +204,7 @@ export function buildGaslessSweepIntent(params: {
           message: {
             solanaRecipient: solanaMintRecipientBytes32,
             usdc: cfg.usdcAddress,
-            cctpMessenger: cfg.cctpTokenMessenger,
+            cctpMessenger: cfg.cctpTokenMessenger ?? routerAddress,
             feeRecipient: feeConfig.feeRecipientEvm ?? routerAddress,
             feeBps: feeConfig.feeBps,
             minNetUsdcOut,

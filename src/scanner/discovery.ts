@@ -18,6 +18,14 @@ const DEXSCREENER_CHAIN_SLUGS: Record<EvmChainId, string> = {
   optimism: 'optimism',
   polygon: 'polygon',
   avalanche: 'avalanche',
+  bnb: 'bsc',
+  sonic: 'sonic',
+  unichain: 'unichain',
+  linea: 'linea',
+  scroll: 'scroll',
+  mantle: 'mantle',
+  blast: 'blast',
+  worldchain: 'worldchain',
 };
 
 const ALCHEMY_NETWORK_SUBDOMAINS: Partial<Record<EvmChainId, string>> = {
@@ -26,15 +34,24 @@ const ALCHEMY_NETWORK_SUBDOMAINS: Partial<Record<EvmChainId, string>> = {
   arbitrum: 'arb-mainnet',
   optimism: 'opt-mainnet',
   polygon: 'polygon-mainnet',
+  bnb: 'bnb-mainnet',
+  linea: 'linea-mainnet',
+  scroll: 'scroll-mainnet',
+  blast: 'blast-mainnet',
+  worldchain: 'worldchain-mainnet',
+  unichain: 'unichain-mainnet',
 };
 
-const MORALIS_CHAIN_HEX: Record<EvmChainId, string> = {
+const MORALIS_CHAIN_HEX: Partial<Record<EvmChainId, string>> = {
   ethereum: '0x1',
   base: '0x2105',
   arbitrum: '0xa4b1',
   optimism: '0xa',
   polygon: '0x89',
   avalanche: '0xa86a',
+  bnb: '0x38',
+  linea: '0xe708',
+  blast: '0x13e31',
 };
 
 export const MIN_VERIFIED_DEX_LIQUIDITY_USD = 2_500;

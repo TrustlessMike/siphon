@@ -4,6 +4,13 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
+  detectAddressFamily,
+  getAdapterForChain,
+  getAdapterForFamily,
+  isEvmChain,
+  listAllFamilyMetas,
+} from '../adapters/registry.js';
+import {
   buildMigrationPlan,
   fetchCctpAttestationForTx,
   solanaAddressToBytes32,
@@ -28,7 +35,8 @@ import {
 } from '../scanner/chains.js';
 import { scanLiveWallet, scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
 import { fetchSolanaWalletBalances, getL2IndexerProvider } from '../scanner/discovery.js';
-import type { EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
+import { evaluatePortfolioRoi } from '../scanner/roi.js';
+import type { AnyChainId, ChainFamily, EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
 import { BackgroundJobStore, type JobLegStatus } from './jobs.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -188,8 +196,42 @@ export function createSiphonServer() {
           protocolFeeBps: PROTOCOL_FEE_BPS,
           protocolFee: getProtocolFeeConfig(),
           chains: CHAIN_LIST,
+          families: listAllFamilyMetas(),
           presets: WALLET_PRESETS,
         });
+      }
+
+      if (method === 'GET' && pathname === '/api/families') {
+        const families = listAllFamilyMetas();
+        const totalChains = families.reduce((s, f) => s + f.chains.length, 0);
+        return sendJson(res, 200, {
+          totalFamilies: families.length,
+          totalChains,
+          families,
+        });
+      }
+
+      if (method === 'POST' && pathname === '/api/roi/evaluate') {
+        const body = await readJsonBody<{
+          scanId?: string;
+          scan?: ScanReport;
+          protocolFeeBps?: number;
+          gasSponsored?: boolean;
+          fixedRelayerOverheadUsd?: number;
+        }>(req);
+        const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
+        if (!scan) {
+          return sendJson(res, 400, { error: 'Valid scan or scanId is required' });
+        }
+        return sendJson(
+          res,
+          200,
+          evaluatePortfolioRoi(scan, {
+            protocolFeeBps: body.protocolFeeBps,
+            gasSponsored: body.gasSponsored,
+            fixedRelayerOverheadUsd: body.fixedRelayerOverheadUsd,
+          })
+        );
       }
 
       if (method === 'GET' && pathname === '/api/contract') {
@@ -228,6 +270,7 @@ export function createSiphonServer() {
       if (method === 'POST' && pathname === '/api/scan') {
         const body = await readJsonBody<{
           address?: string;
+          family?: ChainFamily;
           presetId?: string;
           mode?: 'live' | 'preset';
         }>(req);
@@ -235,18 +278,32 @@ export function createSiphonServer() {
         let report: ScanReport;
         if (body.presetId) {
           report = await scanPresetWallet(body.presetId);
+          report.family = 'evm';
         } else if (body.address) {
+          const detected = detectAddressFamily(body.address, body.family);
+          if (!detected) {
+            return sendJson(res, 400, {
+              error:
+                'Invalid wallet address format. Supported: EVM (0x… / .eth), Cosmos (cosmos1…/osmo1…/noble1…/celestia1…/inj1…/neutron1…), Sui/Aptos (0x… 64-hex), TON (EQ…/UQ…), Tron (T…), Bitcoin (bc1…/1…/3…).',
+            });
+          }
           try {
-            report = await scanLiveWallet(body.address);
+            if (detected === 'evm') {
+              report = await scanLiveWallet(body.address);
+              report.family = 'evm';
+            } else {
+              report = await getAdapterForFamily(detected).scanWallet(body.address);
+            }
           } catch (err) {
             const msg = err instanceof Error ? err.message : 'Invalid wallet address';
-            if (msg.toLowerCase().includes('invalid evm')) {
+            if (msg.toLowerCase().includes('invalid')) {
               return sendJson(res, 400, { error: msg });
             }
             throw err;
           }
         } else {
           report = await scanPresetWallet('veteran_defi');
+          report.family = 'evm';
         }
 
         scanCache.set(report.scanId, report);
@@ -443,7 +500,7 @@ export function createSiphonServer() {
 
       if (method === 'POST' && pathname === '/api/tx/simulate-proof') {
         const body = await readJsonBody<{
-          chain?: EvmChainId;
+          chain?: AnyChainId;
           assets?: ScannedAsset[];
           userAddress?: string;
           solanaDestination?: string;
@@ -462,23 +519,42 @@ export function createSiphonServer() {
         }
 
         try {
-          const batch = await prepareChainBatchExecution({
+          if (isEvmChain(body.chain)) {
+            const batch = await prepareChainBatchExecution({
+              chain: body.chain,
+              assets: body.assets,
+              userAddress: body.userAddress,
+              solanaDestination: body.solanaDestination,
+              outputAsset: body.outputAsset ?? 'USDC',
+              bridgePreference: body.bridgePreference ?? 'auto',
+              protocolFeeBps: body.protocolFeeBps,
+              feeRecipientEvm: body.feeRecipientEvm,
+              bundleDefiCctp: body.bundleDefiCctp ?? false,
+            });
+            const proof = await buildPreSignSimulationProof({
+              batch,
+              assets: body.assets.filter((a) => a.chain === body.chain),
+              nativePriceUsd: body.nativePriceUsd,
+            });
+            return sendJson(res, 200, {
+              proof: { ...proof, family: 'evm', simulationEndpoint: 'eth_call' },
+              batch,
+            });
+          }
+
+          const adapter = getAdapterForChain(body.chain);
+          const proof = await adapter.simulatePreSignProof({
             chain: body.chain,
-            assets: body.assets,
+            assets: body.assets.filter((a) => a.chain === body.chain),
             userAddress: body.userAddress,
             solanaDestination: body.solanaDestination,
             outputAsset: body.outputAsset ?? 'USDC',
             bridgePreference: body.bridgePreference ?? 'auto',
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipientEvm: body.feeRecipientEvm,
-            bundleDefiCctp: body.bundleDefiCctp ?? false,
-          });
-          const proof = await buildPreSignSimulationProof({
-            batch,
-            assets: body.assets.filter((a) => a.chain === body.chain),
+            feeRecipient: body.feeRecipientEvm,
             nativePriceUsd: body.nativePriceUsd,
           });
-          return sendJson(res, 200, { proof, batch });
+          return sendJson(res, 200, { proof, batch: null });
         } catch (err) {
           return sendJson(res, 400, {
             error: err instanceof Error ? err.message : 'Could not build real-time simulation proof',
@@ -488,7 +564,7 @@ export function createSiphonServer() {
 
       if (method === 'POST' && pathname === '/api/tx/prove') {
         const body = await readJsonBody<{
-          chain?: EvmChainId;
+          chain?: AnyChainId;
           txHash?: string;
           userAddress?: string;
           solanaDestination?: string;
@@ -499,25 +575,46 @@ export function createSiphonServer() {
           preSolanaSol?: number;
         }>(req);
 
-        if (!body.chain || !body.txHash || !/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim()) || !body.solanaDestination) {
+        if (!body.chain || !body.txHash?.trim() || !body.solanaDestination) {
           return sendJson(res, 400, {
-            error: 'chain, valid 32-byte txHash, and solanaDestination are required',
+            error: 'chain, txHash, and solanaDestination are required',
           });
         }
 
         try {
-          const proof = await verifyOnchainExecutionProof({
+          if (isEvmChain(body.chain)) {
+            if (!/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim())) {
+              return sendJson(res, 400, {
+                error: 'chain, valid 32-byte txHash, and solanaDestination are required',
+              });
+            }
+            const proof = await verifyOnchainExecutionProof({
+              chain: body.chain,
+              txHash: body.txHash.trim(),
+              userAddress: body.userAddress,
+              solanaDestination: body.solanaDestination.trim(),
+              requestId: body.requestId,
+              provider: body.provider,
+              feeRecipientEvm: body.feeRecipientEvm,
+              preSolanaUsdc: body.preSolanaUsdc,
+              preSolanaSol: body.preSolanaSol,
+            });
+            return sendJson(res, 200, proof);
+          }
+
+          const adapter = getAdapterForChain(body.chain);
+          const result = await adapter.relayAndProve({
             chain: body.chain,
             txHash: body.txHash.trim(),
-            userAddress: body.userAddress,
+            userAddress: body.userAddress || '',
             solanaDestination: body.solanaDestination.trim(),
             requestId: body.requestId,
             provider: body.provider,
-            feeRecipientEvm: body.feeRecipientEvm,
+            feeRecipient: body.feeRecipientEvm,
             preSolanaUsdc: body.preSolanaUsdc,
             preSolanaSol: body.preSolanaSol,
           });
-          return sendJson(res, 200, proof);
+          return sendJson(res, 200, result.proof);
         } catch (err) {
           return sendJson(res, 400, {
             error: err instanceof Error ? err.message : 'Could not verify onchain proof',
@@ -527,7 +624,7 @@ export function createSiphonServer() {
 
       if (method === 'POST' && pathname === '/api/relayer/prepare-intent') {
         const body = await readJsonBody<{
-          chain?: EvmChainId;
+          chain?: AnyChainId;
           assets?: ScannedAsset[];
           userAddress?: string;
           solanaDestination?: string;
@@ -544,17 +641,31 @@ export function createSiphonServer() {
         }
 
         try {
-          const plan = buildGaslessSweepIntent({
+          if (isEvmChain(body.chain)) {
+            const plan = buildGaslessSweepIntent({
+              chain: body.chain,
+              assets: body.assets,
+              userAddress: body.userAddress,
+              solanaDestination: body.solanaDestination,
+              outputAsset: body.outputAsset ?? 'USDC',
+              protocolFeeBps: body.protocolFeeBps,
+              feeRecipientEvm: body.feeRecipientEvm,
+              preferredMode: body.preferredMode,
+            });
+            return sendJson(res, 200, { ...plan, family: 'evm' });
+          }
+
+          const adapter = getAdapterForChain(body.chain);
+          const intent = await adapter.buildGaslessIntent({
             chain: body.chain,
             assets: body.assets,
             userAddress: body.userAddress,
             solanaDestination: body.solanaDestination,
             outputAsset: body.outputAsset ?? 'USDC',
             protocolFeeBps: body.protocolFeeBps,
-            feeRecipientEvm: body.feeRecipientEvm,
-            preferredMode: body.preferredMode,
+            feeRecipient: body.feeRecipientEvm,
           });
-          return sendJson(res, 200, plan);
+          return sendJson(res, 200, intent);
         } catch (err) {
           return sendJson(res, 400, {
             error: err instanceof Error ? err.message : 'Could not prepare gasless sweep intent',
@@ -565,10 +676,11 @@ export function createSiphonServer() {
       if (method === 'POST' && pathname === '/api/relayer/submit') {
         const body = await readJsonBody<{
           intentId?: string;
-          chain?: EvmChainId;
+          chain?: AnyChainId;
           userAddress?: string;
           signature?: string;
           deadline?: number;
+          solanaDestination?: string;
         }>(req);
 
         if (!body.intentId || !body.chain || !body.userAddress || !body.signature || !body.deadline) {
@@ -578,14 +690,27 @@ export function createSiphonServer() {
         }
 
         try {
-          const receipt = submitSignedGaslessIntent({
-            intentId: body.intentId,
+          if (isEvmChain(body.chain)) {
+            const receipt = submitSignedGaslessIntent({
+              intentId: body.intentId,
+              chain: body.chain,
+              userAddress: body.userAddress,
+              signature: body.signature,
+              deadline: body.deadline,
+            });
+            return sendJson(res, 200, receipt);
+          }
+
+          const adapter = getAdapterForChain(body.chain);
+          const result = await adapter.relayAndProve({
             chain: body.chain,
+            intentId: body.intentId,
             userAddress: body.userAddress,
             signature: body.signature,
             deadline: body.deadline,
+            solanaDestination: body.solanaDestination || '',
           });
-          return sendJson(res, 200, receipt);
+          return sendJson(res, 200, result.submitted);
         } catch (err) {
           return sendJson(res, 400, {
             error: err instanceof Error ? err.message : 'Could not submit signed gasless intent',
@@ -606,7 +731,7 @@ export function createSiphonServer() {
           protocolFeeBps?: number;
           feeRecipientEvm?: string | null;
           legs?: Array<{
-            chain: EvmChainId;
+            chain: AnyChainId;
             chainName?: string;
             assetCount: number;
             estimatedNetUsd: number;
@@ -646,7 +771,7 @@ export function createSiphonServer() {
       if (method === 'POST' && pathname.startsWith('/api/jobs/') && pathname.endsWith('/leg')) {
         const jobId = pathname.slice('/api/jobs/'.length, -'/leg'.length);
         const body = await readJsonBody<{
-          chain?: EvmChainId;
+          chain?: AnyChainId;
           status?: JobLegStatus;
           statusText?: string;
           provider?: string;

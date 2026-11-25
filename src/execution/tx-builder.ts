@@ -186,6 +186,11 @@ function splitRawAmountForFee(
   return { feeRaw, netRaw };
 }
 
+function asEvmChain(chain: string): EvmChainId {
+  if (!(chain in EVM_CHAINS)) throw new Error(`Unsupported EVM chain: ${chain}`);
+  return chain as EvmChainId;
+}
+
 function buildProtocolFeeTransferTx(params: {
   asset: ScannedAsset;
   userAddress: string;
@@ -194,7 +199,8 @@ function buildProtocolFeeTransferTx(params: {
 }): ExecutableEvmTx | null {
   const { asset, userAddress, feeRaw, feeConfig } = params;
   if (!feeConfig.feeRecipientEvm || feeRaw <= 0n) return null;
-  const cfg = EVM_CHAINS[asset.chain];
+  const evmChain = asEvmChain(asset.chain);
+  const cfg = EVM_CHAINS[evmChain];
   const recipient = feeConfig.feeRecipientEvm;
   const destLabel = feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'SiphonFeeVault';
 
@@ -203,7 +209,7 @@ function buildProtocolFeeTransferTx(params: {
       stepId: 'protocol_fee_transfer',
       label: `Protocol Fee (${feeConfig.feePercent}% ${asset.symbol} → ${destLabel})`,
       description: `Routes ${feeConfig.feePercent}% (${feeConfig.feeBps} bps) native ${asset.symbol} fee to ${recipient}`,
-      chain: asset.chain,
+      chain: evmChain,
       chainId: cfg.chainId,
       chainName: cfg.name,
       explorerUrl: cfg.explorerUrl,
@@ -218,7 +224,7 @@ function buildProtocolFeeTransferTx(params: {
     stepId: 'protocol_fee_transfer',
     label: `Protocol Fee (${feeConfig.feePercent}% ${asset.symbol} → ${destLabel})`,
     description: `Transfers ${feeConfig.feePercent}% (${feeConfig.feeBps} bps) ${asset.symbol} fee to ${recipient}`,
-    chain: asset.chain,
+    chain: evmChain,
     chainId: cfg.chainId,
     chainName: cfg.name,
     explorerUrl: cfg.explorerUrl,
@@ -258,7 +264,8 @@ async function buildDefiWithdrawExecution(
   asset: ScannedAsset,
   userAddress: string
 ): Promise<PreparedExecution> {
-  const cfg = EVM_CHAINS[asset.chain];
+  const evmChain = asEvmChain(asset.chain);
+  const cfg = EVM_CHAINS[evmChain];
   const rawBal = BigInt(asset.rawBalance);
   const proto = (asset.protocol ?? '').toLowerCase();
 
@@ -270,7 +277,7 @@ async function buildDefiWithdrawExecution(
         `Aave v3 safety guard: wallet has $${asset.aaveDebtUsd.toFixed(2)} active debt (HF ${asset.aaveHealthFactor?.toFixed(2) ?? '—'}). Repay borrow before MAX withdrawal to prevent revert or liquidation.`
       );
     }
-    const safety = await checkAaveV3AccountSafety(asset.chain, userAddress);
+    const safety = await checkAaveV3AccountSafety(evmChain, userAddress);
     if (safety.checked && safety.hasActiveDebt) {
       throw new Error(`Aave v3 safety guard: ${safety.reason}`);
     }
@@ -284,7 +291,7 @@ async function buildDefiWithdrawExecution(
       assetId: asset.id,
       action: asset.action,
       provider: 'aave_v3',
-      chain: asset.chain,
+      chain: evmChain,
       chainId: cfg.chainId,
       chainName: cfg.name,
       explorerUrl: cfg.explorerUrl,
@@ -295,7 +302,7 @@ async function buildDefiWithdrawExecution(
           stepId: 'aave_withdraw',
           label: `Withdraw ${asset.symbol} from Aave v3`,
           description: `Calls Aave v3 Pool.withdraw(${asset.underlyingSymbol ?? 'asset'}, MAX, your wallet)`,
-          chain: asset.chain,
+          chain: evmChain,
           chainId: cfg.chainId,
           chainName: cfg.name,
           explorerUrl: cfg.explorerUrl,
@@ -318,7 +325,7 @@ async function buildDefiWithdrawExecution(
       assetId: asset.id,
       action: asset.action,
       provider: 'compound_v3',
-      chain: asset.chain,
+      chain: evmChain,
       chainId: cfg.chainId,
       chainName: cfg.name,
       explorerUrl: cfg.explorerUrl,
@@ -329,7 +336,7 @@ async function buildDefiWithdrawExecution(
           stepId: 'compound_withdraw',
           label: `Withdraw ${asset.symbol} from Compound v3`,
           description: `Calls Compound v3 Comet.withdraw(USDC, ${asset.uiBalance})`,
-          chain: asset.chain,
+          chain: evmChain,
           chainId: cfg.chainId,
           chainName: cfg.name,
           explorerUrl: cfg.explorerUrl,
@@ -352,7 +359,7 @@ async function buildDefiWithdrawExecution(
       assetId: asset.id,
       action: asset.action,
       provider: 'erc4626',
-      chain: asset.chain,
+      chain: evmChain,
       chainId: cfg.chainId,
       chainName: cfg.name,
       explorerUrl: cfg.explorerUrl,
@@ -363,7 +370,7 @@ async function buildDefiWithdrawExecution(
           stepId: 'erc4626_redeem',
           label: `Redeem ${asset.symbol} Vault Shares`,
           description: `Calls ERC-4626 redeem(${asset.uiBalance} shares) directly on ${asset.address}`,
-          chain: asset.chain,
+          chain: evmChain,
           chainId: cfg.chainId,
           chainName: cfg.name,
           explorerUrl: cfg.explorerUrl,
@@ -393,7 +400,8 @@ async function tryRelayBridgeQuote(params: {
   quoteState?: QuoteState;
 }): Promise<PreparedExecution | null> {
   const { asset, userAddress, solanaDestination, outputAsset, feeConfig, quoteState } = params;
-  const cfg = EVM_CHAINS[asset.chain];
+  const evmChain = asEvmChain(asset.chain);
+  const cfg = EVM_CHAINS[evmChain];
   const originCurrency = asset.address === 'native' ? ZERO_ADDRESS : asset.address;
   const destinationCurrency = outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
   const rawTotal = BigInt(asset.rawBalance);
@@ -497,7 +505,7 @@ async function tryRelayBridgeQuote(params: {
             stepId: step.id,
             label: step.action || `Execute ${step.id}`,
             description: step.description || `${step.id} ${asset.symbol} on ${cfg.name}`,
-            chain: asset.chain,
+            chain: evmChain,
             chainId: item.data.chainId ?? cfg.chainId,
             chainName: cfg.name,
             explorerUrl: cfg.explorerUrl,
@@ -520,7 +528,7 @@ async function tryRelayBridgeQuote(params: {
         assetId: asset.id,
         action: asset.action,
         provider: 'relay',
-        chain: asset.chain,
+        chain: evmChain,
         chainId: cfg.chainId,
         chainName: cfg.name,
         explorerUrl: cfg.explorerUrl,
@@ -565,7 +573,8 @@ async function tryLifiBridgeQuote(params: {
   quoteState?: QuoteState;
 }): Promise<PreparedExecution | null> {
   const { asset, userAddress, solanaDestination, outputAsset, feeConfig, quoteState } = params;
-  const cfg = EVM_CHAINS[asset.chain];
+  const evmChain = asEvmChain(asset.chain);
+  const cfg = EVM_CHAINS[evmChain];
   const fromToken = asset.address === 'native' ? ZERO_ADDRESS : asset.address;
   const toToken = outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
   const rawTotal = BigInt(asset.rawBalance);
@@ -629,7 +638,7 @@ async function tryLifiBridgeQuote(params: {
     const approvalAddr = json.estimate?.approvalAddress;
     if (asset.address !== 'native' && approvalAddr) {
       const allowance = await checkErc20Allowance({
-        chain: asset.chain,
+        chain: evmChain,
         tokenAddress: asset.address,
         owner: userAddress,
         spender: approvalAddr,
@@ -639,7 +648,7 @@ async function tryLifiBridgeQuote(params: {
           stepId: 'approve',
           label: `Approve ${asset.symbol} for ${json.toolDetails?.name ?? 'LI.FI'}`,
           description: `ERC-20 allowance for ${approvalAddr}`,
-          chain: asset.chain,
+          chain: evmChain,
           chainId: cfg.chainId,
           chainName: cfg.name,
           explorerUrl: cfg.explorerUrl,
@@ -655,7 +664,7 @@ async function tryLifiBridgeQuote(params: {
       stepId: 'bridge',
       label: `Swap & Bridge ${asset.symbol} → Solana ${outputAsset}`,
       description: `Via LI.FI (${json.toolDetails?.name ?? 'aggregator'})`,
-      chain: asset.chain,
+      chain: evmChain,
       chainId: txReq.chainId ?? cfg.chainId,
       chainName: cfg.name,
       explorerUrl: cfg.explorerUrl,
@@ -674,7 +683,7 @@ async function tryLifiBridgeQuote(params: {
       assetId: asset.id,
       action: asset.action,
       provider: 'lifi',
-      chain: asset.chain,
+      chain: evmChain,
       chainId: cfg.chainId,
       chainName: cfg.name,
       explorerUrl: cfg.explorerUrl,
@@ -714,7 +723,11 @@ async function buildDirectCctpUsdcExecution(params: {
   feeConfig: ProtocolFeeConfig;
 }): Promise<PreparedExecution> {
   const { asset, userAddress, solanaDestination, feeConfig } = params;
-  const cfg = EVM_CHAINS[asset.chain];
+  const cfg = EVM_CHAINS[asset.chain as EvmChainId];
+  if (!cfg.cctpTokenMessenger || cfg.cctpDomain === null) {
+    throw new Error(`${cfg.name} does not support native Circle CCTP — use Relay or LI.FI auto-routing.`);
+  }
+  const messenger = cfg.cctpTokenMessenger;
   const rawTotal = BigInt(asset.rawBalance);
   const { feeRaw, netRaw } = splitRawAmountForFee(rawTotal, feeConfig);
   const bridgeRaw = feeConfig.feeRecipientEvm ? netRaw : rawTotal;
@@ -732,10 +745,10 @@ async function buildDirectCctpUsdcExecution(params: {
   }
 
   const allowance = await checkErc20Allowance({
-    chain: asset.chain,
+    chain: asset.chain as EvmChainId,
     tokenAddress: cfg.usdcAddress,
     owner: userAddress,
-    spender: cfg.cctpTokenMessenger,
+    spender: messenger,
   });
 
   const netUiUsdc = Number(bridgeRaw) / 1_000_000;
@@ -743,14 +756,14 @@ async function buildDirectCctpUsdcExecution(params: {
     txs.push({
       stepId: 'approve_cctp',
       label: `Approve USDC for Circle CCTP`,
-      description: `Grants Circle TokenMessenger (${cfg.cctpTokenMessenger}) exact spend for ${netUiUsdc.toFixed(2)} USDC`,
-      chain: asset.chain,
+      description: `Grants Circle TokenMessenger (${messenger}) exact spend for ${netUiUsdc.toFixed(2)} USDC`,
+      chain: asset.chain as EvmChainId,
       chainId: cfg.chainId,
       chainName: cfg.name,
       explorerUrl: cfg.explorerUrl,
       from: userAddress,
       to: cfg.usdcAddress,
-      data: encodeErc20Approve(cfg.cctpTokenMessenger, bridgeRaw),
+      data: encodeErc20Approve(messenger, bridgeRaw),
       value: '0x0',
     });
   }
@@ -766,12 +779,12 @@ async function buildDirectCctpUsdcExecution(params: {
     stepId: 'cctp_deposit_for_burn',
     label: `Circle CCTP depositForBurn (${netUiUsdc.toFixed(2)} USDC → Solana)`,
     description: `Native 1:1 burn on ${cfg.name} (Domain ${cfg.cctpDomain} → Domain 5 Solana)`,
-    chain: asset.chain,
+    chain: asset.chain as EvmChainId,
     chainId: cfg.chainId,
     chainName: cfg.name,
     explorerUrl: cfg.explorerUrl,
     from: userAddress,
-    to: cfg.cctpTokenMessenger,
+    to: messenger,
     data: calldata,
     value: '0x0',
   });
@@ -780,7 +793,7 @@ async function buildDirectCctpUsdcExecution(params: {
     assetId: asset.id,
     action: asset.action,
     provider: 'circle_cctp',
-    chain: asset.chain,
+    chain: asset.chain as EvmChainId,
     chainId: cfg.chainId,
     chainName: cfg.name,
     explorerUrl: cfg.explorerUrl,
@@ -814,12 +827,14 @@ async function buildBridgeExecution(
   bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp',
   feeConfig: ProtocolFeeConfig
 ): Promise<PreparedExecution> {
-  const cfg = EVM_CHAINS[asset.chain];
+  const evmChain = asEvmChain(asset.chain);
+  const cfg = EVM_CHAINS[evmChain];
   const isNativeUsdc =
     asset.address.toLowerCase() === cfg.usdcAddress.toLowerCase();
+  const hasNativeCctp = Boolean(cfg.cctpTokenMessenger && cfg.cctpDomain !== null);
   const quoteState: QuoteState = { throttled: false };
 
-  if (bridgePreference === 'cctp' && isNativeUsdc) {
+  if (bridgePreference === 'cctp' && isNativeUsdc && hasNativeCctp) {
     return buildDirectCctpUsdcExecution({ asset, userAddress, solanaDestination, feeConfig });
   }
 
@@ -845,7 +860,7 @@ async function buildBridgeExecution(
   });
   if (lifi) return lifi;
 
-  if (isNativeUsdc) {
+  if (isNativeUsdc && hasNativeCctp) {
     return buildDirectCctpUsdcExecution({ asset, userAddress, solanaDestination, feeConfig });
   }
 
@@ -886,7 +901,8 @@ export async function prepareRealExecution(params: {
   } = params;
   const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
 
-  const cfg = EVM_CHAINS[asset.chain];
+  const evmChain = asEvmChain(asset.chain);
+  const cfg = EVM_CHAINS[evmChain];
   if (!cfg) throw new Error(`Unsupported chain: ${asset.chain}`);
 
   // Validate Solana destination up front
@@ -899,7 +915,7 @@ export async function prepareRealExecution(params: {
   if (asset.action === 'BURN_ZERO_LIQUIDITY') {
     const rawAmount = BigInt(asset.rawBalance);
     const check = await simulateBurnTransferOnchain({
-      chain: asset.chain,
+      chain: evmChain,
       walletAddress: userAddress,
       tokenAddress: asset.address,
       rawAmount,
@@ -911,7 +927,7 @@ export async function prepareRealExecution(params: {
       assetId: asset.id,
       action: asset.action,
       provider: 'erc20_burn',
-      chain: asset.chain,
+      chain: evmChain,
       chainId: cfg.chainId,
       chainName: cfg.name,
       explorerUrl: cfg.explorerUrl,
@@ -922,7 +938,7 @@ export async function prepareRealExecution(params: {
           stepId: 'erc20_burn',
           label: `Burn ${asset.symbol} to 0x000…dEaD`,
           description: check.reason,
-          chain: asset.chain,
+          chain: evmChain,
           chainId: cfg.chainId,
           chainName: cfg.name,
           explorerUrl: cfg.explorerUrl,
@@ -1087,11 +1103,13 @@ export async function prepareChainBatchExecution(params: {
     // Atomic DeFi USDC Withdraw + Circle CCTP depositForBurn in the SAME 1-click batch!
     const isDefiUsdcWithdraw =
       bundleDefiCctp &&
+      Boolean(cfg.cctpTokenMessenger && cfg.cctpDomain !== null) &&
       outputAsset === 'USDC' &&
       (prep.provider === 'aave_v3' || prep.provider === 'compound_v3') &&
       asset.underlyingSymbol === 'USDC';
 
-    if (isDefiUsdcWithdraw) {
+    if (isDefiUsdcWithdraw && cfg.cctpTokenMessenger) {
+      const messenger = cfg.cctpTokenMessenger;
       const rawTotal = BigInt(asset.rawBalance);
       const { feeRaw, netRaw } = splitRawAmountForFee(rawTotal, feeConfig);
       const bridgeRaw = feeConfig.feeRecipientEvm ? netRaw : rawTotal;
@@ -1218,7 +1236,7 @@ export async function prepareChainBatchExecution(params: {
   const permit2ReadyCount = executableAssets.filter((a) => Boolean(a.permit2Approved)).length;
   const eip2612Count = executableAssets.filter(
     (a) =>
-      a.eip2612Supported ?? (a.kind !== 'dead_token' && isEip2612Token(a.chain, a.address, a.symbol))
+      a.eip2612Supported ?? (a.kind !== 'dead_token' && isEip2612Token(asEvmChain(a.chain), a.address, a.symbol))
   ).length;
 
   const totalCalls = finalCalls.length;
