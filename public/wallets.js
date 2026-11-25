@@ -325,6 +325,8 @@ let sdkPreloadPromise = null;
 let cachedCoinbaseProvider = null;
 let activeEvmListeners = null;
 let activeSolanaSession = null;
+let solanaSessionSeq = 0;
+const familyWalletCleanups = {};
 
 const WC_STORAGE_KEY = 'siphon_wc_project_id';
 
@@ -583,6 +585,7 @@ export function disconnectEvmWallet() {
 
 function detachSolanaListeners() {
   if (!activeSolanaSession) return;
+  activeSolanaSession.active = false;
   try {
     activeSolanaSession.cleanup?.();
   } catch {
@@ -1268,6 +1271,45 @@ export function listAvailableSolanaWallets() {
   return list;
 }
 
+function pickSolanaStandardAccount(accounts) {
+  if (!Array.isArray(accounts) || !accounts.length) return null;
+  return (
+    accounts.find(
+      (a) =>
+        a?.address &&
+        (!Array.isArray(a.chains) ||
+          a.chains.length === 0 ||
+          a.chains.some((c) => String(c).startsWith('solana:')))
+    ) ||
+    accounts.find((a) => a?.address) ||
+    null
+  );
+}
+
+function extractSolanaPubkeyString(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'string') return raw.trim() || null;
+  if (typeof raw.toBase58 === 'function') return String(raw.toBase58()).trim() || null;
+  if (typeof raw.toString === 'function') {
+    const s = String(raw.toString()).trim();
+    if (s && s !== '[object Object]') return s;
+  }
+  return null;
+}
+
+function removeProviderEventListener(provider, eventName, handler) {
+  if (!provider || !handler) return;
+  try {
+    if (typeof provider.removeListener === 'function') {
+      provider.removeListener(eventName, handler);
+    } else if (typeof provider.off === 'function') {
+      provider.off(eventName, handler);
+    }
+  } catch {
+    // ignore listener removal errors
+  }
+}
+
 export async function connectSolanaWallet(options = {}) {
   if (typeof window === 'undefined') {
     throw new Error('Solana browser wallet is unavailable in this environment.');
@@ -1288,68 +1330,108 @@ export async function connectSolanaWallet(options = {}) {
     chosen = match;
   }
 
+  const attemptSeq = ++solanaSessionSeq;
   detachSolanaListeners();
 
   let pubkey = null;
   if (chosen.kind === 'standard') {
     const res = await chosen.wallet.features['standard:connect'].connect();
-    const account = res?.accounts?.[0] || chosen.wallet.accounts?.[0];
-    pubkey = account?.address || null;
+    const account = pickSolanaStandardAccount(res?.accounts) || pickSolanaStandardAccount(chosen.wallet.accounts);
+    pubkey = extractSolanaPubkeyString(account?.address);
   } else {
     const res = await chosen.provider.connect();
-    pubkey = res?.publicKey?.toString?.() || chosen.provider.publicKey?.toString?.() || null;
+    pubkey =
+      extractSolanaPubkeyString(res?.publicKey) ||
+      extractSolanaPubkeyString(chosen.provider.publicKey) ||
+      null;
   }
 
   if (!pubkey) throw new Error('Solana wallet connection cancelled.');
+  // Guard against an older async connect resolving after a newer connect or disconnect
+  if (attemptSeq !== solanaSessionSeq) {
+    throw new Error('Solana wallet connection was superseded by a newer request.');
+  }
+
   connectedSolanaAddress = pubkey;
   connectedSolanaWalletName = chosen.name;
+
+  const session = {
+    id: attemptSeq,
+    active: true,
+    kind: chosen.kind,
+    wallet: chosen.wallet || null,
+    provider: chosen.provider || null,
+    cleanup: null,
+  };
+  activeSolanaSession = session;
+
+  const emitAccountUpdate = (nextStr, reason) => {
+    if (!session.active || activeSolanaSession !== session) return;
+    const previousAddress = connectedSolanaAddress;
+    if (!nextStr) {
+      detachSolanaListeners();
+      connectedSolanaAddress = null;
+      connectedSolanaWalletName = null;
+      options.onAccountChanged?.(null, {
+        previousAddress,
+        reason: reason || 'disconnect',
+        walletName: chosen.name,
+      });
+      return;
+    }
+    if (nextStr === previousAddress) return;
+    connectedSolanaAddress = nextStr;
+    options.onAccountChanged?.(nextStr, {
+      previousAddress,
+      reason: reason || 'accountChanged',
+      walletName: chosen.name,
+    });
+  };
 
   let cleanup = null;
   if (chosen.kind === 'standard' && typeof chosen.wallet.features?.['standard:events']?.on === 'function') {
     try {
-      const off = chosen.wallet.features['standard:events'].on('change', ({ accounts }) => {
-        if (!Array.isArray(accounts)) return;
-        const nextStr = accounts[0]?.address || null;
-        connectedSolanaAddress = nextStr;
-        if (!nextStr) connectedSolanaWalletName = null;
-        options.onAccountChanged?.(nextStr);
+      const off = chosen.wallet.features['standard:events'].on('change', (props) => {
+        if (!session.active || activeSolanaSession !== session) return;
+        if (!props || !Array.isArray(props.accounts)) return;
+        const account = pickSolanaStandardAccount(props.accounts);
+        const nextStr = extractSolanaPubkeyString(account?.address);
+        emitAccountUpdate(nextStr, nextStr ? 'accountChanged' : 'disconnect');
       });
-      if (typeof off === 'function') cleanup = off;
+      if (typeof off === 'function') {
+        cleanup = () => {
+          try {
+            off();
+          } catch {
+            // ignore standard unsubscribe errors
+          }
+        };
+      }
     } catch {
       // ignore optional event errors
     }
-  } else if (chosen.kind === 'legacy' && chosen.provider?.on) {
+  } else if (chosen.kind === 'legacy' && typeof chosen.provider?.on === 'function') {
     try {
       const onAccountChanged = (nextPubkey) => {
-        const nextStr = nextPubkey?.toString?.() || null;
-        connectedSolanaAddress = nextStr;
-        if (!nextStr) connectedSolanaWalletName = null;
-        options.onAccountChanged?.(nextStr);
+        if (!session.active || activeSolanaSession !== session) return;
+        const nextStr = extractSolanaPubkeyString(nextPubkey);
+        emitAccountUpdate(nextStr, nextStr ? 'accountChanged' : 'disconnect');
       };
       const onDisconnect = () => {
-        detachSolanaListeners();
-        connectedSolanaAddress = null;
-        connectedSolanaWalletName = null;
-        options.onAccountChanged?.(null);
+        if (!session.active || activeSolanaSession !== session) return;
+        emitAccountUpdate(null, 'disconnect');
       };
       chosen.provider.on('accountChanged', onAccountChanged);
       chosen.provider.on('disconnect', onDisconnect);
       cleanup = () => {
-        chosen.provider.removeListener?.('accountChanged', onAccountChanged);
-        chosen.provider.off?.('accountChanged', onAccountChanged);
-        chosen.provider.removeListener?.('disconnect', onDisconnect);
-        chosen.provider.off?.('disconnect', onDisconnect);
+        removeProviderEventListener(chosen.provider, 'accountChanged', onAccountChanged);
+        removeProviderEventListener(chosen.provider, 'disconnect', onDisconnect);
       };
     } catch {
       // ignore optional listener errors
     }
   }
-  activeSolanaSession = {
-    kind: chosen.kind,
-    wallet: chosen.wallet || null,
-    provider: chosen.provider || null,
-    cleanup,
-  };
+  session.cleanup = cleanup;
 
   return { address: pubkey, walletName: chosen.name };
 }
@@ -1357,6 +1439,37 @@ export async function connectSolanaWallet(options = {}) {
 // =====================================================================
 // MULTI-FAMILY WALLET CONNECTORS (Cosmos, Sui, Aptos, TON, Tron, Bitcoin)
 // =====================================================================
+
+export const FAMILY_WALLET_CATALOG = {
+  keplr: { name: 'Keplr', installUrl: 'https://www.keplr.app' },
+  leap: { name: 'Leap Wallet', installUrl: 'https://www.leapwallet.io' },
+  cosmostation: { name: 'Cosmostation', installUrl: 'https://www.cosmostation.io/wallet' },
+  'okx-cosmos': { name: 'OKX Wallet (Cosmos)', installUrl: 'https://www.okx.com/web3' },
+  ctrl: { name: 'Ctrl / XDEFI', installUrl: 'https://ctrl.xyz' },
+  frontier: { name: 'Frontier', installUrl: 'https://www.frontier.xyz' },
+  'sui-wallet': { name: 'Slush / Sui Wallet', installUrl: 'https://slush.app' },
+  'phantom-sui': { name: 'Phantom (Sui)', installUrl: 'https://phantom.app' },
+  petra: { name: 'Petra Wallet', installUrl: 'https://petra.app' },
+  'phantom-aptos': { name: 'Phantom (Aptos)', installUrl: 'https://phantom.app' },
+  tonkeeper: { name: 'Tonkeeper', installUrl: 'https://tonkeeper.com' },
+  openmask: { name: 'OpenMask', installUrl: 'https://www.openmask.app' },
+  tronlink: { name: 'TronLink', installUrl: 'https://www.tronlink.org' },
+  unisat: { name: 'UniSat Wallet', installUrl: 'https://unisat.io' },
+  xverse: { name: 'Xverse', installUrl: 'https://www.xverse.app' },
+  'phantom-btc': { name: 'Phantom (Bitcoin)', installUrl: 'https://phantom.app' },
+};
+
+function detachFamilyListeners(family) {
+  const entry = familyWalletCleanups[family];
+  if (!entry) return;
+  entry.active = false;
+  try {
+    entry.cleanup?.();
+  } catch {
+    // ignore cleanup errors
+  }
+  delete familyWalletCleanups[family];
+}
 
 export function getConnectedFamilyWallet(family) {
   if (family === 'evm') {
@@ -1371,7 +1484,18 @@ export function disconnectFamilyWallet(family) {
     disconnectEvmWallet();
     return;
   }
+  detachFamilyListeners(family);
   delete familyWalletSessions[family];
+}
+
+function isTonConnect2Bridge(prov) {
+  return Boolean(
+    prov &&
+      typeof prov.connect === 'function' &&
+      (Number(prov.protocolVersion) >= 2 ||
+        typeof prov.restoreConnection === 'function' ||
+        typeof prov.listen === 'function')
+  );
 }
 
 export function listAvailableFamilyWallets(family) {
@@ -1441,12 +1565,64 @@ export function listAvailableFamilyWallets(family) {
 
   if (family === 'ton') {
     const out = [];
-    const tk = window.tonkeeper?.tonconnect || window.tonkeeper || window.ton;
-    if (tk) {
-      out.push({ id: 'tonkeeper', name: 'Tonkeeper', standard: 'TonConnect / Extension', icon: '/logos/tonkeeper.svg', provider: tk });
+    if (window.tonkeeper?.tonconnect) {
+      out.push({
+        id: 'tonkeeper',
+        name: 'Tonkeeper',
+        standard: 'TonConnect 2',
+        icon: '/logos/tonkeeper.svg',
+        kind: 'tonconnect2',
+        provider: window.tonkeeper.tonconnect,
+      });
+    } else if (window.tonkeeper) {
+      const isTc2 = isTonConnect2Bridge(window.tonkeeper);
+      out.push({
+        id: 'tonkeeper',
+        name: 'Tonkeeper',
+        standard: isTc2 ? 'TonConnect 2' : 'TON Extension',
+        icon: '/logos/tonkeeper.svg',
+        kind: isTc2 ? 'tonconnect2' : 'legacy-ton',
+        provider: window.tonkeeper,
+      });
+    } else if (window.ton && !window.ton.isOpenMask) {
+      const isTc2 = isTonConnect2Bridge(window.ton);
+      out.push({
+        id: 'tonkeeper',
+        name: 'Tonkeeper',
+        standard: isTc2 ? 'TonConnect 2' : 'TON Extension',
+        icon: '/logos/tonkeeper.svg',
+        kind: isTc2 ? 'tonconnect2' : 'legacy-ton',
+        provider: window.ton,
+      });
     }
-    if (window.openmask) {
-      out.push({ id: 'openmask', name: 'OpenMask', standard: 'TON Extension', icon: '/logos/ton.svg', provider: window.openmask });
+    if (window.openmask?.tonconnect) {
+      out.push({
+        id: 'openmask',
+        name: 'OpenMask',
+        standard: 'TonConnect 2',
+        icon: '/logos/ton.svg',
+        kind: 'tonconnect2',
+        provider: window.openmask.tonconnect,
+      });
+    } else if (window.openmask) {
+      const isTc2 = isTonConnect2Bridge(window.openmask);
+      out.push({
+        id: 'openmask',
+        name: 'OpenMask',
+        standard: isTc2 ? 'TonConnect 2' : 'TON Extension',
+        icon: '/logos/ton.svg',
+        kind: isTc2 ? 'tonconnect2' : 'legacy-ton',
+        provider: window.openmask,
+      });
+    } else if (window.ton?.isOpenMask) {
+      out.push({
+        id: 'openmask',
+        name: 'OpenMask',
+        standard: 'TON Extension',
+        icon: '/logos/ton.svg',
+        kind: 'legacy-ton',
+        provider: window.ton,
+      });
     }
     return out;
   }
@@ -1488,16 +1664,173 @@ export function listAvailableFamilyWallets(family) {
   return [];
 }
 
-const COSMOS_CONNECT_CHAINS = [
-  { key: 'cosmoshub', chainId: 'cosmoshub-4' },
-  { key: 'osmosis', chainId: 'osmosis-1' },
-  { key: 'noble', chainId: 'noble-1' },
-  { key: 'celestia', chainId: 'celestia' },
-  { key: 'injective', chainId: 'injective-1' },
-  { key: 'neutron', chainId: 'neutron-1' },
+function makeCosmosBech32Config(prefix) {
+  return {
+    bech32PrefixAccAddr: prefix,
+    bech32PrefixAccPub: `${prefix}pub`,
+    bech32PrefixValAddr: `${prefix}valoper`,
+    bech32PrefixValPub: `${prefix}valoperpub`,
+    bech32PrefixConsAddr: `${prefix}valcons`,
+    bech32PrefixConsPub: `${prefix}valconspub`,
+  };
+}
+
+export const COSMOS_CONNECT_CHAINS = [
+  {
+    key: 'cosmoshub',
+    chainId: 'cosmoshub-4',
+    chainName: 'Cosmos Hub',
+    cosmostationNames: ['cosmos', 'cosmoshub', 'Cosmos Hub', 'cosmoshub-4'],
+    suggestInfo: {
+      chainId: 'cosmoshub-4',
+      chainName: 'Cosmos Hub',
+      rpc: 'https://rpc.cosmos.directory/cosmoshub',
+      rest: 'https://rest.cosmos.directory/cosmoshub',
+      bip44: { coinType: 118 },
+      bech32Config: makeCosmosBech32Config('cosmos'),
+      currencies: [{ coinDenom: 'ATOM', coinMinimalDenom: 'uatom', coinDecimals: 6 }],
+      feeCurrencies: [{ coinDenom: 'ATOM', coinMinimalDenom: 'uatom', coinDecimals: 6 }],
+      stakeCurrency: { coinDenom: 'ATOM', coinMinimalDenom: 'uatom', coinDecimals: 6 },
+      features: ['ibc-transfer', 'ibc-go'],
+    },
+  },
+  {
+    key: 'osmosis',
+    chainId: 'osmosis-1',
+    chainName: 'Osmosis',
+    cosmostationNames: ['osmosis', 'Osmosis', 'osmosis-1'],
+    suggestInfo: {
+      chainId: 'osmosis-1',
+      chainName: 'Osmosis',
+      rpc: 'https://rpc.cosmos.directory/osmosis',
+      rest: 'https://rest.cosmos.directory/osmosis',
+      bip44: { coinType: 118 },
+      bech32Config: makeCosmosBech32Config('osmo'),
+      currencies: [{ coinDenom: 'OSMO', coinMinimalDenom: 'uosmo', coinDecimals: 6 }],
+      feeCurrencies: [{ coinDenom: 'OSMO', coinMinimalDenom: 'uosmo', coinDecimals: 6 }],
+      stakeCurrency: { coinDenom: 'OSMO', coinMinimalDenom: 'uosmo', coinDecimals: 6 },
+      features: ['ibc-transfer', 'ibc-go'],
+    },
+  },
+  {
+    key: 'noble',
+    chainId: 'noble-1',
+    chainName: 'Noble',
+    cosmostationNames: ['noble', 'Noble', 'noble-1'],
+    suggestInfo: {
+      chainId: 'noble-1',
+      chainName: 'Noble',
+      rpc: 'https://rpc.cosmos.directory/noble',
+      rest: 'https://rest.cosmos.directory/noble',
+      bip44: { coinType: 118 },
+      bech32Config: makeCosmosBech32Config('noble'),
+      currencies: [{ coinDenom: 'USDC', coinMinimalDenom: 'uusdc', coinDecimals: 6 }],
+      feeCurrencies: [{ coinDenom: 'USDC', coinMinimalDenom: 'uusdc', coinDecimals: 6 }],
+      stakeCurrency: { coinDenom: 'STAKE', coinMinimalDenom: 'ustake', coinDecimals: 6 },
+      features: ['ibc-transfer', 'ibc-go'],
+    },
+  },
+  {
+    key: 'celestia',
+    chainId: 'celestia',
+    chainName: 'Celestia',
+    cosmostationNames: ['celestia', 'Celestia'],
+    suggestInfo: {
+      chainId: 'celestia',
+      chainName: 'Celestia',
+      rpc: 'https://rpc.cosmos.directory/celestia',
+      rest: 'https://rest.cosmos.directory/celestia',
+      bip44: { coinType: 118 },
+      bech32Config: makeCosmosBech32Config('celestia'),
+      currencies: [{ coinDenom: 'TIA', coinMinimalDenom: 'utia', coinDecimals: 6 }],
+      feeCurrencies: [{ coinDenom: 'TIA', coinMinimalDenom: 'utia', coinDecimals: 6 }],
+      stakeCurrency: { coinDenom: 'TIA', coinMinimalDenom: 'utia', coinDecimals: 6 },
+      features: ['ibc-transfer', 'ibc-go'],
+    },
+  },
+  {
+    key: 'injective',
+    chainId: 'injective-1',
+    chainName: 'Injective',
+    cosmostationNames: ['injective', 'Injective', 'injective-1'],
+    suggestInfo: {
+      chainId: 'injective-1',
+      chainName: 'Injective',
+      rpc: 'https://rpc.cosmos.directory/injective',
+      rest: 'https://rest.cosmos.directory/injective',
+      bip44: { coinType: 60 },
+      bech32Config: makeCosmosBech32Config('inj'),
+      currencies: [{ coinDenom: 'INJ', coinMinimalDenom: 'inj', coinDecimals: 18 }],
+      feeCurrencies: [{ coinDenom: 'INJ', coinMinimalDenom: 'inj', coinDecimals: 18 }],
+      stakeCurrency: { coinDenom: 'INJ', coinMinimalDenom: 'inj', coinDecimals: 18 },
+      features: ['eth-address-gen', 'eth-key-sign', 'ibc-transfer', 'ibc-go'],
+    },
+  },
+  {
+    key: 'neutron',
+    chainId: 'neutron-1',
+    chainName: 'Neutron',
+    cosmostationNames: ['neutron', 'Neutron', 'neutron-1'],
+    suggestInfo: {
+      chainId: 'neutron-1',
+      chainName: 'Neutron',
+      rpc: 'https://rpc.cosmos.directory/neutron',
+      rest: 'https://rest.cosmos.directory/neutron',
+      bip44: { coinType: 118 },
+      bech32Config: makeCosmosBech32Config('neutron'),
+      currencies: [{ coinDenom: 'NTRN', coinMinimalDenom: 'untrn', coinDecimals: 6 }],
+      feeCurrencies: [{ coinDenom: 'NTRN', coinMinimalDenom: 'untrn', coinDecimals: 6 }],
+      stakeCurrency: { coinDenom: 'NTRN', coinMinimalDenom: 'untrn', coinDecimals: 6 },
+      features: ['ibc-transfer', 'ibc-go'],
+    },
+  },
 ];
 
-async function readCosmosChainAddress(provider, chainId) {
+function getCosmostationCandidateNames(chainEntry, supportedNames = null) {
+  const base = [];
+  if (Array.isArray(chainEntry?.cosmostationNames)) base.push(...chainEntry.cosmostationNames);
+  if (chainEntry?.key) base.push(chainEntry.key);
+  if (chainEntry?.chainName) base.push(chainEntry.chainName);
+  if (chainEntry?.chainId) base.push(chainEntry.chainId);
+  const deduped = Array.from(new Set(base.filter(Boolean)));
+  if (Array.isArray(supportedNames) && supportedNames.length) {
+    const lowerMap = new Map(supportedNames.map((n) => [String(n).toLowerCase(), String(n)]));
+    const matched = [];
+    for (const candidate of deduped) {
+      const exact = lowerMap.get(String(candidate).toLowerCase());
+      if (exact && !matched.includes(exact)) matched.push(exact);
+    }
+    if (matched.length) {
+      return [...matched, ...deduped.filter((n) => !matched.includes(n))];
+    }
+  }
+  return deduped;
+}
+
+async function queryCosmostationSupportedChainNames(provider) {
+  if (typeof provider?.request !== 'function') return null;
+  try {
+    const res = await provider.request({ method: 'cos_supportedChainNames' });
+    const all = [
+      ...(Array.isArray(res?.official) ? res.official : []),
+      ...(Array.isArray(res?.unofficial) ? res.unofficial : []),
+    ];
+    return all.length ? all : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readCosmosChainAddress(provider, chainOrId, cosmostationSupportedNames = null) {
+  const chainEntry =
+    typeof chainOrId === 'string'
+      ? COSMOS_CONNECT_CHAINS.find((c) => c.chainId === chainOrId || c.key === chainOrId) || {
+          key: chainOrId,
+          chainId: chainOrId,
+        }
+      : chainOrId;
+  const chainId = chainEntry.chainId;
+
   if (typeof provider.getKey === 'function') {
     const key = await provider.getKey(chainId);
     if (key?.bech32Address) return key.bech32Address;
@@ -1513,15 +1846,223 @@ async function readCosmosChainAddress(provider, chainId) {
     if (accs?.[0]?.address) return accs[0].address;
   }
   if (typeof provider.request === 'function') {
-    const acc = await provider.request({ method: 'cos_account', params: { chainName: chainId } });
-    if (acc?.address) return acc.address;
+    const candidates = getCosmostationCandidateNames(chainEntry, cosmostationSupportedNames);
+    for (const method of ['cos_account', 'cos_requestAccount']) {
+      for (const chainName of candidates) {
+        try {
+          const acc = await provider.request({ method, params: { chainName } });
+          if (acc?.address) return acc.address;
+        } catch (err) {
+          if (isUserRejectedError(err)) throw err;
+          // Try next registry chain-name candidate (e.g. 'cosmos' -> 'cosmoshub' -> 'cosmoshub-4')
+        }
+      }
+    }
   }
   return null;
+}
+
+async function readAllCosmosAddresses(provider, chains, cosmostationSupportedNames = null) {
+  const foundMap = {};
+  const settled = await Promise.allSettled(
+    chains.map(async (c) => [c.key, await readCosmosChainAddress(provider, c, cosmostationSupportedNames)])
+  );
+  for (const r of settled) {
+    if (r.status === 'fulfilled' && r.value?.[1]) {
+      foundMap[r.value[0]] = r.value[1];
+    }
+  }
+  const primary =
+    foundMap.cosmoshub ||
+    foundMap.osmosis ||
+    foundMap.noble ||
+    Object.values(foundMap)[0] ||
+    null;
+  return { foundMap, primary };
+}
+
+function selectSuiMainnetAccount(accounts, walletChains = null) {
+  const wChains = Array.isArray(walletChains) ? walletChains.map((c) => String(c)) : [];
+  const wSuiChains = wChains.filter((c) => c.startsWith('sui:'));
+  if (wSuiChains.length && !wSuiChains.includes('sui:mainnet')) {
+    return {
+      ok: false,
+      detectedChain: wSuiChains[0],
+      error: `Sui wallet is connected to ${wSuiChains[0]} (non-mainnet). Switch to Sui Mainnet (sui:mainnet) and reconnect.`,
+    };
+  }
+  if (!Array.isArray(accounts) || !accounts.length) {
+    return { ok: true, account: null };
+  }
+  const suiAccounts = accounts.filter(
+    (a) =>
+      a?.address &&
+      (!Array.isArray(a.chains) || a.chains.length === 0 || a.chains.some((c) => String(c).startsWith('sui:')))
+  );
+  if (!suiAccounts.length) return { ok: true, account: null };
+
+  const accountsWithChains = suiAccounts.filter((a) => Array.isArray(a.chains) && a.chains.length > 0);
+  if (accountsWithChains.length) {
+    const mainnetAcc = accountsWithChains.find((a) => a.chains.some((c) => String(c) === 'sui:mainnet'));
+    if (!mainnetAcc) {
+      const detected = accountsWithChains[0].chains.find((c) => String(c).startsWith('sui:')) || accountsWithChains[0].chains[0];
+      return {
+        ok: false,
+        detectedChain: detected,
+        error: `Sui wallet account is on ${detected} instead of sui:mainnet. Switch your Sui wallet to Mainnet and reconnect.`,
+      };
+    }
+    return { ok: true, account: mainnetAcc };
+  }
+  return { ok: true, account: suiAccounts[0] };
+}
+
+function isAptosMainnetNetwork(net) {
+  if (!net) return false;
+  if (typeof net === 'string') {
+    return net.trim().toLowerCase() === 'mainnet';
+  }
+  if (typeof net === 'object') {
+    const name = String(net.name || net.network || '').trim().toLowerCase();
+    const chainId = net.chainId !== undefined && net.chainId !== null ? String(net.chainId).trim() : '';
+    const url = String(net.url || '').trim().toLowerCase();
+    if (/testnet|devnet|localnet/.test(name) || /testnet|devnet|localhost|127\.0\.0\.1/.test(url)) {
+      return false;
+    }
+    if (name === 'mainnet') return true;
+    if (chainId === '1') return true;
+    return false;
+  }
+  return false;
+}
+
+function describeAptosNetwork(net) {
+  if (!net) return 'unknown';
+  if (typeof net === 'string') return net;
+  return net.name || net.network || (net.chainId !== undefined ? `chainId ${net.chainId}` : 'unknown');
+}
+
+const TRON_BASE58_ADDR_RE = /^T[1-9A-HJ-NP-Za-km-z]{33}$/;
+
+function readReadyTronWeb() {
+  const candidates = [window.tronLink?.tronWeb, window.tronWeb].filter(Boolean);
+  for (const tw of candidates) {
+    const base58 = typeof tw?.defaultAddress?.base58 === 'string' ? tw.defaultAddress.base58.trim() : '';
+    if (base58 && TRON_BASE58_ADDR_RE.test(base58) && tw.ready !== false) {
+      return { tronWeb: tw, address: base58 };
+    }
+  }
+  return null;
+}
+
+async function waitForTronWebReady(timeoutMs = 2500, intervalMs = 50) {
+  const immediate = readReadyTronWeb();
+  if (immediate) return immediate;
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  const step = Math.max(5, Number(intervalMs) || 50);
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, step));
+    const ready = readReadyTronWeb();
+    if (ready) return ready;
+  }
+  return readReadyTronWeb();
+}
+
+function isTronTestnetNode(nodeOrTronWeb) {
+  if (!nodeOrTronWeb) return false;
+  const values = [];
+  if (typeof nodeOrTronWeb === 'string') {
+    values.push(nodeOrTronWeb);
+  } else if (typeof nodeOrTronWeb === 'object') {
+    values.push(
+      nodeOrTronWeb.fullNode?.host,
+      nodeOrTronWeb.solidityNode?.host,
+      nodeOrTronWeb.eventServer?.host,
+      nodeOrTronWeb.fullNode?.instance?.defaults?.baseURL,
+      nodeOrTronWeb.host,
+      nodeOrTronWeb.fullHost,
+      nodeOrTronWeb.node?.fullNode,
+      nodeOrTronWeb.node?.solidityNode,
+      nodeOrTronWeb.node?.eventServer,
+      nodeOrTronWeb.node?.chain,
+      nodeOrTronWeb.node?.name,
+      nodeOrTronWeb.network,
+      nodeOrTronWeb.chain,
+      nodeOrTronWeb.chainId
+    );
+  }
+  const combined = values
+    .filter((v) => typeof v === 'string' && v.trim())
+    .join(' ')
+    .toLowerCase();
+  if (!combined) return false;
+  return (
+    combined.includes('shasta') ||
+    combined.includes('nile') ||
+    combined.includes('testnet') ||
+    combined.includes('0x94a9059e') ||
+    combined.includes('0xcd8690dc')
+  );
+}
+
+export function isBitcoinMainnetAddress(addr) {
+  const s = String(addr || '').trim();
+  if (!s) return false;
+  // Explicitly reject testnet/signet/regtest prefixes (tb1, bcrt1, m, n, 2)
+  if (/^(tb1|bcrt1|[mn2])/i.test(s)) return false;
+  return /^(bc1[ac-hj-np-z02-9]{11,71}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$/i.test(s);
+}
+
+function isUniSatMainnetNetwork(network, chain = null) {
+  if (chain && typeof chain === 'object') {
+    const chainEnum = String(chain.enum || '').trim().toUpperCase();
+    const chainNet = String(chain.network || '').trim().toLowerCase();
+    if (chainEnum) {
+      if (chainEnum !== 'BITCOIN_MAINNET') return false;
+    } else if (chainNet && chainNet !== 'livenet' && chainNet !== 'mainnet') {
+      return false;
+    }
+  }
+  if (network !== undefined && network !== null) {
+    const netStr =
+      typeof network === 'string'
+        ? network.trim().toLowerCase()
+        : String(network.network || network.enum || '').trim().toLowerCase();
+    if (netStr !== 'livenet' && netStr !== 'mainnet' && netStr !== 'bitcoin_mainnet') {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isTonTestnetNetwork(net) {
+  if (net === undefined || net === null || net === '') return false;
+  const s = String(net).trim().toLowerCase();
+  if (s === '-239' || s === 'mainnet') return false;
+  return s === '-3' || s.includes('test') || s !== '-239';
 }
 
 export async function connectFamilyWallet(family, opts = {}) {
   if (family === 'evm') return connectEvmWallet(opts);
   const wallets = listAvailableFamilyWallets(family);
+  const requestedCatalog = opts.walletId ? FAMILY_WALLET_CATALOG[opts.walletId] : null;
+
+  if (opts.walletId) {
+    const exactMatch = wallets.find((w) => w.id === opts.walletId);
+    if (!exactMatch) {
+      const displayName = requestedCatalog?.name || opts.walletId;
+      const installHint = requestedCatalog?.installUrl ? ` Install it from ${requestedCatalog.installUrl} or` : '';
+      const err = new Error(
+        `${displayName} extension is not detected on this page.${installHint} unlock it and allow site access on 127.0.0.1, then retry.`
+      );
+      err.code = 'WALLET_NOT_INSTALLED';
+      err.walletId = opts.walletId;
+      err.walletName = displayName;
+      err.installUrl = requestedCatalog?.installUrl || null;
+      throw err;
+    }
+  }
+
   if (!wallets.length) {
     if (family === 'cosmos') {
       throw new Error(
@@ -1530,95 +2071,292 @@ export async function connectFamilyWallet(family, opts = {}) {
     }
     throw new Error(`No ${family.toUpperCase()} browser wallet detected. Install a supported wallet or paste an address to inspect.`);
   }
-  const chosen = (opts.walletId ? wallets.find((w) => w.id === opts.walletId) : null) || wallets[0];
+
+  const chosen = opts.walletId ? wallets.find((w) => w.id === opts.walletId) : wallets[0];
   let address = null;
   let addressesByChain = null;
+  let cosmosEnabledChains = null;
+  let cosmosFailedChains = [];
+  let cosmosSuggestedChains = [];
+  let cosmosSupportedNames = null;
+  let cosmosRequestedChains = null;
 
   if (family === 'cosmos') {
     const prov = chosen.provider;
-    const requestedChains = opts.chainId
-      ? [{ key: 'custom', chainId: opts.chainId }]
+    cosmosRequestedChains = opts.chainId
+      ? [
+          COSMOS_CONNECT_CHAINS.find((c) => c.chainId === opts.chainId || c.key === opts.chainId) || {
+            key: 'custom',
+            chainId: opts.chainId,
+            chainName: opts.chainId,
+          },
+        ]
       : COSMOS_CONNECT_CHAINS;
-    const chainIds = requestedChains.map((c) => c.chainId);
+    const chainIds = cosmosRequestedChains.map((c) => c.chainId);
 
-    // 1. Try batch enable across all 6 Cosmos chains; fall back to individual enable if any single chain isn't supported
+    // 1. Try batch enable across all 6 Cosmos chains; if a secondary chain fails/isn't suggested,
+    // fall back to per-chain enable + experimentalSuggestChain + partial chain enablement.
     if (typeof prov.enable === 'function') {
       try {
         await prov.enable(chainIds);
+        cosmosEnabledChains = [...cosmosRequestedChains];
       } catch (batchErr) {
-        let enabledAny = false;
-        for (const cid of chainIds) {
+        if (isUserRejectedError(batchErr)) {
+          throw new Error(
+            `${chosen.name} connection was rejected. Unlock ${chosen.name}, approve access, and ensure extension site access is allowed on 127.0.0.1.`
+          );
+        }
+        const enabled = [];
+        for (const c of cosmosRequestedChains) {
           try {
-            await prov.enable(cid);
-            enabledAny = true;
-          } catch {
-            // ignore unsupported optional chain
+            await prov.enable(c.chainId);
+            enabled.push(c);
+          } catch (singleErr) {
+            if (!isUserRejectedError(singleErr) && typeof prov.experimentalSuggestChain === 'function' && c.suggestInfo) {
+              try {
+                await prov.experimentalSuggestChain(c.suggestInfo);
+                await prov.enable(c.chainId);
+                enabled.push(c);
+                cosmosSuggestedChains.push(c.chainId);
+                continue;
+              } catch {
+                // fall through to partial chain failure record
+              }
+            }
+            cosmosFailedChains.push(c.chainId);
           }
         }
-        if (!enabledAny) {
+        if (!enabled.length) {
+          const reason = batchErr?.message ? ` (${batchErr.message})` : '';
           throw new Error(
-            batchErr?.message || `${chosen.name} rejected chain connection — unlock your wallet and approve access.`
+            `${chosen.name} could not enable any Cosmos chain${reason}. Unlock ${chosen.name}, approve access, and ensure extension site access is allowed on 127.0.0.1.`
+          );
+        }
+        cosmosEnabledChains = enabled;
+      }
+    } else {
+      cosmosEnabledChains = [...cosmosRequestedChains];
+      cosmosSupportedNames = await queryCosmostationSupportedChainNames(prov);
+    }
+
+    // 2. Read Bech32 address across enabled Cosmos chains
+    const { foundMap, primary } = await readAllCosmosAddresses(prov, cosmosEnabledChains, cosmosSupportedNames);
+    addressesByChain = foundMap;
+    address = primary;
+
+    if (!address) {
+      throw new Error(
+        `${chosen.name} returned no Cosmos account address. Unlock ${chosen.name}, ensure an account is active, and allow site access on 127.0.0.1 before retrying.`
+      );
+    }
+  } else if (family === 'sui') {
+    if (chosen.kind === 'standard') {
+      const res = await chosen.wallet.features['standard:connect'].connect();
+      const rawAccounts = res?.accounts?.length ? res.accounts : chosen.wallet.accounts || [];
+      const selected = selectSuiMainnetAccount(rawAccounts, chosen.wallet.chains);
+      if (!selected.ok) {
+        throw new Error(selected.error);
+      }
+      address = selected.account?.address || null;
+    } else {
+      let res = null;
+      if (typeof chosen.provider.requestPermissions === 'function') {
+        await chosen.provider.requestPermissions();
+        const accs = await chosen.provider.getAccounts();
+        address = accs?.[0]?.address || accs?.[0] || null;
+      } else if (typeof chosen.provider.connect === 'function') {
+        res = await chosen.provider.connect();
+        address = res?.address || res?.accounts?.[0]?.address || null;
+      }
+      let legacyChain = res?.chain || res?.network || chosen.provider.network || chosen.provider.chain || null;
+      if (!legacyChain && typeof chosen.provider.getChain === 'function') {
+        try {
+          legacyChain = await chosen.provider.getChain();
+        } catch {
+          // ignore if wallet doesn't support getChain
+        }
+      }
+      if (legacyChain) {
+        const chainStr = String(legacyChain).toLowerCase();
+        if (!chainStr.includes('mainnet')) {
+          throw new Error(
+            `Sui wallet is connected to ${legacyChain} (non-mainnet). Switch to Sui Mainnet (sui:mainnet) and reconnect.`
           );
         }
       }
     }
-
-    // 2. Read Bech32 address across every enabled Cosmos chain
-    const foundMap = {};
-    const settled = await Promise.allSettled(
-      requestedChains.map(async (c) => [c.key, await readCosmosChainAddress(prov, c.chainId)])
-    );
-    for (const r of settled) {
-      if (r.status === 'fulfilled' && r.value?.[1]) {
-        foundMap[r.value[0]] = r.value[1];
-      }
-    }
-    addressesByChain = foundMap;
-    address =
-      foundMap.cosmoshub ||
-      foundMap.osmosis ||
-      foundMap.noble ||
-      Object.values(foundMap)[0] ||
-      null;
-  } else if (family === 'sui') {
-    if (chosen.kind === 'standard') {
-      const res = await chosen.wallet.features['standard:connect'].connect();
-      address = res?.accounts?.[0]?.address || chosen.wallet.accounts?.[0]?.address || null;
-    } else if (typeof chosen.provider.requestPermissions === 'function') {
-      await chosen.provider.requestPermissions();
-      const accs = await chosen.provider.getAccounts();
-      address = accs?.[0] || null;
-    } else if (typeof chosen.provider.connect === 'function') {
-      const res = await chosen.provider.connect();
-      address = res?.address || res?.accounts?.[0]?.address || null;
-    }
   } else if (family === 'aptos') {
     const res = await chosen.provider.connect();
     address = res?.address || (await chosen.provider.account?.())?.address || null;
+    if (typeof chosen.provider.network === 'function' || typeof chosen.provider.getNetwork === 'function') {
+      let net = null;
+      try {
+        net =
+          typeof chosen.provider.network === 'function'
+            ? await chosen.provider.network()
+            : await chosen.provider.getNetwork();
+      } catch (err) {
+        throw new Error(
+          `Could not verify Aptos network (${err?.message || 'network check failed'}). Switch ${chosen.name} to Aptos Mainnet and reconnect.`
+        );
+      }
+      if (!isAptosMainnetNetwork(net)) {
+        throw new Error(
+          `${chosen.name} is connected to Aptos ${describeAptosNetwork(net)}. Switch to Aptos Mainnet and reconnect.`
+        );
+      }
+    } else if (res?.network && !isAptosMainnetNetwork(res.network)) {
+      throw new Error(
+        `${chosen.name} is connected to Aptos ${describeAptosNetwork(res.network)}. Switch to Aptos Mainnet and reconnect.`
+      );
+    }
   } else if (family === 'ton') {
-    if (typeof chosen.provider.send === 'function') {
-      const accs = await chosen.provider.send('ton_requestAccounts');
+    const prov = chosen.provider;
+    if (chosen.kind === 'tonconnect2' || isTonConnect2Bridge(prov)) {
+      const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : 'https://siphon.app';
+      const manifestUrl = opts.manifestUrl || `${origin}/tonconnect-manifest.json`;
+      let res;
+      try {
+        res = await prov.connect(2, {
+          manifestUrl,
+          items: [{ name: 'ton_addr' }],
+        });
+      } catch (err) {
+        if (isUserRejectedError(err)) {
+          throw new Error(`${chosen.name} connection was rejected by the user.`);
+        }
+        throw new Error(
+          `${chosen.name} TonConnect 2 connection failed: ${err?.message || 'bridge error'}. Ensure ${chosen.name} is unlocked and updated.`
+        );
+      }
+      if (res?.event === 'connect_error') {
+        const code = res?.payload?.code;
+        const msg = res?.payload?.message || 'connection failed';
+        if (code === 300 || /reject|declin|cancel/i.test(msg)) {
+          throw new Error(`${chosen.name} connection was rejected by the user.`);
+        }
+        if (code === 2 || /manifest/i.test(msg)) {
+          throw new Error(
+            `${chosen.name} could not load TonConnect manifest (${msg}). Ensure /tonconnect-manifest.json is reachable from your wallet.`
+          );
+        }
+        throw new Error(`${chosen.name} TonConnect 2 error${code ? ` (${code})` : ''}: ${msg}`);
+      }
+      const items = Array.isArray(res?.payload?.items) ? res.payload.items : [];
+      const addrItem = items.find((it) => it?.name === 'ton_addr') || items[0] || null;
+      if (addrItem?.network !== undefined && isTonTestnetNetwork(addrItem.network)) {
+        throw new Error(
+          `${chosen.name} is connected to TON Testnet (${addrItem.network}). Switch to TON Mainnet (-239) and reconnect.`
+        );
+      }
+      address = addrItem?.address || res?.account?.address || res?.address || null;
+    } else if (typeof prov.send === 'function') {
+      const accs = await prov.send('ton_requestAccounts');
       address = Array.isArray(accs) ? accs[0] : accs?.address || null;
-    } else if (typeof chosen.provider.connect === 'function') {
-      const res = await chosen.provider.connect();
+      let chain = prov.chainId ?? null;
+      if (chain === null) {
+        try {
+          chain = await prov.send('ton_getChain');
+        } catch {
+          // optional method on legacy providers
+        }
+      }
+      if (chain !== null && chain !== undefined && isTonTestnetNetwork(chain)) {
+        throw new Error(
+          `${chosen.name} is connected to TON Testnet (${chain}). Switch to TON Mainnet (-239) and reconnect.`
+        );
+      }
+    } else if (typeof prov.connect === 'function') {
+      const res = await prov.connect();
       address = res?.account?.address || res?.address || null;
+    } else {
+      throw new Error(
+        `${chosen.name} does not expose a supported TonConnect 2 JS Bridge or ton_requestAccounts API.`
+      );
     }
   } else if (family === 'tron') {
-    if (window.tronLink?.request) {
+    let lockedHint = false;
+    if (typeof window.tronLink?.request === 'function') {
       const res = await window.tronLink.request({ method: 'tron_requestAccounts' });
-      if (res && res.code && res.code !== 200) {
-        throw new Error(res.message || 'TronLink connection rejected.');
+      if (res === '' || res === undefined || res === false) {
+        lockedHint = true;
+      } else if (res && typeof res === 'object' && res.code && res.code !== 200) {
+        if (res.code === 4000) {
+          throw new Error(
+            'TronLink connection request is already pending. Open the TronLink extension popup to approve.'
+          );
+        }
+        if (res.code === 4001) {
+          throw new Error('TronLink connection was rejected by the user.');
+        }
+        throw new Error(res.message || `TronLink connection rejected (code ${res.code}).`);
       }
     }
-    address = window.tronWeb?.defaultAddress?.base58 || window.tronLink?.tronWeb?.defaultAddress?.base58 || null;
+    const readyTimeout = lockedHint
+      ? Math.min(250, Number(opts.tronReadyTimeoutMs ?? 250))
+      : Number(opts.tronReadyTimeoutMs ?? 2500);
+    const readyResult = await waitForTronWebReady(readyTimeout, Number(opts.tronPollIntervalMs ?? 50));
+    if (!readyResult?.address) {
+      throw new Error(
+        lockedHint
+          ? 'TronLink is locked. Unlock your TronLink extension and retry.'
+          : 'TronLink is locked or tronWeb did not finish initializing. Unlock TronLink, approve site access, and retry.'
+      );
+    }
+    if (isTronTestnetNode(readyResult.tronWeb)) {
+      throw new Error(
+        'TronLink is connected to a Tron testnet (Shasta/Nile). Switch TronLink to Tron Mainnet and reconnect.'
+      );
+    }
+    address = readyResult.address;
   } else if (family === 'btc') {
     if (chosen.id === 'unisat') {
       const accs = await chosen.provider.requestAccounts();
       address = accs?.[0] || null;
+      if (typeof chosen.provider.getChain === 'function') {
+        let chainInfo = null;
+        try {
+          chainInfo = await chosen.provider.getChain();
+        } catch (err) {
+          throw new Error(
+            `Could not verify UniSat Bitcoin network (${err?.message || 'getChain failed'}). Switch UniSat to Bitcoin Mainnet (livenet) and reconnect.`
+          );
+        }
+        if (!chainInfo || !isUniSatMainnetNetwork(chainInfo.network, chainInfo)) {
+          throw new Error(
+            `UniSat is connected to ${chainInfo?.enum || chainInfo?.network || 'non-mainnet'}. Switch UniSat to Bitcoin Mainnet (livenet) and reconnect.`
+          );
+        }
+      }
+      if (typeof chosen.provider.getNetwork === 'function') {
+        let net = null;
+        try {
+          net = await chosen.provider.getNetwork();
+        } catch (err) {
+          throw new Error(
+            `Could not verify UniSat Bitcoin network (${err?.message || 'getNetwork failed'}). Switch UniSat to Bitcoin Mainnet (livenet) and reconnect.`
+          );
+        }
+        if (!net || !isUniSatMainnetNetwork(net, null)) {
+          throw new Error(
+            `UniSat is connected to Bitcoin ${net || 'non-mainnet'}. Switch UniSat to Bitcoin Mainnet (livenet) and reconnect.`
+          );
+        }
+      }
+      if (address && !isBitcoinMainnetAddress(address)) {
+        throw new Error(
+          `UniSat returned a non-mainnet Bitcoin address (${address}). Switch to Bitcoin Mainnet (livenet) and reconnect.`
+        );
+      }
     } else if (chosen.id === 'phantom-btc') {
       const accs = await chosen.provider.requestAccounts();
       const payment = accs?.find((a) => a.purpose === 'payment') || accs?.[0];
       address = payment?.address || (typeof payment === 'string' ? payment : null);
+      if (address && !isBitcoinMainnetAddress(address)) {
+        throw new Error(
+          `Phantom Bitcoin returned a non-mainnet address (${address}). Switch to Bitcoin Mainnet and reconnect.`
+        );
+      }
     } else if (typeof chosen.provider.request === 'function') {
       // Request strictly `payment` accounts (never `ordinals`) to avoid sweeping inscribed Taproot UTXOs
       const res = await chosen.provider.request('getAccounts', { purposes: ['payment'] });
@@ -1627,12 +2365,19 @@ export async function connectFamilyWallet(family, opts = {}) {
         ? accs.find((a) => a?.purpose === 'payment') || null
         : null;
       address = payment?.address || null;
+      if (address && !isBitcoinMainnetAddress(address)) {
+        throw new Error(
+          `${chosen.name} returned a non-mainnet Bitcoin address (${address}). Switch to Bitcoin Mainnet and reconnect.`
+        );
+      }
     }
   }
 
   if (!address) {
     throw new Error(`${chosen.name} connection was cancelled or returned no address.`);
   }
+
+  detachFamilyListeners(family);
 
   const session = {
     family,
@@ -1642,8 +2387,325 @@ export async function connectFamilyWallet(family, opts = {}) {
     walletId: chosen.id,
     provider: chosen.provider || chosen.wallet,
     kind: chosen.kind || 'extension',
+    ...(family === 'cosmos'
+      ? {
+          enabledChains: (cosmosEnabledChains || []).map((c) => c.chainId),
+          failedChains: cosmosFailedChains,
+          suggestedChains: cosmosSuggestedChains,
+        }
+      : {}),
   };
   familyWalletSessions[family] = session;
+
+  // Attach lifecycle listeners with active-session guard & deterministic cleanup
+  const listenerState = { active: true, cleanup: null };
+  familyWalletCleanups[family] = listenerState;
+  const isCurrentSession = () => listenerState.active && familyWalletSessions[family] === session;
+
+  if (family === 'cosmos') {
+    const prov = chosen.provider;
+    const refreshChains = cosmosRequestedChains || COSMOS_CONNECT_CHAINS;
+    const onKeystoreChange = async () => {
+      if (!isCurrentSession()) return;
+      try {
+        const { foundMap, primary } = await readAllCosmosAddresses(prov, refreshChains, cosmosSupportedNames);
+        if (!isCurrentSession()) return;
+        if (!primary) {
+          disconnectFamilyWallet('cosmos');
+          opts.onAccountChanged?.(null, { reason: 'disconnect', walletName: chosen.name });
+          notifyWalletDiscovery();
+          return;
+        }
+        session.address = primary;
+        session.addressesByChain = foundMap;
+        opts.onAccountChanged?.({
+          address: primary,
+          addressesByChain: foundMap,
+          session,
+          walletName: chosen.name,
+        });
+        notifyWalletDiscovery();
+      } catch {
+        // ignore transient keystore read failures
+      }
+    };
+    const eventNames = [];
+    if (chosen.id === 'leap') {
+      eventNames.push('leap_keystorechange');
+    } else if (chosen.id === 'cosmostation') {
+      eventNames.push('cosmostation_keystorechange', 'keplr_keystorechange');
+    } else {
+      eventNames.push('keplr_keystorechange');
+    }
+    const cleanups = [];
+    for (const ev of eventNames) {
+      window.addEventListener(ev, onKeystoreChange);
+      cleanups.push(() => window.removeEventListener(ev, onKeystoreChange));
+    }
+    if (typeof prov.on === 'function') {
+      try {
+        const off = prov.on('accountChanged', onKeystoreChange);
+        if (typeof off === 'function') {
+          cleanups.push(() => {
+            try {
+              off();
+            } catch {
+              // ignore
+            }
+          });
+        } else {
+          cleanups.push(() => removeProviderEventListener(prov, 'accountChanged', onKeystoreChange));
+        }
+      } catch {
+        // ignore optional listener errors
+      }
+    }
+    listenerState.cleanup = () => cleanups.forEach((fn) => fn());
+  } else if (family === 'sui') {
+    if (chosen.kind === 'standard' && typeof chosen.wallet?.features?.['standard:events']?.on === 'function') {
+      try {
+        const off = chosen.wallet.features['standard:events'].on('change', (props) => {
+          if (!isCurrentSession() || !props) return;
+          if (Array.isArray(props.chains)) {
+            const suiChains = props.chains.map((c) => String(c)).filter((c) => c.startsWith('sui:'));
+            if (suiChains.length && !suiChains.includes('sui:mainnet')) {
+              const msg = `Sui wallet switched to ${suiChains[0]} (non-mainnet) — disconnected for safety.`;
+              disconnectFamilyWallet('sui');
+              opts.onNetworkChanged?.({ chain: suiChains[0], isMainnet: false });
+              opts.onAccountChanged?.(null, { reason: 'testnet_rejected', message: msg, walletName: chosen.name });
+              return;
+            }
+          }
+          if (!Array.isArray(props.accounts)) return;
+          const selected = selectSuiMainnetAccount(props.accounts, props.chains || chosen.wallet.chains);
+          if (!selected.ok) {
+            disconnectFamilyWallet('sui');
+            opts.onNetworkChanged?.({ chain: selected.detectedChain, isMainnet: false });
+            opts.onAccountChanged?.(null, { reason: 'testnet_rejected', message: selected.error, walletName: chosen.name });
+            return;
+          }
+          const nextAddr = selected.account?.address || null;
+          if (!nextAddr) {
+            disconnectFamilyWallet('sui');
+            opts.onAccountChanged?.(null, { reason: 'disconnect', walletName: chosen.name });
+            return;
+          }
+          if (nextAddr === session.address) return;
+          session.address = nextAddr;
+          opts.onAccountChanged?.({ address: nextAddr, session, walletName: chosen.name });
+        });
+        if (typeof off === 'function') {
+          listenerState.cleanup = () => {
+            try {
+              off();
+            } catch {
+              // ignore
+            }
+          };
+        }
+      } catch {
+        // ignore optional event errors
+      }
+    }
+  } else if (family === 'aptos') {
+    const prov = chosen.provider;
+    const cleanups = [];
+    if (typeof prov.onAccountChange === 'function') {
+      try {
+        const unsub = prov.onAccountChange((nextAcc) => {
+          if (!isCurrentSession()) return;
+          const nextAddr = typeof nextAcc === 'string' ? nextAcc.trim() : nextAcc?.address?.trim?.() || null;
+          if (!nextAddr) {
+            disconnectFamilyWallet('aptos');
+            opts.onAccountChanged?.(null, { reason: 'disconnect', walletName: chosen.name });
+            return;
+          }
+          if (nextAddr === session.address) return;
+          session.address = nextAddr;
+          opts.onAccountChanged?.({ address: nextAddr, session, walletName: chosen.name });
+        });
+        if (typeof unsub === 'function') cleanups.push(() => unsub());
+      } catch {
+        // ignore
+      }
+    }
+    if (typeof prov.onNetworkChange === 'function') {
+      try {
+        const unsub = prov.onNetworkChange((nextNet) => {
+          if (!isCurrentSession()) return;
+          const isMainnet = isAptosMainnetNetwork(nextNet);
+          opts.onNetworkChanged?.({ network: nextNet, isMainnet });
+          if (!isMainnet) {
+            const msg = `${chosen.name} switched to Aptos ${describeAptosNetwork(nextNet)} — disconnected for safety.`;
+            disconnectFamilyWallet('aptos');
+            opts.onAccountChanged?.(null, { reason: 'testnet_rejected', message: msg, walletName: chosen.name });
+          }
+        });
+        if (typeof unsub === 'function') cleanups.push(() => unsub());
+      } catch {
+        // ignore
+      }
+    }
+    if (typeof prov.onDisconnect === 'function') {
+      try {
+        const unsub = prov.onDisconnect(() => {
+          if (!isCurrentSession()) return;
+          disconnectFamilyWallet('aptos');
+          opts.onAccountChanged?.(null, { reason: 'disconnect', walletName: chosen.name });
+        });
+        if (typeof unsub === 'function') cleanups.push(() => unsub());
+      } catch {
+        // ignore
+      }
+    }
+    listenerState.cleanup = () => {
+      for (const fn of cleanups) {
+        try {
+          fn();
+        } catch {
+          // ignore
+        }
+      }
+    };
+  } else if (family === 'ton') {
+    const prov = chosen.provider;
+    if ((chosen.kind === 'tonconnect2' || isTonConnect2Bridge(prov)) && typeof prov.listen === 'function') {
+      try {
+        const off = prov.listen((event) => {
+          if (!isCurrentSession() || !event) return;
+          if (event.event === 'disconnect') {
+            disconnectFamilyWallet('ton');
+            opts.onAccountChanged?.(null, { reason: 'disconnect', walletName: chosen.name });
+          }
+        });
+        if (typeof off === 'function') {
+          listenerState.cleanup = () => {
+            try {
+              off();
+            } catch {
+              // ignore
+            }
+          };
+        }
+      } catch {
+        // ignore
+      }
+    } else if (typeof prov.on === 'function') {
+      const onAccounts = (accs) => {
+        if (!isCurrentSession()) return;
+        const nextAddr = Array.isArray(accs) ? accs[0] : accs?.address || null;
+        if (!nextAddr) {
+          disconnectFamilyWallet('ton');
+          opts.onAccountChanged?.(null, { reason: 'disconnect', walletName: chosen.name });
+          return;
+        }
+        if (nextAddr === session.address) return;
+        session.address = nextAddr;
+        opts.onAccountChanged?.({ address: nextAddr, session, walletName: chosen.name });
+      };
+      const onChain = (nextChain) => {
+        if (!isCurrentSession()) return;
+        const isTestnet = isTonTestnetNetwork(nextChain);
+        opts.onNetworkChanged?.({ chain: nextChain, isMainnet: !isTestnet });
+        if (isTestnet) {
+          const msg = `${chosen.name} switched to TON Testnet (${nextChain}) — disconnected for safety.`;
+          disconnectFamilyWallet('ton');
+          opts.onAccountChanged?.(null, { reason: 'testnet_rejected', message: msg, walletName: chosen.name });
+        }
+      };
+      prov.on('accountsChanged', onAccounts);
+      prov.on('chainChanged', onChain);
+      listenerState.cleanup = () => {
+        removeProviderEventListener(prov, 'accountsChanged', onAccounts);
+        removeProviderEventListener(prov, 'chainChanged', onChain);
+      };
+    }
+  } else if (family === 'tron') {
+    const onTronMessage = (event) => {
+      if (!isCurrentSession()) return;
+      const msg = event?.data?.message;
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.action === 'setNode') {
+        if (isTronTestnetNode(msg.data)) {
+          const reasonMsg = 'TronLink switched to a Tron testnet (Shasta/Nile) — disconnected for safety.';
+          disconnectFamilyWallet('tron');
+          opts.onNetworkChanged?.({ node: msg.data, isMainnet: false });
+          opts.onAccountChanged?.(null, { reason: 'testnet_rejected', message: reasonMsg, walletName: chosen.name });
+        } else {
+          opts.onNetworkChanged?.({ node: msg.data, isMainnet: true });
+        }
+      } else if (msg.action === 'accountsChanged' || msg.action === 'setAccount') {
+        const nextAddr =
+          typeof msg.data?.address === 'string' && TRON_BASE58_ADDR_RE.test(msg.data.address.trim())
+            ? msg.data.address.trim()
+            : null;
+        if (!nextAddr) {
+          disconnectFamilyWallet('tron');
+          opts.onAccountChanged?.(null, { reason: 'disconnect', walletName: chosen.name });
+          return;
+        }
+        if (nextAddr === session.address) return;
+        session.address = nextAddr;
+        opts.onAccountChanged?.({ address: nextAddr, session, walletName: chosen.name });
+      } else if (msg.action === 'disconnect') {
+        disconnectFamilyWallet('tron');
+        opts.onAccountChanged?.(null, { reason: 'disconnect', walletName: chosen.name });
+      }
+    };
+    window.addEventListener('message', onTronMessage);
+    listenerState.cleanup = () => window.removeEventListener('message', onTronMessage);
+  } else if (family === 'btc') {
+    const prov = chosen.provider;
+    if (chosen.id === 'unisat' && typeof prov.on === 'function') {
+      const onAccountsChanged = (accs) => {
+        if (!isCurrentSession()) return;
+        const nextAddr = Array.isArray(accs) ? accs[0] : typeof accs === 'string' ? accs : null;
+        if (!nextAddr) {
+          disconnectFamilyWallet('btc');
+          opts.onAccountChanged?.(null, { reason: 'disconnect', walletName: chosen.name });
+          return;
+        }
+        if (!isBitcoinMainnetAddress(nextAddr)) {
+          const msg = `UniSat switched to a non-mainnet Bitcoin address (${nextAddr}) — disconnected for safety.`;
+          disconnectFamilyWallet('btc');
+          opts.onAccountChanged?.(null, { reason: 'testnet_rejected', message: msg, walletName: chosen.name });
+          return;
+        }
+        if (nextAddr === session.address) return;
+        session.address = nextAddr;
+        opts.onAccountChanged?.({ address: nextAddr, session, walletName: chosen.name });
+      };
+      const onNetworkChanged = (nextNet) => {
+        if (!isCurrentSession()) return;
+        const isMainnet = isUniSatMainnetNetwork(nextNet, null);
+        opts.onNetworkChanged?.({ network: nextNet, isMainnet });
+        if (!isMainnet) {
+          const msg = `UniSat switched to Bitcoin ${nextNet || 'non-mainnet'} — disconnected for safety.`;
+          disconnectFamilyWallet('btc');
+          opts.onAccountChanged?.(null, { reason: 'testnet_rejected', message: msg, walletName: chosen.name });
+        }
+      };
+      const onChainChanged = (nextChain) => {
+        if (!isCurrentSession()) return;
+        const isMainnet = isUniSatMainnetNetwork(nextChain?.network, nextChain);
+        opts.onNetworkChanged?.({ chain: nextChain, isMainnet });
+        if (!isMainnet) {
+          const msg = `UniSat switched to ${nextChain?.enum || nextChain?.network || 'non-mainnet'} — disconnected for safety.`;
+          disconnectFamilyWallet('btc');
+          opts.onAccountChanged?.(null, { reason: 'testnet_rejected', message: msg, walletName: chosen.name });
+        }
+      };
+      prov.on('accountsChanged', onAccountsChanged);
+      prov.on('networkChanged', onNetworkChanged);
+      prov.on('chainChanged', onChainChanged);
+      listenerState.cleanup = () => {
+        removeProviderEventListener(prov, 'accountsChanged', onAccountsChanged);
+        removeProviderEventListener(prov, 'networkChanged', onNetworkChanged);
+        removeProviderEventListener(prov, 'chainChanged', onChainChanged);
+      };
+    }
+  }
+
   return session;
 }
 
@@ -1810,6 +2872,22 @@ export async function executeNonEvmDirectBatch(family, batch, opts = {}) {
     if (typeof session.provider.sendTransaction === 'function') {
       const res = await session.provider.sendTransaction(txPayload);
       const hash = res?.boc || res?.hash || res?.txHash || 'ton_boc_submitted';
+      txHashes.push(String(hash));
+      return { txHashes, mode: 'ton_tonconnect_batch' };
+    }
+    if (
+      (session.kind === 'tonconnect2' || isTonConnect2Bridge(session.provider)) &&
+      typeof session.provider.send === 'function'
+    ) {
+      const res = await session.provider.send({
+        method: 'sendTransaction',
+        params: [JSON.stringify(txPayload)],
+        id: String(Date.now()),
+      });
+      if (res?.error) {
+        throw new Error(res.error.message || `TonConnect sendTransaction failed (code ${res.error.code || 'unknown'}).`);
+      }
+      const hash = res?.result || res?.boc || res?.hash || 'ton_boc_submitted';
       txHashes.push(String(hash));
       return { txHashes, mode: 'ton_tonconnect_batch' };
     }

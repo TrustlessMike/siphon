@@ -660,6 +660,15 @@ function updateFamilyChrome() {
   updateWalletButtons();
 }
 
+function getScanAddressForSession(family, session) {
+  if (!session) return null;
+  if (family === 'cosmos' && session.addressesByChain) {
+    const multiAddrs = Array.from(new Set(Object.values(session.addressesByChain).filter(Boolean)));
+    if (multiAddrs.length > 1) return multiAddrs.join(',');
+  }
+  return session.address || null;
+}
+
 function selectFamily(family, { autoScanConnected = true } = {}) {
   activeFamily = family || 'evm';
   // Default to Direct conversion mode across all families (matches Rabby/EVM UX; users can still toggle Gasless)
@@ -669,8 +678,9 @@ function selectFamily(family, { autoScanConnected = true } = {}) {
   });
   updateFamilyChrome();
   const connected = getConnectedFamilyWallet(activeFamily);
-  if (autoScanConnected && connected?.address) {
-    runScan({ address: connected.address, family: activeFamily, autoOpen: false });
+  const scanAddr = getScanAddressForSession(activeFamily, connected);
+  if (autoScanConnected && scanAddr) {
+    runScan({ address: scanAddr, family: activeFamily, autoOpen: false });
   } else if (currentScan?.family && currentScan.family !== activeFamily) {
     currentScan = null;
     currentPlan = null;
@@ -3401,11 +3411,13 @@ async function loadContract() {
 // =====================================================================
 let activeWalletModalTab = 'evm';
 let walletModalError = null;
+let walletModalErrorAction = null;
 let walletModalConnecting = null;
 let walletWcPromptOpen = false;
 
 function closeWalletModal() {
   walletModalError = null;
+  walletModalErrorAction = null;
   walletModalConnecting = null;
   walletWcPromptOpen = false;
   document.getElementById('walletModalBackdrop')?.classList.add('hidden');
@@ -3474,7 +3486,11 @@ function renderWalletModalContent() {
 
   const rows = [];
   if (walletModalError) {
-    rows.push(`<div class="wallet-modal-error">${escapeHtml(walletModalError)}</div>`);
+    const actionLink =
+      walletModalErrorAction?.url && safeHttpUrl(walletModalErrorAction.url) !== '#'
+        ? ` <a class="explorer-link" href="${safeHttpUrl(walletModalErrorAction.url)}" target="_blank" rel="noreferrer">${escapeHtml(walletModalErrorAction.label || 'Install wallet ↗')}</a>`
+        : '';
+    rows.push(`<div class="wallet-modal-error">${escapeHtml(walletModalError)}${actionLink}</div>`);
   }
 
   if (isEvm && !isSourceEvm) {
@@ -3484,7 +3500,7 @@ function renderWalletModalContent() {
       for (const w of detectedFam) {
         const isBusy = walletModalConnecting === `fam:${w.id}`;
         rows.push(`
-          <button type="button" class="wallet-option-row" data-pick-family-wallet="${escapeHtml(w.id)}" ${walletModalConnecting ? 'disabled' : ''}>
+          <button type="button" class="wallet-option-row" data-pick-family-wallet="${escapeHtml(w.id)}" data-wallet-installed="true" data-wallet-name="${escapeHtml(w.name)}" ${walletModalConnecting ? 'disabled' : ''}>
             <div class="wallet-option-left">
               ${getWalletBrandBadge(w.name, w.icon)}
               <div>
@@ -3498,30 +3514,54 @@ function renderWalletModalContent() {
       }
     }
     if (activeFamily === 'cosmos') {
-      // Offer clickable Connect rows for all supported Cosmos wallets (deduped against detected ones)
+      // Show uninstalled Cosmos wallet rows clearly without silently falling back to wallets[0]
       const detectedIds = new Set(detectedFam.map((w) => w.id));
       const cosmosChoices = [
-        { id: 'keplr', name: 'Keplr', logo: '/logos/keplr.svg', sub: 'Cosmos Hub · Osmosis · Noble · Celestia · Injective · Neutron' },
-        { id: 'leap', name: 'Leap Wallet', logo: '/logos/leap.svg', sub: 'All 6 Cosmos / IBC chains' },
-        { id: 'cosmostation', name: 'Cosmostation', logo: '/logos/cosmos.svg', sub: 'Cosmostation browser extension' },
-        { id: 'okx-cosmos', name: 'OKX Wallet (Cosmos)', logo: '/logos/okx.svg', sub: 'OKX multi-chain Cosmos provider' },
+        {
+          id: 'keplr',
+          name: 'Keplr',
+          logo: '/logos/keplr.svg',
+          installUrl: 'https://www.keplr.app',
+          sub: 'Cosmos Hub · Osmosis · Noble · Celestia · Injective · Neutron',
+        },
+        {
+          id: 'leap',
+          name: 'Leap Wallet',
+          logo: '/logos/leap.svg',
+          installUrl: 'https://www.leapwallet.io',
+          sub: 'All 6 Cosmos / IBC chains',
+        },
+        {
+          id: 'cosmostation',
+          name: 'Cosmostation',
+          logo: '/logos/cosmos.svg',
+          installUrl: 'https://www.cosmostation.io/wallet',
+          sub: 'Cosmostation browser extension',
+        },
+        {
+          id: 'okx-cosmos',
+          name: 'OKX Wallet (Cosmos)',
+          logo: '/logos/okx.svg',
+          installUrl: 'https://www.okx.com/web3',
+          sub: 'OKX multi-chain Cosmos provider',
+        },
       ].filter((cw) => !detectedIds.has(cw.id));
       if (cosmosChoices.length) {
         rows.push(
-          `<div class="wallet-section-label">${detectedFam.length ? 'Other Cosmos wallets' : 'Connect Cosmos Wallet'}</div>`
+          `<div class="wallet-section-label">${detectedFam.length ? 'Other Cosmos wallets (not detected)' : 'Install or unlock a Cosmos wallet'}</div>`
         );
         for (const cw of cosmosChoices) {
           const isBusy = walletModalConnecting === `fam:${cw.id}`;
           rows.push(`
-            <button type="button" class="wallet-option-row" data-pick-family-wallet="${escapeHtml(cw.id)}" ${walletModalConnecting ? 'disabled' : ''}>
+            <button type="button" class="wallet-option-row" data-pick-family-wallet="${escapeHtml(cw.id)}" data-wallet-installed="false" data-wallet-name="${escapeHtml(cw.name)}" data-install-url="${safeHttpUrl(cw.installUrl)}" ${walletModalConnecting ? 'disabled' : ''}>
               <div class="wallet-option-left">
                 ${getWalletBrandBadge(cw.name, cw.logo)}
                 <div>
                   <div class="wallet-option-name">${escapeHtml(cw.name)}</div>
-                  <div class="wallet-option-meta mono">${escapeHtml(cw.sub)}</div>
+                  <div class="wallet-option-meta mono">Not detected · ${escapeHtml(cw.sub)}</div>
                 </div>
               </div>
-              <span class="mono wallet-option-action">${isBusy ? 'Connecting…' : 'Connect →'}</span>
+              <span class="mono wallet-option-action">${isBusy ? 'Checking…' : 'Install / Retry ↗'}</span>
             </button>
           `);
         }
@@ -3798,24 +3838,41 @@ function renderWalletModalContent() {
     btn.addEventListener('click', async () => {
       const walletId = btn.dataset.pickSol;
       walletModalError = null;
+      walletModalErrorAction = null;
       walletModalConnecting = `sol:${walletId}`;
       renderWalletModalContent();
       try {
         const { address, walletName } = await connectSolanaWallet({
           walletId,
-          onAccountChanged: (nextAddr) => {
-            if (nextAddr) {
-              document.getElementById('solanaDestInput').value = nextAddr;
-              manualDestConfirmedAddress = null;
-              const chk = document.getElementById('manualDestConfirmChk');
-              if (chk) chk.checked = false;
-              syncDestinationUiState();
+          onAccountChanged: (nextAddr, meta) => {
+            const solInput = document.getElementById('solanaDestInput');
+            const currentVal = solInput?.value?.trim() || '';
+            const prevAddr = meta?.previousAddress || null;
+            const followsConnectedWallet = !currentVal || (prevAddr && currentVal === prevAddr);
+
+            if (followsConnectedWallet) {
+              if (nextAddr) {
+                if (solInput) solInput.value = nextAddr;
+                manualDestConfirmedAddress = null;
+                const chk = document.getElementById('manualDestConfirmChk');
+                if (chk) chk.checked = false;
+                syncDestinationUiState();
+              } else {
+                clearSolanaDestinationUi();
+              }
+              updateWalletButtons();
+              recomputePlan();
+              refreshSolanaBalance();
             } else {
-              clearSolanaDestinationUi();
+              // Never clobber a manually edited #solanaDestInput on wallet accountChanged/disconnect
+              syncDestinationUiState();
+              updateWalletButtons();
+              showToast(
+                nextAddr
+                  ? `${meta?.walletName || 'Solana wallet'} switched to ${shortAddr(nextAddr)} — kept your manual destination (${shortAddr(currentVal)}).`
+                  : `${meta?.walletName || 'Solana wallet'} disconnected — kept your manual destination (${shortAddr(currentVal)}).`
+              );
             }
-            updateWalletButtons();
-            recomputePlan();
-            refreshSolanaBalance();
           },
         });
         document.getElementById('solanaDestInput').value = address;
@@ -3830,6 +3887,7 @@ function renderWalletModalContent() {
       } catch (err) {
         walletModalConnecting = null;
         walletModalError = err?.message || 'Solana wallet connection cancelled.';
+        walletModalErrorAction = null;
         renderWalletModalContent();
         showToast(walletModalError);
       }
@@ -3842,6 +3900,7 @@ function renderWalletModalContent() {
     if (!addr) return;
     if (!isValidSolanaBase58(addr)) {
       walletModalError = 'Invalid Solana base58 destination address.';
+      walletModalErrorAction = null;
       renderWalletModalContent();
       return;
     }
@@ -3859,9 +3918,16 @@ function renderWalletModalContent() {
     if (isEvm) {
       disconnectFamilyWallet(activeFamily);
     } else {
+      const prevSol = getConnectedSolanaAddress();
+      const curVal = document.getElementById('solanaDestInput')?.value?.trim() || '';
+      const followsConnectedWallet = !curVal || (prevSol && curVal === prevSol);
       disconnectSolanaWallet();
-      clearSolanaDestinationUi();
-      recomputePlan();
+      if (followsConnectedWallet) {
+        clearSolanaDestinationUi();
+        recomputePlan();
+      } else {
+        syncDestinationUiState();
+      }
     }
     updateWalletButtons();
     renderWalletModalContent();
@@ -3871,28 +3937,97 @@ function renderWalletModalContent() {
   listEl.querySelectorAll('[data-pick-family-wallet]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const walletId = btn.dataset.pickFamilyWallet;
+      const isInstalledAttr = btn.dataset.walletInstalled;
+      const displayName = btn.dataset.walletName || walletId;
+      const installUrl = btn.dataset.installUrl || null;
+      const targetFamily = activeFamily;
+
       walletModalError = null;
+      walletModalErrorAction = null;
+
+      if (isInstalledAttr === 'false') {
+        refreshInstalledWallets();
+        const nowDetected = listAvailableFamilyWallets(targetFamily).some((w) => w.id === walletId);
+        if (!nowDetected) {
+          walletModalError = `${displayName} is not detected on this page. Install ${displayName} or unlock it and allow site access on 127.0.0.1, then retry.`;
+          walletModalErrorAction = installUrl ? { label: `Install ${displayName} ↗`, url: installUrl } : null;
+          renderWalletModalContent();
+          showToast(walletModalError);
+          return;
+        }
+      }
+
       walletModalConnecting = `fam:${walletId}`;
       renderWalletModalContent();
       try {
-        const res = await connectFamilyWallet(activeFamily, { walletId });
+        const res = await connectFamilyWallet(targetFamily, {
+          walletId,
+          onAccountChanged: (next, meta) => {
+            updateWalletButtons();
+            const modalEl = document.getElementById('walletModalBackdrop');
+            if (modalEl && !modalEl.classList.contains('hidden')) {
+              renderWalletModalContent();
+            }
+            if (!next || !next.address) {
+              const reasonMsg =
+                meta?.message ||
+                `${meta?.walletName || targetFamily.toUpperCase()} wallet disconnected.`;
+              showToast(reasonMsg);
+              if (activeFamily === targetFamily) {
+                currentScan = null;
+                currentPlan = null;
+                selectedAssetIds.clear();
+                batchRescuedDustIds.clear();
+                lastDustPlan = null;
+                renderEmptyScanState();
+              }
+              return;
+            }
+            const nextMultiAddrs =
+              targetFamily === 'cosmos' && next.addressesByChain
+                ? Array.from(new Set(Object.values(next.addressesByChain).filter(Boolean)))
+                : [];
+            const nextChainNote =
+              nextMultiAddrs.length > 1 ? ` · ${nextMultiAddrs.length} Cosmos chains` : '';
+            showToast(
+              `Switched ${next.walletName || targetFamily.toUpperCase()} account (${shortAddr(next.address)})${nextChainNote}`
+            );
+            if (activeFamily === targetFamily) {
+              const nextScanAddr = getScanAddressForSession(targetFamily, next.session || next);
+              if (nextScanAddr) {
+                runScan({ address: nextScanAddr, family: targetFamily, autoOpen: false });
+              }
+            }
+          },
+          onNetworkChanged: () => {
+            updateWalletButtons();
+          },
+        });
         closeWalletModal();
         updateWalletButtons();
         const multiAddrs =
-          activeFamily === 'cosmos' && res.addressesByChain
+          targetFamily === 'cosmos' && res.addressesByChain
             ? Array.from(new Set(Object.values(res.addressesByChain).filter(Boolean)))
             : [];
+        const totalCosmos = 6;
         const chainCountNote =
-          multiAddrs.length > 1 ? ` · ${multiAddrs.length} Cosmos chains` : '';
+          targetFamily === 'cosmos' && res.failedChains?.length
+            ? ` · ${multiAddrs.length}/${totalCosmos} Cosmos chains`
+            : multiAddrs.length > 1
+            ? ` · ${multiAddrs.length} Cosmos chains`
+            : '';
         showToast(`Connected ${res.walletName} (${shortAddr(res.address)})${chainCountNote}`);
         await runScan({
-          address: multiAddrs.length > 1 ? multiAddrs.join(',') : res.address,
-          family: activeFamily,
+          address: getScanAddressForSession(targetFamily, res),
+          family: targetFamily,
           autoOpen: true,
         });
       } catch (err) {
         walletModalConnecting = null;
         walletModalError = err?.message || 'Wallet connection cancelled.';
+        walletModalErrorAction = err?.installUrl
+          ? { label: `Install ${err.walletName || displayName} ↗`, url: err.installUrl }
+          : null;
         renderWalletModalContent();
         showToast(walletModalError);
       }
@@ -3912,6 +4047,7 @@ function openWalletModal(kind = 'evm') {
   refreshInstalledWallets();
   preloadWalletSdks();
   walletModalError = null;
+  walletModalErrorAction = null;
   walletModalConnecting = null;
   walletWcPromptOpen = false;
   activeWalletModalTab = kind;
