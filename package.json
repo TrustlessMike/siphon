@@ -1,7 +1,7 @@
 {
   "name": "siphon-migrator",
   "version": "0.1.0",
-  "description": "Multi-chain EVM dust, DeFi position & zero-liquidity token migrator into native Solana USDC via Circle CCTP",
+  "description": "Agentic multi-chain EVM-to-Solana migrator with EIP-5792 1-click batching, background settlement tracking, and 5-10% protocol fee vault",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server/index.ts",
