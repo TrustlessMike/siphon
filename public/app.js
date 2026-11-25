@@ -1,5 +1,5 @@
-import { mountSiphonFunnelScene } from './siphon-3d.js?v=4';
-import { renderConvergenceSvg } from './siphon-svg.js?v=4';
+import { mountSiphonFunnelScene } from './siphon-3d.js?v=5';
+import { renderConvergenceSvg } from './siphon-svg.js?v=5';
 import {
   connectCoinbaseSmartWallet,
   connectEvmWallet,
@@ -31,7 +31,7 @@ import {
   signGaslessTypedData,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
-} from './wallets.js?v=4';
+} from './wallets.js?v=5';
 
 let currentScan = null;
 let currentPlan = null;
@@ -51,6 +51,10 @@ let latestPreSignProof = null;
 let backgroundJobs = [];
 let activeJobId = null;
 let bgPollTimer = null;
+let unifiedWallets = []; // [{ address, label, family }]
+let agentMandates = [];
+let agentApprovals = [];
+let pluginSetupData = null;
 
 const FEE_RECIPIENT_STORAGE_KEY = 'siphon_fee_recipient_evm';
 
@@ -221,6 +225,7 @@ function switchView(viewName) {
     pane.classList.toggle('active', pane.id === `view-${viewName}`);
   });
   if (viewName === 'contract' && !contractData) loadContract();
+  if (viewName === 'agents') loadAgentsAndPlugins();
   renderBackgroundAgentUI();
 }
 
@@ -703,6 +708,14 @@ function renderAssetList() {
   const filtered = currentScan.assets.filter((a) => {
     if (activeChainFilter !== 'all' && a.chain !== activeChainFilter) return false;
     if (activeFilter === 'defi') return a.action === 'WITHDRAW_AND_BRIDGE';
+    if (activeFilter === 'dust')
+      return (
+        a.grossUsd > 0 &&
+        a.grossUsd <= 25 &&
+        a.kind !== 'defi_position' &&
+        a.action !== 'SKIP_HONEYPOT' &&
+        a.action !== 'BURN_ZERO_LIQUIDITY'
+      );
     if (activeFilter === 'liquid')
       return (
         (a.action === 'SELL_AND_BRIDGE' || a.action === 'BRIDGE_DIRECT_USDC') &&
@@ -744,6 +757,10 @@ function renderAssetList() {
         a.aaveDebtUsd > 0
           ? `<span class="micro-pill" style="background:var(--block-bg);border-color:#fecaca;color:#991b1b;">Debt Guard</span>`
           : '';
+      const walletTag =
+        currentScan?.unifiedWallets?.length > 1 && a.sourceWalletLabel
+          ? `<span class="micro-pill">${escapeHtml(a.sourceWalletLabel)}</span>`
+          : '';
 
       const rowTip = escapeHtml(formatRoiTooltip(a));
       return `
@@ -758,6 +775,7 @@ function renderAssetList() {
               <div class="asset-row-sym">
                 <span>${escapeHtml(a.symbol)}</span>
                 ${a.protocol ? `<span class="muted-xs" style="font-weight:400;">${escapeHtml(a.protocol)}</span>` : ''}
+                ${walletTag}
                 ${debtBadge}
               </div>
               <div class="asset-row-meta">${escapeHtml(a.name)} · ${escapeHtml(a.chainName)}</div>
@@ -2226,6 +2244,149 @@ function wireEvents() {
     });
   });
 
+  document.getElementById('selectDustBtn')?.addEventListener('click', selectConvertibleDust);
+
+  document.getElementById('toggleUnifyBarBtn')?.addEventListener('click', () => {
+    const bar = document.getElementById('unifiedWalletsBar');
+    if (!bar) return;
+    if (!unifiedWallets.length && currentScan?.walletAddress && !currentScan.walletAddress.includes(',')) {
+      unifiedWallets.push({
+        address: currentScan.walletAddress,
+        label: currentScan.walletLabel || shortAddr(currentScan.walletAddress),
+        family: currentScan.family || activeFamily,
+      });
+    }
+    bar.classList.toggle('hidden');
+    renderUnifiedWalletsBar();
+  });
+
+  document.getElementById('unifiedAddForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const addrIn = document.getElementById('unifiedWalletInput');
+    const lblIn = document.getElementById('unifiedWalletLabelInput');
+    const addr = addrIn?.value.trim();
+    if (!addr) return;
+    if (!unifiedWallets.length && currentScan?.walletAddress && !currentScan.walletAddress.includes(',')) {
+      unifiedWallets.push({
+        address: currentScan.walletAddress,
+        label: currentScan.walletLabel || shortAddr(currentScan.walletAddress),
+        family: currentScan.family || activeFamily,
+      });
+    }
+    if (!unifiedWallets.some((w) => w.address.toLowerCase() === addr.toLowerCase())) {
+      unifiedWallets.push({
+        address: addr,
+        label: lblIn?.value.trim() || shortAddr(addr),
+      });
+    }
+    if (addrIn) addrIn.value = '';
+    if (lblIn) lblIn.value = '';
+    await runUnifiedScan();
+  });
+
+  document.getElementById('createMandateForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const solDest = document.getElementById('solanaDestInput')?.value.trim();
+    const owner = getActiveSourceWallet()?.address || currentScan?.walletAddress?.split(',')[0] || '0x0000000000000000000000000000000000000001';
+    const actions = Array.from(document.querySelectorAll('input[name="mandateAction"]:checked')).map((el) => el.value);
+    if (!actions.length) {
+      showToast('Select at least one allowed action for the agent mandate.');
+      return;
+    }
+    try {
+      const created = await api('/api/agents/mandates', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: document.getElementById('mandateNameInput')?.value.trim(),
+          ownerAddress: owner,
+          lockedSolanaRecipient: solDest,
+          maxPerTxUsd: Number(document.getElementById('mandateMaxTxInput')?.value || 250),
+          dailyCapUsd: Number(document.getElementById('mandateDailyCapInput')?.value || 1000),
+          autoApproveUnderUsd: Number(document.getElementById('mandateAutoTierInput')?.value || 50),
+          allowedActions: actions,
+        }),
+      });
+      showToast(`Granted SiphonAgentVault mandate (${created.mandateId})`);
+      await loadAgentsAndPlugins();
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  document.getElementById('simulateAiProposalBtn')?.addEventListener('click', async () => {
+    const solDest = document.getElementById('solanaDestInput')?.value.trim();
+    const activeMandate = agentMandates.find((m) => m.active);
+    const gross = currentPlan?.totals?.grossUsd || 180;
+    const net = currentPlan?.totals?.netSolanaUsdc || 162;
+    const chains = currentPlan?.legs?.map((l) => l.chain) || ['base', 'arbitrum'];
+    try {
+      const req = await api('/api/agents/approvals', {
+        method: 'POST',
+        body: JSON.stringify({
+          client: 'claude_mcp',
+          mandateId: activeMandate?.mandateId,
+          actionType: 'dust_convert',
+          summary: `Claude MCP proposed batched dust & DeFi sweep across ${chains.length} chain(s) → Solana`,
+          sourceWallets: unifiedWallets.length ? unifiedWallets.map((w) => w.address) : [currentScan?.walletAddress || 'vitalik.eth'],
+          chains,
+          solanaDestination: solDest,
+          grossUsd: gross,
+          estimatedNetUsdc: net,
+          protocolFeeBps: getActiveProtocolFeeBps(),
+          assetIds: Array.from(selectedAssetIds),
+        }),
+      });
+      showToast(
+        req.status === 'auto_approved_by_mandate'
+          ? `Auto-approved within mandate (${req.approvalId})`
+          : `Permission request queued (${req.approvalId}) — approve or reject below`
+      );
+      await loadAgentsAndPlugins();
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  document.getElementById('copyClaudeMcpBtn')?.addEventListener('click', async () => {
+    if (!pluginSetupData?.claudeDesktopConfig) return;
+    await navigator.clipboard?.writeText(JSON.stringify(pluginSetupData.claudeDesktopConfig, null, 2)).catch(() => {});
+    showToast('Copied Claude Desktop MCP config JSON.');
+  });
+
+  document.getElementById('copyChatgptUrlBtn')?.addEventListener('click', async () => {
+    if (!pluginSetupData?.chatgptOpenApiUrl) return;
+    await navigator.clipboard?.writeText(pluginSetupData.chatgptOpenApiUrl).catch(() => {});
+    showToast('Copied ChatGPT OpenAPI 3.1 URL.');
+  });
+
+  document.getElementById('issueGptTokenBtn')?.addEventListener('click', async () => {
+    try {
+      const issued = await api('/api/plugin/tokens', {
+        method: 'POST',
+        body: JSON.stringify({ label: 'ChatGPT Custom GPT Action', client: 'chatgpt_action' }),
+      });
+      await navigator.clipboard?.writeText(issued.token).catch(() => {});
+      showToast(`Generated & copied ChatGPT token (${issued.record.tokenPreview})`);
+      await loadAgentsAndPlugins();
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  document.getElementById('issueMcpTokenBtn')?.addEventListener('click', async () => {
+    try {
+      const issued = await api('/api/plugin/tokens', {
+        method: 'POST',
+        body: JSON.stringify({ label: 'Claude MCP HTTP Bearer', client: 'claude_mcp' }),
+      });
+      await navigator.clipboard?.writeText(issued.token).catch(() => {});
+      showToast(`Generated & copied Claude MCP token (${issued.record.tokenPreview})`);
+      await loadAgentsAndPlugins();
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
   document.getElementById('selectProfitableBtn').addEventListener('click', () => {
     selectedAssetIds = new Set(currentScan.assets.filter((a) => a.selectedByDefault).map((a) => a.id));
     recomputePlan();
@@ -2302,6 +2463,284 @@ loadWalletConnectorConfig().then((cfg) => {
   }
   setTimeout(() => preloadWalletSdks(), 600);
   syncBackgroundJobs();
+  loadAgentsAndPlugins();
 });
 heroScene = mountSiphonFunnelScene(document.getElementById('siphonHeroCanvas'));
 runScan({ presetId: 'vitalik_live', autoOpen: false });
+
+async function runUnifiedScan() {
+  if (!unifiedWallets.length) return;
+  const btn = document.getElementById('unifiedAddSubmitBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Unifying…';
+  }
+  try {
+    const scan = await api('/api/scan/unified', {
+      method: 'POST',
+      body: JSON.stringify({
+        wallets: unifiedWallets,
+        hasSolanaUsdcAta: solanaBalances ? Boolean(solanaBalances.hasUsdcAta) : undefined,
+      }),
+    });
+    currentScan = scan;
+    activeChainFilter = 'all';
+    selectedAssetIds = new Set(scan.assets.filter((a) => a.selectedByDefault).map((a) => a.id));
+    renderUnifiedWalletsBar();
+    await recomputePlan();
+    showToast(`Unified ${scan.unifiedWallets?.length || unifiedWallets.length} wallets across ${scan.chains.filter((c) => c.assetCount > 0).length} active chains.`);
+  } catch (err) {
+    showToast(err.message);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Add & Unify';
+    }
+  }
+}
+
+function renderUnifiedWalletsBar() {
+  const pillsHost = document.getElementById('unifiedWalletPills');
+  if (!pillsHost) return;
+  const summaries = currentScan?.unifiedWallets || [];
+  if (!unifiedWallets.length) {
+    pillsHost.innerHTML = `<span class="muted-xs">Add 2+ wallets (EVM, Cosmos, Sui, Aptos, TON, Tron, Bitcoin) to consolidate them into one Solana sweep.</span>`;
+    return;
+  }
+  pillsHost.innerHTML = unifiedWallets
+    .map((w, idx) => {
+      const s = summaries.find((u) => u.address.toLowerCase() === w.address.toLowerCase());
+      const usdTag = s ? ` · ${fmtUsd(s.grossUsd)}` : '';
+      return `
+        <span class="unified-wallet-pill mono">
+          <span>${escapeHtml(w.label || shortAddr(w.address))}${escapeHtml(usdTag)}</span>
+          <button type="button" class="unified-wallet-remove" data-remove-unified="${idx}" aria-label="Remove wallet">×</button>
+        </span>
+      `;
+    })
+    .join('');
+
+  pillsHost.querySelectorAll('[data-remove-unified]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const idx = Number(btn.dataset.removeUnified);
+      unifiedWallets.splice(idx, 1);
+      renderUnifiedWalletsBar();
+      if (unifiedWallets.length >= 1) {
+        await runUnifiedScan();
+      }
+    });
+  });
+}
+
+async function selectConvertibleDust() {
+  if (!currentScan) return;
+  try {
+    const dustPlan = await api('/api/dust/plan', {
+      method: 'POST',
+      body: JSON.stringify({
+        scan: currentScan,
+        maxDustThresholdUsd: 25,
+        protocolFeeBps: getActiveProtocolFeeBps(),
+        hasSolanaUsdcAta: solanaBalances ? Boolean(solanaBalances.hasUsdcAta) : undefined,
+      }),
+    });
+    if (!dustPlan.convertibleAssetIds.length) {
+      showToast(`Found ${dustPlan.totalDustAssetsFound} dust tokens — none are net-positive after fees/gas (negative-ROI protected).`);
+      return;
+    }
+    selectedAssetIds = new Set(dustPlan.convertibleAssetIds);
+    activeFilter = 'dust';
+    document.querySelectorAll('.filter-pill').forEach((b) => b.classList.toggle('active', b.dataset.filter === 'dust'));
+    await recomputePlan();
+    showToast(
+      `Selected ${dustPlan.convertibleCount} convertible dust tokens (est. $${dustPlan.estimatedNetSolanaUsdc.toFixed(2)} USDC · +$${dustPlan.totalBatchRescueGainUsd.toFixed(2)} batch rescue gain).`
+    );
+  } catch (err) {
+    showToast(err.message);
+  }
+}
+
+async function loadAgentsAndPlugins() {
+  try {
+    const [mRes, aRes, pRes] = await Promise.all([
+      api('/api/agents/mandates'),
+      api('/api/agents/approvals'),
+      api('/api/plugin/setup'),
+    ]);
+    agentMandates = mRes.mandates || [];
+    agentApprovals = aRes.approvals || [];
+    pluginSetupData = pRes;
+    renderAgentsAndPlugins();
+  } catch {
+    // non-fatal during initial boot
+  }
+}
+
+function renderAgentsAndPlugins() {
+  const pendingCount = agentApprovals.filter((a) => a.status === 'pending_approval').length;
+  const tabCountEl = document.getElementById('tabApprovalCount');
+  if (tabCountEl) {
+    tabCountEl.textContent = String(pendingCount);
+    tabCountEl.classList.toggle('muted', pendingCount === 0);
+  }
+  const metaEl = document.getElementById('approvalsCountMeta');
+  if (metaEl) metaEl.textContent = `${pendingCount} pending · ${agentApprovals.length} total`;
+
+  const destNote = document.getElementById('mandateLockedDestNote');
+  const solDest = document.getElementById('solanaDestInput')?.value.trim();
+  if (destNote && solDest) {
+    destNote.textContent = `Immutably locks destination → ${shortAddr(solDest)}`;
+  }
+
+  const approvalsHost = document.getElementById('agentApprovalsHost');
+  if (approvalsHost) {
+    if (!agentApprovals.length) {
+      approvalsHost.innerHTML = `<div class="muted-xs" style="padding:10px 0;">No permission requests yet. Connect Claude MCP or ChatGPT Actions — or click "Test AI Permission Request" above to preview the approval flow.</div>`;
+    } else {
+      approvalsHost.innerHTML = agentApprovals
+        .map((req) => {
+          const isPending = req.status === 'pending_approval';
+          const isApproved = req.status === 'approved' || req.status === 'auto_approved_by_mandate';
+          const badgeClass = isPending ? 'roi-low' : isApproved ? 'roi-worth' : 'roi-neg';
+          const clientLabel =
+            req.client === 'claude_mcp'
+              ? 'Claude MCP'
+              : req.client === 'chatgpt_action'
+              ? 'ChatGPT Action'
+              : 'Smart-Contract Agent';
+          return `
+            <div class="approval-card ${isPending ? 'is-pending' : isApproved ? 'is-approved' : ''}">
+              <div class="approval-card-head">
+                <div>
+                  <strong>${escapeHtml(req.summary)}</strong>
+                  <div class="muted-xs mono">${escapeHtml(clientLabel)} · ${escapeHtml(req.actionType)} · ${escapeHtml(req.chains.join(', ') || 'multi-chain')}</div>
+                </div>
+                <span class="roi-pill ${badgeClass}">${escapeHtml(req.status.replaceAll('_', ' '))}</span>
+              </div>
+              <div class="muted-xs mono">Gross $${Number(req.grossUsd).toFixed(2)} → Est. $${Number(req.estimatedNetUsdc).toFixed(2)} USDC · Dest ${escapeHtml(shortAddr(req.solanaDestination))} · Digest ${escapeHtml(shortAddr(req.requestDigestSha256))}</div>
+              <div class="muted-xs">${escapeHtml(req.decisionReason || '')}</div>
+              ${
+                isPending
+                  ? `<div class="btn-row" style="margin-top:4px;">
+                      <button type="button" class="btn-pill-dark btn-sm" data-decide-approval="${escapeHtml(req.approvalId)}" data-decision="approve">Approve Permission</button>
+                      <button type="button" class="btn-outline-sm" data-decide-approval="${escapeHtml(req.approvalId)}" data-decision="reject">Reject</button>
+                    </div>`
+                  : ''
+              }
+            </div>
+          `;
+        })
+        .join('');
+
+      approvalsHost.querySelectorAll('[data-decide-approval]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          try {
+            await api(`/api/agents/approvals/${encodeURIComponent(btn.dataset.decideApproval)}/decide`, {
+              method: 'POST',
+              body: JSON.stringify({ decision: btn.dataset.decision }),
+            });
+            showToast(btn.dataset.decision === 'approve' ? 'Permission approved.' : 'Permission rejected.');
+            await loadAgentsAndPlugins();
+          } catch (err) {
+            showToast(err.message);
+          }
+        });
+      });
+    }
+  }
+
+  const mandatesHost = document.getElementById('agentMandatesHost');
+  if (mandatesHost) {
+    if (!agentMandates.length) {
+      mandatesHost.innerHTML = `<div class="muted-xs">No active smart-contract agent mandates yet. Grant one above to set an immutable Solana destination and daily USD cap.</div>`;
+    } else {
+      mandatesHost.innerHTML = agentMandates
+        .map(
+          (m) => `
+          <div class="mandate-card">
+            <div class="approval-card-head">
+              <div>
+                <strong>${escapeHtml(m.name)}</strong>
+                <div class="muted-xs mono">${escapeHtml(m.mandateId)} · Locked → ${escapeHtml(shortAddr(m.lockedSolanaRecipient))}</div>
+              </div>
+              <span class="roi-pill ${m.active ? 'roi-worth' : 'roi-neg'}">${m.active ? 'Active' : 'Revoked'}</span>
+            </div>
+            <div class="muted-xs mono">Caps: $${m.maxPerTxUsd}/tx · $${m.remainingDailyUsd}/$${m.dailyCapUsd} daily left · Auto <= $${m.autoApproveUnderUsd} · Actions: ${escapeHtml(m.allowedActions.join(', '))}</div>
+            ${
+              m.active
+                ? `<div><button type="button" class="btn-outline-sm" data-revoke-mandate="${escapeHtml(m.mandateId)}">Revoke Mandate</button></div>`
+                : ''
+            }
+          </div>
+        `
+        )
+        .join('');
+
+      mandatesHost.querySelectorAll('[data-revoke-mandate]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          await api(`/api/agents/mandates/${encodeURIComponent(btn.dataset.revokeMandate)}/revoke`, {
+            method: 'POST',
+          });
+          showToast('Mandate revoked immediately.');
+          await loadAgentsAndPlugins();
+        });
+      });
+    }
+  }
+
+  if (pluginSetupData) {
+    const claudeHost = document.getElementById('claudeMcpConfigHost');
+    if (claudeHost) claudeHost.textContent = JSON.stringify(pluginSetupData.claudeDesktopConfig, null, 2);
+    const cmdHost = document.getElementById('claudeCodeCmdHost');
+    if (cmdHost) cmdHost.textContent = `Claude Code CLI: ${pluginSetupData.claudeCodeCommand}`;
+    const gptHost = document.getElementById('chatgptPluginHost');
+    if (gptHost) {
+      gptHost.textContent = JSON.stringify(
+        {
+          manifest: pluginSetupData.chatgptPluginManifestUrl,
+          openApiSpec: pluginSetupData.chatgptOpenApiUrl,
+          mcpHttp: pluginSetupData.mcpHttpEndpoint,
+          auth: 'Bearer <generated token>',
+        },
+        null,
+        2
+      );
+    }
+
+    const tokHost = document.getElementById('pluginTokensHost');
+    if (tokHost) {
+      const toks = pluginSetupData.tokens || [];
+      tokHost.innerHTML = toks.length
+        ? toks
+            .map(
+              (t) => `
+              <div class="mandate-card">
+                <div class="approval-card-head">
+                  <div>
+                    <strong>${escapeHtml(t.label)}</strong>
+                    <div class="muted-xs mono">${escapeHtml(t.tokenPreview)} · Scopes: ${escapeHtml(t.scopes.join(', '))}</div>
+                  </div>
+                  ${
+                    t.revoked
+                      ? `<span class="roi-pill roi-neg">Revoked</span>`
+                      : `<button type="button" class="btn-outline-sm" data-revoke-token="${escapeHtml(t.tokenId)}">Revoke</button>`
+                  }
+                </div>
+              </div>
+            `
+            )
+            .join('')
+        : `<div class="muted-xs">No scoped AI plugin tokens issued yet.</div>`;
+
+      tokHost.querySelectorAll('[data-revoke-token]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          await api(`/api/plugin/tokens/${encodeURIComponent(btn.dataset.revokeToken)}/revoke`, {
+            method: 'POST',
+          });
+          showToast('AI plugin token revoked.');
+          await loadAgentsAndPlugins();
+        });
+      });
+    }
+  }
+}

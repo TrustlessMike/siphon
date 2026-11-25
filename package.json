@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/server/index.ts",
     "start": "node dist/src/server/index.js",
+    "mcp": "node dist/src/mcp/server.js",
     "build:vendor": "esbuild src/client/wallet-sdks.ts --bundle --format=esm --platform=browser --target=es2022 --minify --define:global=globalThis --define:process.env.NODE_ENV='\"production\"' --outfile=dist/vendor/wallet-sdks.js",
     "build": "tsc && npm run build:vendor",
     "typecheck": "tsc --noEmit",

@@ -35,6 +35,19 @@ import {
 } from '../scanner/chains.js';
 import { scanLiveWallet, scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
 import { fetchSolanaWalletBalances, getL2IndexerProvider } from '../scanner/discovery.js';
+import {
+  SiphonAgentEngine,
+  type AgentActionType,
+  type PluginClientKind,
+} from '../agent/mandate-engine.js';
+import {
+  buildAiPluginManifest,
+  buildOpenApiSpec,
+  buildPluginSetupGuide,
+} from '../agent/plugin-spec.js';
+import { handleMcpJsonRpc } from '../mcp/server.js';
+import { planDustConversion } from '../scanner/dust.js';
+import { scanUnifiedWallets, type UnifiedWalletInput } from '../scanner/unify.js';
 import { evaluatePortfolioRoi } from '../scanner/roi.js';
 import type { AnyChainId, ChainFamily, EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
 import { BackgroundJobStore, type JobLegStatus } from './jobs.js';
@@ -101,6 +114,9 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   });
   res.end(JSON.stringify(payload));
 }
@@ -163,11 +179,23 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
 export function createSiphonServer() {
   const scanCache = new Map<string, ScanReport>();
   const jobStore = new BackgroundJobStore();
+  const agentEngine = new SiphonAgentEngine();
 
   const server = http.createServer(async (req, res) => {
     const method = req.method ?? 'GET';
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     const pathname = url.pathname;
+    const baseUrl = `${url.protocol}//${url.host}`;
+
+    if (method === 'OPTIONS') {
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      });
+      res.end();
+      return;
+    }
 
     try {
       if (method === 'GET' && pathname === '/api/health') {
@@ -242,9 +270,11 @@ export function createSiphonServer() {
         const routerPath = path.join(CONTRACTS_DIR, 'SiphonRouter.sol');
         const feeVaultPath = path.join(CONTRACTS_DIR, 'SiphonFeeVault.sol');
         const delegatePath = path.join(CONTRACTS_DIR, 'SiphonSweepDelegate.sol');
+        const agentVaultPath = path.join(CONTRACTS_DIR, 'SiphonAgentVault.sol');
         const source = fs.existsSync(routerPath) ? fs.readFileSync(routerPath, 'utf8') : '';
         const feeVaultSource = fs.existsSync(feeVaultPath) ? fs.readFileSync(feeVaultPath, 'utf8') : '';
         const delegateSource = fs.existsSync(delegatePath) ? fs.readFileSync(delegatePath, 'utf8') : '';
+        const agentVaultSource = fs.existsSync(agentVaultPath) ? fs.readFileSync(agentVaultPath, 'utf8') : '';
         const protocolFee = getProtocolFeeConfig();
         return sendJson(res, 200, {
           name: 'SiphonRouter.sol',
@@ -256,9 +286,11 @@ export function createSiphonServer() {
           source,
           feeVaultSource,
           delegateSource,
+          agentVaultSource,
           contracts: [
             { id: 'router', filename: 'contracts/SiphonRouter.sol', title: 'SiphonRouter.sol', source },
             { id: 'delegate', filename: 'contracts/SiphonSweepDelegate.sol', title: 'SiphonSweepDelegate.sol (EIP-7702)', source: delegateSource },
+            { id: 'agent', filename: 'contracts/SiphonAgentVault.sol', title: 'SiphonAgentVault.sol (Agents)', source: agentVaultSource },
             { id: 'vault', filename: 'contracts/SiphonFeeVault.sol', title: 'SiphonFeeVault.sol', source: feeVaultSource },
           ],
           chains: CHAIN_LIST.map((c) => ({
@@ -269,6 +301,222 @@ export function createSiphonServer() {
             tokenMessenger: c.cctpTokenMessenger,
           })),
         });
+      }
+
+      if (method === 'POST' && pathname === '/api/scan/unified') {
+        const body = await readJsonBody<{
+          wallets?: UnifiedWalletInput[];
+          hasSolanaUsdcAta?: boolean;
+        }>(req);
+        if (!Array.isArray(body.wallets) || !body.wallets.length) {
+          return sendJson(res, 400, { error: 'wallets[] array with at least one wallet is required.' });
+        }
+        const report = await scanUnifiedWallets({
+          wallets: body.wallets,
+          hasSolanaUsdcAta: body.hasSolanaUsdcAta,
+        });
+        scanCache.set(report.scanId, report);
+        if (scanCache.size > 40) {
+          const firstKey = scanCache.keys().next().value;
+          if (firstKey) scanCache.delete(firstKey);
+        }
+        return sendJson(res, 200, report);
+      }
+
+      if (method === 'POST' && pathname === '/api/dust/plan') {
+        const body = await readJsonBody<{
+          scanId?: string;
+          scan?: ScanReport;
+          maxDustThresholdUsd?: number;
+          protocolFeeBps?: number;
+          hasSolanaUsdcAta?: boolean;
+        }>(req);
+        const scan = body.scan ?? (body.scanId ? scanCache.get(body.scanId) : undefined);
+        if (!scan) {
+          return sendJson(res, 400, { error: 'Valid scan or scanId is required' });
+        }
+        return sendJson(
+          res,
+          200,
+          planDustConversion({
+            scan,
+            maxDustThresholdUsd: body.maxDustThresholdUsd,
+            protocolFeeBps: body.protocolFeeBps,
+            hasSolanaUsdcAta: body.hasSolanaUsdcAta,
+          })
+        );
+      }
+
+      // ================= SMART-CONTRACT AGENTS & PERMISSION GATE =================
+      if (method === 'GET' && pathname === '/api/agents/mandates') {
+        return sendJson(res, 200, { mandates: agentEngine.listMandates() });
+      }
+
+      if (method === 'POST' && pathname === '/api/agents/mandates') {
+        const body = await readJsonBody<{
+          name?: string;
+          ownerAddress?: string;
+          agentKey?: string;
+          lockedSolanaRecipient?: string;
+          maxPerTxUsd?: number;
+          dailyCapUsd?: number;
+          autoApproveUnderUsd?: number;
+          durationDays?: number;
+          maxFeeBps?: number;
+          minNetOutBps?: number;
+          allowedActions?: AgentActionType[];
+        }>(req);
+        if (!body.ownerAddress || !body.lockedSolanaRecipient) {
+          return sendJson(res, 400, { error: 'ownerAddress and lockedSolanaRecipient are required.' });
+        }
+        try {
+          const mandate = agentEngine.createMandate({
+            name: body.name,
+            ownerAddress: body.ownerAddress,
+            agentKey: body.agentKey,
+            lockedSolanaRecipient: body.lockedSolanaRecipient,
+            maxPerTxUsd: body.maxPerTxUsd,
+            dailyCapUsd: body.dailyCapUsd,
+            autoApproveUnderUsd: body.autoApproveUnderUsd,
+            durationDays: body.durationDays,
+            maxFeeBps: body.maxFeeBps,
+            minNetOutBps: body.minNetOutBps,
+            allowedActions: body.allowedActions,
+          });
+          return sendJson(res, 200, mandate);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Invalid agent mandate parameters',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname.startsWith('/api/agents/mandates/') && pathname.endsWith('/revoke')) {
+        const mandateId = pathname.slice('/api/agents/mandates/'.length, -'/revoke'.length);
+        const revoked = agentEngine.revokeMandate(mandateId);
+        if (!revoked) return sendJson(res, 404, { error: 'Agent mandate not found' });
+        return sendJson(res, 200, revoked);
+      }
+
+      if (method === 'GET' && pathname === '/api/agents/approvals') {
+        return sendJson(res, 200, { approvals: agentEngine.listApprovals() });
+      }
+
+      if (method === 'POST' && pathname === '/api/agents/approvals') {
+        const authHeader = req.headers.authorization;
+        const verifiedToken = authHeader ? agentEngine.verifyPluginToken(authHeader) : null;
+        if (authHeader && !verifiedToken) {
+          return sendJson(res, 401, { error: 'Invalid or revoked Siphon AI Plugin Bearer token.' });
+        }
+
+        const body = await readJsonBody<{
+          client?: PluginClientKind;
+          mandateId?: string;
+          actionType?: AgentActionType;
+          summary?: string;
+          sourceWallets?: string[];
+          chains?: AnyChainId[];
+          solanaDestination?: string;
+          grossUsd?: number;
+          estimatedNetUsdc?: number;
+          protocolFeeBps?: number;
+          assetIds?: string[];
+        }>(req);
+
+        if (!body.actionType || !body.solanaDestination) {
+          return sendJson(res, 400, { error: 'actionType and solanaDestination are required.' });
+        }
+        try {
+          const approval = agentEngine.requestPermission({
+            client: verifiedToken?.client ?? body.client ?? 'smart_contract_agent',
+            mandateId: body.mandateId,
+            actionType: body.actionType,
+            summary: body.summary || `Permission request (${body.actionType})`,
+            sourceWallets: Array.isArray(body.sourceWallets) ? body.sourceWallets : [],
+            chains: Array.isArray(body.chains) ? body.chains : [],
+            solanaDestination: body.solanaDestination,
+            grossUsd: Number(body.grossUsd ?? 0),
+            estimatedNetUsdc: Number(body.estimatedNetUsdc ?? 0),
+            protocolFeeBps: body.protocolFeeBps,
+            assetIds: body.assetIds,
+          });
+          return sendJson(res, 200, approval);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Could not create permission request',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname.startsWith('/api/agents/approvals/') && pathname.endsWith('/decide')) {
+        const approvalId = pathname.slice('/api/agents/approvals/'.length, -'/decide'.length);
+        const body = await readJsonBody<{ decision?: 'approve' | 'reject'; reason?: string }>(req);
+        if (body.decision !== 'approve' && body.decision !== 'reject') {
+          return sendJson(res, 400, { error: "decision must be 'approve' or 'reject'" });
+        }
+        const decided = agentEngine.decideApproval({
+          approvalId,
+          decision: body.decision,
+          reason: body.reason,
+        });
+        if (!decided) return sendJson(res, 404, { error: 'Permission request not found' });
+        return sendJson(res, 200, decided);
+      }
+
+      // ================= CLAUDE MCP & CHATGPT ACTION PLUGIN =================
+      if (method === 'GET' && pathname === '/.well-known/ai-plugin.json') {
+        return sendJson(res, 200, buildAiPluginManifest(baseUrl));
+      }
+
+      if (method === 'GET' && pathname === '/openapi.json') {
+        return sendJson(res, 200, buildOpenApiSpec(baseUrl));
+      }
+
+      if (method === 'GET' && pathname === '/api/plugin/setup') {
+        return sendJson(res, 200, {
+          ...buildPluginSetupGuide({ baseUrl, rootDir: ROOT_DIR }),
+          tokens: agentEngine.listPluginTokens(),
+        });
+      }
+
+      if (method === 'POST' && pathname === '/api/plugin/tokens') {
+        const body = await readJsonBody<{
+          label?: string;
+          client?: 'claude_mcp' | 'chatgpt_action';
+          scopes?: string[];
+        }>(req);
+        const issued = agentEngine.issuePluginToken({
+          label: body.label || 'AI Assistant Token',
+          client: body.client === 'chatgpt_action' ? 'chatgpt_action' : 'claude_mcp',
+          scopes: body.scopes,
+        });
+        return sendJson(res, 200, issued);
+      }
+
+      if (method === 'POST' && pathname.startsWith('/api/plugin/tokens/') && pathname.endsWith('/revoke')) {
+        const tokenId = pathname.slice('/api/plugin/tokens/'.length, -'/revoke'.length);
+        const revoked = agentEngine.revokePluginToken(tokenId);
+        if (!revoked) return sendJson(res, 404, { error: 'Plugin token not found' });
+        return sendJson(res, 200, revoked);
+      }
+
+      if (method === 'POST' && pathname === '/mcp') {
+        const authHeader = req.headers.authorization;
+        if (authHeader && !agentEngine.verifyPluginToken(authHeader)) {
+          return sendJson(res, 401, {
+            jsonrpc: '2.0',
+            id: null,
+            error: { code: -32001, message: 'Invalid or revoked Siphon MCP Bearer token.' },
+          });
+        }
+        const rpcReq = await readJsonBody<{
+          jsonrpc?: string;
+          id?: string | number | null;
+          method?: string;
+          params?: Record<string, unknown>;
+        }>(req);
+        const rpcRes = await handleMcpJsonRpc(rpcReq, { agentEngine, scanCache });
+        return sendJson(res, 200, rpcRes);
       }
 
       if (method === 'POST' && pathname === '/api/scan') {

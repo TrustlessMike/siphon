@@ -312,17 +312,26 @@ def main():
             assert sendCallsD[0]["params"][0]["chainId"] == "0x2105"
             maybe_shot(pgD, "goal_desktop_pipeline_1440.png", full_page=True)
 
-            # Verify Contract switcher toggles between SiphonRouter.sol, SiphonSweepDelegate.sol & SiphonFeeVault.sol
-            for view in ["scanner", "activity", "contract"]:
+            # Verify Contract switcher toggles between SiphonRouter.sol, SiphonSweepDelegate.sol, SiphonAgentVault.sol & SiphonFeeVault.sol + Agents & AI tab
+            for view in ["scanner", "activity", "agents", "contract"]:
                 pgD.click(f".app-tab[data-view='{view}']")
                 pgD.wait_for_timeout(250)
                 overflowD[view] = pgD.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
                 if view == "activity":
                     maybe_shot(pgD, "goal_desktop_burns_1440.png", full_page=True)
+                elif view == "agents":
+                    pgD.wait_for_function("() => (document.querySelector('#claudeMcpConfigHost')?.innerText || '').includes('siphon')", timeout=5000)
+                    pgD.click("#simulateAiProposalBtn")
+                    pgD.wait_for_function("() => (document.querySelector('#agentApprovalsHost')?.innerText || '').includes('Approve Permission')", timeout=5000)
+                    pgD.click("[data-decision='approve']")
+                    pgD.wait_for_function("() => (document.querySelector('#agentApprovalsHost')?.innerText || '').includes('approved')", timeout=5000)
+                    maybe_shot(pgD, "goal_desktop_agents_1440.png", full_page=True)
                 elif view == "contract":
                     pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonRouter')", timeout=5000)
                     pgD.click(".contract-tab[data-contract-id='delegate']")
                     pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonSweepDelegate')", timeout=5000)
+                    pgD.click(".contract-tab[data-contract-id='agent']")
+                    pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonAgentVault')", timeout=5000)
                     pgD.click(".contract-tab[data-contract-id='vault']")
                     pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonFeeVault')", timeout=5000)
                     pgD.click(".contract-tab[data-contract-id='router']")
@@ -445,7 +454,7 @@ def main():
             pgM.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=15000)
             pgM.wait_for_timeout(300)
 
-            for view in ["scanner", "activity", "contract"]:
+            for view in ["scanner", "activity", "agents", "contract"]:
                 pgM.click(f".app-tab[data-view='{view}']")
                 pgM.wait_for_timeout(250)
                 overflowM[view] = pgM.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")

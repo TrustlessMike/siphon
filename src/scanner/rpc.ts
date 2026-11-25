@@ -112,6 +112,34 @@ export async function evmJsonRpcBatch(
       const parsed = await res.json();
       const arr = Array.isArray(parsed) ? parsed : [parsed];
       if (!arr.length || (arr.length === 1 && !arr[0]?.result && arr[0]?.error && requests.length > 1)) {
+        // Some public RPCs disable JSON-RPC batch arrays — fall back to parallel single calls on this endpoint
+        try {
+          const singles = await Promise.all(
+            requests.map(async (r) => {
+              const c2 = new AbortController();
+              const t2 = setTimeout(() => c2.abort(), timeoutMs);
+              try {
+                const sRes = await fetch(rpcUrl, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ jsonrpc: '2.0', ...r }),
+                  signal: c2.signal,
+                });
+                clearTimeout(t2);
+                if (!sRes.ok) return { id: r.id, error: { message: `HTTP ${sRes.status}` } };
+                return (await sRes.json()) as { id: number; result?: string; error?: { message: string; code?: number } };
+              } catch (e2) {
+                clearTimeout(t2);
+                return { id: r.id, error: { message: e2 instanceof Error ? e2.message : String(e2) } };
+              }
+            })
+          );
+          if (singles.some((s) => s.result !== undefined)) {
+            return singles;
+          }
+        } catch {
+          // continue to next RPC
+        }
         lastErr = new Error(arr[0]?.error?.message ?? 'Empty batch response');
         continue;
       }

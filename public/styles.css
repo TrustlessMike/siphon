@@ -2523,3 +2523,163 @@ select {
   border-radius: 7px;
   padding: 5px 9px;
 }
+
+/* Multi-Wallet Unification Strip */
+.unified-wallets-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+
+.unified-pills-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.unified-wallet-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-paper);
+  font-size: 11.5px;
+  color: var(--ink-0);
+}
+
+.unified-wallet-remove {
+  border: none;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.unified-wallet-remove:hover {
+  color: #991b1b;
+}
+
+.unified-add-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.unified-add-form .field-input-xs {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+/* Agents & AI Plugins View */
+.agents-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.agents-col {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.agents-card {
+  padding: 18px;
+}
+
+.agents-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.approval-card,
+.mandate-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-paper);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.approval-card.is-pending {
+  border-color: #fcd34d;
+  background: #fffbeb;
+}
+
+.approval-card.is-approved {
+  border-color: #a7f3d0;
+  background: #f0fdf4;
+}
+
+.approval-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.mandate-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mandate-form-row {
+  display: grid;
+  grid-template-columns: 1.5fr 0.7fr 0.7fr 0.7fr;
+  gap: 8px;
+}
+
+.mandate-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  font-size: 12px;
+}
+
+.mandate-form-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.plugin-code-box {
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-x: auto;
+  max-width: 100%;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (max-width: 900px) {
+  .agents-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .mandate-form-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

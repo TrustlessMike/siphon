@@ -15,7 +15,7 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=4" />
+    <link rel="stylesheet" href="/styles.css?v=5" />
   </head>
   <body>
     <!-- =============================================================== -->
@@ -168,6 +168,10 @@
               Activity
               <span class="tab-count muted" id="tabBurnCount">0</span>
             </button>
+            <button type="button" class="app-tab" data-view="agents" role="tab">
+              Agents &amp; AI
+              <span class="tab-count muted" id="tabApprovalCount">0</span>
+            </button>
             <button type="button" class="app-tab" data-view="contract" role="tab">Contracts</button>
           </nav>
 
@@ -237,6 +241,7 @@
                 />
               </div>
               <button type="submit" class="btn-outline-sm" id="appScanBtn">Scan</button>
+              <button type="button" class="btn-outline-sm" id="toggleUnifyBarBtn">+ Unify Wallet</button>
               <div class="source-presets" id="sourcePresetsBar">
                 <button type="button" class="text-action" data-preset="vitalik_live">vitalik.eth</button>
                 <span class="sep-dot">·</span>
@@ -244,6 +249,29 @@
               </div>
             </form>
             <div class="source-strip-summary mono" id="sourceSummaryText">Scanning 14 EVM chains…</div>
+          </div>
+
+          <!-- Multi-Wallet Unification Strip (Combine multiple EVM + Cosmos + Sui + BTC wallets into 1 sweep) -->
+          <div class="unified-wallets-bar hidden" id="unifiedWalletsBar">
+            <div class="unified-pills-row" id="unifiedWalletPills"></div>
+            <form class="unified-add-form" id="unifiedAddForm">
+              <input
+                type="text"
+                id="unifiedWalletInput"
+                class="field-input-xs mono"
+                placeholder="Add another 0x…, cosmos1…, bc1…, EQ…, T… wallet to unify"
+                aria-label="Additional wallet address to unify"
+              />
+              <input
+                type="text"
+                id="unifiedWalletLabelInput"
+                class="field-input-xs"
+                placeholder="Label (e.g. Hardware, Keplr)"
+                aria-label="Wallet label"
+                style="max-width:165px;"
+              />
+              <button type="submit" class="btn-pill-dark btn-sm" id="unifiedAddSubmitBtn">Add &amp; Unify</button>
+            </form>
           </div>
 
           <!-- 2-Column Calm Workspace -->
@@ -259,12 +287,15 @@
                   <div class="filter-tabs" role="group" aria-label="Filter assets by type">
                     <button type="button" class="filter-pill active" data-filter="all">All</button>
                     <button type="button" class="filter-pill" data-filter="liquid">Worth It</button>
+                    <button type="button" class="filter-pill" data-filter="dust">Dust Rescue</button>
                     <button type="button" class="filter-pill" data-filter="low_efficiency">High Cost</button>
                     <button type="button" class="filter-pill" data-filter="defi">DeFi</button>
                     <button type="button" class="filter-pill" data-filter="burn">Dead Burns</button>
                     <button type="button" class="filter-pill" data-filter="skipped">Blocked / Neg ROI</button>
                   </div>
                   <div class="btn-row">
+                    <button type="button" class="text-action" id="selectDustBtn">Convert dust</button>
+                    <span class="sep-dot">·</span>
                     <button type="button" class="text-action" id="selectProfitableBtn">Select all</button>
                     <span class="sep-dot">·</span>
                     <button type="button" class="text-action muted" id="clearSelectionBtn">Clear</button>
@@ -516,18 +547,102 @@
         </section>
 
         <!-- ======================================================= -->
-        <!-- VIEW 3: SMART CONTRACTS & TREASURY FEE VAULT            -->
+        <!-- VIEW 3: SMART-CONTRACT AGENTS & AI PLUGINS (CLAUDE/GPT) -->
+        <!-- ======================================================= -->
+        <section class="view-pane" id="view-agents">
+          <div class="view-header">
+            <div>
+              <h1>Smart-Contract Agents &amp; AI Plugins</h1>
+              <p>Authorize policy-bounded autonomous dust &amp; DeFi agents (SiphonAgentVault.sol) and connect Claude (MCP) or ChatGPT (Actions) with human-in-the-loop permission approvals.</p>
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn-outline-sm" id="simulateAiProposalBtn">Test AI Permission Request</button>
+            </div>
+          </div>
+
+          <div class="agents-grid">
+            <!-- LEFT: Permission Gate Approvals + Smart-Contract Mandates -->
+            <div class="agents-col">
+              <div class="card agents-card">
+                <div class="card-head">
+                  <h2>Pending AI &amp; Agent Approvals</h2>
+                  <span class="mono muted-xs" id="approvalsCountMeta">0 pending</span>
+                </div>
+                <div class="agents-list" id="agentApprovalsHost">
+                  <div class="muted-xs" style="padding:14px 0;">No permission requests yet. When Claude, ChatGPT, or an autonomous agent proposes a sweep above your auto-approve tier, it appears here for explicit confirmation.</div>
+                </div>
+              </div>
+
+              <div class="card agents-card">
+                <div class="card-head">
+                  <h2>Smart-Contract Agent Mandates</h2>
+                  <span class="mono muted-xs">SiphonAgentVault.sol</span>
+                </div>
+                <form class="mandate-form" id="createMandateForm">
+                  <div class="mandate-form-row">
+                    <input type="text" id="mandateNameInput" class="field-input-xs" value="Dust &amp; DeFi Auto-Sweep Agent" placeholder="Agent name" aria-label="Agent mandate name" />
+                    <input type="number" id="mandateMaxTxInput" class="field-input-xs mono" value="250" min="5" max="100000" placeholder="Max $/tx" aria-label="Max USD per transaction" />
+                    <input type="number" id="mandateDailyCapInput" class="field-input-xs mono" value="1000" min="5" max="500000" placeholder="Daily $ cap" aria-label="Daily USD cap" />
+                    <input type="number" id="mandateAutoTierInput" class="field-input-xs mono" value="50" min="0" max="10000" placeholder="Auto <= $" aria-label="Auto-approve USD threshold" />
+                  </div>
+                  <div class="mandate-checks">
+                    <label class="inline-check"><input type="checkbox" name="mandateAction" value="dust_convert" checked /><span>Dust Conversion</span></label>
+                    <label class="inline-check"><input type="checkbox" name="mandateAction" value="defi_withdraw" checked /><span>DeFi Withdraw</span></label>
+                    <label class="inline-check"><input type="checkbox" name="mandateAction" value="bridge_solana" checked /><span>Bridge → Locked Solana</span></label>
+                    <label class="inline-check"><input type="checkbox" name="mandateAction" value="burn_zero_liq" /><span>Burn $0 Spam</span></label>
+                  </div>
+                  <div class="mandate-form-foot">
+                    <span class="muted-xs mono" id="mandateLockedDestNote">Locks destination to your Solana wallet</span>
+                    <button type="submit" class="btn-pill-dark btn-sm">Grant Agent Mandate</button>
+                  </div>
+                </form>
+                <div class="agents-list" id="agentMandatesHost" style="margin-top:12px;"></div>
+              </div>
+            </div>
+
+            <!-- RIGHT: Claude MCP + ChatGPT Action Plugin Setup & Scoped Tokens -->
+            <div class="agents-col">
+              <div class="card agents-card">
+                <div class="card-head">
+                  <h2>Claude Plugin (MCP Server)</h2>
+                  <button type="button" class="btn-outline-sm" id="copyClaudeMcpBtn">Copy Config</button>
+                </div>
+                <p class="muted-xs" style="margin:0 0 8px;">Connect Claude Desktop or Claude Code via stdio or HTTP MCP (`POST /mcp`). Claude can scan unified wallets, plan batch dust conversions, and queue permission-gated sweeps.</p>
+                <pre class="plugin-code-box mono" id="claudeMcpConfigHost">Loading…</pre>
+                <div class="muted-xs mono" id="claudeCodeCmdHost" style="margin-top:6px; word-break:break-all;"></div>
+              </div>
+
+              <div class="card agents-card">
+                <div class="card-head">
+                  <h2>ChatGPT Plugin (Custom GPT Action)</h2>
+                  <button type="button" class="btn-outline-sm" id="copyChatgptUrlBtn">Copy OpenAPI URL</button>
+                </div>
+                <p class="muted-xs" style="margin:0 0 8px;">Import Siphon's OpenAPI 3.1 schema in ChatGPT Custom GPT Actions (`/.well-known/ai-plugin.json` &amp; `/openapi.json`) with a scoped Bearer token below.</p>
+                <pre class="plugin-code-box mono" id="chatgptPluginHost">Loading…</pre>
+                <div class="btn-row" style="margin-top:10px;">
+                  <button type="button" class="btn-pill-dark btn-sm" id="issueGptTokenBtn">Generate ChatGPT Token</button>
+                  <button type="button" class="btn-outline-sm" id="issueMcpTokenBtn">Generate Claude Token</button>
+                </div>
+                <div class="agents-list" id="pluginTokensHost" style="margin-top:10px;"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ======================================================= -->
+        <!-- VIEW 4: SMART CONTRACTS & TREASURY FEE VAULT            -->
         <!-- ======================================================= -->
         <section class="view-pane" id="view-contract">
           <div class="view-header">
             <div>
               <h1>Smart Contracts &amp; Treasury Fee Vault</h1>
-              <p>Auditable Solidity 0.8.24 contracts handling DeFi withdrawals, DEX swaps, isolated zero-liquidity burns, 5–10% protocol fee routing, and Circle CCTP bridging.</p>
+              <p>Auditable Solidity 0.8.24 contracts handling DeFi withdrawals, DEX swaps, isolated zero-liquidity burns, policy-bounded agents, 5–10% protocol fee routing, and Circle CCTP bridging.</p>
             </div>
             <div class="btn-row">
               <div class="seg-output" role="tablist" aria-label="Smart contract selector">
                 <button type="button" class="seg-opt contract-tab active" data-contract-id="router">SiphonRouter.sol</button>
                 <button type="button" class="seg-opt contract-tab" data-contract-id="delegate">SiphonSweepDelegate.sol</button>
+                <button type="button" class="seg-opt contract-tab" data-contract-id="agent">SiphonAgentVault.sol</button>
                 <button type="button" class="seg-opt contract-tab" data-contract-id="vault">SiphonFeeVault.sol</button>
               </div>
               <button type="button" class="btn-outline-sm" id="copyContractBtn">Copy Solidity Source</button>
@@ -579,6 +694,6 @@
 
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>
 
-    <script type="module" src="/app.js?v=4"></script>
+    <script type="module" src="/app.js?v=5"></script>
   </body>
 </html>

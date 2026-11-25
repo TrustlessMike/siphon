@@ -490,6 +490,139 @@ export async function discoverEthereumTokens(
  * Discovers arbitrary ERC-20 tokens on ANY of the 6 EVM chains when SIM_API_KEY,
  * MORALIS_API_KEY, or ALCHEMY_API_KEY is configured, falling back to Ethplorer on Ethereum.
  */
+const BLOCKSCOUT_V2_HOSTS: Partial<Record<EvmChainId, string>> = {
+  ethereum: 'https://eth.blockscout.com',
+  base: 'https://base.blockscout.com',
+  optimism: 'https://optimism.blockscout.com',
+  arbitrum: 'https://arbitrum.blockscout.com',
+  polygon: 'https://polygon.blockscout.com',
+  scroll: 'https://scroll.blockscout.com',
+  unichain: 'https://unichain.blockscout.com',
+  worldchain: 'https://worldchain-mainnet.explorer.alchemy.com',
+};
+
+/**
+ * Zero-key public Blockscout v2 token-balances discovery covering Ethereum + major L2s
+ * (Base, Optimism, Arbitrum, Polygon, Scroll, Unichain, World Chain) without needing paid API keys.
+ */
+async function discoverBlockscoutTokens(
+  chain: EvmChainId,
+  walletAddress: string,
+  maxTokens = 24
+): Promise<DiscoveredEthToken[]> {
+  const host = BLOCKSCOUT_V2_HOSTS[chain];
+  if (!host) return [];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3800);
+  try {
+    const res = await fetch(
+      `${host}/api/v2/addresses/${encodeURIComponent(walletAddress)}/token-balances`,
+      { headers: { Accept: 'application/json' }, signal: controller.signal }
+    );
+    clearTimeout(timer);
+    if (!res.ok) return [];
+    const items = (await res.json()) as Array<{
+      value?: string;
+      token?: {
+        address?: string;
+        address_hash?: string;
+        symbol?: string;
+        name?: string;
+        decimals?: string | number;
+        type?: string;
+        exchange_rate?: string | number | null;
+      };
+    }>;
+    if (!Array.isArray(items)) return [];
+    const out: DiscoveredEthToken[] = [];
+    for (const item of items) {
+      const tok = item.token;
+      const addr = tok?.address_hash || tok?.address;
+      if (!addr || !/^0x[0-9a-fA-F]{40}$/.test(addr)) continue;
+      if (tok?.type && tok.type !== 'ERC-20') continue;
+      if (!item.value) continue;
+      try {
+        const rawBalance = BigInt(item.value);
+        if (rawBalance <= 0n) continue;
+        const decimals = Math.min(36, Math.max(0, Number(tok?.decimals ?? 18) || 18));
+        const rate = Number(tok?.exchange_rate ?? 0);
+        out.push({
+          address: addr,
+          symbol: (tok?.symbol || 'UNKNOWN').slice(0, 18),
+          name: (tok?.name || tok?.symbol || 'ERC-20 Token').slice(0, 48),
+          decimals,
+          rawBalance,
+          ethplorerPriceUsd: Number.isFinite(rate) && rate > 0 ? rate : 0,
+        });
+      } catch {
+        // ignore malformed balance
+      }
+    }
+    const deadCap = Math.min(5, Math.floor(maxTokens / 4));
+    const dead = out.filter((t) => t.ethplorerPriceUsd === 0).slice(0, deadCap);
+    const valued = out.filter((t) => t.ethplorerPriceUsd > 0).slice(0, maxTokens - dead.length);
+    return [...valued, ...dead];
+  } catch {
+    clearTimeout(timer);
+    return [];
+  }
+}
+
+/**
+ * Zero-key Routescan public ERC-20 holdings fallback for chains without Blockscout v2
+ * (Avalanche, BNB Chain, Mantle, Blast, Linea, Sonic).
+ */
+async function discoverRoutescanTokens(
+  chain: EvmChainId,
+  walletAddress: string,
+  maxTokens = 24
+): Promise<DiscoveredEthToken[]> {
+  const cfg = EVM_CHAINS[chain];
+  if (!cfg) return [];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3800);
+  try {
+    const url = `https://cdn.routescan.io/api/evm/${cfg.chainId}/address/${encodeURIComponent(walletAddress)}/erc20-holdings?limit=${maxTokens}`;
+    const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return [];
+    const json = (await res.json()) as {
+      items?: Array<{
+        tokenAddress?: string;
+        tokenSymbol?: string;
+        tokenName?: string;
+        tokenDecimals?: number | string;
+        tokenQuantity?: string;
+        tokenPrice?: number | string;
+      }>;
+    };
+    const out: DiscoveredEthToken[] = [];
+    for (const item of json.items ?? []) {
+      if (!item.tokenAddress || !/^0x[0-9a-fA-F]{40}$/.test(item.tokenAddress) || !item.tokenQuantity) continue;
+      try {
+        const rawBalance = BigInt(item.tokenQuantity);
+        if (rawBalance <= 0n) continue;
+        const decimals = Math.min(36, Math.max(0, Number(item.tokenDecimals ?? 18) || 18));
+        const price = Number(item.tokenPrice ?? 0);
+        out.push({
+          address: item.tokenAddress,
+          symbol: (item.tokenSymbol || 'UNKNOWN').slice(0, 18),
+          name: (item.tokenName || item.tokenSymbol || 'ERC-20 Token').slice(0, 48),
+          decimals,
+          rawBalance,
+          ethplorerPriceUsd: Number.isFinite(price) && price > 0 ? price : 0,
+        });
+      } catch {
+        // ignore
+      }
+    }
+    return out.slice(0, maxTokens);
+  } catch {
+    clearTimeout(timer);
+    return [];
+  }
+}
+
 export async function discoverChainTokens(
   chain: EvmChainId,
   walletAddress: string,
@@ -636,9 +769,12 @@ export async function discoverChainTokens(
   }
 
   if (chain === 'ethereum') {
-    return discoverEthereumTokens(walletAddress, maxTokens);
+    const ethplorer = await discoverEthereumTokens(walletAddress, maxTokens);
+    if (ethplorer.length) return ethplorer;
   }
-  return [];
+  const blockscout = await discoverBlockscoutTokens(chain, walletAddress, maxTokens);
+  if (blockscout.length) return blockscout;
+  return discoverRoutescanTokens(chain, walletAddress, maxTokens);
 }
 
 /**

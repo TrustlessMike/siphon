@@ -462,7 +462,8 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
     assert.ok(c.feeVaultSource.includes('contract SiphonFeeVault'));
     assert.ok(c.delegateSource.includes('contract SiphonSweepDelegate'));
     assert.ok(c.delegateSource.includes('struct ApprovalRevoke'));
-    assert.equal(c.contracts.length, 3);
+    assert.ok(c.agentVaultSource.includes('contract SiphonAgentVault'));
+    assert.equal(c.contracts.length, 4);
 
     // Witness-bound Gasless 1-Signature Permit2 / EIP-7702 intent preparation & signature verification
     const opAssets = report.assets.filter((a) => a.chain === 'optimism');
@@ -1196,4 +1197,165 @@ test('Smart-contract DeFi withdrawals (Aave non-USDC, Compound cWETHv3, ERC-4626
     'cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh,osmo1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh,noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh';
   assert.equal(cosmosAdapter.matchesAddress(multiCosmos), true);
   assert.equal(detectAddressFamily(multiCosmos), 'cosmos');
+});
+
+test('Unified multi-wallet scan, Dust Conversion engine, Smart-Contract Agent Mandates, Claude MCP & ChatGPT Plugin', async () => {
+  const { server } = createSiphonServer();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = server.address();
+  assert.ok(addr && typeof addr !== 'string');
+  const base = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    // 1. Multi-wallet unification across 2 distinct source wallets
+    const unified = await fetch(`${base}/api/scan/unified`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        wallets: [
+          { presetId: 'veteran_defi', label: 'Rabby Main' },
+          { presetId: 'airdrop_farmer', label: 'Airdrop Alt' },
+        ],
+      }),
+    }).then((r) => r.json());
+    assert.equal(unified.unifiedWallets.length, 2);
+    assert.ok(unified.assets.some((a: ScannedAsset) => a.sourceWalletLabel === 'Rabby Main'));
+    assert.ok(unified.assets.some((a: ScannedAsset) => a.sourceWalletLabel === 'Airdrop Alt'));
+    assert.ok(unified.totals.grossUsd > 1000);
+
+    // 2. Dust Conversion & Batch Rescue plan
+    const dustPlan = await fetch(`${base}/api/dust/plan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scanId: unified.scanId, maxDustThresholdUsd: 25 }),
+    }).then((r) => r.json());
+    assert.ok(dustPlan.totalDustAssetsFound >= 1);
+    assert.equal(dustPlan.maxDustThresholdUsd, 25);
+
+    // 3. Smart-Contract Agent Mandate (SiphonAgentVault) + Auto-Approve vs Pending Human Approval
+    const mandate = await fetch(`${base}/api/agents/mandates`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Dust Sweeper',
+        ownerAddress: '0x71C7656EC7ab88b098defB751B7401B5f6d8976F',
+        lockedSolanaRecipient: SAMPLE_SOLANA_WALLET,
+        maxPerTxUsd: 200,
+        dailyCapUsd: 500,
+        autoApproveUnderUsd: 50,
+        allowedActions: ['dust_convert', 'bridge_solana'],
+      }),
+    }).then((r) => r.json());
+    assert.ok(mandate.mandateId.startsWith('mnd_'));
+    assert.equal(mandate.active, true);
+
+    // Small $30 dust sweep matching locked Solana destination -> auto_approved_by_mandate!
+    const autoApproval = await fetch(`${base}/api/agents/approvals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client: 'smart_contract_agent',
+        mandateId: mandate.mandateId,
+        actionType: 'dust_convert',
+        summary: 'Auto dust convert $30',
+        sourceWallets: ['0x71C7656EC7ab88b098defB751B7401B5f6d8976F'],
+        chains: ['base'],
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+        grossUsd: 30,
+        estimatedNetUsdc: 27.5,
+      }),
+    }).then((r) => r.json());
+    assert.equal(autoApproval.status, 'auto_approved_by_mandate');
+
+    // Larger $150 sweep above $50 auto tier -> pending_approval until owner approves!
+    const pendingApproval = await fetch(`${base}/api/agents/approvals`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client: 'chatgpt_action',
+        mandateId: mandate.mandateId,
+        actionType: 'bridge_solana',
+        summary: 'ChatGPT proposed $150 sweep',
+        sourceWallets: ['0x71C7656EC7ab88b098defB751B7401B5f6d8976F'],
+        chains: ['arbitrum'],
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+        grossUsd: 150,
+        estimatedNetUsdc: 138,
+      }),
+    }).then((r) => r.json());
+    assert.equal(pendingApproval.status, 'pending_approval');
+
+    const decided = await fetch(`${base}/api/agents/approvals/${pendingApproval.approvalId}/decide`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'approve' }),
+    }).then((r) => r.json());
+    assert.equal(decided.status, 'approved');
+
+    // 4. ChatGPT Plugin Manifest + OpenAPI 3.1 + Scoped Bearer Token Auth
+    const manifest = await fetch(`${base}/.well-known/ai-plugin.json`).then((r) => r.json());
+    assert.equal(manifest.name_for_model, 'siphon_migrator');
+    const openapi = await fetch(`${base}/openapi.json`).then((r) => r.json());
+    assert.equal(openapi.openapi, '3.1.0');
+    assert.ok(openapi.paths['/api/scan/unified']);
+    assert.ok(openapi.paths['/api/agents/approvals']);
+
+    const tok = await fetch(`${base}/api/plugin/tokens`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'ChatGPT Test', client: 'chatgpt_action' }),
+    }).then((r) => r.json());
+    assert.ok(tok.token.startsWith('siphon_gpt_'));
+
+    // Invalid bearer token rejected with 401
+    const unauth = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer invalid_token' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    assert.equal(unauth.status, 401);
+
+    // 5. Claude MCP JSON-RPC 2.0 (initialize, tools/list, tools/call siphon_request_sweep_permission)
+    const mcpInit = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok.token}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize' }),
+    }).then((r) => r.json());
+    assert.equal(mcpInit.result.serverInfo.name, 'siphon-migrator-mcp');
+
+    const mcpTools = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok.token}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
+    }).then((r) => r.json());
+    assert.ok(mcpTools.result.tools.some((t: { name: string }) => t.name === 'siphon_scan_wallets'));
+    assert.ok(mcpTools.result.tools.some((t: { name: string }) => t.name === 'siphon_request_sweep_permission'));
+
+    const mcpReq = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok.token}` },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: {
+          name: 'siphon_request_sweep_permission',
+          arguments: {
+            actionType: 'defi_withdraw',
+            summary: 'Claude requested Aave withdrawal',
+            sourceWallets: ['0x71C7656EC7ab88b098defB751B7401B5f6d8976F'],
+            chains: ['ethereum'],
+            solanaDestination: SAMPLE_SOLANA_WALLET,
+            grossUsd: 500,
+            estimatedNetUsdc: 460,
+          },
+        },
+      }),
+    }).then((r) => r.json());
+    assert.equal(mcpReq.result.structuredContent.status, 'pending_approval');
+    assert.equal(mcpReq.result.structuredContent.client, 'claude_mcp');
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

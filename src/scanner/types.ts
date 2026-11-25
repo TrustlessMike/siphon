@@ -106,6 +106,8 @@ export interface TokenDescriptor {
 export interface ScannedAsset {
   id: string;
   family?: ChainFamily;
+  sourceWallet?: string;
+  sourceWalletLabel?: string;
   chain: AnyChainId;
   chainName: string;
   address: string;
@@ -180,9 +182,21 @@ export interface ChainScanSummary {
   solanaAtaRentUsd?: number;
 }
 
+export interface UnifiedWalletSummary {
+  address: string;
+  label: string;
+  family: ChainFamily;
+  chainsWithAssets: number;
+  assetCount: number;
+  grossUsd: number;
+  scanDurationMs: number;
+  error?: string;
+}
+
 export interface ScanReport {
   scanId: string;
   family?: ChainFamily;
+  unifiedWallets?: UnifiedWalletSummary[];
   mode: 'live_rpc' | 'preset';
   walletAddress: string;
   walletLabel?: string;
