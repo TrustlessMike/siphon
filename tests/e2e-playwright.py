@@ -165,8 +165,11 @@ def main():
                 async getKey(chainId) {{
                   const map = {{
                     'cosmoshub-4': 'cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh',
-                    'osmosis-1': 'osmo1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh',
-                    'noble-1': 'noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh',
+                    'osmosis-1': 'osmo1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3aq6l09',
+                    'noble-1': 'noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3acu8pe',
+                    'celestia': 'celestia1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3y3clr6',
+                    'injective-1': 'inj1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3lj7tt0',
+                    'neutron-1': 'neutron1fl48vsnmsdzcv85q5d2q4z5ajdha8yu33yqdrs',
                   }};
                   return {{ bech32Address: map[chainId] || 'cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh' }};
                 }},
@@ -623,7 +626,7 @@ def main():
             pgD.wait_for_function("() => document.documentElement.dataset.uiMode === 'lite' && document.getElementById('view-scanner')?.classList.contains('active')", timeout=5000)
 
             assert all(v <= 0 for v in overflowD.values()), f"Desktop overflow: {overflowD}"
-            assert not errsD, f"Desktop errors: {errsD}"
+            assert not errsD, f"Desktop errors: {errsD} | badHttpD={badHttpD}"
             assert not badHttpD, f"Desktop bad HTTP: {badHttpD}"
             results["desktop_1440"] = {
                 "ok": True,
