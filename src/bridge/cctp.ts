@@ -395,11 +395,27 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
         target: evmCfg ? 'wallet_sendCalls' : chainName,
       });
     }
+    const legDefiExitPlans: NonNullable<CctpBridgeLeg['defiExitPlans']> = [];
     for (const d of defiItems) {
+      if (d.defiExitPlan) {
+        legDefiExitPlans.push({
+          assetId: d.id,
+          symbol: d.symbol,
+          plan: d.defiExitPlan,
+        });
+      }
       steps.push({
-        step: `Withdraw ${d.protocol}`,
-        detail: `Redeem ${d.uiBalance} ${d.symbol} ($${d.grossUsd.toFixed(2)}) → ${d.underlyingSymbol ?? 'USDC'}`,
+        step:
+          d.defiExitPlan?.exitStrategy === 'direct_swap_bypass_cooldown'
+            ? `Direct Swap ${d.symbol} (Skip Cooldown)`
+            : d.defiExitPlan?.exitStrategy === 'safe_partial_debt_exit'
+            ? `Safe Partial Withdraw ${d.protocol}`
+            : `Withdraw ${d.protocol}`,
+        detail:
+          d.defiExitPlan?.plainEnglishSteps?.[0] ||
+          `Redeem ${d.uiBalance} ${d.symbol} ($${d.grossUsd.toFixed(2)}) → ${d.underlyingSymbol ?? 'USDC'}`,
         target: d.protocolAddress ?? d.address,
+        defiExitPlan: d.defiExitPlan,
       });
     }
     if (swapItems.length > 0) {
@@ -487,6 +503,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
       skippedNegativeRoi: chainRoi.skipChainNegativeRoi,
       solanaAtaRentUsd: chainRoi.solanaAtaRentUsd,
       cctpCalldata,
+      defiExitPlans: legDefiExitPlans.length ? legDefiExitPlans : undefined,
       steps,
     });
 
@@ -503,6 +520,15 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
   const times = legs.filter((l) => l.bridgedUsdc > 0).map((l) => l.estimatedSeconds);
   const solPrice = scan.totals.solPriceUsd || 70;
   const activeBridgeMeta = getBridgeProviderMeta(bridgePreference, outputAsset, 20);
+
+  const allDefiExitPlans = legs.flatMap((l) =>
+    (l.defiExitPlans ?? []).map((entry) => ({
+      assetId: entry.assetId,
+      symbol: entry.symbol,
+      chain: l.chain,
+      plan: entry.plan,
+    }))
+  );
 
   return {
     planId: `plan_${crypto.randomBytes(5).toString('hex')}`,
@@ -521,6 +547,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     feeRecipientEvm: feeConfig.feeRecipientEvm,
     feeDestinationType: feeConfig.feeDestinationType,
     legs,
+    defiExitPlans: allDefiExitPlans.length ? allDefiExitPlans : undefined,
     totals: {
       selectedAssets: chosen.length,
       defiWithdrawnCount: totalDefi,

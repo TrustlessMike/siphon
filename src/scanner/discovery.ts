@@ -150,6 +150,7 @@ export interface AaveAccountSafety {
   hasActiveDebt: boolean;
   totalCollateralUsd: number;
   totalDebtUsd: number;
+  currentLiquidationThresholdBps: number;
   healthFactor: number;
   safeForMaxWithdraw: boolean;
   reason: string;
@@ -167,6 +168,7 @@ export function decodeAaveAccountData(hexResult: string): AaveAccountSafety {
       hasActiveDebt: false,
       totalCollateralUsd: 0,
       totalDebtUsd: 0,
+      currentLiquidationThresholdBps: 8000,
       healthFactor: Number.POSITIVE_INFINITY,
       safeForMaxWithdraw: true,
       reason: 'Empty Aave account data response.',
@@ -175,6 +177,7 @@ export function decodeAaveAccountData(hexResult: string): AaveAccountSafety {
   const word = (i: number) => BigInt('0x' + clean.slice(i * 64, (i + 1) * 64));
   const totalCollateralBase = word(0);
   const totalDebtBase = word(1);
+  const currentLiquidationThreshold = Number(word(3));
   const hfRaw = word(5);
 
   const totalCollateralUsd = Number(totalCollateralBase) / 1e8;
@@ -188,6 +191,10 @@ export function decodeAaveAccountData(hexResult: string): AaveAccountSafety {
     hasActiveDebt,
     totalCollateralUsd: Number(totalCollateralUsd.toFixed(2)),
     totalDebtUsd: Number(totalDebtUsd.toFixed(2)),
+    currentLiquidationThresholdBps:
+      currentLiquidationThreshold > 0 && currentLiquidationThreshold <= 10_000
+        ? currentLiquidationThreshold
+        : 8000,
     healthFactor: Number.isFinite(healthFactor) ? Number(healthFactor.toFixed(2)) : 999,
     safeForMaxWithdraw: !hasActiveDebt,
     reason: hasActiveDebt
@@ -201,18 +208,21 @@ export function decodeAaveAccountData(hexResult: string): AaveAccountSafety {
  */
 export async function checkAaveV3AccountSafety(
   chain: EvmChainId,
-  userAddress: string
+  userAddress: string,
+  poolAddressOverride?: string
 ): Promise<AaveAccountSafety> {
   const cfg = EVM_CHAINS[chain];
-  if (!cfg?.aaveV3Pool || !/^0x[0-9a-fA-F]{40}$/.test(userAddress)) {
+  const poolAddress = poolAddressOverride || cfg?.aaveV3Pool;
+  if (!cfg || !poolAddress || !/^0x[0-9a-fA-F]{40}$/.test(userAddress)) {
     return {
       checked: false,
       hasActiveDebt: false,
       totalCollateralUsd: 0,
       totalDebtUsd: 0,
+      currentLiquidationThresholdBps: 8000,
       healthFactor: 999,
       safeForMaxWithdraw: true,
-      reason: 'Aave v3 Pool not configured on this chain.',
+      reason: 'Aave Pool not configured on this chain.',
     };
   }
 
@@ -222,7 +232,7 @@ export async function checkAaveV3AccountSafety(
     const json = await evmJsonRpcCall<string>(
       cfg.rpcUrls,
       'eth_call',
-      [{ to: cfg.aaveV3Pool, data }, 'latest'],
+      [{ to: poolAddress, data }, 'latest'],
       3500
     );
     if (!json.result || json.result === '0x') {
@@ -231,6 +241,7 @@ export async function checkAaveV3AccountSafety(
         hasActiveDebt: false,
         totalCollateralUsd: 0,
         totalDebtUsd: 0,
+        currentLiquidationThresholdBps: 8000,
         healthFactor: 999,
         safeForMaxWithdraw: true,
         reason: 'Could not read Aave account data.',
@@ -243,6 +254,7 @@ export async function checkAaveV3AccountSafety(
       hasActiveDebt: false,
       totalCollateralUsd: 0,
       totalDebtUsd: 0,
+      currentLiquidationThresholdBps: 8000,
       healthFactor: 999,
       safeForMaxWithdraw: true,
       reason: 'Aave account check timed out.',

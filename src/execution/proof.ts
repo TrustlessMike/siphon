@@ -150,9 +150,16 @@ function decodeCallSummary(to: string, data: string, value: string): { actionTyp
       summary: `Circle CCTP depositForBurn(${amt.toFixed(2)} USDC → Domain ${domain} Solana)`,
     };
   }
-  if (sel === '0x69328dec') return { actionType: 'aave_v3_withdraw', summary: 'Aave v3 Pool.withdraw to user' };
+  if (sel === '0x69328dec') return { actionType: 'aave_v3_withdraw', summary: 'Aave Pool.withdraw to user' };
   if (sel === '0xf3fef3a3') return { actionType: 'compound_v3_withdraw', summary: 'Compound v3 Comet.withdraw' };
+  if (sel === '0xdb006a75') return { actionType: 'compound_v2_redeem', summary: 'Compound v2 / Venus / Benqi cToken.redeem' };
   if (sel === '0xba087652') return { actionType: 'erc4626_redeem', summary: 'ERC-4626 vault redeem' };
+  if (sel === '0xbaa2abde' || sel === '0x0dede6c4') {
+    return { actionType: 'uniswap_v2_remove_liquidity', summary: 'DEX v2 LP removeLiquidity' };
+  }
+  if (sel === '0xac9650d8') {
+    return { actionType: 'uniswap_v3_nft_multicall', summary: 'Uniswap v3 / Aerodrome CL NFT multicall exit' };
+  }
   return { actionType: 'bridge_or_swap', summary: `Bridge / swap router call to ${to.slice(0, 6)}…${to.slice(-4)}` };
 }
 
@@ -261,7 +268,10 @@ export async function buildPreSignSimulationProof(params: {
       decoded.actionType === 'erc20_approve' ||
       decoded.actionType === 'aave_v3_withdraw' ||
       decoded.actionType === 'compound_v3_withdraw' ||
-      decoded.actionType === 'erc4626_redeem'
+      decoded.actionType === 'compound_v2_redeem' ||
+      decoded.actionType === 'erc4626_redeem' ||
+      decoded.actionType === 'uniswap_v2_remove_liquidity' ||
+      decoded.actionType === 'uniswap_v3_nft_multicall'
     ) {
       priorMutatingCall = true;
     }
