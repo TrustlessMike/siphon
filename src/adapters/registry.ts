@@ -1,4 +1,5 @@
 import type { AnyChainId, ChainFamily, EvmChainId } from '../scanner/types.js';
+import { detectAddress, detectAddressFamilyStrict } from '../scanner/address.js';
 import { EVM_CHAINS } from '../scanner/chains.js';
 import { aptosAdapter } from './aptos.js';
 import { btcAdapter } from './btc.js';
@@ -43,23 +44,30 @@ const CHAIN_TO_FAMILY: Record<string, ChainFamily> = {
   btc: 'btc',
 };
 
-export function isEvmChain(chain: AnyChainId): chain is EvmChainId {
-  return chain in EVM_CHAINS;
+export function isEvmChain(chain: AnyChainId | string): chain is EvmChainId {
+  return typeof chain === 'string' && Object.prototype.hasOwnProperty.call(EVM_CHAINS, chain);
 }
 
-export function getFamilyForChain(chain: AnyChainId): ChainFamily {
+export function getFamilyForChain(chain: AnyChainId | string): ChainFamily | null {
   if (isEvmChain(chain)) return 'evm';
-  return CHAIN_TO_FAMILY[chain] ?? 'evm';
+  if (typeof chain === 'string' && Object.prototype.hasOwnProperty.call(CHAIN_TO_FAMILY, chain)) {
+    return CHAIN_TO_FAMILY[chain];
+  }
+  return null;
 }
 
 export function getAdapterForFamily(family: ChainFamily): ChainFamilyAdapter {
-  const adapter = ADAPTER_BY_FAMILY[family];
+  const adapter = Object.prototype.hasOwnProperty.call(ADAPTER_BY_FAMILY, family)
+    ? ADAPTER_BY_FAMILY[family]
+    : undefined;
   if (!adapter) throw new Error(`Unsupported chain family: ${family}`);
   return adapter;
 }
 
-export function getAdapterForChain(chain: AnyChainId): ChainFamilyAdapter {
-  return getAdapterForFamily(getFamilyForChain(chain));
+export function getAdapterForChain(chain: AnyChainId | string): ChainFamilyAdapter {
+  const family = getFamilyForChain(chain);
+  if (!family) throw new Error(`Unsupported chain: ${String(chain)}`);
+  return getAdapterForFamily(family);
 }
 
 export function listAllFamilyMetas(): ChainFamilyMeta[] {
@@ -67,36 +75,16 @@ export function listAllFamilyMetas(): ChainFamilyMeta[] {
 }
 
 /**
- * Automatically detects the blockchain family from an address format.
- * When an address is 0x + 64 hex chars (shared by Sui & Aptos), `preferredFamily` disambiguates.
+ * Automatically detects the blockchain family from an address using cryptographic
+ * checksum validation across all 7 families (EVM EIP-55 + ENS, Cosmos Bech32,
+ * Sui/Aptos Move hex, TON CRC16-XMODEM/raw, Tron Base58Check/41-hex, Bitcoin Base58Check/Bech32/Bech32m).
+ * When an address is 0x + 64 hex (shared by Sui & Aptos), `preferredFamily` disambiguates.
  */
 export function detectAddressFamily(
   rawAddress: string,
   preferredFamily?: ChainFamily
 ): ChainFamily | null {
-  const addr = rawAddress.trim();
-  if (!addr) return null;
-
-  // Disambiguate 0x + 64 hex (Sui vs Aptos) using explicit preferredFamily first
-  if (/^0x[0-9a-fA-F]{64}$/.test(addr)) {
-    if (preferredFamily === 'aptos') return 'aptos';
-    if (preferredFamily === 'sui') return 'sui';
-    return 'sui';
-  }
-
-  // If preferred family explicitly matches, honor it first
-  if (preferredFamily && ADAPTER_BY_FAMILY[preferredFamily]?.matchesAddress(addr)) {
-    return preferredFamily;
-  }
-
-  // Check unambiguous formats in order
-  if (evmAdapter.matchesAddress(addr)) return 'evm';
-  if (cosmosAdapter.matchesAddress(addr)) return 'cosmos';
-  if (tronAdapter.matchesAddress(addr)) return 'tron';
-  if (tonAdapter.matchesAddress(addr)) return 'ton';
-  if (btcAdapter.matchesAddress(addr)) return 'btc';
-  if (suiAdapter.matchesAddress(addr)) return 'sui';
-  if (aptosAdapter.matchesAddress(addr)) return 'aptos';
-
-  return null;
+  return detectAddressFamilyStrict(rawAddress, preferredFamily);
 }
+
+export { detectAddress };

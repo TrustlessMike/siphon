@@ -1,3 +1,9 @@
+import {
+  isValidEnsName,
+  resolveEnsNameOrThrow,
+  validateEvmAddressOrEns,
+  validateEvmHexAddress,
+} from '../scanner/address.js';
 import { EVM_CHAINS, CHAIN_LIST, getProtocolFeeConfig } from '../scanner/chains.js';
 import { scanLiveWallet } from '../scanner/classifier.js';
 import type { AnyChainId, EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
@@ -50,12 +56,30 @@ export const evmAdapter: ChainFamilyAdapter = {
   meta: EVM_FAMILY_META,
 
   matchesAddress(address: string): boolean {
-    const clean = address.trim();
-    return /^0x[0-9a-fA-F]{40}$/.test(clean) || /^[a-zA-Z0-9-]+\.eth$/i.test(clean);
+    return validateEvmAddressOrEns(address).valid;
   },
 
   async scanWallet(address: string, label?: string): Promise<ScanReport> {
-    const report = await scanLiveWallet(address, label);
+    const clean = address.trim();
+    let targetAddress: string;
+    let resolvedLabel = label;
+
+    if (isValidEnsName(clean)) {
+      const normalizedEns = clean.toLowerCase();
+      targetAddress = await resolveEnsNameOrThrow(normalizedEns);
+      if (!resolvedLabel) resolvedLabel = normalizedEns;
+    } else {
+      const check = validateEvmHexAddress(clean);
+      if (!check.valid || !check.normalized) {
+        throw new Error(
+          check.reason ||
+            'Invalid EVM wallet address (expected 0x followed by 40 hex characters or a .eth ENS name).'
+        );
+      }
+      targetAddress = check.normalized;
+    }
+
+    const report = await scanLiveWallet(targetAddress, resolvedLabel);
     report.family = 'evm';
     for (const c of report.chains) {
       c.family = 'evm';

@@ -606,11 +606,11 @@ test('Multi-chain expansion: 14 EVMs + 7 families registry + auto address detect
   assert.equal(detectAddressFamily('0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045'), 'evm');
   assert.equal(detectAddressFamily('vitalik.eth'), 'evm');
   assert.equal(detectAddressFamily('cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
-  assert.equal(detectAddressFamily('osmo1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
-  assert.equal(detectAddressFamily('noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
-  assert.equal(detectAddressFamily('celestia1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
-  assert.equal(detectAddressFamily('inj1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
-  assert.equal(detectAddressFamily('neutron1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh'), 'cosmos');
+  assert.equal(detectAddressFamily('osmo1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3aq6l09'), 'cosmos');
+  assert.equal(detectAddressFamily('noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3acu8pe'), 'cosmos');
+  assert.equal(detectAddressFamily('celestia1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3y3clr6'), 'cosmos');
+  assert.equal(detectAddressFamily('inj1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3lj7tt0'), 'cosmos');
+  assert.equal(detectAddressFamily('neutron1fl48vsnmsdzcv85q5d2q4z5ajdha8yu33yqdrs'), 'cosmos');
   assert.equal(
     detectAddressFamily('0x0000000000000000000000000000000000000000000000000000000000000006'),
     'sui'
@@ -1222,7 +1222,7 @@ test('Smart-contract DeFi withdrawals (Aave non-USDC, Compound cWETHv3, ERC-4626
 
   // 4. Multi-chain comma-separated Cosmos addresses match cosmosAdapter & detectAddressFamily
   const multiCosmos =
-    'cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh,osmo1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh,noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh';
+    'cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh,osmo1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3aq6l09,noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3acu8pe';
   assert.equal(cosmosAdapter.matchesAddress(multiCosmos), true);
   assert.equal(detectAddressFamily(multiCosmos), 'cosmos');
 });
