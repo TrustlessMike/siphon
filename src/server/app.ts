@@ -8,11 +8,17 @@ import {
   fetchCctpAttestationForTx,
   solanaAddressToBytes32,
 } from '../bridge/cctp.js';
+import { buildPreSignSimulationProof, verifyOnchainExecutionProof } from '../execution/proof.js';
 import {
   checkLiveExecutionStatus,
   prepareChainBatchExecution,
   prepareRealExecution,
 } from '../execution/tx-builder.js';
+import {
+  buildGaslessSweepIntent,
+  isSponsorRelayerConfigured,
+  submitSignedGaslessIntent,
+} from '../relayer/sponsor.js';
 import {
   CHAIN_LIST,
   DEAD_BURN_ADDRESS,
@@ -171,6 +177,7 @@ export function createSiphonServer() {
           walletConnectProjectId: process.env.WALLETCONNECT_PROJECT_ID?.trim() || null,
           l2IndexerProvider: getL2IndexerProvider(),
           protocolFee: getProtocolFeeConfig(),
+          gaslessRelayerConfigured: isSponsorRelayerConfigured(),
         });
       }
 
@@ -188,8 +195,10 @@ export function createSiphonServer() {
       if (method === 'GET' && pathname === '/api/contract') {
         const routerPath = path.join(CONTRACTS_DIR, 'SiphonRouter.sol');
         const feeVaultPath = path.join(CONTRACTS_DIR, 'SiphonFeeVault.sol');
+        const delegatePath = path.join(CONTRACTS_DIR, 'SiphonSweepDelegate.sol');
         const source = fs.existsSync(routerPath) ? fs.readFileSync(routerPath, 'utf8') : '';
         const feeVaultSource = fs.existsSync(feeVaultPath) ? fs.readFileSync(feeVaultPath, 'utf8') : '';
+        const delegateSource = fs.existsSync(delegatePath) ? fs.readFileSync(delegatePath, 'utf8') : '';
         const protocolFee = getProtocolFeeConfig();
         return sendJson(res, 200, {
           name: 'SiphonRouter.sol',
@@ -200,8 +209,10 @@ export function createSiphonServer() {
           solanaCctpDomain: SOLANA_CCTP_DOMAIN,
           source,
           feeVaultSource,
+          delegateSource,
           contracts: [
             { id: 'router', filename: 'contracts/SiphonRouter.sol', title: 'SiphonRouter.sol', source },
+            { id: 'delegate', filename: 'contracts/SiphonSweepDelegate.sol', title: 'SiphonSweepDelegate.sol (EIP-7702)', source: delegateSource },
             { id: 'vault', filename: 'contracts/SiphonFeeVault.sol', title: 'SiphonFeeVault.sol', source: feeVaultSource },
           ],
           chains: CHAIN_LIST.map((c) => ({
@@ -426,6 +437,158 @@ export function createSiphonServer() {
         } catch (err) {
           return sendJson(res, 400, {
             error: err instanceof Error ? err.message : 'Could not fetch CCTP attestation',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/tx/simulate-proof') {
+        const body = await readJsonBody<{
+          chain?: EvmChainId;
+          assets?: ScannedAsset[];
+          userAddress?: string;
+          solanaDestination?: string;
+          outputAsset?: 'USDC' | 'SOL';
+          bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+          protocolFeeBps?: number;
+          feeRecipientEvm?: string | null;
+          bundleDefiCctp?: boolean;
+          nativePriceUsd?: number;
+        }>(req);
+
+        if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
+          return sendJson(res, 400, {
+            error: 'chain, assets[], userAddress, and solanaDestination are required',
+          });
+        }
+
+        try {
+          const batch = await prepareChainBatchExecution({
+            chain: body.chain,
+            assets: body.assets,
+            userAddress: body.userAddress,
+            solanaDestination: body.solanaDestination,
+            outputAsset: body.outputAsset ?? 'USDC',
+            bridgePreference: body.bridgePreference ?? 'auto',
+            protocolFeeBps: body.protocolFeeBps,
+            feeRecipientEvm: body.feeRecipientEvm,
+            bundleDefiCctp: body.bundleDefiCctp ?? false,
+          });
+          const proof = await buildPreSignSimulationProof({
+            batch,
+            assets: body.assets.filter((a) => a.chain === body.chain),
+            nativePriceUsd: body.nativePriceUsd,
+          });
+          return sendJson(res, 200, { proof, batch });
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Could not build real-time simulation proof',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/tx/prove') {
+        const body = await readJsonBody<{
+          chain?: EvmChainId;
+          txHash?: string;
+          userAddress?: string;
+          solanaDestination?: string;
+          requestId?: string;
+          provider?: string;
+          feeRecipientEvm?: string | null;
+          preSolanaUsdc?: number;
+          preSolanaSol?: number;
+        }>(req);
+
+        if (!body.chain || !body.txHash || !/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim()) || !body.solanaDestination) {
+          return sendJson(res, 400, {
+            error: 'chain, valid 32-byte txHash, and solanaDestination are required',
+          });
+        }
+
+        try {
+          const proof = await verifyOnchainExecutionProof({
+            chain: body.chain,
+            txHash: body.txHash.trim(),
+            userAddress: body.userAddress,
+            solanaDestination: body.solanaDestination.trim(),
+            requestId: body.requestId,
+            provider: body.provider,
+            feeRecipientEvm: body.feeRecipientEvm,
+            preSolanaUsdc: body.preSolanaUsdc,
+            preSolanaSol: body.preSolanaSol,
+          });
+          return sendJson(res, 200, proof);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Could not verify onchain proof',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/relayer/prepare-intent') {
+        const body = await readJsonBody<{
+          chain?: EvmChainId;
+          assets?: ScannedAsset[];
+          userAddress?: string;
+          solanaDestination?: string;
+          outputAsset?: 'USDC' | 'SOL';
+          protocolFeeBps?: number;
+          feeRecipientEvm?: string | null;
+          preferredMode?: 'permit2_batch' | 'eip7702_delegate';
+        }>(req);
+
+        if (!body.chain || !Array.isArray(body.assets) || !body.userAddress || !body.solanaDestination) {
+          return sendJson(res, 400, {
+            error: 'chain, assets[], userAddress, and solanaDestination are required',
+          });
+        }
+
+        try {
+          const plan = buildGaslessSweepIntent({
+            chain: body.chain,
+            assets: body.assets,
+            userAddress: body.userAddress,
+            solanaDestination: body.solanaDestination,
+            outputAsset: body.outputAsset ?? 'USDC',
+            protocolFeeBps: body.protocolFeeBps,
+            feeRecipientEvm: body.feeRecipientEvm,
+            preferredMode: body.preferredMode,
+          });
+          return sendJson(res, 200, plan);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Could not prepare gasless sweep intent',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/relayer/submit') {
+        const body = await readJsonBody<{
+          intentId?: string;
+          chain?: EvmChainId;
+          userAddress?: string;
+          signature?: string;
+          deadline?: number;
+        }>(req);
+
+        if (!body.intentId || !body.chain || !body.userAddress || !body.signature || !body.deadline) {
+          return sendJson(res, 400, {
+            error: 'intentId, chain, userAddress, signature, and deadline are required',
+          });
+        }
+
+        try {
+          const receipt = submitSignedGaslessIntent({
+            intentId: body.intentId,
+            chain: body.chain,
+            userAddress: body.userAddress,
+            signature: body.signature,
+            deadline: body.deadline,
+          });
+          return sendJson(res, 200, receipt);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Could not submit signed gasless intent',
           });
         }
       }

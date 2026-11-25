@@ -649,6 +649,28 @@ export async function sendRealEvmTransaction(tx) {
 }
 
 /**
+ * Signs a gasless off-chain EIP-712 typed-data payload (Permit2 PermitBatchTransferFrom or
+ * EIP-7702 SweepIntent) with ZERO native ETH/POL/AVAX gas required in the user's wallet.
+ */
+export async function signGaslessTypedData(typedData, chainId) {
+  if (!activeEvmProvider || !connectedEvmAddress) {
+    throw new Error('Connect your EVM wallet to sign the gasless sweep intent.');
+  }
+  if (chainId) {
+    await ensureEvmChain(chainId);
+  }
+  const payload = typeof typedData === 'string' ? typedData : JSON.stringify(typedData);
+  const signature = await activeEvmProvider.request({
+    method: 'eth_signTypedData_v4',
+    params: [connectedEvmAddress, payload],
+  });
+  if (!signature || typeof signature !== 'string') {
+    throw new Error('Gasless signature was cancelled.');
+  }
+  return signature;
+}
+
+/**
  * Submits ALL calls on a single EVM chain in ONE wallet confirmation popup via EIP-5792 `wallet_sendCalls`.
  * Supports both EIP-5792 v2 (`version: "2.0.0"`, `atomicRequired: false`) and v1 (`version: "1.0"`).
  * Throws an Error with `err.unsupportedEip5792 = true` if the wallet lacks EIP-5792 so callers can fall back seamlessly.

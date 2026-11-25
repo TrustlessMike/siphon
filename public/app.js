@@ -23,6 +23,7 @@ import {
   sendEip5792Batch,
   sendRealEvmTransaction,
   setSavedWalletConnectProjectId,
+  signGaslessTypedData,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
 } from './wallets.js';
@@ -33,11 +34,13 @@ let selectedAssetIds = new Set();
 let activeFilter = 'all';
 let activeChainFilter = 'all';
 let activeView = 'scanner';
+let executionMode = 'direct'; // 'direct' | 'gasless'
 let outputAsset = 'USDC';
 let heroScene = null;
 let contractData = null;
 let activeContractId = 'router';
 let solanaBalances = null;
+let latestPreSignProof = null;
 let backgroundJobs = [];
 let activeJobId = null;
 let bgPollTimer = null;
@@ -284,16 +287,21 @@ function updateWalletButtons() {
     } else if (!evmAddr) {
       ctaBtn.textContent = `Connect Wallet to Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`;
       ctaBtn.disabled = false;
+    } else if (executionMode === 'gasless') {
+      ctaBtn.textContent = `Gasless 1-Sig Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'}) →`;
+      ctaBtn.disabled = false;
     } else {
       ctaBtn.textContent = `Sweep ${n} ${n === 1 ? 'Chain' : 'Chains'} to Solana →`;
       ctaBtn.disabled = false;
     }
   }
   if (ctaNote) {
-    if (evmAddr && caps.probed && caps.anySupported) {
+    if (executionMode === 'gasless') {
+      ctaNote.textContent = `$0 native gas required · 1 off-chain Permit2 / EIP-7702 signature · gas paid from fee`;
+    } else if (evmAddr && caps.probed && caps.anySupported) {
       ctaNote.textContent = `EIP-5792 armed · 1 click per chain (${stats.popupsSaved} popups saved) · settles in background`;
     } else if (evmAddr && caps.probed && !caps.anySupported) {
-      ctaNote.textContent = `Sequential signing ready · tracks settlement automatically in background`;
+      ctaNote.textContent = `EOA detected · switch to Gasless 1-Sig for 1 signature & $0 gas, or sign sequentially`;
     } else {
       ctaNote.textContent = `1 confirmation per chain · settles automatically in the background`;
     }
@@ -620,21 +628,26 @@ function renderChainQueueList() {
   }
 
   host.innerHTML = currentPlan.legs
-    .map(
-      (leg) => `
+    .map((leg) => {
+      const chainMeta = currentScan.chains.find((c) => c.chain === leg.chain);
+      const noGasBadge = chainMeta?.needsGasSponsorship
+        ? `<span class="gas-warn-pill" title="Low native gas on ${escapeHtml(leg.chainName)} — use Gasless 1-Sig sponsored mode">No Gas · Sponsor</span>`
+        : '';
+      return `
       <div class="chain-queue-item">
         <span class="inline-logo-row">
           <img src="${escapeHtml(getChainLogoPath(leg.chain))}" alt="" class="chain-logo-xs" />
           <strong>${escapeHtml(leg.chainName)}</strong>
           <span class="mono muted-xs">${leg.defiExits + leg.swaps + leg.burns} items</span>
+          ${noGasBadge}
         </span>
         <span class="inline-logo-row">
           <span class="mono" style="font-weight:600;">$${leg.bridgedUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-          <button type="button" class="chain-queue-run" data-exec-chain-batch="${escapeHtml(leg.chain)}">Run</button>
+          <button type="button" class="chain-queue-run" data-exec-chain-batch="${escapeHtml(leg.chain)}">${executionMode === 'gasless' ? '1-Sig' : 'Run'}</button>
         </span>
       </div>
-    `
-    )
+    `;
+    })
     .join('');
 
   host.querySelectorAll('[data-exec-chain-batch]').forEach((btn) => {
@@ -642,6 +655,127 @@ function renderChainQueueList() {
       executeChainBatchLive(btn.dataset.execChainBatch);
     });
   });
+}
+
+function renderPreSignProofCard(proof) {
+  const card = document.getElementById('preSignProofCard');
+  if (!card) return;
+  if (!proof) {
+    card.classList.add('hidden');
+    return;
+  }
+  card.classList.remove('hidden');
+  card.classList.toggle('is-safe', Boolean(proof.allChecksSafe && proof.hasEnoughNativeGas));
+  card.classList.toggle('is-warn', !proof.allChecksSafe || !proof.hasEnoughNativeGas);
+
+  const gasLabel = proof.hasEnoughNativeGas
+    ? `✓ ${proof.nativeBalanceUi} ${proof.nativeSymbol} (~$${proof.nativeBalanceUsd.toFixed(2)})`
+    : `! Low gas (${proof.nativeBalanceUi} ${proof.nativeSymbol}) → Switch to Gasless 1-Sig`;
+  const checkRows = (proof.checks || [])
+    .slice(0, 6)
+    .map((c) => {
+      const mark =
+        c.preflightStatus === 'verified'
+          ? '✓'
+          : c.preflightStatus === 'reverted'
+          ? '✕'
+          : '•';
+      return `<div class="proof-check-row"><span>${mark} ${escapeHtml(c.assetSymbol)}: ${escapeHtml(c.summary)}</span><span class="mono muted-xs">${escapeHtml(c.preflightStatus)}</span></div>`;
+    })
+    .join('');
+
+  card.innerHTML = `
+    <div class="proof-head">
+      <span>${proof.allChecksSafe ? '✓ Real-Time Pre-Sign Proof' : '! Simulation Warning'} (${escapeHtml(proof.chainName)} #${proof.blockNumber ? proof.blockNumber.toLocaleString() : 'live'})</span>
+      <span class="mono muted-xs">${escapeHtml(shortAddr(proof.proofDigestSha256))}</span>
+    </div>
+    <div class="proof-kv"><span>Wallet Proven</span><strong class="mono">${escapeHtml(shortAddr(proof.userAddress))}</strong></div>
+    <div class="proof-kv"><span>Gas Check</span><span class="mono">${escapeHtml(gasLabel)}</span></div>
+    <div class="proof-kv"><span>Solana Recipient bytes32</span><span class="mono">${proof.mintRecipientVerified ? '✓ Matched bit-for-bit' : '✕ Mismatch'}</span></div>
+    <div class="proof-kv"><span>Guaranteed Min Output</span><strong class="mono">≥ $${proof.guaranteedMinNetUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })} ${escapeHtml(proof.outputAsset)}</strong></div>
+    <div class="proof-kv"><span>Protocol Fee (${proof.protocolFee.feePercent}%)</span><span class="mono">$${proof.protocolFee.estimatedFeeUsd.toFixed(2)} (${escapeHtml(proof.protocolFee.collectionMethod)})</span></div>
+    ${proof.preSolanaSnapshot ? `<div class="proof-kv"><span>Pre-Sweep Solana Snapshot</span><span class="mono">${proof.preSolanaSnapshot.usdcBalance.toFixed(2)} USDC · slot #${proof.preSolanaSnapshot.slot.toLocaleString()}</span></div>` : ''}
+    ${checkRows ? `<div class="proof-checks">${checkRows}</div>` : ''}
+    <div style="display:flex; justify-content:flex-end; padding-top:4px;">
+      <button type="button" class="text-action mono" id="downloadProofCertBtn">Download Proof Certificate (JSON) ↓</button>
+    </div>
+  `;
+  document.getElementById('downloadProofCertBtn')?.addEventListener('click', () => {
+    const blob = new Blob([JSON.stringify(proof, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `siphon-proof-${proof.chain}-${proof.proofId}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('Downloaded cryptographic migration proof certificate.');
+  });
+}
+
+async function runPreSignProof() {
+  if (!currentScan || !currentPlan || !currentPlan.legs.length) {
+    showToast('Select at least one asset to prove.');
+    return;
+  }
+  const targetChain =
+    activeChainFilter !== 'all' && currentPlan.legs.some((l) => l.chain === activeChainFilter)
+      ? activeChainFilter
+      : currentPlan.legs[0].chain;
+  const chainAssets = currentScan.assets.filter(
+    (a) => a.chain === targetChain && selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
+  );
+  if (!chainAssets.length) return;
+
+  const btn = document.getElementById('verifyProofBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = `Simulating ${targetChain} on live RPC…`;
+  }
+  try {
+    const solDest = document.getElementById('solanaDestInput').value.trim();
+    const connectedEvm = getConnectedEvmAddress();
+    const userAddress = connectedEvm || currentScan.walletAddress;
+    const chainMeta = currentScan.chains.find((c) => c.chain === targetChain);
+
+    const res = await api('/api/tx/simulate-proof', {
+      method: 'POST',
+      body: JSON.stringify({
+        chain: targetChain,
+        assets: chainAssets,
+        userAddress,
+        solanaDestination: solDest,
+        outputAsset,
+        bridgePreference: getActiveBridgePreference(),
+        protocolFeeBps: getActiveProtocolFeeBps(),
+        feeRecipientEvm: getActiveFeeRecipientEvm(),
+        nativePriceUsd: chainMeta?.nativePriceUsd,
+      }),
+    });
+    latestPreSignProof = res.proof;
+    renderPreSignProofCard(res.proof);
+    if (!res.proof.hasEnoughNativeGas && executionMode !== 'gasless') {
+      setExecutionMode('gasless');
+      showToast(`Low gas on ${res.proof.chainName} — switched to $0 Gasless 1-Sig Mode.`);
+    } else {
+      showToast(`Pre-sign proof verified on ${res.proof.chainName} (${shortAddr(res.proof.proofDigestSha256)}).`);
+    }
+  } catch (err) {
+    showToast(err.message);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Prove Swap & Gas Before Signing (Live eth_call)';
+    }
+  }
+}
+
+function setExecutionMode(mode) {
+  executionMode = mode === 'gasless' ? 'gasless' : 'direct';
+  document.querySelectorAll('.mode-opt[data-exec-mode]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.execMode === executionMode);
+  });
+  updateWalletButtons();
+  renderChainQueueList();
 }
 
 function legStatusBadge(status) {
@@ -694,6 +828,9 @@ function renderBackgroundAgentUI() {
             leg.solanaTxHash
               ? `<a class="explorer-link" href="https://solscan.io/tx/${escapeHtml(leg.solanaTxHash)}" target="_blank" rel="noreferrer">Solscan ↗</a>`
               : '',
+            leg.evmTxHash
+              ? `<button type="button" class="text-action" data-prove-leg="${escapeHtml(activeJob.jobId)}:${escapeHtml(leg.chain)}">Prove ✓</button>`
+              : '',
           ]
             .filter(Boolean)
             .join(' · ');
@@ -712,6 +849,13 @@ function renderBackgroundAgentUI() {
           `;
         })
         .join('');
+
+      feed.querySelectorAll('[data-prove-leg]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const [jId, chain] = String(btn.dataset.proveLeg).split(':');
+          proveLegOnchain(jId, chain, btn);
+        });
+      });
     }
   }
 
@@ -849,6 +993,86 @@ async function waitForEvmReceipt(chain, txHash, maxAttempts = 12) {
   return null;
 }
 
+async function proveLegOnchain(jobId, chain, btnEl = null) {
+  const job = backgroundJobs.find((j) => j.jobId === jobId);
+  const leg = job?.legs.find((l) => l.chain === chain);
+  if (!job || !leg?.evmTxHash) return;
+  if (btnEl) btnEl.textContent = 'Proving…';
+  try {
+    const proof = await api('/api/tx/prove', {
+      method: 'POST',
+      body: JSON.stringify({
+        chain,
+        txHash: leg.evmTxHash,
+        userAddress: job.sourceWallet,
+        solanaDestination: job.solanaDestination,
+        requestId: leg.requestId,
+        provider: leg.provider,
+        feeRecipientEvm: job.feeRecipientEvm,
+        preSolanaUsdc: latestPreSignProof?.preSolanaSnapshot?.usdcBalance ?? solanaBalances?.usdcBalance,
+        preSolanaSol: latestPreSignProof?.preSolanaSnapshot?.solBalance ?? solanaBalances?.solBalance,
+      }),
+    });
+    const deltaPart =
+      proof.solanaDeltaProof?.deltaUsdc > 0
+        ? ` · +${proof.solanaDeltaProof.deltaUsdc} USDC verified on Solana`
+        : '';
+    await patchJobLeg(jobId, chain, {
+      status: proof.verified ? 'landed' : leg.status,
+      solanaTxHash: proof.bridgeProof?.solanaTxHash || leg.solanaTxHash,
+      statusText: `${proof.summary}${deltaPart} (${shortAddr(proof.proofDigestSha256)})`,
+    });
+    showToast(proof.summary);
+  } catch (err) {
+    showToast(err.message);
+  } finally {
+    if (btnEl) btnEl.textContent = 'Prove ✓';
+  }
+}
+
+async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress, solDest) {
+  await patchJobLeg(jobId, chain, {
+    status: 'preparing',
+    provider: 'permit2_gasless',
+    statusText: 'Preparing 1-signature gasless Permit2 / EIP-7702 intent ($0 gas)…',
+  });
+  const intent = await api('/api/relayer/prepare-intent', {
+    method: 'POST',
+    body: JSON.stringify({
+      chain,
+      assets: chainAssets,
+      userAddress,
+      solanaDestination: solDest,
+      outputAsset,
+      protocolFeeBps: getActiveProtocolFeeBps(),
+      feeRecipientEvm: getActiveFeeRecipientEvm(),
+    }),
+  });
+  await patchJobLeg(jobId, chain, {
+    status: 'signing',
+    provider: intent.mode,
+    statusText: `Sign 1 gasless off-chain message ($0 gas · covers ${intent.coveredAssets.length} tokens)…`,
+  });
+  const signature = await signGaslessTypedData(intent.typedData, intent.chainId);
+  const receipt = await api('/api/relayer/submit', {
+    method: 'POST',
+    body: JSON.stringify({
+      intentId: intent.intentId,
+      chain,
+      userAddress,
+      signature,
+      deadline: intent.deadline,
+    }),
+  });
+  await patchJobLeg(jobId, chain, {
+    status: receipt.mode === 'relayer_submitted' ? 'relaying' : 'attested',
+    provider: intent.mode,
+    evmTxHash: receipt.txHash,
+    statusText: receipt.nextStep,
+  });
+  showToast(receipt.nextStep);
+}
+
 async function executeChainBatchLive(chain, existingJobId = null) {
   if (!currentScan || !currentPlan) return;
   const chainAssets = currentScan.assets.filter(
@@ -943,6 +1167,11 @@ async function executeChainBatchLive(chain, existingJobId = null) {
       });
       showToast('Connected EVM wallet differs from scanned address. Scanning your wallet now.');
       await runScan({ address: connectedEvm, autoOpen: true });
+      return;
+    }
+
+    if (executionMode === 'gasless') {
+      await executeGaslessIntentChain(chain, jobId, chainAssets, connectedEvm, solDest);
       return;
     }
 
@@ -1634,6 +1863,10 @@ function wireEvents() {
   });
 
   document.getElementById('runLiveQueueBtn').addEventListener('click', executeSelectedLiveQueue);
+  document.getElementById('verifyProofBtn')?.addEventListener('click', runPreSignProof);
+  document.querySelectorAll('.mode-opt[data-exec-mode]').forEach((btn) => {
+    btn.addEventListener('click', () => setExecutionMode(btn.dataset.execMode));
+  });
 
   document.getElementById('downloadBurnCsvBtn').addEventListener('click', () => {
     if (!currentPlan) return;

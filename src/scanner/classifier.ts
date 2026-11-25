@@ -180,8 +180,8 @@ function classifyAndBuildReport(params: {
       honeypotSafe = false;
     } else if (item.kind === 'dead_token' || item.liquidityUsd === 0 || item.priceUsd === 0) {
       action = 'BURN_ZERO_LIQUIDITY';
-      actionReason = 'Zero verified DEX liquidity ($0.00). Burn to 0x…dEaD via isolated try/catch.';
-      selectedByDefault = true;
+      actionReason = 'Zero verified DEX liquidity ($0.00). Opt-in burn to 0x…dEaD (unchecked by default to save gas & popups).';
+      selectedByDefault = false;
       calldataPreview = encodeTransferPreview(DEAD_BURN_ADDRESS, item.rawBalance);
     } else if (item.kind === 'defi_position') {
       action = 'WITHDRAW_AND_BRIDGE';
@@ -299,7 +299,9 @@ function classifyAndBuildReport(params: {
       totalGasUsd: round2(batchedGas),
       gasSavedByBatchUsd: round2(Math.max(0, singleGas - batchedGas)),
       cctpAttestationSec: c.cctpAttestationSec,
-      needsGasSponsorship: chainAssets.length > 0 && meta.nativeBalance * meta.nativePriceUsd < 0.25,
+      needsGasSponsorship:
+        activeSweep.length > 0 &&
+        meta.nativeBalance * meta.nativePriceUsd < Math.max(0.25, batchedGas * 1.35),
     };
   });
 

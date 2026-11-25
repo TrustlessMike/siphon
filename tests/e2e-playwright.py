@@ -94,6 +94,9 @@ def main():
                     if (statusPoll === 1) return {{ status: 100, receipts: [] }};
                     return {{ status: 200, receipts: [{{ transactionHash: '0x' + 'aa'.repeat(32) }}] }};
                   }}
+                  if (method === 'eth_signTypedData_v4') {{
+                    return '0x' + 'cd'.repeat(65);
+                  }}
                   return null;
                 }}
               }});
@@ -227,7 +230,23 @@ def main():
             pgD.click("#selectProfitableBtn")
             pgD.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=5000)
 
-            # Execute Base 1-click EIP-5792 batch -> verifies Background Agent card & server job!
+            # Verify live Pre-Sign Proof (real RPC eth_call + bytes32 check + SHA-256 digest)
+            pgD.click("#verifyProofBtn")
+            pgD.wait_for_selector("#preSignProofCard:not(.hidden)", timeout=20000)
+            proofText = pgD.locator("#preSignProofCard").inner_text()
+            assert "Matched bit-for-bit" in proofText, proofText
+
+            # Verify Gasless 1-Sig Permit2 / EIP-7702 mode signs ONE off-chain EIP-712 message ($0 gas!)
+            pgD.click(".mode-opt[data-exec-mode='gasless']")
+            pgD.click("[data-exec-chain-batch='base']")
+            pgD.wait_for_selector("#agentStatusCard:not(.hidden)", timeout=15000)
+            pgD.wait_for_function(
+                "() => (window.__rpcD || []).some(r => r.method === 'eth_signTypedData_v4')",
+                timeout=15000,
+            )
+
+            # Switch back to Direct Batch and execute Base 1-click EIP-5792 batch
+            pgD.click(".mode-opt[data-exec-mode='direct']")
             pgD.wait_for_selector("[data-exec-chain-batch='base']")
             pgD.click("[data-exec-chain-batch='base']")
             pgD.wait_for_selector("#agentStatusCard:not(.hidden)", timeout=20000)
@@ -241,7 +260,7 @@ def main():
             assert sendCallsD[0]["params"][0]["chainId"] == "0x2105"
             maybe_shot(pgD, "goal_desktop_pipeline_1440.png", full_page=True)
 
-            # Verify Contract switcher toggles between SiphonRouter.sol and SiphonFeeVault.sol
+            # Verify Contract switcher toggles between SiphonRouter.sol, SiphonSweepDelegate.sol & SiphonFeeVault.sol
             for view in ["scanner", "activity", "contract"]:
                 pgD.click(f".app-tab[data-view='{view}']")
                 pgD.wait_for_timeout(250)
@@ -250,6 +269,8 @@ def main():
                     maybe_shot(pgD, "goal_desktop_burns_1440.png", full_page=True)
                 elif view == "contract":
                     pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonRouter')", timeout=5000)
+                    pgD.click(".contract-tab[data-contract-id='delegate']")
+                    pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonSweepDelegate')", timeout=5000)
                     pgD.click(".contract-tab[data-contract-id='vault']")
                     pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonFeeVault')", timeout=5000)
                     pgD.click(".contract-tab[data-contract-id='router']")

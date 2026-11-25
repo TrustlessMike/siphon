@@ -1014,9 +1014,13 @@ export async function prepareChainBatchExecution(params: {
     SKIP_HONEYPOT: 6,
   };
 
-  const ordered = [...chainAssets].sort(
-    (a, b) => (actionOrder[a.action] ?? 9) - (actionOrder[b.action] ?? 9)
-  );
+  const ordered = [...chainAssets].sort((a, b) => {
+    // Always sweep native gas token (ETH/POL/AVAX) AFTER ERC-20s so we never drain gas mid-batch!
+    const aNativeLast = a.address === 'native' ? 1 : 0;
+    const bNativeLast = b.address === 'native' ? 1 : 0;
+    if (aNativeLast !== bNativeLast) return aNativeLast - bNativeLast;
+    return (actionOrder[a.action] ?? 9) - (actionOrder[b.action] ?? 9);
+  });
 
   const skippedAssets: PreparedChainBatch['skippedAssets'] = [];
   const executableAssets: ScannedAsset[] = [];

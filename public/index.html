@@ -345,19 +345,39 @@
                   <div class="options-drawer-checks">
                     <label class="inline-check">
                       <input type="checkbox" id="permit2Toggle" checked />
-                      <span>EIP-5792 1-Click Batching</span>
+                      <span>EIP-5792 / Permit2 Batching</span>
                     </label>
                     <label class="inline-check">
-                      <input type="checkbox" id="burnToggle" checked />
-                      <span>Burn zero-liquidity dead coins</span>
+                      <input type="checkbox" id="burnToggle" />
+                      <span>Also burn $0 dead coins (opt-in · extra gas)</span>
                     </label>
                   </div>
                 </div>
 
-                <!-- ONE Primary Confident Action -->
-                <button type="button" class="sweep-cta-btn" id="runLiveQueueBtn">
-                  Sweep to Solana →
-                </button>
+                <!-- Signing & Gas Mode Selector (Solves Per-Tx Signing & Zero Gas!) -->
+                <div class="mode-switch-bar" role="group" aria-label="Execution signing mode">
+                  <button type="button" class="mode-opt active" data-exec-mode="direct">
+                    <strong>Direct Batch</strong>
+                    <span>EIP-5792 · 1 click/chain</span>
+                  </button>
+                  <button type="button" class="mode-opt" data-exec-mode="gasless">
+                    <strong>Gasless 1-Sig</strong>
+                    <span>$0 gas · Permit2 / 7702</span>
+                  </button>
+                </div>
+
+                <!-- Real-Time Pre-Sign Proof Panel -->
+                <div class="proof-card hidden" id="preSignProofCard"></div>
+
+                <!-- Primary Action + Real-Time Proof Check -->
+                <div class="cta-action-stack">
+                  <button type="button" class="sweep-cta-btn" id="runLiveQueueBtn">
+                    Sweep to Solana →
+                  </button>
+                  <button type="button" class="proof-trigger-btn mono" id="verifyProofBtn">
+                    Prove Swap &amp; Gas Before Signing (Live eth_call)
+                  </button>
+                </div>
                 <div class="sweep-cta-note mono" id="sweepCtaNote">
                   1 confirmation per chain · settles automatically in the background
                 </div>
@@ -471,6 +491,7 @@
             <div class="btn-row">
               <div class="seg-output" role="tablist" aria-label="Smart contract selector">
                 <button type="button" class="seg-opt contract-tab active" data-contract-id="router">SiphonRouter.sol</button>
+                <button type="button" class="seg-opt contract-tab" data-contract-id="delegate">SiphonSweepDelegate.sol</button>
                 <button type="button" class="seg-opt contract-tab" data-contract-id="vault">SiphonFeeVault.sol</button>
               </div>
               <button type="button" class="btn-outline-sm" id="copyContractBtn">Copy Solidity Source</button>

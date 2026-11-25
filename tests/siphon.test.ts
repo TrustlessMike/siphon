@@ -72,8 +72,20 @@ test('Preset multi-chain scan reconciles DeFi withdrawals, liquid dust, zero-liq
   assert.ok(report.totals.netSolanaUsdc > 1000);
   assert.ok(report.totals.gasSavedUsd > 0);
 
+  // By default, $0 dead-token burns are opt-in (NOT auto-selected) to prevent wasted gas & spam popups
+  const defaultPlan = buildMigrationPlan({
+    scan: report,
+    solanaDestination: SAMPLE_SOLANA_WALLET,
+    usePermit2Batch: true,
+    includeBurns: true,
+  });
+  assert.ok(defaultPlan.legs.length >= 5);
+  assert.equal(defaultPlan.totals.tokensBurnedCount, 0);
+
+  // When user explicitly selects all assets including dead burns, burn manifest reconciles cleanly
   const plan = buildMigrationPlan({
     scan: report,
+    selectedAssetIds: report.assets.filter((a) => a.action !== 'SKIP_HONEYPOT').map((a) => a.id),
     solanaDestination: SAMPLE_SOLANA_WALLET,
     usePermit2Batch: true,
     includeBurns: true,
@@ -424,8 +436,65 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
     const c = await fetch(`http://127.0.0.1:${addr.port}/api/contract`).then((r) => r.json());
     assert.ok(c.source.includes('MIN_FEE_BPS = 500'));
     assert.ok(c.source.includes('MAX_FEE_BPS = 1000'));
+    assert.ok(c.source.includes('permitWitnessTransferFrom'));
     assert.ok(c.feeVaultSource.includes('contract SiphonFeeVault'));
-    assert.equal(c.contracts.length, 2);
+    assert.ok(c.delegateSource.includes('contract SiphonSweepDelegate'));
+    assert.ok(c.delegateSource.includes('struct ApprovalRevoke'));
+    assert.equal(c.contracts.length, 3);
+
+    // Witness-bound Gasless 1-Signature Permit2 / EIP-7702 intent preparation & signature verification
+    const opAssets = report.assets.filter((a) => a.chain === 'optimism');
+    const intent = await fetch(`http://127.0.0.1:${addr.port}/api/relayer/prepare-intent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chain: 'optimism',
+        assets: opAssets,
+        userAddress: report.walletAddress,
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+        protocolFeeBps: 700,
+        feeRecipientEvm: treasury,
+      }),
+    }).then((r) => r.json());
+    assert.equal(intent.userGasCostUsd, 0);
+    assert.equal(intent.mode, 'permit2_batch');
+    assert.equal(intent.typedData.primaryType, 'PermitBatchWitnessTransferFrom');
+    assert.ok(intent.typedData.message.witness.solanaRecipient.startsWith('0x'));
+    assert.equal(intent.typedData.message.witness.feeBps, 700);
+    assert.match(intent.intentDigestSha256, /^0x[0-9a-f]{64}$/);
+
+    const sigReceipt = await fetch(`http://127.0.0.1:${addr.port}/api/relayer/submit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        intentId: intent.intentId,
+        chain: 'optimism',
+        userAddress: report.walletAddress,
+        signature: '0x' + 'ab'.repeat(65),
+        deadline: intent.deadline,
+      }),
+    }).then((r) => r.json());
+    assert.equal(sigReceipt.accepted, true);
+    assert.equal(sigReceipt.signatureValid, true);
+
+    // Real-time Pre-Sign Simulation Proof (POST /api/tx/simulate-proof)
+    const simProofRes = await fetch(`http://127.0.0.1:${addr.port}/api/tx/simulate-proof`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chain: 'optimism',
+        assets: [opUsdc],
+        userAddress: report.walletAddress,
+        solanaDestination: SAMPLE_SOLANA_WALLET,
+        bridgePreference: 'cctp',
+        protocolFeeBps: 700,
+        feeRecipientEvm: treasury,
+      }),
+    }).then((r) => r.json());
+    assert.equal(simProofRes.proof.mintRecipientVerified, true);
+    assert.match(simProofRes.proof.proofDigestSha256, /^0x[0-9a-f]{64}$/);
+    assert.equal(simProofRes.proof.protocolFee.feeBps, 700);
+    assert.ok(simProofRes.proof.checks.length >= 2);
 
     // Background job lifecycle: POST /api/jobs -> POST /api/jobs/:id/leg -> GET /api/jobs
     const job = await fetch(`http://127.0.0.1:${addr.port}/api/jobs`, {

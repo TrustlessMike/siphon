@@ -44,6 +44,33 @@ interface IERC4626Vault {
     function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
 }
 
+interface IPermit2 {
+    struct TokenPermissions {
+        address token;
+        uint256 amount;
+    }
+
+    struct PermitBatchTransferFrom {
+        TokenPermissions[] permitted;
+        uint256 nonce;
+        uint256 deadline;
+    }
+
+    struct SignatureTransferDetails {
+        address to;
+        uint256 requestedAmount;
+    }
+
+    function permitWitnessTransferFrom(
+        PermitBatchTransferFrom calldata permit,
+        SignatureTransferDetails[] calldata transferDetails,
+        address owner,
+        bytes32 witness,
+        string calldata witnessTypeString,
+        bytes calldata signature
+    ) external;
+}
+
 library SafeERC20Lite {
     error SafeTransferFailed(address token);
     error SafeTransferFromFailed(address token);
@@ -85,6 +112,23 @@ contract SiphonRouter {
 
     /// @notice Canonical burn sink for verifiable zero-liquidity token disposal.
     address public constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+
+    /// @notice Canonical Uniswap Permit2 contract deployed identically on all 6 EVM chains.
+    IPermit2 public constant PERMIT2 = IPermit2(0x000000000022D473030F116dDEE9F6B43aC78BA3);
+
+    bytes32 public constant SIPHON_WITNESS_TYPEHASH = keccak256(
+        "SiphonSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient)"
+    );
+    string public constant SIPHON_WITNESS_TYPESTRING =
+        "SiphonSweepWitness witness)SiphonSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient)TokenPermissions(address token,uint256 amount)";
+
+    struct SiphonSweepWitness {
+        bytes32 solanaRecipient;
+        uint256 minNetUsdcOut;
+        uint256 maxGasReimbursementUsdc;
+        uint16 feeBps;
+        address feeRecipient;
+    }
 
     /// @notice Circle CCTP destination domain ID for Solana Mainnet.
     uint32 public constant SOLANA_CCTP_DOMAIN = 5;
@@ -365,6 +409,112 @@ contract SiphonRouter {
             cctpNonce,
             burnedCount,
             skippedBurns
+        );
+    }
+
+    /**
+     * @notice Witness-bound gasless 1-signature sweep via Uniswap Permit2 permitWitnessTransferFrom.
+     *         The user's SINGLE off-chain EIP-712 signature cryptographically locks solanaRecipient,
+     *         minNetUsdcOut, maxGasReimbursementUsdc, feeBps, and feeRecipient so no relayer can tamper.
+     */
+    function sweepWithPermit2Batch(
+        address user,
+        IPermit2.PermitBatchTransferFrom calldata permit,
+        SiphonSweepWitness calldata witness,
+        bytes calldata permitSignature,
+        uint256 gasReimbursementUsdc,
+        SwapStep[] calldata swaps
+    ) external nonReentrant returns (uint256 bridgedUsdc, uint64 cctpNonce) {
+        if (user == address(0) || witness.feeRecipient == address(0)) revert InvalidAddress();
+        if (witness.solanaRecipient == bytes32(0)) revert InvalidSolanaRecipient();
+        if (block.timestamp > permit.deadline) revert ExpiredDeadline();
+        if (witness.feeBps < MIN_FEE_BPS || witness.feeBps > MAX_FEE_BPS) {
+            revert FeeOutOfBounds(witness.feeBps);
+        }
+        if (gasReimbursementUsdc > witness.maxGasReimbursementUsdc) {
+            revert SlippageExceeded(0, witness.minNetUsdcOut);
+        }
+
+        uint256 usdcBefore = IERC20(usdc).balanceOf(address(this));
+
+        // 1. Pull ALL permitted tokens in ONE witness-bound gasless Permit2 signature
+        uint256 len = permit.permitted.length;
+        IPermit2.SignatureTransferDetails[] memory details = new IPermit2.SignatureTransferDetails[](len);
+        for (uint256 i = 0; i < len; i++) {
+            details[i] = IPermit2.SignatureTransferDetails({
+                to: address(this),
+                requestedAmount: permit.permitted[i].amount
+            });
+        }
+        bytes32 witnessHash = keccak256(
+            abi.encode(
+                SIPHON_WITNESS_TYPEHASH,
+                witness.solanaRecipient,
+                witness.minNetUsdcOut,
+                witness.maxGasReimbursementUsdc,
+                witness.feeBps,
+                witness.feeRecipient
+            )
+        );
+        PERMIT2.permitWitnessTransferFrom(
+            permit,
+            details,
+            user,
+            witnessHash,
+            SIPHON_WITNESS_TYPESTRING,
+            permitSignature
+        );
+
+        // 2. Swap pulled tokens into native USDC via allowlisted aggregators
+        for (uint256 i = 0; i < swaps.length; i++) {
+            SwapStep calldata s = swaps[i];
+            if (s.amountIn == 0 || s.tokenIn == usdc) continue;
+            if (!allowedTargets[s.aggregator]) revert TargetNotAllowed(s.aggregator);
+            uint256 currentBal = IERC20(s.tokenIn).balanceOf(address(this));
+            uint256 swapAmount = s.amountIn < currentBal ? s.amountIn : currentBal;
+            if (swapAmount == 0) continue;
+            s.tokenIn.forceApprove(s.aggregator, swapAmount);
+            (bool ok, ) = s.aggregator.call(s.swapCalldata);
+            if (!ok) revert AggregatorSwapFailed(s.aggregator);
+            s.tokenIn.forceApprove(s.aggregator, 0);
+        }
+
+        // 3. Account exact USDC delta, reimburse capped sponsor gas, route user-signed fee, & bridge
+        uint256 grossUsdc = IERC20(usdc).balanceOf(address(this)) - usdcBefore;
+        if (grossUsdc == 0) revert ZeroUsdcOutput();
+
+        uint256 feeUsdc = (grossUsdc * witness.feeBps) / 10_000;
+        uint256 deductions = feeUsdc + gasReimbursementUsdc;
+        if (grossUsdc <= deductions) revert SlippageExceeded(0, witness.minNetUsdcOut);
+
+        bridgedUsdc = grossUsdc - deductions;
+        if (bridgedUsdc < witness.minNetUsdcOut) revert SlippageExceeded(bridgedUsdc, witness.minNetUsdcOut);
+
+        if (gasReimbursementUsdc > 0) {
+            usdc.safeTransfer(msg.sender, gasReimbursementUsdc);
+        }
+        if (feeUsdc > 0) {
+            usdc.safeTransfer(witness.feeRecipient, feeUsdc);
+        }
+
+        usdc.forceApprove(address(cctpMessenger), bridgedUsdc);
+        cctpNonce = cctpMessenger.depositForBurn(
+            bridgedUsdc,
+            SOLANA_CCTP_DOMAIN,
+            witness.solanaRecipient,
+            usdc
+        );
+        usdc.forceApprove(address(cctpMessenger), 0);
+
+        emit SiphonMigrated(
+            user,
+            witness.solanaRecipient,
+            grossUsdc,
+            feeUsdc,
+            bridgedUsdc,
+            cctpNonce,
+            0,
+            0
         );
     }
 }
