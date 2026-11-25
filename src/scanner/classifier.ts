@@ -109,6 +109,7 @@ interface RawAssetSeed {
   rawBalance: bigint;
   priceUsd: number;
   liquidityUsd: number;
+  volume24hUsd?: number;
   honeypot?: boolean;
   permit2Approved?: boolean;
   aaveDebtUsd?: number;
@@ -208,6 +209,7 @@ function classifyAndBuildReport(params: {
     const estimatedSlippageUsd = estimateLiquidityScaledSlippageUsd({
       grossUsd,
       liquidityUsd: item.liquidityUsd,
+      volume24hUsd: item.volume24hUsd,
       isDirectUsdc: isDirectUsdc || item.underlyingSymbol === 'USDC',
       isDead: item.kind === 'dead_token',
     });
@@ -681,6 +683,13 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
           ])
         : [new Map(), new Map<string, number>()];
 
+      const liquidCandidates: Array<{
+        dt: (typeof novelTokens)[number];
+        verifiedLiq: number;
+        verifiedPrice: number;
+        volume24hUsd: number;
+        isRegistry: boolean;
+      }> = [];
       const extraDead: typeof novelTokens = [];
       for (const dt of novelTokens) {
         if (seenAddrs.has(dt.address.toLowerCase())) continue;
@@ -799,27 +808,23 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
         const dex = dexLiquidityMap.get(addrLower);
         const verifiedLiq = dex?.liquidityUsd ?? 0;
         const verifiedPrice = dex && dex.priceUsd > 0 ? dex.priceUsd : 0;
+        const verifiedVol24h = dex?.volume24hUsd ?? 0;
         const isRegistry = isCuratedRegistryToken(c.id, dt.address);
         const dexCheckedCleanly =
           dexLiquidityResult.ok && dexLiquidityResult.queriedAddresses.has(addrLower);
 
         // Require verified DEX liquidity >= $2,500 before counting a discovered long-tail token as sellable USD
         if (verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD && verifiedPrice > 0) {
-          rawAssets.push({
-            chain: c.id,
-            address: dt.address,
-            symbol: dt.symbol,
-            name: dt.name,
-            decimals: dt.decimals,
-            kind: 'erc20',
-            rawBalance: dt.rawBalance,
-            priceUsd: verifiedPrice,
-            liquidityUsd: Math.round(verifiedLiq),
-            dexLiquidityVerified: true,
-            isRegistryToken: isRegistry,
+          liquidCandidates.push({
+            dt,
+            verifiedLiq,
+            verifiedPrice,
+            volume24hUsd: verifiedVol24h,
+            isRegistry,
           });
-        } else if (!dexCheckedCleanly || isRegistry) {
-          // CRIT-08: When DexScreener lookup fails/times out or token is in curated TOKEN_REGISTRY,
+        } else if (!dexCheckedCleanly || isRegistry || verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD) {
+          // CRIT-08 / HIGH-07: When DexScreener lookup fails/times out, token is in curated TOKEN_REGISTRY,
+          // or verified liquidity >= $2,500 without derivable spot price,
           // NEVER classify as BURN_ZERO_LIQUIDITY — fail closed to SKIP_UNPRICED.
           rawAssets.push({
             chain: c.id,
@@ -830,21 +835,28 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
             kind: 'erc20',
             rawBalance: dt.rawBalance,
             priceUsd: 0,
-            liquidityUsd: 0,
-            dexLiquidityVerified: false,
+            liquidityUsd: Math.round(verifiedLiq),
+            dexLiquidityVerified: verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD,
             isRegistryToken: isRegistry,
             dexLookupFailed: !dexCheckedCleanly,
-            pricingUnavailable: isRegistry,
+            pricingUnavailable: isRegistry || verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD,
           });
         } else if (extraDead.length < 6) {
           extraDead.push(dt);
         }
       }
 
-      // Live onchain eth_call honeypot verification on discovered zero-liquidity / illiquid tokens!
-      if (extraDead.length > 0) {
+      // HIGH-07: Live onchain eth_call transfer/honeypot verification across ALL novel discovered ERC-20s
+      // (both >= $2,500 LP liquid candidates AND < $2,500 LP / zero-liquidity candidates)
+      // so transfer-locked phishing tokens with >= $2,500 locked LP are caught as SKIP_HONEYPOT!
+      const simTargets = [
+        ...liquidCandidates.filter((item) => !item.isRegistry).map((item) => item.dt),
+        ...extraDead,
+      ];
+      const simByAddr = new Map<string, { safeToBurn: boolean; reason: string }>();
+      if (simTargets.length > 0) {
         const simChecks = await Promise.all(
-          extraDead.map((dt) =>
+          simTargets.map((dt) =>
             simulateBurnTransferOnchain({
               chain: c.id,
               walletAddress: cleanAddr,
@@ -853,20 +865,44 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
             })
           )
         );
-        extraDead.forEach((dt, idx) => {
-          rawAssets.push({
-            chain: c.id,
-            address: dt.address,
-            symbol: dt.symbol,
-            name: dt.name,
-            decimals: dt.decimals,
-            kind: 'dead_token',
-            rawBalance: dt.rawBalance,
-            priceUsd: 0,
-            liquidityUsd: 0,
-            honeypot: !simChecks[idx].safeToBurn,
-            dexLiquidityVerified: false,
-          });
+        simTargets.forEach((dt, idx) => {
+          simByAddr.set(dt.address.toLowerCase(), simChecks[idx]);
+        });
+      }
+
+      for (const item of liquidCandidates) {
+        const sim = simByAddr.get(item.dt.address.toLowerCase());
+        rawAssets.push({
+          chain: c.id,
+          address: item.dt.address,
+          symbol: item.dt.symbol,
+          name: item.dt.name,
+          decimals: item.dt.decimals,
+          kind: 'erc20',
+          rawBalance: item.dt.rawBalance,
+          priceUsd: item.verifiedPrice,
+          liquidityUsd: Math.round(item.verifiedLiq),
+          volume24hUsd: item.volume24hUsd,
+          honeypot: sim ? !sim.safeToBurn : false,
+          dexLiquidityVerified: true,
+          isRegistryToken: item.isRegistry,
+        });
+      }
+
+      for (const dt of extraDead) {
+        const sim = simByAddr.get(dt.address.toLowerCase());
+        rawAssets.push({
+          chain: c.id,
+          address: dt.address,
+          symbol: dt.symbol,
+          name: dt.name,
+          decimals: dt.decimals,
+          kind: 'dead_token',
+          rawBalance: dt.rawBalance,
+          priceUsd: 0,
+          liquidityUsd: 0,
+          honeypot: sim ? !sim.safeToBurn : false,
+          dexLiquidityVerified: false,
         });
       }
     }
@@ -1107,7 +1143,7 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
   // Check real onchain Permit2 allowances per chain in a single parallel Multicall3 pass
   const erc20ByChain = new Map<EvmChainId, string[]>();
   for (const a of rawAssets) {
-    if (a.address !== 'native' && a.kind !== 'dead_token') {
+    if (a.address !== 'native' && a.kind !== 'dead_token' && !a.honeypot) {
       const list = erc20ByChain.get(a.chain) ?? [];
       list.push(a.address);
       erc20ByChain.set(a.chain, list);

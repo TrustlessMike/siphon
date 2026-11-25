@@ -10,7 +10,12 @@ import {
   pad32Hex,
 } from '../defi/extractors.js';
 import { DEAD_BURN_ADDRESS, EVM_CHAINS } from './chains.js';
-import { decodeMulticall3Aggregate3, encodeMulticall3Aggregate3, evmJsonRpcCall } from './rpc.js';
+import {
+  decodeMulticall3Aggregate3,
+  encodeMulticall3Aggregate3,
+  evmJsonRpcCall,
+  isEvmExecutionRevertError,
+} from './rpc.js';
 import { sanitizeTokenName, sanitizeTokenSymbol } from './sanitize.js';
 import type { EvmChainId } from './types.js';
 
@@ -39,15 +44,17 @@ const DEXSCREENER_CHAIN_SLUGS: Record<EvmChainId, string> = {
   worldchain: 'worldchain',
 };
 
-const ALCHEMY_NETWORK_SUBDOMAINS: Partial<Record<EvmChainId, string>> = {
+export const ALCHEMY_NETWORK_SUBDOMAINS: Partial<Record<EvmChainId, string>> = {
   ethereum: 'eth-mainnet',
   base: 'base-mainnet',
   arbitrum: 'arb-mainnet',
   optimism: 'opt-mainnet',
   polygon: 'polygon-mainnet',
+  avalanche: 'avax-mainnet',
   bnb: 'bnb-mainnet',
   linea: 'linea-mainnet',
   scroll: 'scroll-mainnet',
+  mantle: 'mantle-mainnet',
   blast: 'blast-mainnet',
   worldchain: 'worldchain-mainnet',
   unichain: 'unichain-mainnet',
@@ -463,7 +470,9 @@ export async function fetchDexLiquidityBatchWithStatus(
     const pairs = (await res.json()) as Array<{
       dexId?: string;
       baseToken?: { address?: string };
+      quoteToken?: { address?: string };
       priceUsd?: string;
+      priceNative?: string;
       liquidity?: { usd?: number };
       volume?: { h24?: number };
     }>;
@@ -477,19 +486,50 @@ export async function fetchDexLiquidityBatchWithStatus(
       };
     }
     for (const pair of pairs) {
-      const addr = pair.baseToken?.address?.toLowerCase();
-      if (!addr) continue;
-      const liq = Number(pair.liquidity?.usd ?? 0);
-      const price = Number(pair.priceUsd ?? 0);
-      const vol = Number(pair.volume?.h24 ?? 0);
-      const prev = out.get(addr);
-      if (!prev || liq > prev.liquidityUsd) {
-        out.set(addr, {
-          priceUsd: Number.isFinite(price) ? price : 0,
-          liquidityUsd: Number.isFinite(liq) ? liq : 0,
-          volume24hUsd: Number.isFinite(vol) ? vol : 0,
-          dexId: pair.dexId,
-        });
+      const baseAddr = pair.baseToken?.address?.toLowerCase();
+      const quoteAddr = pair.quoteToken?.address?.toLowerCase();
+      const rawLiq = Number(pair.liquidity?.usd ?? 0);
+      const safeLiq = Number.isFinite(rawLiq) && rawLiq > 0 ? rawLiq : 0;
+      const rawPrice = Number(pair.priceUsd ?? 0);
+      const safeBasePrice = Number.isFinite(rawPrice) && rawPrice > 0 ? rawPrice : 0;
+      const rawVol = Number(pair.volume?.h24 ?? 0);
+      const safeVol = Number.isFinite(rawVol) && rawVol > 0 ? rawVol : 0;
+
+      if (baseAddr) {
+        const prev = out.get(baseAddr);
+        if (!prev || safeLiq > prev.liquidityUsd || (safeBasePrice > 0 && prev.priceUsd <= 0)) {
+          out.set(baseAddr, {
+            priceUsd: safeBasePrice > 0 ? safeBasePrice : prev?.priceUsd ?? 0,
+            liquidityUsd: Math.max(safeLiq, prev?.liquidityUsd ?? 0),
+            volume24hUsd: safeLiq >= (prev?.liquidityUsd ?? 0) ? safeVol : prev?.volume24hUsd ?? safeVol,
+            dexId: pair.dexId ?? prev?.dexId,
+          });
+        }
+      }
+
+      // HIGH-07: Also match queried tokens that appear on the quote side of a DexScreener pair
+      // (e.g., WETH / USDC / WBTC / major quote assets) so they are never treated as zero liquidity.
+      if (quoteAddr && quoteAddr !== baseAddr && queriedAddresses.has(quoteAddr)) {
+        const rawPriceNative = Number(pair.priceNative ?? 0);
+        const derivedQuotePrice =
+          safeBasePrice > 0 && Number.isFinite(rawPriceNative) && rawPriceNative > 0
+            ? safeBasePrice / rawPriceNative
+            : 0;
+        const safeQuotePrice =
+          Number.isFinite(derivedQuotePrice) && derivedQuotePrice > 0 ? derivedQuotePrice : 0;
+        const prev = out.get(quoteAddr);
+        if (
+          !prev ||
+          (safeQuotePrice > 0 && (prev.priceUsd <= 0 || safeLiq > prev.liquidityUsd)) ||
+          (prev.priceUsd <= 0 && safeLiq > prev.liquidityUsd)
+        ) {
+          out.set(quoteAddr, {
+            priceUsd: safeQuotePrice > 0 ? safeQuotePrice : prev?.priceUsd ?? 0,
+            liquidityUsd: Math.max(safeLiq, prev?.liquidityUsd ?? 0),
+            volume24hUsd: safeLiq >= (prev?.liquidityUsd ?? 0) ? safeVol : prev?.volume24hUsd ?? safeVol,
+            dexId: pair.dexId ?? prev?.dexId,
+          });
+        }
       }
     }
     return { liquidity: out, ok: true, queriedAddresses };
@@ -1086,6 +1126,188 @@ export async function discoverDefiProtocolPositions(
   }
 }
 
+const ERC20_DECIMALS_SELECTOR = '0x313ce567'; // decimals()
+const ERC20_SYMBOL_SELECTOR = '0x95d89b41'; // symbol()
+const ERC20_NAME_SELECTOR = '0x06fdde03'; // name()
+const MAX_ALCHEMY_PAGES = 10;
+
+export interface ResolvedErc20Metadata {
+  decimals?: number;
+  symbol?: string;
+  name?: string;
+}
+
+/**
+ * Decodes either a standard ABI dynamic `string` or a fixed `bytes32` (e.g. MKR)
+ * returned by ERC-20 `symbol()` / `name()` calls.
+ */
+export function decodeAbiStringOrBytes32(hex: string): string | null {
+  const clean = hex.replace(/^0x/i, '');
+  if (!clean || clean.length < 64 || clean.length % 2 !== 0) return null;
+
+  if (clean.length >= 128) {
+    try {
+      const offsetBytes = Number(BigInt('0x' + clean.slice(0, 64)));
+      const offsetHex = offsetBytes * 2;
+      if (offsetBytes >= 32 && offsetHex + 64 <= clean.length) {
+        const byteLen = Number(BigInt('0x' + clean.slice(offsetHex, offsetHex + 64)));
+        const dataStart = offsetHex + 64;
+        const dataEnd = dataStart + byteLen * 2;
+        if (byteLen > 0 && byteLen <= 256 && dataEnd <= clean.length) {
+          const str = Buffer.from(clean.slice(dataStart, dataEnd), 'hex')
+            .toString('utf8')
+            .replace(/\0+$/g, '')
+            .trim();
+          if (str) return str;
+        }
+      }
+    } catch {
+      // fall through to bytes32 decode
+    }
+  }
+
+  if (clean.length === 64) {
+    const buf = Buffer.from(clean, 'hex');
+    let end = buf.length;
+    while (end > 0 && buf[end - 1] === 0) end--;
+    if (end > 0) {
+      const str = buf.subarray(0, end).toString('utf8').replace(/\0/g, '').trim();
+      if (str) return str;
+    }
+  }
+
+  return null;
+}
+
+function decodeErc20Decimals(hex: string): number | undefined {
+  const val = decodeAbiUint256Word(hex);
+  if (val === null || val < 0n || val > 36n) return undefined;
+  return Number(val);
+}
+
+/**
+ * Resolves real ERC-20 `decimals()`, `symbol()`, and `name()` in a single Multicall3 batch,
+ * falling back to batched `alchemy_getTokenMetadata` when provided and any field is unresolved.
+ */
+export async function resolveErc20Metadata(params: {
+  chain: EvmChainId;
+  tokenAddresses: string[];
+  alchemyUrl?: string;
+}): Promise<Map<string, ResolvedErc20Metadata>> {
+  const out = new Map<string, ResolvedErc20Metadata>();
+  const cfg = EVM_CHAINS[params.chain];
+  const unique = Array.from(
+    new Set(
+      params.tokenAddresses
+        .filter((a) => /^0x[0-9a-fA-F]{40}$/.test(a))
+        .map((a) => a.toLowerCase())
+    )
+  );
+  if (!cfg || !unique.length) return out;
+
+  // Pass 1: Single Multicall3.aggregate3 call for decimals(), symbol(), name() across all tokens
+  const calls = unique.flatMap((target) => [
+    { target, allowFailure: true, callData: ERC20_DECIMALS_SELECTOR },
+    { target, allowFailure: true, callData: ERC20_SYMBOL_SELECTOR },
+    { target, allowFailure: true, callData: ERC20_NAME_SELECTOR },
+  ]);
+
+  const rpcUrls = params.alchemyUrl
+    ? Array.from(new Set([params.alchemyUrl, ...cfg.rpcUrls]))
+    : cfg.rpcUrls;
+
+  try {
+    const mcData = encodeMulticall3Aggregate3(calls);
+    const json = await evmJsonRpcCall<string>(
+      rpcUrls,
+      'eth_call',
+      [{ to: cfg.multicall3, data: mcData }, 'latest'],
+      4000
+    );
+    if (json.result && json.result !== '0x') {
+      const decoded = decodeMulticall3Aggregate3(json.result);
+      for (let i = 0; i < unique.length; i++) {
+        const addr = unique[i];
+        const rDec = decoded[i * 3];
+        const rSym = decoded[i * 3 + 1];
+        const rName = decoded[i * 3 + 2];
+        const decimals = rDec?.success ? decodeErc20Decimals(rDec.returnData) : undefined;
+        const symbol = rSym?.success ? decodeAbiStringOrBytes32(rSym.returnData) ?? undefined : undefined;
+        const name = rName?.success ? decodeAbiStringOrBytes32(rName.returnData) ?? undefined : undefined;
+        if (decimals !== undefined || symbol !== undefined || name !== undefined) {
+          out.set(addr, { decimals, symbol, name });
+        }
+      }
+    }
+  } catch {
+    // Non-fatal: fall through to alchemy_getTokenMetadata fallback
+  }
+
+  // Pass 2: For any token still missing decimals/symbol/name, batch-query alchemy_getTokenMetadata
+  if (params.alchemyUrl) {
+    const missing = unique.filter((addr) => {
+      const meta = out.get(addr);
+      return !meta || meta.decimals === undefined || !meta.symbol || !meta.name;
+    });
+    if (missing.length > 0) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      try {
+        const payload = missing.map((addr, idx) => ({
+          jsonrpc: '2.0',
+          id: idx + 1,
+          method: 'alchemy_getTokenMetadata',
+          params: [addr],
+        }));
+        const res = await fetch(params.alchemyUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (res.ok) {
+          const rawJson = await res.json();
+          const responses = (Array.isArray(rawJson) ? rawJson : [rawJson]) as Array<{
+            id?: number;
+            result?: { decimals?: number | null; symbol?: string | null; name?: string | null };
+          }>;
+          const byId = new Map(responses.map((r) => [r.id, r.result]));
+          missing.forEach((addr, idx) => {
+            const metaRes = byId.get(idx + 1);
+            if (!metaRes) return;
+            const prev = out.get(addr) ?? {};
+            const parsedDec =
+              typeof metaRes.decimals === 'number' &&
+              Number.isInteger(metaRes.decimals) &&
+              metaRes.decimals >= 0 &&
+              metaRes.decimals <= 36
+                ? metaRes.decimals
+                : undefined;
+            const parsedSym =
+              typeof metaRes.symbol === 'string' && metaRes.symbol.trim()
+                ? metaRes.symbol.trim()
+                : undefined;
+            const parsedName =
+              typeof metaRes.name === 'string' && metaRes.name.trim()
+                ? metaRes.name.trim()
+                : undefined;
+            out.set(addr, {
+              decimals: prev.decimals ?? parsedDec,
+              symbol: prev.symbol ?? parsedSym,
+              name: prev.name ?? parsedName,
+            });
+          });
+        }
+      } catch {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  return out;
+}
+
 export async function discoverChainTokens(
   chain: EvmChainId,
   walletAddress: string,
@@ -1188,43 +1410,91 @@ export async function discoverChainTokens(
   const alchemySub = ALCHEMY_NETWORK_SUBDOMAINS[chain];
   if (alchemyKey && alchemySub) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 4500);
-      const res = await fetch(`https://${alchemySub}.g.alchemy.com/v2/${alchemyKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'alchemy_getTokenBalances',
-          params: [walletAddress, 'erc20'],
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (res.ok) {
-        const json = (await res.json()) as {
-          result?: { tokenBalances?: Array<{ contractAddress?: string; tokenBalance?: string }> };
-        };
-        const out: DiscoveredEthToken[] = [];
-        for (const item of json.result?.tokenBalances ?? []) {
-          if (!item.contractAddress || !item.tokenBalance) continue;
-          try {
-            const rawBalance = BigInt(item.tokenBalance);
-            if (rawBalance <= 0n) continue;
-            out.push({
-              address: item.contractAddress,
-              symbol: item.contractAddress.slice(0, 6).toUpperCase(),
-              name: 'Discovered ERC-20',
-              decimals: 18,
-              rawBalance,
-              ethplorerPriceUsd: 0,
-            });
-          } catch {
-            // ignore
+      const alchemyUrl = `https://${alchemySub}.g.alchemy.com/v2/${alchemyKey}`;
+      const rawEntries: Array<{ address: string; rawBalance: bigint }> = [];
+      const seenContracts = new Set<string>();
+      const seenPageKeys = new Set<string>();
+      let pageKey: string | undefined;
+
+      for (let page = 0; page < MAX_ALCHEMY_PAGES && rawEntries.length < maxTokens; page++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 4500);
+        try {
+          const reqParams = pageKey
+            ? [walletAddress, 'erc20', { pageKey }]
+            : [walletAddress, 'erc20'];
+          const res = await fetch(alchemyUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: page + 1,
+              method: 'alchemy_getTokenBalances',
+              params: reqParams,
+            }),
+            signal: controller.signal,
+          });
+          clearTimeout(timer);
+          if (!res.ok) break;
+          const json = (await res.json()) as {
+            result?: {
+              tokenBalances?: Array<{
+                contractAddress?: string;
+                tokenBalance?: string;
+                error?: unknown;
+              }>;
+              pageKey?: string;
+            };
+          };
+          for (const item of json.result?.tokenBalances ?? []) {
+            if (!item.contractAddress || !item.tokenBalance || item.error) continue;
+            if (!/^0x[0-9a-fA-F]{40}$/.test(item.contractAddress)) continue;
+            const addrLower = item.contractAddress.toLowerCase();
+            if (seenContracts.has(addrLower)) continue;
+            try {
+              const rawBalance = BigInt(item.tokenBalance);
+              if (rawBalance <= 0n) continue;
+              seenContracts.add(addrLower);
+              rawEntries.push({ address: item.contractAddress, rawBalance });
+              if (rawEntries.length >= maxTokens) break;
+            } catch {
+              // ignore malformed balance
+            }
           }
+          const nextPageKey = json.result?.pageKey;
+          if (!nextPageKey || seenPageKeys.has(nextPageKey)) break;
+          seenPageKeys.add(nextPageKey);
+          pageKey = nextPageKey;
+        } catch {
+          clearTimeout(timer);
+          break;
         }
-        if (out.length) return out.slice(0, maxTokens);
+      }
+
+      if (rawEntries.length > 0) {
+        const limited = rawEntries.slice(0, maxTokens);
+        const metadataMap = await resolveErc20Metadata({
+          chain,
+          tokenAddresses: limited.map((e) => e.address),
+          alchemyUrl,
+        });
+        return limited.map((entry) => {
+          const meta = metadataMap.get(entry.address.toLowerCase());
+          const decimals =
+            meta?.decimals !== undefined && meta.decimals >= 0 && meta.decimals <= 36
+              ? meta.decimals
+              : 18;
+          const symbol = sanitizeTokenSymbol(meta?.symbol, 'UNKNOWN');
+          const name = sanitizeTokenName(meta?.name || meta?.symbol, 'ERC-20 Token');
+          return {
+            address: entry.address,
+            symbol,
+            name,
+            decimals,
+            rawBalance: entry.rawBalance,
+            ethplorerPriceUsd: 0,
+          };
+        });
       }
     } catch {
       // fall through
@@ -1275,15 +1545,26 @@ export async function simulateBurnTransferOnchain(params: {
     );
 
     if (json.error) {
+      if (isEvmExecutionRevertError(json.error)) {
+        return {
+          safeToBurn: false,
+          reason: `eth_call burn simulation reverted (${json.error.message ?? 'transfer locked'}). Safely skipped.`,
+        };
+      }
       return {
-        safeToBurn: false,
-        reason: `eth_call burn simulation reverted (${json.error.message ?? 'transfer locked'}). Safely skipped.`,
+        safeToBurn: true,
+        reason: `RPC simulation error (${json.error.message ?? 'unavailable'}); not classified as honeypot.`,
       };
     }
 
     const resultHex = (json.result ?? '0x').toLowerCase();
     // Standard ERC-20 returns true (0x...01) or empty bytes (USDT-style non-returning transfer)
-    if (resultHex === '0x' || resultHex.endsWith('1')) {
+    const returnedTrue =
+      resultHex === '0x' ||
+      resultHex === '0x1' ||
+      resultHex === '0x01' ||
+      (/^0x[0-9a-f]{64,}$/.test(resultHex) && BigInt(resultHex.slice(0, 66)) === 1n);
+    if (returnedTrue) {
       return {
         safeToBurn: true,
         reason: 'Verified live via eth_call: transfer(0x…dEaD) succeeds with zero revert.',

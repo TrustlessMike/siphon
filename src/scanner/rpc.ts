@@ -88,6 +88,117 @@ export function decodeMulticall3Aggregate3(
   return out;
 }
 
+const TRANSIENT_RPC_ERROR_CODES = new Set<number>([
+  -32005, // limit exceeded
+  -32603, // internal error
+  -32016, // rate limit exceeded
+  -32007, // quota / rate limit
+  -32097, // rate limit
+  429,
+  502,
+  503,
+  504,
+]);
+
+const TRANSIENT_RPC_ERROR_RE =
+  /429|limit exceeded|rate[\s_-]?limit|too many requests|timeout|timed out|compute units|quota|throttl|over capacity|service unavailable|bad gateway|internal error|temporarily unavailable|try again/i;
+
+export interface JsonRpcErrorLike {
+  message?: string;
+  code?: number;
+}
+
+/**
+ * Returns true for node/infrastructure/rate-limit JSON-RPC errors that MUST trigger
+ * failover to the next configured RPC endpoint rather than being accepted as valid answers.
+ */
+export function isTransientJsonRpcError(error?: JsonRpcErrorLike): boolean {
+  if (!error) return false;
+  if (typeof error.code === 'number' && TRANSIENT_RPC_ERROR_CODES.has(error.code)) {
+    return true;
+  }
+  const msg = error.message ?? '';
+  return TRANSIENT_RPC_ERROR_RE.test(msg);
+}
+
+/**
+ * Returns true ONLY for genuine EVM execution reverts (EIP-1474 code 3 or explicit revert message),
+ * never for rate-limit / timeout / internal node errors.
+ */
+export function isEvmExecutionRevertError(error?: JsonRpcErrorLike): boolean {
+  if (!error) return false;
+  if (error.code === 3) return true;
+  if (isTransientJsonRpcError(error)) return false;
+  const msg = error.message ?? '';
+  return /execution reverted|revert/i.test(msg);
+}
+
+function isMulticall3BatchRequest(req: { method: string; params: unknown[] }): boolean {
+  if (req.method !== 'eth_call') return false;
+  const first = req.params[0] as { data?: string } | undefined;
+  const data = typeof first?.data === 'string' ? first.data.toLowerCase() : '';
+  return data.startsWith(`0x${AGGREGATE3_SELECTOR}`);
+}
+
+function isCriticalBatchRequest(req: { method: string; params: unknown[] }): boolean {
+  return (
+    req.method === 'eth_blockNumber' ||
+    req.method === 'eth_getBalance' ||
+    req.method === 'eth_call'
+  );
+}
+
+function validateBatchResponses(
+  requests: Array<{ id: number; method: string; params: unknown[] }>,
+  responses: Array<{ id: number; result?: string; error?: { message: string; code?: number } }>
+): { ok: true } | { ok: false; reason: string } {
+  if (!responses.length) {
+    return { ok: false, reason: 'Empty batch response' };
+  }
+
+  const byId = new Map(responses.map((r) => [r.id, r]));
+
+  for (const req of requests) {
+    const resp = byId.get(req.id);
+    if (resp?.error && isTransientJsonRpcError(resp.error)) {
+      return {
+        ok: false,
+        reason: `RPC ${req.method} failed (${resp.error.code ?? 'err'}: ${resp.error.message ?? 'node error'})`,
+      };
+    }
+
+    if (isCriticalBatchRequest(req)) {
+      if (!resp) {
+        return { ok: false, reason: `Missing batch response for critical method ${req.method}` };
+      }
+      if (resp.error) {
+        // Non-Multicall3 eth_call reverts are only acceptable if explicitly not Multicall3;
+        // Multicall3 aggregate3(allowFailure=true), eth_blockNumber, and eth_getBalance must always return a result.
+        if (req.method !== 'eth_call' || isMulticall3BatchRequest(req) || !isEvmExecutionRevertError(resp.error)) {
+          return {
+            ok: false,
+            reason: `Critical RPC ${req.method} error (${resp.error.code ?? 'err'}: ${resp.error.message ?? 'failed'})`,
+          };
+        }
+      } else if (resp.result === undefined) {
+        return { ok: false, reason: `Missing result for critical RPC ${req.method}` };
+      }
+    }
+  }
+
+  // If the batch had no critical methods, still require at least one concrete result without transient errors.
+  const hasCritical = requests.some((r) => isCriticalBatchRequest(r));
+  if (!hasCritical && !responses.some((r) => r.result !== undefined)) {
+    const firstErr = responses.find((r) => r.error)?.error;
+    return {
+      ok: false,
+      reason: firstErr?.message ?? 'Batch response contained no results',
+    };
+  }
+
+  return { ok: true };
+}
+
 export async function evmJsonRpcBatch(
   rpcUrls: string[],
   requests: Array<{ id: number; method: string; params: unknown[] }>,
@@ -110,9 +221,27 @@ export async function evmJsonRpcBatch(
         continue;
       }
       const parsed = await res.json();
-      const arr = Array.isArray(parsed) ? parsed : [parsed];
-      if (!arr.length || (arr.length === 1 && !arr[0]?.result && arr[0]?.error && requests.length > 1)) {
-        // Some public RPCs disable JSON-RPC batch arrays — fall back to parallel single calls on this endpoint
+      const arr = (Array.isArray(parsed) ? parsed : [parsed]) as Array<{
+        id: number;
+        result?: string;
+        error?: { message: string; code?: number };
+      }>;
+
+      const batchCheck = validateBatchResponses(requests, arr);
+      if (batchCheck.ok) {
+        return arr;
+      }
+
+      const batchUnsupported =
+        requests.length > 1 &&
+        arr.length === 1 &&
+        arr[0]?.result === undefined &&
+        Boolean(arr[0]?.error) &&
+        !isTransientJsonRpcError(arr[0]?.error);
+
+      if (batchUnsupported) {
+        // Some public RPCs disable JSON-RPC batch arrays — fall back to parallel single calls on this endpoint,
+        // but still require ALL critical items to succeed without rate-limit/node errors before accepting.
         try {
           const singles = await Promise.all(
             requests.map(async (r) => {
@@ -126,24 +255,34 @@ export async function evmJsonRpcBatch(
                   signal: c2.signal,
                 });
                 clearTimeout(t2);
-                if (!sRes.ok) return { id: r.id, error: { message: `HTTP ${sRes.status}` } };
-                return (await sRes.json()) as { id: number; result?: string; error?: { message: string; code?: number } };
+                if (!sRes.ok) {
+                  return { id: r.id, error: { code: sRes.status, message: `HTTP ${sRes.status}` } };
+                }
+                return (await sRes.json()) as {
+                  id: number;
+                  result?: string;
+                  error?: { message: string; code?: number };
+                };
               } catch (e2) {
                 clearTimeout(t2);
                 return { id: r.id, error: { message: e2 instanceof Error ? e2.message : String(e2) } };
               }
             })
           );
-          if (singles.some((s) => s.result !== undefined)) {
+          const singleCheck = validateBatchResponses(requests, singles);
+          if (singleCheck.ok) {
             return singles;
           }
-        } catch {
-          // continue to next RPC
+          lastErr = new Error(`${singleCheck.reason} (${rpcUrl})`);
+          continue;
+        } catch (eFallback) {
+          lastErr = eFallback;
+          continue;
         }
-        lastErr = new Error(arr[0]?.error?.message ?? 'Empty batch response');
-        continue;
       }
-      return arr;
+
+      lastErr = new Error(`${batchCheck.reason} (${rpcUrl})`);
+      continue;
     } catch (err) {
       clearTimeout(timer);
       lastErr = err;
@@ -179,15 +318,9 @@ export async function evmJsonRpcCall<T = string>(
         return json;
       }
       if (json.error !== undefined) {
-        // Application-level EVM execution revert is a valid onchain answer;
-        // RPC provider errors (usage/rate limits, auth, internal errors) MUST fail over to the next RPC URL!
-        const errMsg = (json.error.message ?? '').toLowerCase();
-        const isExecutionRevert =
-          json.error.code === 3 ||
-          errMsg.includes('revert') ||
-          errMsg.includes('invalid opcode') ||
-          errMsg.includes('out of gas');
-        if (isExecutionRevert) {
+        // Short-circuit ONLY on genuine EVM execution reverts (code === 3 or /execution reverted|revert/i).
+        // Infrastructure, rate-limit, and node errors MUST fail over to the next configured RPC URL.
+        if (isEvmExecutionRevertError(json.error)) {
           return json;
         }
         lastErr = new Error(json.error.message ?? `RPC error ${json.error.code ?? ''}`);
@@ -247,10 +380,14 @@ export async function scanSingleEvmChain(
     ]);
 
     const byId = new Map(batch.map((r) => [r.id, r]));
-    const blockHex = byId.get(1)?.result ?? '0x0';
+    const blockHex = byId.get(1)?.result;
     const gasHex = byId.get(2)?.result ?? '0x3b9aca00';
-    const balHex = byId.get(3)?.result ?? '0x0';
-    const mcHex = byId.get(4)?.result ?? '0x';
+    const balHex = byId.get(3)?.result;
+    const mcHex = byId.get(4)?.result;
+
+    if (blockHex === undefined || balHex === undefined || mcHex === undefined) {
+      throw new Error(`Incomplete RPC batch response for ${chain.name}`);
+    }
 
     const tokenBalances = new Map<string, bigint>();
     const decoded = decodeMulticall3Aggregate3(mcHex);
