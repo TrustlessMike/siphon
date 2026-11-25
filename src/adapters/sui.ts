@@ -737,33 +737,71 @@ export const suiAdapter: ChainFamilyAdapter = {
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
     const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
-    const expectedBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+    const cleanAddr = params.userAddress.trim();
+    const userAddressValid = suiAdapter.matchesAddress(cleanAddr);
+    let expectedBytes32 = '0x' + '00'.repeat(32);
+    let solanaRecipientValid = false;
+    try {
+      expectedBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+      solanaRecipientValid = true;
+    } catch {
+      solanaRecipientValid = false;
+    }
+
     const sweepable = filterChainSweepableAssets('sui', params.assets);
-    const escapedAddr = params.userAddress.replace(/[^0-9a-fA-Fx]/g, '');
+    const outputAsset = params.outputAsset ?? 'USDC';
+    const escapedAddr = cleanAddr.replace(/[^0-9a-fA-Fx]/g, '');
 
     const [gqlData, solSnap, priceMap] = await Promise.all([
-      suiGraphql<{
-        checkpoint?: { sequenceNumber?: number };
-        address?: { balance?: { totalBalance?: string } };
-      }>(
-        `{ checkpoint { sequenceNumber } address(address: "${escapedAddr}") { balance(type: "0x2::sui::SUI") { totalBalance } } }`
-      ),
-      fetchSolanaWalletBalances(params.solanaDestination).catch(() => null),
+      userAddressValid
+        ? suiGraphql<{
+            checkpoint?: { sequenceNumber?: number };
+            address?: {
+              balances?: { nodes?: Array<{ coinType?: { repr?: string }; totalBalance?: string }> };
+            };
+          }>(
+            `{ checkpoint { sequenceNumber } address(address: "${escapedAddr}") { balances(first: 50) { nodes { coinType { repr } totalBalance } } } }`
+          )
+        : Promise.resolve(null),
+      solanaRecipientValid
+        ? fetchSolanaWalletBalances(params.solanaDestination).catch(() => null)
+        : Promise.resolve(null),
       fetchLiveUsdPrices(['coingecko:sui']),
     ]);
 
     let blockNumber = Number(gqlData?.checkpoint?.sequenceNumber ?? 0);
-    let rawSui = gqlData?.address?.balance?.totalBalance ?? null;
-    if (!blockNumber) {
-      const [cp, bal] = await Promise.all([
-        suiRpc<string>('sui_getLatestCheckpointSequenceNumber', []),
-        suiRpc<{ totalBalance: string }>('suix_getBalance', [params.userAddress, '0x2::sui::SUI']),
-      ]);
-      blockNumber = Number(cp || 0);
-      rawSui = bal?.totalBalance ?? '0';
+    const liveCoinBalances = new Map<string, bigint>();
+    let liveBalancesFetched = Boolean(gqlData?.address?.balances);
+    for (const n of gqlData?.address?.balances?.nodes ?? []) {
+      if (n.coinType?.repr && n.totalBalance !== undefined) {
+        try {
+          liveCoinBalances.set(normalizeMoveCoinType(n.coinType.repr), BigInt(n.totalBalance));
+        } catch {
+          // ignore malformed balance
+        }
+      }
     }
 
-    const nativeBalanceUi = Number(unitsToUi(rawSui || '0', 9).toFixed(5));
+    if (!blockNumber && userAddressValid) {
+      const [cp, rpcBals] = await Promise.all([
+        suiRpc<string>('sui_getLatestCheckpointSequenceNumber', []),
+        suiRpc<Array<{ coinType: string; totalBalance: string }>>('suix_getAllBalances', [cleanAddr]),
+      ]);
+      blockNumber = Number(cp || 0);
+      if (Array.isArray(rpcBals)) {
+        liveBalancesFetched = true;
+        for (const b of rpcBals) {
+          try {
+            liveCoinBalances.set(normalizeMoveCoinType(b.coinType), BigInt(b.totalBalance || '0'));
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+
+    const rawSui = (liveCoinBalances.get('0x2::sui::SUI') ?? 0n).toString();
+    const nativeBalanceUi = Number(unitsToUi(rawSui, 9).toFixed(5));
     const nativePriceUsd = params.nativePriceUsd ?? priceMap.get('coingecko:sui') ?? 2.45;
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
     const estimatedGasUsd = 0.01;
@@ -772,7 +810,143 @@ export const suiAdapter: ChainFamilyAdapter = {
     const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
-    const rpcVerified = blockNumber > 0;
+    const rpcReachable = blockNumber > 0;
+
+    // Fail-closed live balance verification for liquid Sui coins
+    let insufficientBalanceDetail: string | null = null;
+    if (liveBalancesFetched) {
+      for (const a of sweepable) {
+        if (a.id === 'sui:native_stake' || a.address.startsWith('staked:')) continue;
+        let reqRaw = 0n;
+        try {
+          reqRaw = BigInt(a.rawBalance || '0');
+        } catch {
+          reqRaw = 0n;
+        }
+        const normType = normalizeMoveCoinType(a.address);
+        const availRaw = liveCoinBalances.get(normType) ?? 0n;
+        if (reqRaw > availRaw) {
+          insufficientBalanceDetail = `Insufficient live Sui balance for ${a.symbol} (${availRaw.toString()} available < ${reqRaw.toString()} requested).`;
+          break;
+        }
+      }
+    }
+
+    const ataMissing = outputAsset === 'USDC' && solSnap !== null && !solSnap.hasUsdcAta;
+
+    // Real live sui_dryRunTransactionBlock when BCS base64 txBytes are provided
+    const rawTxBytes = (
+      params.rawTxBytes ??
+      (typeof params.simulationPayload?.txBytes === 'string' ? params.simulationPayload.txBytes : undefined)
+    )?.trim();
+
+    let liveSimSucceeded = false;
+    let liveSimError: string | null = null;
+    let liveSimGasSummary: string | null = null;
+    let liveSimUnreachable = false;
+
+    if (rawTxBytes && userAddressValid && solanaRecipientValid && !insufficientBalanceDetail) {
+      let responded = false;
+      for (const url of SUI_RPC_URLS) {
+        const res = await fetchWithRetry(
+          url,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'sui_dryRunTransactionBlock',
+              params: [rawTxBytes],
+            }),
+          },
+          4200
+        );
+        if (!res) continue;
+        responded = true;
+        const json = (await res.json().catch(() => ({}))) as {
+          result?: {
+            effects?: {
+              status?: { status?: string; error?: string };
+              gasUsed?: { computationCost?: string; storageCost?: string };
+            };
+          };
+          error?: { message?: string };
+        };
+        if (json.error) {
+          liveSimError = json.error.message || 'sui_dryRunTransactionBlock RPC error';
+        } else if (json.result?.effects?.status?.status === 'success') {
+          liveSimSucceeded = true;
+          liveSimGasSummary = `computationCost=${json.result.effects.gasUsed?.computationCost ?? '0'}`;
+        } else {
+          liveSimError =
+            json.result?.effects?.status?.error ||
+            `Sui dry-run failed with status=${json.result?.effects?.status?.status ?? 'unknown'}`;
+        }
+        break;
+      }
+      if (!responded) {
+        liveSimUnreachable = true;
+      }
+    }
+
+    const warnings: string[] = [];
+    if (!userAddressValid) {
+      warnings.push(`Invalid Sui address format: ${cleanAddr || '(empty)'}.`);
+    }
+    if (!solanaRecipientValid) {
+      warnings.push('Invalid Solana destination address (expected valid non-zero base58 pubkey).');
+    }
+    if (ataMissing) {
+      warnings.push('Destination Solana wallet has no canonical USDC ATA yet; create ATA before claiming CCTP USDC.');
+    }
+    if (sweepable.length === 0) {
+      warnings.push('No sweepable Sui assets selected.');
+    }
+    if (insufficientBalanceDetail) {
+      warnings.push(insufficientBalanceDetail);
+    }
+    if (!hasEnoughNativeGas) {
+      warnings.push(`Low SUI balance (${nativeBalanceUi} SUI). Native Sponsored PTB sets gasData.owner = Siphon Relayer ($0 user gas).`);
+    }
+    if (!rpcReachable) {
+      warnings.push('Sui Mainnet GraphQL/RPC checkpoint could not be reached for live verification.');
+    }
+    if (liveSimError) {
+      warnings.push(`Sui sui_dryRunTransactionBlock reverted: ${liveSimError}`);
+    }
+
+    const failClosedTx =
+      !userAddressValid ||
+      sweepable.length === 0 ||
+      Boolean(insufficientBalanceDetail) ||
+      Boolean(liveSimError);
+    const failClosedRecipient = !solanaRecipientValid || ataMissing;
+
+    const simulatedLive = Boolean(rawTxBytes && liveSimSucceeded && !failClosedTx && !failClosedRecipient);
+    const allChecksSafe = Boolean(simulatedLive && !failClosedTx && !failClosedRecipient);
+
+    const ptbCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedTx
+      ? 'reverted'
+      : liveSimUnreachable || (!rawTxBytes && !rpcReachable)
+      ? 'rpc_skipped'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const cctpCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedRecipient
+      ? 'reverted'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const simulationNote = simulatedLive
+      ? `Live Sui sui_dryRunTransactionBlock passed (${liveSimGasSummary ?? 'ok'}) at checkpoint #${blockNumber.toLocaleString()}.`
+      : failClosedTx || failClosedRecipient
+      ? `Pre-flight check failed closed: ${warnings[0] ?? 'validation rejected.'}`
+      : liveSimUnreachable || !rpcReachable
+      ? 'Sui GraphQL/RPC dry-run endpoint unreachable; transaction was not simulated.'
+      : 'High-level Sui PTB intent pre-flight only: sui_dryRunTransactionBlock requires BCS-serialized txBytes from wallet/SDK.';
 
     const proofDigestSha256 =
       '0x' +
@@ -782,21 +956,14 @@ export const suiAdapter: ChainFamilyAdapter = {
           JSON.stringify({
             family: 'sui',
             checkpoint: blockNumber,
-            userAddress: params.userAddress,
+            userAddress: cleanAddr,
             expectedBytes32,
+            simulatedLive,
             outflows: sweepable.map((a) => ({ id: a.id, raw: a.rawBalance })),
             guaranteedMinNetUsd,
           })
         )
         .digest('hex');
-
-    const warnings: string[] = [];
-    if (!hasEnoughNativeGas) {
-      warnings.push(`Low SUI balance (${nativeBalanceUi} SUI). Native Sponsored PTB sets gasData.owner = Siphon Relayer ($0 user gas).`);
-    }
-    if (!rpcVerified) {
-      warnings.push('Sui Mainnet GraphQL/RPC checkpoint could not be reached for live verification.');
-    }
 
     return {
       proofId: `prf_sui_${crypto.randomBytes(4).toString('hex')}`,
@@ -807,17 +974,19 @@ export const suiAdapter: ChainFamilyAdapter = {
       chainId: 'sui:mainnet',
       chainName: 'Sui',
       blockNumber,
-      userAddress: params.userAddress,
+      userAddress: cleanAddr,
       solanaDestination: params.solanaDestination,
       solanaMintRecipientBytes32: expectedBytes32,
-      mintRecipientVerified: true,
+      mintRecipientVerified: solanaRecipientValid,
       hasEnoughNativeGas,
       nativeBalanceUi,
       nativeSymbol: 'SUI',
       nativeBalanceUsd,
       estimatedGasUsd,
       recommendedMode: hasEnoughNativeGas ? 'eip5792_batch' : 'sponsored_gasless',
-      simulationEndpoint: 'graphql.mainnet.sui.io + dryRunTransactionBlock',
+      simulationEndpoint: 'graphql.mainnet.sui.io + sui_dryRunTransactionBlock',
+      simulatedLive,
+      simulationNote,
       outflows: sweepable.map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
@@ -833,7 +1002,7 @@ export const suiAdapter: ChainFamilyAdapter = {
       },
       guaranteedMinNetUsd,
       estimatedNetUsd,
-      outputAsset: params.outputAsset ?? 'USDC',
+      outputAsset,
       preSolanaSnapshot: solSnap
         ? {
             usdcBalance: solSnap.usdcBalance,
@@ -847,26 +1016,48 @@ export const suiAdapter: ChainFamilyAdapter = {
           stepId: 'sui_dry_run_ptb',
           assetSymbol: 'SUI',
           actionType: 'sui_ptb_dry_run',
-          target: 'graphql.mainnet.sui.io/graphql',
-          summary: rpcVerified
-            ? `Sui GraphQL state verified at checkpoint #${blockNumber.toLocaleString()}`
-            : 'Sui GraphQL checkpoint unreachable',
-          preflightStatus: rpcVerified ? 'verified' : 'rpc_skipped',
-          preflightDetail: rpcVerified
-            ? `Live Sui checkpoint #${blockNumber.toLocaleString()} (${nativeBalanceUi} SUI) verified`
-            : 'Sui GraphQL/RPC unavailable',
+          target: 'sui_dryRunTransactionBlock',
+          summary:
+            ptbCheckStatus === 'verified'
+              ? `Live Sui dryRunTransactionBlock passed (${liveSimGasSummary ?? 'ok'})`
+              : ptbCheckStatus === 'reverted'
+              ? liveSimError
+                ? `Sui dry-run reverted: ${liveSimError.slice(0, 120)}`
+                : insufficientBalanceDetail || warnings[0] || 'Sui pre-flight rejected'
+              : ptbCheckStatus === 'rpc_skipped'
+              ? 'Sui GraphQL/RPC endpoint unreachable'
+              : `Pre-flight Sui state checked at #${blockNumber.toLocaleString()} (no BCS txBytes simulated)`,
+          preflightStatus: ptbCheckStatus,
+          preflightDetail:
+            ptbCheckStatus === 'verified'
+              ? `Checkpoint #${blockNumber.toLocaleString()} · sui_dryRunTransactionBlock success (${liveSimGasSummary ?? 'ok'})`
+              : ptbCheckStatus === 'reverted'
+              ? liveSimError || insufficientBalanceDetail || warnings[0] || 'Sui pre-flight check failed closed'
+              : ptbCheckStatus === 'rpc_skipped'
+              ? 'Sui GraphQL/RPC unavailable'
+              : `Checkpoint #${blockNumber.toLocaleString()} (${nativeBalanceUi} SUI) · BCS txBytes not supplied for live dry-run`,
         },
         {
           stepId: 'sui_cctp_domain8',
           assetSymbol: 'USDC',
           actionType: 'cctp_deposit_for_burn',
           target: 'cctp::token_messenger_minter::deposit_for_burn',
-          summary: `Native Sui Circle CCTP Domain 8 → Solana USDC ATA PDA`,
-          preflightStatus: 'verified',
-          preflightDetail: `Canonical Solana USDC ATA bytes32 (${expectedBytes32.slice(0, 14)}…) verified`,
+          summary: !solanaRecipientValid
+            ? 'Invalid Solana destination address'
+            : ataMissing
+            ? 'Solana destination USDC ATA missing'
+            : `Native Sui CCTP Domain 8 → Solana USDC ATA PDA (${simulatedLive ? 'verified' : 'unsimulated'})`,
+          preflightStatus: cctpCheckStatus,
+          preflightDetail: !solanaRecipientValid
+            ? 'Solana destination failed base58 / non-zero public key validation'
+            : ataMissing
+            ? 'Solana wallet has no canonical USDC ATA yet'
+            : simulatedLive
+            ? `Canonical Solana USDC ATA bytes32 (${expectedBytes32.slice(0, 14)}…) verified alongside live dry-run`
+            : `Canonical Solana USDC ATA bytes32 (${expectedBytes32.slice(0, 14)}…) derived (tx execution not simulated live)`,
         },
       ],
-      allChecksSafe: rpcVerified,
+      allChecksSafe,
       warnings,
     };
   },

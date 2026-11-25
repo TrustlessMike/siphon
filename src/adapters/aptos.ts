@@ -645,25 +645,53 @@ export const aptosAdapter: ChainFamilyAdapter = {
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
     const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
-    const expectedBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
-    const sweepable = filterChainSweepableAssets('aptos', params.assets);
+    const cleanAddr = params.userAddress.trim();
+    const userAddressValid = aptosAdapter.matchesAddress(cleanAddr);
+    let expectedBytes32 = '0x' + '00'.repeat(32);
+    let solanaRecipientValid = false;
+    try {
+      expectedBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+      solanaRecipientValid = true;
+    } catch {
+      solanaRecipientValid = false;
+    }
 
-    const [ledger, aptFaRes, aptCoinRes, solSnap, priceMap] = await Promise.all([
+    const sweepable = filterChainSweepableAssets('aptos', params.assets);
+    const outputAsset = params.outputAsset ?? 'USDC';
+
+    const [ledger, aptFaRes, aptCoinRes, usdcFaRes, solSnap, priceMap] = await Promise.all([
       aptosGet<{ block_height?: string; ledger_version?: string }>(''),
-      aptosView<[string]>({
-        function: '0x1::primary_fungible_store::balance',
-        type_arguments: ['0x1::fungible_asset::Metadata'],
-        arguments: [params.userAddress, '0xa'],
-      }),
-      aptosGet<{ data?: { coin?: { value?: string } } }>(
-        `/accounts/${encodeURIComponent(params.userAddress)}/resource/0x1::coin::CoinStore%3C0x1::aptos_coin::AptosCoin%3E`
-      ),
-      fetchSolanaWalletBalances(params.solanaDestination).catch(() => null),
+      userAddressValid
+        ? aptosView<[string]>({
+            function: '0x1::primary_fungible_store::balance',
+            type_arguments: ['0x1::fungible_asset::Metadata'],
+            arguments: [cleanAddr, '0xa'],
+          })
+        : Promise.resolve(null),
+      userAddressValid
+        ? aptosGet<{ data?: { coin?: { value?: string } } }>(
+            `/accounts/${encodeURIComponent(cleanAddr)}/resource/0x1::coin::CoinStore%3C0x1::aptos_coin::AptosCoin%3E`
+          )
+        : Promise.resolve(null),
+      userAddressValid
+        ? aptosView<[string]>({
+            function: '0x1::primary_fungible_store::balance',
+            type_arguments: ['0x1::fungible_asset::Metadata'],
+            arguments: [cleanAddr, APTOS_NATIVE_USDC_FA],
+          })
+        : Promise.resolve(null),
+      solanaRecipientValid
+        ? fetchSolanaWalletBalances(params.solanaDestination).catch(() => null)
+        : Promise.resolve(null),
       fetchLiveUsdPrices(['coingecko:aptos']),
     ]);
 
     const blockNumber = Number(ledger?.block_height || ledger?.ledger_version || 0);
+    const aptBalanceKnown = Boolean(aptFaRes?.[0] !== undefined || aptCoinRes?.data?.coin?.value !== undefined);
     const rawApt = aptFaRes?.[0] || aptCoinRes?.data?.coin?.value || '0';
+    const usdcBalanceKnown = Boolean(usdcFaRes?.[0] !== undefined);
+    const rawUsdc = usdcFaRes?.[0] || '0';
+
     const nativeBalanceUi = Number(unitsToUi(rawApt, 8).toFixed(5));
     const nativePriceUsd = params.nativePriceUsd ?? priceMap.get('coingecko:aptos') ?? 6.1;
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
@@ -673,7 +701,155 @@ export const aptosAdapter: ChainFamilyAdapter = {
     const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
-    const rpcVerified = blockNumber > 0;
+    const rpcReachable = blockNumber > 0;
+
+    // Fail-closed live balance verification for APT & Native FA USDC
+    let insufficientBalanceDetail: string | null = null;
+    for (const a of sweepable) {
+      const addrLower = a.address.trim().toLowerCase();
+      let reqRaw = 0n;
+      try {
+        reqRaw = BigInt(a.rawBalance || '0');
+      } catch {
+        reqRaw = 0n;
+      }
+      if (
+        (addrLower === '0xa' || addrLower === APTOS_NATIVE_APT_FA || addrLower === '0x1::aptos_coin::aptoscoin') &&
+        aptBalanceKnown
+      ) {
+        if (reqRaw > BigInt(rawApt)) {
+          insufficientBalanceDetail = `Insufficient live Aptos APT balance (${rawApt} available < ${reqRaw.toString()} requested).`;
+          break;
+        }
+      } else if (addrLower === APTOS_NATIVE_USDC_FA && usdcBalanceKnown) {
+        if (reqRaw > BigInt(rawUsdc)) {
+          insufficientBalanceDetail = `Insufficient live Aptos Native USDC FA balance (${rawUsdc} available < ${reqRaw.toString()} requested).`;
+          break;
+        }
+      }
+    }
+
+    const ataMissing = outputAsset === 'USDC' && solSnap !== null && !solSnap.hasUsdcAta;
+
+    // Real live POST /v1/transactions/simulate ONLY when a UserTransaction simulation payload is supplied
+    let simPayload: Record<string, unknown> | null = params.simulationPayload ?? null;
+    if (!simPayload && params.rawTxBytes?.trim().startsWith('{')) {
+      try {
+        const parsed = JSON.parse(params.rawTxBytes);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          simPayload = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // invalid JSON handled below
+      }
+    }
+    const rawPayloadMalformed = Boolean(params.rawTxBytes && !simPayload);
+
+    let liveSimSucceeded = false;
+    let liveSimError: string | null = rawPayloadMalformed
+      ? 'Aptos /v1/transactions/simulate requires a JSON UserTransaction payload.'
+      : null;
+    let liveSimGasUsed: string | null = null;
+    let liveSimUnreachable = false;
+
+    if (simPayload && userAddressValid && solanaRecipientValid && !insufficientBalanceDetail) {
+      let responded = false;
+      for (const base of APTOS_REST_URLS) {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        };
+        if (process.env.APTOS_API_KEY?.trim()) {
+          headers.Authorization = `Bearer ${process.env.APTOS_API_KEY.trim()}`;
+        }
+        const res = await fetchWithRetry(
+          `${base}/transactions/simulate?estimate_max_gas_amount=true&estimate_gas_unit_price=true`,
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(simPayload),
+          },
+          4200
+        );
+        if (!res) continue;
+        responded = true;
+        const json = (await res.json().catch(() => null)) as
+          | Array<{ success?: boolean; vm_status?: string; gas_used?: string }>
+          | { message?: string; error_code?: string }
+          | null;
+        if (res.ok && Array.isArray(json) && json[0]?.success === true) {
+          liveSimSucceeded = true;
+          liveSimGasUsed = String(json[0].gas_used ?? '0');
+        } else if (Array.isArray(json) && json[0]) {
+          liveSimError = json[0].vm_status || 'Aptos VM simulation failed (success=false)';
+        } else {
+          const errObj = json as { message?: string } | null;
+          liveSimError = errObj?.message || `Aptos /v1/transactions/simulate returned HTTP ${res.status}`;
+        }
+        break;
+      }
+      if (!responded) {
+        liveSimUnreachable = true;
+      }
+    }
+
+    const warnings: string[] = [];
+    if (!userAddressValid) {
+      warnings.push(`Invalid Aptos address format: ${cleanAddr || '(empty)'}.`);
+    }
+    if (!solanaRecipientValid) {
+      warnings.push('Invalid Solana destination address (expected valid non-zero base58 pubkey).');
+    }
+    if (ataMissing) {
+      warnings.push('Destination Solana wallet has no canonical USDC ATA yet; create ATA before claiming CCTP USDC.');
+    }
+    if (sweepable.length === 0) {
+      warnings.push('No sweepable Aptos assets selected.');
+    }
+    if (insufficientBalanceDetail) {
+      warnings.push(insufficientBalanceDetail);
+    }
+    if (!hasEnoughNativeGas) {
+      warnings.push(`Low APT gas (${nativeBalanceUi} APT). FeePayerRawTransaction covers $0 user gas.`);
+    }
+    if (!rpcReachable) {
+      warnings.push('Aptos REST API could not be reached for live block height verification.');
+    }
+    if (liveSimError) {
+      warnings.push(`Aptos /v1/transactions/simulate reverted: ${liveSimError}`);
+    }
+
+    const failClosedTx =
+      !userAddressValid ||
+      sweepable.length === 0 ||
+      Boolean(insufficientBalanceDetail) ||
+      Boolean(liveSimError);
+    const failClosedRecipient = !solanaRecipientValid || ataMissing;
+
+    const simulatedLive = Boolean(simPayload && liveSimSucceeded && !failClosedTx && !failClosedRecipient);
+    const allChecksSafe = Boolean(simulatedLive && !failClosedTx && !failClosedRecipient);
+
+    const txCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedTx
+      ? 'reverted'
+      : liveSimUnreachable || (!simPayload && !rpcReachable)
+      ? 'rpc_skipped'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const cctpCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedRecipient
+      ? 'reverted'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const simulationNote = simulatedLive
+      ? `Live Aptos /v1/transactions/simulate passed (gas_used=${liveSimGasUsed ?? 'ok'}) at block #${blockNumber.toLocaleString()}.`
+      : failClosedTx || failClosedRecipient
+      ? `Pre-flight check failed closed: ${warnings[0] ?? 'validation rejected.'}`
+      : liveSimUnreachable || !rpcReachable
+      ? 'Aptos REST /v1/transactions/simulate unreachable; transaction was not simulated.'
+      : 'High-level Aptos intent pre-flight only: /v1/transactions/simulate requires a signed/unsigned UserTransaction payload with account public key.';
 
     const proofDigestSha256 =
       '0x' +
@@ -683,21 +859,14 @@ export const aptosAdapter: ChainFamilyAdapter = {
           JSON.stringify({
             family: 'aptos',
             blockNumber,
-            userAddress: params.userAddress,
+            userAddress: cleanAddr,
             expectedBytes32,
+            simulatedLive,
             outflows: sweepable.map((a) => ({ id: a.id, raw: a.rawBalance })),
             guaranteedMinNetUsd,
           })
         )
         .digest('hex');
-
-    const warnings: string[] = [];
-    if (!hasEnoughNativeGas) {
-      warnings.push(`Low APT gas (${nativeBalanceUi} APT). FeePayerRawTransaction covers $0 user gas.`);
-    }
-    if (!rpcVerified) {
-      warnings.push('Aptos REST API could not be reached for live block height verification.');
-    }
 
     return {
       proofId: `prf_aptos_${crypto.randomBytes(4).toString('hex')}`,
@@ -708,10 +877,10 @@ export const aptosAdapter: ChainFamilyAdapter = {
       chainId: 1,
       chainName: 'Aptos',
       blockNumber,
-      userAddress: params.userAddress,
+      userAddress: cleanAddr,
       solanaDestination: params.solanaDestination,
       solanaMintRecipientBytes32: expectedBytes32,
-      mintRecipientVerified: true,
+      mintRecipientVerified: solanaRecipientValid,
       hasEnoughNativeGas,
       nativeBalanceUi,
       nativeSymbol: 'APT',
@@ -719,6 +888,8 @@ export const aptosAdapter: ChainFamilyAdapter = {
       estimatedGasUsd,
       recommendedMode: hasEnoughNativeGas ? 'sequential' : 'sponsored_gasless',
       simulationEndpoint: '/v1/transactions/simulate',
+      simulatedLive,
+      simulationNote,
       outflows: sweepable.map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
@@ -734,7 +905,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
       },
       guaranteedMinNetUsd,
       estimatedNetUsd,
-      outputAsset: params.outputAsset ?? 'USDC',
+      outputAsset,
       preSolanaSnapshot: solSnap
         ? {
             usdcBalance: solSnap.usdcBalance,
@@ -749,25 +920,47 @@ export const aptosAdapter: ChainFamilyAdapter = {
           assetSymbol: 'APT',
           actionType: 'aptos_move_simulate',
           target: 'api.mainnet.aptoslabs.com/v1/transactions/simulate',
-          summary: rpcVerified
-            ? `Aptos live state verified at block #${blockNumber.toLocaleString()} (${nativeBalanceUi} APT)`
-            : 'Aptos REST unreachable',
-          preflightStatus: rpcVerified ? 'verified' : 'rpc_skipped',
-          preflightDetail: rpcVerified
-            ? `Live Aptos block #${blockNumber.toLocaleString()} · AIP-63 FA APT + Fee Payer ready`
-            : 'Aptos REST busy',
+          summary:
+            txCheckStatus === 'verified'
+              ? `Live Aptos /v1/transactions/simulate passed (gas ${liveSimGasUsed ?? 'ok'})`
+              : txCheckStatus === 'reverted'
+              ? liveSimError
+                ? `Aptos simulation reverted: ${liveSimError.slice(0, 120)}`
+                : insufficientBalanceDetail || warnings[0] || 'Aptos pre-flight rejected'
+              : txCheckStatus === 'rpc_skipped'
+              ? 'Aptos REST API unreachable'
+              : `Pre-flight Aptos state checked at #${blockNumber.toLocaleString()} (no UserTransaction simulated)`,
+          preflightStatus: txCheckStatus,
+          preflightDetail:
+            txCheckStatus === 'verified'
+              ? `Block #${blockNumber.toLocaleString()} · /v1/transactions/simulate success (gas_used=${liveSimGasUsed ?? 'ok'})`
+              : txCheckStatus === 'reverted'
+              ? liveSimError || insufficientBalanceDetail || warnings[0] || 'Aptos pre-flight check failed closed'
+              : txCheckStatus === 'rpc_skipped'
+              ? 'Aptos REST busy'
+              : `Block #${blockNumber.toLocaleString()} (${nativeBalanceUi} APT) · UserTransaction payload not supplied for live dry-run`,
         },
         {
           stepId: 'aptos_cctp_domain9',
           assetSymbol: 'USDC',
           actionType: 'cctp_deposit_for_burn',
           target: 'cctp::token_messenger::deposit_for_burn',
-          summary: `Native Circle CCTP Domain 9 → Solana USDC ATA PDA`,
-          preflightStatus: 'verified',
-          preflightDetail: `Canonical Solana USDC ATA bytes32 (${expectedBytes32.slice(0, 14)}…) verified`,
+          summary: !solanaRecipientValid
+            ? 'Invalid Solana destination address'
+            : ataMissing
+            ? 'Solana destination USDC ATA missing'
+            : `Native Aptos CCTP Domain 9 → Solana USDC ATA PDA (${simulatedLive ? 'verified' : 'unsimulated'})`,
+          preflightStatus: cctpCheckStatus,
+          preflightDetail: !solanaRecipientValid
+            ? 'Solana destination failed base58 / non-zero public key validation'
+            : ataMissing
+            ? 'Solana wallet has no canonical USDC ATA yet'
+            : simulatedLive
+            ? `Canonical Solana USDC ATA bytes32 (${expectedBytes32.slice(0, 14)}…) verified alongside live simulate`
+            : `Canonical Solana USDC ATA bytes32 (${expectedBytes32.slice(0, 14)}…) derived (tx execution not simulated live)`,
         },
       ],
-      allChecksSafe: rpcVerified,
+      allChecksSafe,
       warnings,
     };
   },

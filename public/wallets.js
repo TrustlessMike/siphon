@@ -1436,6 +1436,258 @@ export async function connectSolanaWallet(options = {}) {
   return { address: pubkey, walletName: chosen.name };
 }
 
+function base64ToUint8Array(b64) {
+  const clean = String(b64 || '').trim();
+  if (!clean) return null;
+  if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
+    return new Uint8Array(Buffer.from(clean, 'base64'));
+  }
+  const binary = atob(clean);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+function bytesToBase58(bytes) {
+  if (!(bytes instanceof Uint8Array) || !bytes.length) return '';
+  let leadingZeros = 0;
+  while (leadingZeros < bytes.length && bytes[leadingZeros] === 0) leadingZeros += 1;
+  let value = 0n;
+  for (let i = 0; i < bytes.length; i += 1) {
+    value = (value << 8n) | BigInt(bytes[i]);
+  }
+  const chars = [];
+  while (value > 0n) {
+    const rem = Number(value % 58n);
+    chars.push(BASE58_ALPHABET[rem]);
+    value /= 58n;
+  }
+  chars.reverse();
+  return '1'.repeat(leadingZeros) + chars.join('');
+}
+
+function extractSolanaSignature(res) {
+  if (!res) return null;
+  if (typeof res === 'string') return res.trim() || null;
+  if (res instanceof Uint8Array) return bytesToBase58(res) || null;
+  if (Array.isArray(res) && res[0]) return extractSolanaSignature(res[0]);
+  if (res.signature instanceof Uint8Array) return bytesToBase58(res.signature) || null;
+  if (typeof res.signature === 'string') return res.signature.trim() || null;
+  if (typeof res.txid === 'string') return res.txid.trim() || null;
+  return null;
+}
+
+/**
+ * Signs and submits a server-built Circle CCTP Solana `receiveMessage` claim transaction plan
+ * using Phantom, Backpack, or Solflare (Wallet Standard `solana:signAndSendTransaction` or legacy
+ * `provider.signAndSendTransaction` / `provider.request`).
+ * Fails closed on recipient/ATA mismatch and surfaces clean fallback instructions if the wallet
+ * does not expose `signAndSendTransaction`.
+ */
+export async function claimCctpOnSolana(claimPlan, options = {}) {
+  if (!claimPlan || typeof claimPlan !== 'object') {
+    throw new Error('Missing Solana CCTP claim transaction plan.');
+  }
+  if (claimPlan.mintRecipientVerified !== true || !claimPlan.recipientUsdcAta) {
+    throw new Error('Pre-sign check failed: CCTP claim plan is missing verified Solana USDC ATA recipient.');
+  }
+  if (!isValidSolanaBase58(claimPlan.solanaDestination)) {
+    throw new Error('Pre-sign check failed: invalid Solana destination address in claim plan.');
+  }
+  if (
+    options.expectedSolanaDestination &&
+    String(claimPlan.solanaDestination).trim() !== String(options.expectedSolanaDestination).trim()
+  ) {
+    throw new Error(
+      'Pre-sign check failed: CCTP claim destination does not match your job Solana destination.'
+    );
+  }
+  if (!Array.isArray(claimPlan.instructions) || !claimPlan.instructions.length) {
+    throw new Error('Solana CCTP claim plan contains no executable instructions.');
+  }
+
+  // Verify canonical USDC ATA bytes32 when browser SDK bundle is available
+  if (claimPlan.expectedMintRecipientBytes32) {
+    const derivedAtaHex = await resolveExpectedSolanaUsdcAtaBytes32Hex(claimPlan.solanaDestination);
+    if (
+      derivedAtaHex &&
+      derivedAtaHex.toLowerCase() !== String(claimPlan.expectedMintRecipientBytes32).toLowerCase()
+    ) {
+      throw new Error(
+        'Pre-sign check failed: CCTP claim mintRecipient does not match canonical Solana USDC ATA PDA.'
+      );
+    }
+  }
+
+  // Ensure a Solana wallet session is connected
+  if (!activeSolanaSession || !connectedSolanaAddress) {
+    if (options.autoConnect === false) {
+      throw new Error('Connect your Solana wallet (Phantom, Backpack, or Solflare) before claiming USDC.');
+    }
+    await connectSolanaWallet({ walletId: options.walletId });
+  }
+
+  // Enforce destinationCaller lock if the Circle message specifies a non-zero destinationCaller
+  const destCaller = String(claimPlan.decodedMessage?.destinationCallerBytes32 || '').toLowerCase();
+  if (destCaller && destCaller !== ZERO_BYTES32 && connectedSolanaAddress) {
+    const connectedBytes32 = solanaBase58ToBytes32Hex(connectedSolanaAddress).toLowerCase();
+    if (connectedBytes32 !== destCaller) {
+      throw new Error(
+        'Pre-sign check failed: this CCTP message restricts destinationCaller to a different Solana signer.'
+      );
+    }
+  }
+
+  const fallbackInstructions =
+    Array.isArray(claimPlan.fallbackInstructions) && claimPlan.fallbackInstructions.length
+      ? claimPlan.fallbackInstructions
+      : [
+          `Connect Phantom, Backpack, or Solflare and call MessageTransmitter.receiveMessage (${claimPlan.programs?.messageTransmitter || 'CCTP'}) for messageHash ${claimPlan.messageHash || 'unknown'}.`,
+        ];
+
+  const txBytes = base64ToUint8Array(claimPlan.serializedTransactionBase64);
+  const msgBytes = base64ToUint8Array(claimPlan.serializedMessageBase64);
+  if (!txBytes) {
+    const err = new Error(
+      'Solana claim transaction could not be serialized (missing recentBlockhash from RPC). Retry or submit manually.'
+    );
+    err.code = 'SOLANA_BLOCKHASH_UNAVAILABLE';
+    err.fallbackInstructions = fallbackInstructions;
+    throw err;
+  }
+
+  const walletName = connectedSolanaWalletName || 'Solana Wallet';
+
+  // 1. Wallet Standard (`solana:signAndSendTransaction`) — Phantom, Backpack, Solflare modern standard
+  if (activeSolanaSession?.kind === 'standard') {
+    const stdFeature = activeSolanaSession.wallet?.features?.['solana:signAndSendTransaction'];
+    if (typeof stdFeature?.signAndSendTransaction === 'function') {
+      const account = pickSolanaStandardAccount(activeSolanaSession.wallet.accounts);
+      if (!account) {
+        throw new Error(`No active Solana account exposed by ${walletName}.`);
+      }
+      const res = await stdFeature.signAndSendTransaction({
+        transaction: txBytes,
+        account,
+        chain: 'solana:mainnet',
+      });
+      const signature = extractSolanaSignature(res);
+      if (!signature) {
+        throw new Error(`${walletName} did not return a Solana transaction signature.`);
+      }
+      return {
+        claimed: true,
+        signature,
+        walletName,
+        mode: 'wallet_standard_sign_and_send',
+        explorerUrl: `https://solscan.io/tx/${signature}`,
+        recipientUsdcAta: claimPlan.recipientUsdcAta,
+        amountUsdc: claimPlan.amountUsdc,
+      };
+    }
+  }
+
+  // 2. Legacy injected provider (`signAndSendTransaction` / `request`) — Phantom, Backpack, Solflare
+  const provider =
+    activeSolanaSession?.provider ||
+    (typeof window !== 'undefined'
+      ? window.phantom?.solana ||
+        window.backpack?.solana ||
+        window.backpack ||
+        window.solflare ||
+        window.solana
+      : null);
+
+  if (provider && typeof provider.signAndSendTransaction === 'function') {
+    const txLike = {
+      serialize: () => txBytes,
+      serializeMessage: () => msgBytes || txBytes,
+      recentBlockhash: claimPlan.recentBlockhash,
+      feePayer: claimPlan.payer || connectedSolanaAddress,
+      instructions: claimPlan.instructions,
+      serializedTransactionBase64: claimPlan.serializedTransactionBase64,
+      serializedMessageBase64: claimPlan.serializedMessageBase64,
+    };
+    try {
+      const res = await provider.signAndSendTransaction(txLike, {
+        skipPreflight: false,
+        preflightCommitment: 'confirmed',
+      });
+      const signature = extractSolanaSignature(res);
+      if (!signature) {
+        throw new Error(`${walletName} did not return a Solana transaction signature.`);
+      }
+      return {
+        claimed: true,
+        signature,
+        walletName,
+        mode: 'legacy_sign_and_send',
+        explorerUrl: `https://solscan.io/tx/${signature}`,
+        recipientUsdcAta: claimPlan.recipientUsdcAta,
+        amountUsdc: claimPlan.amountUsdc,
+      };
+    } catch (err) {
+      if (isUserRejectedError(err)) throw err;
+      // Fallback to Phantom/Solflare native JSON-RPC `request({ method: 'signAndSendTransaction', params: { message } })`
+      if (typeof provider.request === 'function' && msgBytes) {
+        const rpcRes = await provider.request({
+          method: 'signAndSendTransaction',
+          params: { message: bytesToBase58(msgBytes) },
+        });
+        const signature = extractSolanaSignature(rpcRes);
+        if (signature) {
+          return {
+            claimed: true,
+            signature,
+            walletName,
+            mode: 'provider_request_sign_and_send',
+            explorerUrl: `https://solscan.io/tx/${signature}`,
+            recipientUsdcAta: claimPlan.recipientUsdcAta,
+            amountUsdc: claimPlan.amountUsdc,
+          };
+        }
+      }
+      throw err;
+    }
+  }
+
+  if (provider && typeof provider.request === 'function' && msgBytes) {
+    const rpcRes = await provider.request({
+      method: 'signAndSendTransaction',
+      params: { message: bytesToBase58(msgBytes) },
+    });
+    const signature = extractSolanaSignature(rpcRes);
+    if (!signature) {
+      throw new Error(`${walletName} did not return a Solana transaction signature.`);
+    }
+    return {
+      claimed: true,
+      signature,
+      walletName,
+      mode: 'provider_request_sign_and_send',
+      explorerUrl: `https://solscan.io/tx/${signature}`,
+      recipientUsdcAta: claimPlan.recipientUsdcAta,
+      amountUsdc: claimPlan.amountUsdc,
+    };
+  }
+
+  // 3. Clean fallback error when active Solana wallet does not expose signAndSendTransaction
+  const unsupportedErr = new Error(
+    `${walletName} does not expose signAndSendTransaction. Connect Phantom, Backpack, or Solflare, or follow the fallback instructions to claim manually.`
+  );
+  unsupportedErr.code = 'SOLANA_SIGN_AND_SEND_UNSUPPORTED';
+  unsupportedErr.fallbackInstructions = fallbackInstructions;
+  unsupportedErr.claimPlanSummary = {
+    messageHash: claimPlan.messageHash,
+    messageTransmitter: claimPlan.programs?.messageTransmitter,
+    recipientUsdcAta: claimPlan.recipientUsdcAta,
+    amountUsdc: claimPlan.amountUsdc,
+  };
+  throw unsupportedErr;
+}
+
 // =====================================================================
 // MULTI-FAMILY WALLET CONNECTORS (Cosmos, Sui, Aptos, TON, Tron, Bitcoin)
 // =====================================================================

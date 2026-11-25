@@ -636,34 +636,181 @@ export const btcAdapter: ChainFamilyAdapter = {
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
     const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
-    const expectedBytes32 = solanaAddressToBytes32(params.solanaDestination);
+    const cleanAddr = params.userAddress.trim();
+    const userAddressValid = btcAdapter.matchesAddress(cleanAddr);
+    let expectedBytes32 = '0x' + '00'.repeat(32);
+    let solanaRecipientValid = false;
+    try {
+      expectedBytes32 = solanaAddressToBytes32(params.solanaDestination);
+      solanaRecipientValid = true;
+    } catch {
+      solanaRecipientValid = false;
+    }
 
-    const [tipHeight, fees, solSnap, priceMap] = await Promise.all([
+    const [tipHeight, fees, liveUtxos, solSnap, priceMap] = await Promise.all([
       mempoolGet<number | string>('/blocks/tip/height'),
-      mempoolGet<{ halfHourFee?: number }>('/v1/fees/recommended'),
-      fetchSolanaWalletBalances(params.solanaDestination).catch(() => null),
+      mempoolGet<{ halfHourFee?: number; fastestFee?: number }>('/v1/fees/recommended'),
+      userAddressValid
+        ? mempoolGet<MempoolUtxo[]>(`/address/${encodeURIComponent(cleanAddr)}/utxo`)
+        : Promise.resolve(null),
+      solanaRecipientValid
+        ? fetchSolanaWalletBalances(params.solanaDestination).catch(() => null)
+        : Promise.resolve(null),
       fetchLiveUsdPrices(['coingecko:bitcoin']),
     ]);
 
     const blockNumber = Number(tipHeight || 0);
-    const satPerVbyte = Number(fees?.halfHourFee ?? 12);
+    const satPerVbyte = Number(fees?.halfHourFee ?? fees?.fastestFee ?? 12);
     const btcPrice = params.nativePriceUsd ?? priceMap.get('coingecko:bitcoin') ?? 86_000;
     const spendableAssets = filterChainSweepableAssets('btc', params.assets);
     const skippedDust = params.assets.filter((a) => a.chain === 'btc' && a.action === 'SKIP_GAS_NEGATIVE');
-    const nativeBalanceUi = Number(
-      spendableAssets.reduce((s, a) => s + a.uiBalance, 0).toFixed(8)
-    );
+    const requestedSats = spendableAssets.reduce((s, a) => {
+      try {
+        return s + BigInt(a.rawBalance || '0');
+      } catch {
+        return s;
+      }
+    }, 0n);
+
+    const utxosFetched = Array.isArray(liveUtxos);
+    const classified = utxosFetched
+      ? classifyBtcUtxos({
+          utxos: liveUtxos,
+          address: cleanAddr,
+          satPerVbyte,
+          btcPriceUsd: btcPrice,
+        })
+      : null;
+
+    const nativeBalanceUi = classified
+      ? Number((classified.spendableSats / 1e8).toFixed(8))
+      : Number(spendableAssets.reduce((s, a) => s + a.uiBalance, 0).toFixed(8));
     const nativeBalanceUsd = Number((nativeBalanceUi * btcPrice).toFixed(2));
-    const estimatedGasUsd = Number(spendableAssets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(2));
-    const feeUsd = Number(((nativeBalanceUsd * feeCfg.feeBps) / 10_000).toFixed(2));
-    const estimatedNetUsd = Number(Math.max(0, nativeBalanceUsd - feeUsd - estimatedGasUsd).toFixed(2));
+    const estimatedGasUsd = classified
+      ? classified.spendableFeeUsd
+      : Number(spendableAssets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(2));
+    const grossUsd = Number(spendableAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.98).toFixed(2));
-    const outputCode = params.outputAsset === 'SOL' ? 'SOL.SOL' : 'SOL.USDC';
+    const outputAsset = params.outputAsset ?? 'USDC';
+    const outputCode = outputAsset === 'SOL' ? 'SOL.SOL' : 'SOL.USDC';
     const expectedMemo = `=:${outputCode}:${params.solanaDestination}::siphon:${feeCfg.feeBps}`;
     const memoBytes = Buffer.byteLength(expectedMemo, 'utf8');
     const memoWithinLimit = memoBytes <= 80;
     const mempoolReachable = blockNumber > 0;
-    const hasEnoughNativeGas = nativeBalanceUsd > estimatedGasUsd;
+    const ordinalsBlocked = Boolean(classified && classified.spendable.length === 0 && classified.protectedUtxos.length > 0);
+    const unconfirmedBlocked = Boolean(classified && classified.spendable.length === 0 && classified.unconfirmed.length > 0);
+    const insufficientBalance = Boolean(
+      classified &&
+        (classified.spendable.length === 0 ||
+          BigInt(classified.spendableSats) < requestedSats ||
+          classified.spendableSats <= classified.spendableFeeSats + 546)
+    );
+    const hasEnoughNativeGas = classified
+      ? classified.spendableSats > classified.spendableFeeSats + 546 && BigInt(classified.spendableSats) >= requestedSats
+      : spendableAssets.length > 0 && nativeBalanceUsd > estimatedGasUsd;
+    const ataMissing = outputAsset === 'USDC' && solSnap !== null && !solSnap.hasUsdcAta;
+
+    // Optional live BIP-174 PSBT binary validation when raw PSBT hex is supplied
+    const rawPsbt = (
+      params.rawTxBytes ??
+      (typeof params.simulationPayload?.psbtHex === 'string' ? params.simulationPayload.psbtHex : undefined)
+    )?.trim();
+    const psbtProvided = Boolean(rawPsbt);
+    let psbtValid = false;
+    let psbtError: string | null = null;
+    if (rawPsbt) {
+      const cleanHex = rawPsbt.toLowerCase().replace(/^0x/, '');
+      if (!/^[0-9a-f]+$/.test(cleanHex) || cleanHex.length % 2 !== 0 || cleanHex.length < 32) {
+        psbtError = 'Malformed PSBT hex payload (invalid hex or truncated).';
+      } else if (!cleanHex.startsWith('70736274ff')) {
+        psbtError = 'Invalid BIP-174 PSBT magic header (expected 70736274ff).';
+      } else {
+        psbtValid = true;
+      }
+    }
+
+    const warnings: string[] = [];
+    if (!userAddressValid) {
+      warnings.push(`Invalid Bitcoin source address: ${cleanAddr || '(empty)'}.`);
+    }
+    if (!solanaRecipientValid) {
+      warnings.push('Invalid Solana destination address (expected valid non-zero base58 pubkey).');
+    }
+    if (ataMissing) {
+      warnings.push('Destination Solana wallet has no canonical USDC ATA yet; create ATA before settling USDC.');
+    }
+    if (spendableAssets.length === 0) {
+      warnings.push('No sweepable Bitcoin assets selected.');
+    }
+    if (classified?.protectedUtxos.length) {
+      warnings.push(
+        `Protected ${classified.protectedUtxos.length} Taproot postage UTXO(s) (<= ${ORDINALS_POSTAGE_FLOOR_SATS} sats) from sweeping to avoid burning Ordinals/Runes.`
+      );
+    }
+    if (classified?.unconfirmed.length) {
+      warnings.push(`Excluded ${classified.unconfirmed.length} unconfirmed mempool UTXO(s).`);
+    }
+    if (ordinalsBlocked) {
+      warnings.push('Blocked: all confirmed Taproot UTXOs are Ordinals/Runes postage UTXOs (<= 10,000 sats).');
+    } else if (unconfirmedBlocked) {
+      warnings.push('Blocked: only unconfirmed mempool UTXOs exist; wait for 1 confirmation before sweeping.');
+    } else if (insufficientBalance) {
+      warnings.push(
+        `Insufficient spendable confirmed BTC UTXOs (${classified?.spendableSats ?? 0} sats spendable vs ${requestedSats.toString()} sats requested + ${classified?.spendableFeeSats ?? 0} sats miner fee).`
+      );
+    }
+    if (skippedDust.length > 0) {
+      warnings.push(`Excluded ${skippedDust.length} sub-fee dust UTXO bucket(s) as SKIP_GAS_NEGATIVE at ${satPerVbyte} sat/vB.`);
+    }
+    if (!memoWithinLimit) {
+      warnings.push(`OP_RETURN memo (${memoBytes}B) exceeds 80B relay limit; Direct Mode will use Relay/Chainflip deposit address PSBT.`);
+    }
+    if (!mempoolReachable || (userAddressValid && !utxosFetched)) {
+      warnings.push('Mempool.space tip height or UTXO endpoint could not be reached for live validation.');
+    }
+    if (psbtError) {
+      warnings.push(psbtError);
+    }
+
+    const failClosedTx =
+      !userAddressValid ||
+      spendableAssets.length === 0 ||
+      insufficientBalance ||
+      ordinalsBlocked ||
+      unconfirmedBlocked ||
+      !hasEnoughNativeGas ||
+      Boolean(psbtError);
+    const failClosedRecipient = !solanaRecipientValid || !memoWithinLimit || ataMissing;
+
+    const simulatedLive = Boolean(
+      psbtProvided && psbtValid && mempoolReachable && utxosFetched && !failClosedTx && !failClosedRecipient
+    );
+
+    const psbtCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedTx
+      ? 'reverted'
+      : !mempoolReachable || !utxosFetched
+      ? 'rpc_skipped'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const recipientCheckStatus: UniversalPreSignProof['checks'][number]['preflightStatus'] = failClosedRecipient
+      ? 'reverted'
+      : simulatedLive
+      ? 'verified'
+      : 'unsimulated';
+
+    const simulationNote = simulatedLive
+      ? `Live mempool.space UTXO/fee/Ordinals check (#${blockNumber.toLocaleString()} @ ${satPerVbyte} sat/vB) + BIP-174 PSBT binary validation passed.`
+      : failClosedTx || failClosedRecipient
+      ? `Pre-flight check failed closed: ${warnings[0] ?? 'validation rejected.'}`
+      : !mempoolReachable || !utxosFetched
+      ? 'Mempool.space live UTXO/fee endpoint unavailable; no live PSBT validation executed.'
+      : 'High-level Bitcoin intent pre-flight only (no BIP-174 PSBT hex supplied for live transaction validation). Supply rawTxBytes/psbtHex to verify PSBT.';
+
+    const allChecksSafe = Boolean(simulatedLive && !failClosedTx && !failClosedRecipient);
 
     const proofDigestSha256 =
       '0x' +
@@ -674,24 +821,14 @@ export const btcAdapter: ChainFamilyAdapter = {
             family: 'btc',
             blockNumber,
             satPerVbyte,
-            userAddress: params.userAddress,
+            userAddress: cleanAddr,
             expectedMemo,
+            simulatedLive,
             outflows: spendableAssets.map((a) => ({ id: a.id, raw: a.rawBalance })),
             guaranteedMinNetUsd,
           })
         )
         .digest('hex');
-
-    const warnings: string[] = [];
-    if (skippedDust.length > 0) {
-      warnings.push(`Excluded ${skippedDust.length} sub-fee dust UTXO bucket(s) as SKIP_GAS_NEGATIVE at ${satPerVbyte} sat/vB.`);
-    }
-    if (!memoWithinLimit) {
-      warnings.push(`OP_RETURN memo (${memoBytes}B) exceeds 80B relay limit; Direct Mode will use Relay/Chainflip deposit address PSBT.`);
-    }
-    if (!mempoolReachable) {
-      warnings.push('Mempool.space tip height could not be reached for live confirmation.');
-    }
 
     return {
       proofId: `prf_btc_${crypto.randomBytes(4).toString('hex')}`,
@@ -702,17 +839,19 @@ export const btcAdapter: ChainFamilyAdapter = {
       chainId: 'bitcoin-mainnet',
       chainName: 'Bitcoin',
       blockNumber,
-      userAddress: params.userAddress,
+      userAddress: cleanAddr,
       solanaDestination: params.solanaDestination,
       solanaMintRecipientBytes32: expectedBytes32,
-      mintRecipientVerified: expectedMemo.includes(params.solanaDestination),
+      mintRecipientVerified: solanaRecipientValid && expectedMemo.includes(params.solanaDestination),
       hasEnoughNativeGas,
       nativeBalanceUi,
       nativeSymbol: 'BTC',
       nativeBalanceUsd,
       estimatedGasUsd,
       recommendedMode: 'eip5792_batch',
-      simulationEndpoint: 'mempool.space + Relay PSBT / OP_RETURN verifier',
+      simulationEndpoint: 'mempool.space UTXO/fee/Ordinals check + BIP-174 PSBT validator',
+      simulatedLive,
+      simulationNote,
       outflows: spendableAssets.map((a) => ({
         symbol: a.symbol,
         amount: a.uiBalance,
@@ -728,7 +867,7 @@ export const btcAdapter: ChainFamilyAdapter = {
       },
       guaranteedMinNetUsd,
       estimatedNetUsd,
-      outputAsset: params.outputAsset ?? 'USDC',
+      outputAsset,
       preSolanaSnapshot: solSnap
         ? {
             usdcBalance: solSnap.usdcBalance,
@@ -742,26 +881,48 @@ export const btcAdapter: ChainFamilyAdapter = {
           stepId: 'btc_psbt_outputs',
           assetSymbol: 'BTC',
           actionType: 'psbt_output_verify',
-          target: 'Relay / Chainflip / THORChain Vault',
-          summary: `PSBT inputs/outputs verified @ ${satPerVbyte} sat/vB (${skippedDust.length} dust UTXO groups skipped)`,
-          preflightStatus: mempoolReachable && hasEnoughNativeGas ? 'verified' : !hasEnoughNativeGas ? 'reverted' : 'rpc_skipped',
-          preflightDetail: mempoolReachable
-            ? `Mempool tip #${blockNumber.toLocaleString()} · Ordinals/unconfirmed guard active`
-            : 'Mempool.space unreachable',
+          target: 'mempool.space /address/utxo + BIP-174 PSBT',
+          summary:
+            psbtCheckStatus === 'verified'
+              ? `PSBT & live UTXOs verified @ ${satPerVbyte} sat/vB (${classified?.spendable.length ?? 0} spendable, ${classified?.protectedUtxos.length ?? 0} Ordinals protected)`
+              : psbtCheckStatus === 'reverted'
+              ? `Bitcoin pre-flight rejected: ${warnings[0] ?? 'UTXO/Ordinals/balance check failed'}`
+              : psbtCheckStatus === 'rpc_skipped'
+              ? 'Mempool.space UTXO/fee API unreachable'
+              : `Pre-flight UTXO/Ordinals check passed @ ${satPerVbyte} sat/vB (no PSBT hex simulated)`,
+          preflightStatus: psbtCheckStatus,
+          preflightDetail:
+            psbtCheckStatus === 'reverted'
+              ? warnings[0] ?? 'Pre-flight check failed closed'
+              : mempoolReachable && utxosFetched
+              ? `Tip #${blockNumber.toLocaleString()} · ${classified?.spendable.length ?? 0} spendable UTXOs (${classified?.spendableSats ?? 0} sats) · ${classified?.protectedUtxos.length ?? 0} Ordinals protected${psbtProvided ? ' · PSBT magic OK' : ' · PSBT not supplied'}`
+              : 'Mempool.space unreachable',
         },
         {
           stepId: 'btc_op_return_memo',
-          assetSymbol: params.outputAsset ?? 'USDC',
+          assetSymbol: outputAsset,
           actionType: 'psbt_memo_verify',
           target: 'OP_RETURN / Relay PSBT',
-          summary: `Solana recipient verified (${memoBytes}B <= 80B relay limit)`,
-          preflightStatus: memoWithinLimit ? 'verified' : 'reverted',
-          preflightDetail: memoWithinLimit
-            ? 'Exact Solana address & Siphon affiliate bps matched within 80B limit'
-            : `Memo length ${memoBytes}B exceeds Bitcoin Core 80B standardness limit`,
+          summary: !solanaRecipientValid
+            ? 'Invalid Solana destination address'
+            : ataMissing
+            ? 'Solana destination USDC ATA missing'
+            : memoWithinLimit
+            ? `Solana recipient formatted (${memoBytes}B <= 80B relay limit${simulatedLive ? '' : ', unsimulated'})`
+            : `OP_RETURN memo (${memoBytes}B) exceeds 80B relay limit`,
+          preflightStatus: recipientCheckStatus,
+          preflightDetail: !solanaRecipientValid
+            ? 'Solana destination failed base58 / non-zero public key validation'
+            : ataMissing
+            ? 'Recipient Solana wallet has no canonical USDC ATA yet'
+            : !memoWithinLimit
+            ? `Memo length ${memoBytes}B exceeds Bitcoin Core 80B standardness limit`
+            : simulatedLive
+            ? 'Exact Solana address & Siphon affiliate bps verified with live PSBT'
+            : 'Solana address & memo format checked (tx execution not simulated live)',
         },
       ],
-      allChecksSafe: mempoolReachable && hasEnoughNativeGas && memoWithinLimit,
+      allChecksSafe,
       warnings,
     };
   },
