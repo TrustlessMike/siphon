@@ -324,7 +324,10 @@ export async function scanUnifiedWallets(params: {
       burnCandidateCount: mergedAssets.filter((a) => a.action === 'BURN_ZERO_LIQUIDITY').length,
       honeypotSkippedCount: mergedAssets.filter((a) => a.action === 'SKIP_HONEYPOT').length,
       gasNegativeCount: mergedAssets.filter(
-        (a) => a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_NEGATIVE_ROI'
+        (a) =>
+          a.action === 'SKIP_GAS_NEGATIVE' ||
+          a.action === 'SKIP_NEGATIVE_ROI' ||
+          a.action === 'SKIP_UNPRICED'
       ).length,
     },
     warnings: Array.from(new Set(warnings)),

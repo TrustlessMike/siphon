@@ -9,6 +9,7 @@ import {
   type CompoundAccountSafety,
   computeAaveSafePartialWithdrawal,
   identifyProtocolExtractorId,
+  isCuratedDefiVault,
   isKnownCooldownVault,
   isLiquidReceiptToken,
   MIN_SAFE_HEALTH_FACTOR,
@@ -20,6 +21,7 @@ import {
   DEAD_BURN_ADDRESS,
   EVM_CHAINS,
   getProtocolFeeConfig,
+  isCuratedRegistryToken,
   type ProtocolFeeConfig,
   SOLANA_CCTP_DOMAIN,
 } from '../scanner/chains.js';
@@ -391,23 +393,51 @@ async function buildDefiWithdrawExecution(params: {
   const protocolId = identifyProtocolExtractorId(asset);
   const quoteDirectBridge = followUpQuoteFn ?? buildBridgeExecution;
 
-  // 0. Security guard: verify protocolAddress against canonical trusted contracts before building calldata
-  if (!isLiquidReceiptToken(asset.symbol, asset.address) && asset.protocolAddress) {
-    const targetToVerify =
-      protocolId === 'uniswap_v2_lp'
-        ? asset.lpRouterAddress || asset.protocolAddress
-        : protocolId === 'uniswap_v3_nft'
-        ? asset.nftManagerAddress || asset.protocolAddress
-        : asset.protocolAddress;
-    const trust = validateTrustedProtocolTarget({
-      chain: evmChain,
-      protocolId,
-      assetAddress: asset.address,
-      protocolAddress: targetToVerify,
-    });
-    if (!trust.trusted) {
-      throw new Error(trust.reason || `Blocked untrusted protocol target for ${asset.symbol}.`);
+  // 0. Security guard: verify protocolAddress against canonical trusted contracts before building calldata.
+  // Never bypass validation when protocolAddress redirects away from the receipt contract itself.
+  if (asset.protocolAddress) {
+    const isDirectLiquidOnly =
+      protocolId === 'liquid_receipt' &&
+      isLiquidReceiptToken(asset.symbol, asset.address) &&
+      asset.protocolAddress.toLowerCase() === asset.address.toLowerCase();
+    if (!isDirectLiquidOnly) {
+      const targetToVerify =
+        protocolId === 'uniswap_v2_lp'
+          ? asset.lpRouterAddress || asset.protocolAddress
+          : protocolId === 'uniswap_v3_nft'
+          ? asset.nftManagerAddress || asset.protocolAddress
+          : asset.protocolAddress;
+      const trust = validateTrustedProtocolTarget({
+        chain: evmChain,
+        protocolId: protocolId === 'liquid_receipt' ? 'erc4626' : protocolId,
+        assetAddress: asset.address,
+        protocolAddress: targetToVerify,
+      });
+      if (!trust.trusted) {
+        throw new Error(trust.reason || `Blocked untrusted protocol target for ${asset.symbol}.`);
+      }
     }
+  }
+
+  // Defense in depth: never allow Aave debt tokens to be executed as collateral withdrawals
+  if (
+    (protocolId === 'aave_v3' || protocolId === 'aave_v2') &&
+    /^(variable|stable)debt/i.test(asset.symbol.trim())
+  ) {
+    throw new Error(
+      `Blocked Aave debt token (${asset.symbol}): borrow debt tokens cannot be withdrawn as collateral.`
+    );
+  }
+
+  // Block assets whose exit plan already failed preflight verification (unless liquid receipt direct swap)
+  if (
+    asset.defiExitPlan?.preflightStatus === 'blocked' &&
+    !(isLiquidReceiptToken(asset.symbol, asset.address) && asset.defiExitPlan.cooldownDetected)
+  ) {
+    throw new Error(
+      asset.defiExitPlan.preflightReason ||
+        `${asset.protocol || 'Vault'} (${asset.symbol}) is blocked by preflight safety checks.`
+    );
   }
 
   // 1. Cooldown-locked vaults (like Ethena sUSDe) MUST bypass redeem() via Direct Swap when liquid!
@@ -1355,7 +1385,18 @@ export async function prepareRealExecution(params: {
     throw new Error(`${asset.symbol} is flagged as a reverting honeypot and cannot be executed.`);
   }
 
+  if (asset.action === 'SKIP_UNPRICED') {
+    throw new Error(
+      `${asset.symbol} could not be priced or liquidity-verified due to an API outage and is safely skipped.`
+    );
+  }
+
   if (asset.action === 'BURN_ZERO_LIQUIDITY') {
+    if (isCuratedRegistryToken(evmChain, asset.address)) {
+      throw new Error(
+        `Blocked burn on curated blue-chip registry token ${asset.symbol} (${asset.address}) — curated tokens can never be burned to 0x…dEaD.`
+      );
+    }
     const rawAmount = BigInt(asset.rawBalance);
     const check = await simulateBurnTransferOnchain({
       chain: evmChain,
@@ -1492,6 +1533,7 @@ export async function prepareChainBatchExecution(params: {
     BURN_ZERO_LIQUIDITY: 4,
     SKIP_GAS_NEGATIVE: 5,
     SKIP_NEGATIVE_ROI: 5,
+    SKIP_UNPRICED: 6,
     SKIP_HONEYPOT: 6,
   };
 
@@ -1512,6 +1554,14 @@ export async function prepareChainBatchExecution(params: {
         assetId: asset.id,
         assetSymbol: asset.symbol,
         reason: 'Reverting honeypot — safely skipped from chain batch.',
+      });
+      continue;
+    }
+    if (asset.action === 'SKIP_UNPRICED') {
+      skippedAssets.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        reason: 'Unpriced or liquidity lookup unavailable — safely skipped from chain batch.',
       });
       continue;
     }
@@ -1825,8 +1875,32 @@ export async function prepareChainBatchExecution(params: {
           if (unlockedRaw <= 0n || !unlocked.address) continue;
 
           const isNativeUsdc = unlocked.address.toLowerCase() === cfg.usdcAddress.toLowerCase();
+          const expectedUsdcDecimals = cfg.id === 'bnb' ? 18 : 6;
+          // CRIT-02: Never size bundled CCTP transfers (which spend user's real USDC in the same atomic batch)
+          // from an unverified/uncurated ERC-4626 or receipt balance!
+          const erc4626CctpAllowed =
+            prep.provider !== 'erc4626' ||
+            (Boolean(prep.defiExitPlan?.expectedUnderlyingRaw) &&
+              prep.defiExitPlan?.preflightStatus === 'verified' &&
+              prep.defiExitPlan?.supportsAtomicBatch !== false &&
+              unlocked.decimals === expectedUsdcDecimals &&
+              (isCuratedDefiVault(chain, asset.address) || Boolean(prep.defiExitPlan?.simulatedLive)));
+          const receiptOutputVerified =
+            (prep.provider !== 'yearn_v2' && prep.provider !== 'compound_v2') ||
+            (Boolean(prep.defiExitPlan?.expectedUnderlyingRaw) &&
+              prep.defiExitPlan?.preflightStatus !== 'blocked');
+
+          if (isNativeUsdc && (!erc4626CctpAllowed || !receiptOutputVerified)) {
+            notes.push(
+              `Skipped atomic CCTP bundling for ${asset.symbol}: unverified or non-curated vault receipt output must confirm onchain before sizing a USDC bridge.`
+            );
+            continue;
+          }
+
           const canCctpBundle =
             isNativeUsdc &&
+            erc4626CctpAllowed &&
+            receiptOutputVerified &&
             outputAsset === 'USDC' &&
             Boolean(cfg.cctpTokenMessenger && cfg.cctpDomain !== null) &&
             (bridgePreference === 'cctp' ||

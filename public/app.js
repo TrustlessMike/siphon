@@ -549,7 +549,7 @@ function estimateChainCallCounts() {
   if (!currentScan) return { totalCalls: 0, totalChains: 0, popupsSaved: 0, perChain: new Map() };
   const perChain = new Map();
   const chosen = currentScan.assets.filter(
-    (a) => selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
+    (a) => selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT' && a.action !== 'SKIP_UNPRICED'
   );
   for (const a of chosen) {
     const entry = perChain.get(a.chain) || { assets: [], estCalls: 0, permit2Count: 0, eip2612Count: 0 };
@@ -1049,6 +1049,7 @@ function formatRoiTooltip(a) {
 
 function renderRoiVerdictBadge(a) {
   if (a.action === 'SKIP_HONEYPOT') return `<span class="action-tag tag-skip">Honeypot</span>`;
+  if (a.action === 'SKIP_UNPRICED') return `<span class="action-tag tag-skip" title="${escapeHtml(a.actionReason || 'Price or liquidity lookup unavailable')}">Unpriced</span>`;
   if (a.action === 'BURN_ZERO_LIQUIDITY') return `<span class="action-tag tag-burn">Burn $0</span>`;
   if (isDefiAsset(a) && a.defiExitPlan?.preflightStatus === 'blocked') {
     const tip = escapeHtml(a.defiExitPlan?.preflightReason || a.actionReason || '');
@@ -1086,6 +1087,7 @@ function compactActionTag(action) {
   if (action === 'SELL_AND_BRIDGE') return `<span class="action-tag tag-sell">Swap</span>`;
   if (action === 'BURN_ZERO_LIQUIDITY') return `<span class="action-tag tag-burn">Burn</span>`;
   if (action === 'SKIP_HONEYPOT') return `<span class="action-tag tag-skip">Honeypot</span>`;
+  if (action === 'SKIP_UNPRICED') return `<span class="action-tag tag-skip">Unpriced</span>`;
   return `<span class="action-tag tag-skip">Dust</span>`;
 }
 
@@ -1295,7 +1297,8 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
       statusRaw === 'blocked' ||
       statusRaw === 'reverted' ||
       statusRaw === 'failed' ||
-      asset?.action === 'SKIP_HONEYPOT'
+      asset?.action === 'SKIP_HONEYPOT' ||
+      asset?.action === 'SKIP_UNPRICED'
   );
   const safePartialReady = Boolean(
     plan?.safePartialSupported ||
@@ -1848,6 +1851,7 @@ function renderAssetList() {
         a.grossUsd <= 25 &&
         a.kind !== 'defi_position' &&
         a.action !== 'SKIP_HONEYPOT' &&
+        a.action !== 'SKIP_UNPRICED' &&
         a.action !== 'BURN_ZERO_LIQUIDITY'
       );
     if (activeFilter === 'liquid')
@@ -1860,6 +1864,7 @@ function renderAssetList() {
     if (activeFilter === 'skipped')
       return (
         a.action === 'SKIP_HONEYPOT' ||
+        a.action === 'SKIP_UNPRICED' ||
         a.action === 'SKIP_GAS_NEGATIVE' ||
         a.action === 'SKIP_NEGATIVE_ROI' ||
         a.roiVerdict === 'negative_roi'
@@ -1876,7 +1881,10 @@ function renderAssetList() {
     .map((a) => {
       const checked = selectedAssetIds.has(a.id);
       const defiNorm = isDefiAsset(a) ? normalizeDefiPosition(a, outputAsset) : null;
-      const disabled = a.action === 'SKIP_HONEYPOT' || Boolean(defiNorm && defiNorm.preflightLevel === 'blocked');
+      const disabled =
+        a.action === 'SKIP_HONEYPOT' ||
+        a.action === 'SKIP_UNPRICED' ||
+        Boolean(defiNorm && defiNorm.preflightLevel === 'blocked');
       const localProtoLogo = a.protocol ? getProtocolLogoPath(a.protocol) : null;
       const remoteProtoLogo = safeHttpUrl(a.protocolLogoUrl || a.defiExitPlan?.protocolLogoUrl);
       const protoLogo =
@@ -1889,6 +1897,8 @@ function renderAssetList() {
           ? '$0.00'
           : a.action === 'SKIP_HONEYPOT'
           ? 'Blocked'
+          : a.action === 'SKIP_UNPRICED'
+          ? 'Unpriced'
           : `$${a.grossUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
       const balStr = `${a.uiBalance.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${a.symbol}`;
       const debtBadge =
@@ -2115,7 +2125,11 @@ async function runPreSignProof() {
       : currentPlan.legs[0].chain;
   const effectiveScan = buildEffectiveScanForPlan();
   const chainAssets = effectiveScan.assets.filter(
-    (a) => a.chain === targetChain && selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
+    (a) =>
+      a.chain === targetChain &&
+      selectedAssetIds.has(a.id) &&
+      a.action !== 'SKIP_HONEYPOT' &&
+      a.action !== 'SKIP_UNPRICED'
   );
   if (!chainAssets.length) return;
 
@@ -2719,9 +2733,15 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
   const effectiveScan = buildEffectiveScanForPlan();
   const overrideAssets = Array.isArray(opts?.overrideAssets) ? opts.overrideAssets : null;
   const chainAssets = overrideAssets
-    ? overrideAssets.filter((a) => a.chain === chain && a.action !== 'SKIP_HONEYPOT')
+    ? overrideAssets.filter(
+        (a) => a.chain === chain && a.action !== 'SKIP_HONEYPOT' && a.action !== 'SKIP_UNPRICED'
+      )
     : effectiveScan.assets.filter(
-        (a) => a.chain === chain && selectedAssetIds.has(a.id) && a.action !== 'SKIP_HONEYPOT'
+        (a) =>
+          a.chain === chain &&
+          selectedAssetIds.has(a.id) &&
+          a.action !== 'SKIP_HONEYPOT' &&
+          a.action !== 'SKIP_UNPRICED'
       );
   if (!chainAssets.length) {
     showToast(`No selected assets on ${chain}.`);
