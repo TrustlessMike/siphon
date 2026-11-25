@@ -12,8 +12,23 @@ import { evaluateChainBatchRoi } from '../scanner/roi.js';
 import { evmJsonRpcCall } from '../scanner/rpc.js';
 import type { AnyChainId, CctpBridgeLeg, EvmChainId, MigrationPlan, ScanReport } from '../scanner/types.js';
 
-// Circle CCTP TokenMessenger.depositForBurn(uint256,uint32,bytes32,address)
-const DEPOSIT_FOR_BURN_SELECTOR = '6fd3504e';
+// Circle CCTP V1 TokenMessenger.depositForBurn(uint256,uint32,bytes32,address)
+export const CCTP_V1_DEPOSIT_FOR_BURN_SELECTOR = '6fd3504e';
+// Circle CCTP V2 TokenMessengerV2.depositForBurn(uint256,uint32,bytes32,address,bytes32,uint256,uint32)
+export const CCTP_V2_DEPOSIT_FOR_BURN_SELECTOR = '8e0250ee';
+const ZERO_BYTES32 = '0x' + '00'.repeat(32);
+
+// Canonical Solana SPL Token, Associated Token Account Program, and Native USDC Mint
+export const SOLANA_TOKEN_PROGRAM_ID = new PublicKey(
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+);
+export const SOLANA_ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL'
+);
+export const SOLANA_USDC_MINT_PUBKEY = new PublicKey(
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+);
+
 // Circle CCTP MessageTransmitter event: MessageSent(bytes message)
 export const CCTP_MESSAGE_SENT_TOPIC =
   '0x8c5261668696ce22758910d05bab8f186d6eb247ceac2af2e82c7dc17669b036';
@@ -21,6 +36,36 @@ export const SOLANA_CCTP_PROGRAMS = {
   messageTransmitter: 'CCTPmbSD7gX1bxKPAmg77w8oFzNFpaQiQUWD43TKaecd',
   tokenMessengerMinter: 'CCTPiPYPc6AsJuwueEnWgSgucamXDZwBd53dQ11YiKX3',
 } as const;
+export const SOLANA_CCTP_PROGRAMS_V2 = {
+  messageTransmitter: 'CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC',
+  tokenMessengerMinter: 'CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe',
+} as const;
+
+export type SolanaCctpPrograms =
+  | typeof SOLANA_CCTP_PROGRAMS
+  | typeof SOLANA_CCTP_PROGRAMS_V2;
+
+export function getSolanaCctpPrograms(cctpVersion?: 1 | 2 | null): SolanaCctpPrograms {
+  return cctpVersion === 2 ? SOLANA_CCTP_PROGRAMS_V2 : SOLANA_CCTP_PROGRAMS;
+}
+
+export function getCctpIrisAttestationUrl(params: {
+  cctpVersion: 1 | 2;
+  messageHash?: string;
+  sourceDomain?: number | null;
+  txHash?: string;
+}): string {
+  if (params.cctpVersion === 2) {
+    if (params.sourceDomain === null || params.sourceDomain === undefined || !params.txHash) {
+      throw new Error('CCTP V2 Iris polling requires sourceDomain and txHash');
+    }
+    return `https://iris-api.circle.com/v2/messages/${params.sourceDomain}?transactionHash=${encodeURIComponent(params.txHash)}`;
+  }
+  if (!params.messageHash) {
+    throw new Error('CCTP V1 Iris polling requires messageHash');
+  }
+  return `https://iris-api.circle.com/v1/attestations/${encodeURIComponent(params.messageHash)}`;
+}
 
 function round2(n: number): number {
   return Number(n.toFixed(2));
@@ -31,71 +76,200 @@ function round4(n: number): number {
 }
 
 /**
- * Validates a Solana base58 public key and converts its exact 32 raw bytes
- * into a 0x-prefixed EVM bytes32 value for Circle CCTP `mintRecipient`.
+ * Validates a Solana base58 public key and converts its raw 32 bytes into a 0x-prefixed bytes32.
+ * WARNING: For Circle CCTP `mintRecipient` on Solana (domain 5), ALWAYS use `solanaOwnerToUsdcAtaBytes32`
+ * (the canonical SPL USDC Associated Token Account PDA) — never pass the raw wallet owner pubkey!
  */
 export function solanaAddressToBytes32(solanaAddress: string): string {
   const pubkey = new PublicKey(solanaAddress.trim());
+  if (pubkey.equals(PublicKey.default)) {
+    throw new Error('Invalid Solana address: all-zero System Program pubkey is not allowed');
+  }
   return '0x' + Buffer.from(pubkey.toBytes()).toString('hex');
 }
 
 /**
- * Encodes Circle CCTP TokenMessenger.depositForBurn(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken).
+ * Derives the canonical Solana USDC Associated Token Account (ATA) PDA for a Solana wallet owner.
+ * Circle CCTP `TokenMessengerMinter.handle_receive_message` on Solana requires `mintRecipient` to be
+ * the recipient's SPL USDC Token Account (canonical ATA), NOT the raw wallet owner pubkey.
+ */
+export function deriveSolanaUsdcAta(ownerPubkey: string): PublicKey {
+  const trimmed = ownerPubkey.trim();
+  if (!trimmed) {
+    throw new Error('Solana owner public key is required');
+  }
+  const owner = new PublicKey(trimmed);
+  if (owner.equals(PublicKey.default)) {
+    throw new Error('Invalid Solana owner public key: all-zero System Program pubkey is not allowed');
+  }
+  const [ata] = PublicKey.findProgramAddressSync(
+    [owner.toBytes(), SOLANA_TOKEN_PROGRAM_ID.toBytes(), SOLANA_USDC_MINT_PUBKEY.toBytes()],
+    SOLANA_ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+  return ata;
+}
+
+/**
+ * Derives the canonical 32-byte Solana USDC Associated Token Account (ATA) PDA as a 0x-prefixed
+ * EVM `bytes32` value for Circle CCTP `depositForBurn(..., mintRecipient, ...)`.
+ */
+export function solanaOwnerToUsdcAtaBytes32(ownerPubkey: string): string {
+  const ata = deriveSolanaUsdcAta(ownerPubkey);
+  return '0x' + Buffer.from(ata.toBytes()).toString('hex');
+}
+
+/**
+ * Encodes Circle CCTP `depositForBurn` calldata for either:
+ *   - CCTP V1 (`0x6fd3504e`): depositForBurn(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken)
+ *   - CCTP V2 (`0x8e0250ee`): depositForBurn(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold)
  */
 export function encodeCctpDepositForBurn(params: {
   rawUsdcAmount: bigint;
   destinationDomain: number;
   solanaMintRecipientBytes32: string;
   usdcAddress: string;
+  cctpVersion?: 1 | 2;
+  destinationCallerBytes32?: string;
+  maxFee?: bigint;
+  minFinalityThreshold?: number;
 }): string {
+  if (params.rawUsdcAmount < 0n) {
+    throw new Error('rawUsdcAmount must be non-negative');
+  }
+  if (!Number.isInteger(params.destinationDomain) || params.destinationDomain < 0 || params.destinationDomain > 0xffffffff) {
+    throw new Error(`Invalid CCTP destinationDomain: ${params.destinationDomain}`);
+  }
+  const recClean = params.solanaMintRecipientBytes32.trim().toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(recClean) || recClean === ZERO_BYTES32) {
+    throw new Error('Invalid non-zero 32-byte solanaMintRecipientBytes32');
+  }
+  const tokClean = params.usdcAddress.trim().toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(tokClean)) {
+    throw new Error(`Invalid EVM usdcAddress: ${params.usdcAddress}`);
+  }
+
   const amtHex = params.rawUsdcAmount.toString(16).padStart(64, '0');
   const domHex = params.destinationDomain.toString(16).padStart(64, '0');
-  const recHex = params.solanaMintRecipientBytes32.replace(/^0x/, '').toLowerCase().padStart(64, '0');
-  const tokHex = params.usdcAddress.replace(/^0x/, '').toLowerCase().padStart(64, '0');
-  return `0x${DEPOSIT_FOR_BURN_SELECTOR}${amtHex}${domHex}${recHex}${tokHex}`;
+  const recHex = recClean.slice(2);
+  const tokHex = tokClean.slice(2).padStart(64, '0');
+
+  if (params.cctpVersion === 2) {
+    const callerClean = (params.destinationCallerBytes32 ?? ZERO_BYTES32).trim().toLowerCase();
+    if (!/^0x[0-9a-f]{64}$/.test(callerClean)) {
+      throw new Error('Invalid 32-byte destinationCallerBytes32 for CCTP V2');
+    }
+    const maxFee = params.maxFee ?? 0n;
+    if (maxFee < 0n) throw new Error('CCTP V2 maxFee must be non-negative');
+    // Standard finality threshold is 2000 (Fast Transfer is 1000)
+    const minFinalityThreshold = params.minFinalityThreshold ?? 2000;
+    if (!Number.isInteger(minFinalityThreshold) || minFinalityThreshold < 0 || minFinalityThreshold > 0xffffffff) {
+      throw new Error(`Invalid CCTP V2 minFinalityThreshold: ${minFinalityThreshold}`);
+    }
+    const callerHex = callerClean.slice(2);
+    const maxFeeHex = maxFee.toString(16).padStart(64, '0');
+    const finalityHex = minFinalityThreshold.toString(16).padStart(64, '0');
+    return `0x${CCTP_V2_DEPOSIT_FOR_BURN_SELECTOR}${amtHex}${domHex}${recHex}${tokHex}${callerHex}${maxFeeHex}${finalityHex}`;
+  }
+
+  return `0x${CCTP_V1_DEPOSIT_FOR_BURN_SELECTOR}${amtHex}${domHex}${recHex}${tokHex}`;
+}
+
+export interface ExtractedCctpMessage {
+  messageBytesHex: string;
+  messageHash: string;
+  emitterAddress?: string;
 }
 
 /**
- * Extracts Circle CCTP `MessageSent(bytes)` raw message bytes and its `keccak256` message hash
- * from EVM transaction receipt logs.
+ * Extracts ALL valid Circle CCTP `MessageSent(bytes)` raw message bytes and `keccak256` hashes
+ * from EVM transaction receipt logs with strict emitter-address and ABI bounds validation.
  */
-export function extractCctpMessageFromLogs(
-  logs: Array<{ topics?: string[]; data?: string }>
-): { messageBytesHex: string; messageHash: string } | null {
+export function extractAllCctpMessagesFromLogs(
+  logs: Array<{ address?: string; topics?: string[]; data?: string }>,
+  options?: { expectedMessageTransmitter?: string | null }
+): ExtractedCctpMessage[] {
+  const expectedAddr = options?.expectedMessageTransmitter?.trim().toLowerCase() || null;
+  const results: ExtractedCctpMessage[] = [];
+
   for (const log of logs) {
     const topic0 = log.topics?.[0]?.toLowerCase();
     if (topic0 !== CCTP_MESSAGE_SENT_TOPIC || !log.data) continue;
-    const raw = log.data.replace(/^0x/, '');
-    if (raw.length < 128) continue;
-    const offsetBytes = Number(BigInt('0x' + raw.slice(0, 64)));
-    const lenStart = offsetBytes * 2;
-    if (raw.length < lenStart + 64) continue;
-    const msgByteLen = Number(BigInt('0x' + raw.slice(lenStart, lenStart + 64)));
-    const msgHex = raw.slice(lenStart + 64, lenStart + 64 + msgByteLen * 2);
-    if (msgHex.length !== msgByteLen * 2 || msgByteLen === 0) continue;
+
+    if (expectedAddr) {
+      const logAddr = log.address?.trim().toLowerCase();
+      if (!logAddr || logAddr !== expectedAddr) continue;
+    }
+
+    const raw = log.data.startsWith('0x') || log.data.startsWith('0X') ? log.data.slice(2) : log.data;
+    if (raw.length < 128 || raw.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(raw)) continue;
+
+    let offsetBytes: bigint;
+    try {
+      offsetBytes = BigInt('0x' + raw.slice(0, 64));
+    } catch {
+      continue;
+    }
+    // Dynamic `bytes` in MessageSent(bytes) must start at a 32-byte aligned offset within bounds
+    if (offsetBytes < 32n || offsetBytes > 1024n || offsetBytes % 32n !== 0n) continue;
+    const lenStartBig = offsetBytes * 2n;
+    const rawLenBig = BigInt(raw.length);
+    if (lenStartBig + 64n > rawLenBig) continue;
+
+    const lenStart = Number(lenStartBig);
+    let msgByteLenBig: bigint;
+    try {
+      msgByteLenBig = BigInt('0x' + raw.slice(lenStart, lenStart + 64));
+    } catch {
+      continue;
+    }
+    if (msgByteLenBig <= 0n || msgByteLenBig > 65_536n) continue;
+    const msgHexLenBig = msgByteLenBig * 2n;
+    if (lenStartBig + 64n + msgHexLenBig > rawLenBig) continue;
+
+    const msgHexLen = Number(msgHexLenBig);
+    const msgHex = raw.slice(lenStart + 64, lenStart + 64 + msgHexLen);
+    if (msgHex.length !== msgHexLen) continue;
 
     const msgBytes = Buffer.from(msgHex, 'hex');
     const hashBytes = keccak_256(msgBytes);
     const messageHash = '0x' + Buffer.from(hashBytes).toString('hex');
-    return {
-      messageBytesHex: '0x' + msgHex,
+    results.push({
+      messageBytesHex: '0x' + msgHex.toLowerCase(),
       messageHash,
-    };
+      emitterAddress: log.address,
+    });
   }
-  return null;
+
+  return results;
+}
+
+/**
+ * Extracts the first valid Circle CCTP `MessageSent(bytes)` raw message bytes and its `keccak256` message hash
+ * from EVM transaction receipt logs.
+ */
+export function extractCctpMessageFromLogs(
+  logs: Array<{ address?: string; topics?: string[]; data?: string }>,
+  options?: { expectedMessageTransmitter?: string | null }
+): ExtractedCctpMessage | null {
+  const all = extractAllCctpMessagesFromLogs(logs, options);
+  return all[0] ?? null;
 }
 
 export interface CctpAttestationResult {
   found: boolean;
   chain: EvmChainId;
+  cctpVersion?: 1 | 2;
   txHash: string;
   messageHash?: string;
   messageBytesHex?: string;
+  messagesCount?: number;
   attestationStatus: 'not_found' | 'pending_confirmations' | 'complete' | 'error';
   attestation?: string;
-  solanaProgramIds: typeof SOLANA_CCTP_PROGRAMS;
+  irisEndpoint?: string;
+  solanaProgramIds: SolanaCctpPrograms;
   solanaDestinationReady?: {
     address: string;
+    usdcAta?: string;
     hasUsdcAta: boolean;
     solBalance: number;
     warning?: string;
@@ -104,9 +278,9 @@ export interface CctpAttestationResult {
 }
 
 /**
- * Fetches an EVM transaction receipt, extracts the Circle CCTP `MessageSent` log,
- * polls Circle's live Iris Attestation API, and checks whether the Solana recipient
- * already has a USDC Associated Token Account (ATA) + SOL for `receiveMessage`.
+ * Fetches an EVM transaction receipt, validates receipt status and MessageTransmitter emitter,
+ * extracts the Circle CCTP `MessageSent` log, polls Circle's live Iris Attestation API (V1 or V2),
+ * and checks whether the Solana recipient already has a canonical USDC ATA + SOL for `receiveMessage`.
  */
 export async function fetchCctpAttestationForTx(params: {
   chain: EvmChainId;
@@ -115,10 +289,12 @@ export async function fetchCctpAttestationForTx(params: {
 }): Promise<CctpAttestationResult> {
   const cfg = EVM_CHAINS[params.chain];
   if (!cfg) throw new Error(`Unsupported chain: ${params.chain}`);
+  const cctpVersion: 1 | 2 = cfg.cctpVersion === 2 ? 2 : 1;
+  const solanaProgramIds = getSolanaCctpPrograms(cctpVersion);
 
   const receiptRes = await evmJsonRpcCall<{
     status?: string;
-    logs?: Array<{ topics?: string[]; data?: string }>;
+    logs?: Array<{ address?: string; topics?: string[]; data?: string }>;
   } | null>(cfg.rpcUrls, 'eth_getTransactionReceipt', [params.txHash], 4500);
 
   const receipt = receiptRes.result;
@@ -126,41 +302,88 @@ export async function fetchCctpAttestationForTx(params: {
     return {
       found: false,
       chain: params.chain,
+      cctpVersion,
       txHash: params.txHash,
       attestationStatus: 'not_found',
-      solanaProgramIds: SOLANA_CCTP_PROGRAMS,
+      solanaProgramIds,
       nextStep: 'Transaction receipt not yet indexed on EVM RPC. Retry in a few seconds.',
     };
   }
 
-  const extracted = extractCctpMessageFromLogs(receipt.logs);
+  // HIGH-10: Reject reverted transactions before scanning logs
+  if (receipt.status !== '0x1') {
+    return {
+      found: false,
+      chain: params.chain,
+      cctpVersion,
+      txHash: params.txHash,
+      attestationStatus: 'error',
+      solanaProgramIds,
+      nextStep: 'EVM transaction reverted onchain (receipt.status !== 0x1). No CCTP burn occurred.',
+    };
+  }
+
+  const allExtracted = extractAllCctpMessagesFromLogs(receipt.logs, {
+    expectedMessageTransmitter: cfg.cctpMessageTransmitter,
+  });
+  const extracted = allExtracted[0] ?? null;
   if (!extracted) {
     return {
       found: false,
       chain: params.chain,
+      cctpVersion,
       txHash: params.txHash,
       attestationStatus: 'not_found',
-      solanaProgramIds: SOLANA_CCTP_PROGRAMS,
-      nextStep: 'No Circle CCTP MessageSent event found in this transaction.',
+      solanaProgramIds,
+      nextStep: cfg.cctpMessageTransmitter
+        ? `No Circle CCTP MessageSent event from canonical MessageTransmitter (${cfg.cctpMessageTransmitter}) found in this transaction.`
+        : 'No Circle CCTP MessageSent event found in this transaction.',
     };
   }
 
   let attestationStatus: CctpAttestationResult['attestationStatus'] = 'pending_confirmations';
   let attestation: string | undefined;
+  const irisEndpoint = getCctpIrisAttestationUrl({
+    cctpVersion,
+    messageHash: extracted.messageHash,
+    sourceDomain: cfg.cctpDomain,
+    txHash: params.txHash,
+  });
+
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
-    const irisRes = await fetch(
-      `https://iris-api.circle.com/v1/attestations/${extracted.messageHash}`,
-      { signal: controller.signal }
-    );
+    const irisRes = await fetch(irisEndpoint, { signal: controller.signal });
     clearTimeout(timer);
     if (irisRes.ok) {
-      const irisJson = (await irisRes.json()) as { status?: string; attestation?: string };
-      if (irisJson.status === 'complete' && irisJson.attestation) {
-        attestationStatus = 'complete';
-        attestation = irisJson.attestation;
+      if (cctpVersion === 2) {
+        const irisJson = (await irisRes.json()) as {
+          messages?: Array<{ status?: string; attestation?: string }>;
+        };
+        const msg = irisJson.messages?.[0];
+        if (
+          msg?.status === 'complete' &&
+          typeof msg.attestation === 'string' &&
+          /^0x[0-9a-fA-F]{130,}$/.test(msg.attestation)
+        ) {
+          attestationStatus = 'complete';
+          attestation = msg.attestation;
+        }
+      } else {
+        const irisJson = (await irisRes.json()) as { status?: string; attestation?: string };
+        if (
+          irisJson.status === 'complete' &&
+          typeof irisJson.attestation === 'string' &&
+          /^0x[0-9a-fA-F]{130,}$/.test(irisJson.attestation)
+        ) {
+          attestationStatus = 'complete';
+          attestation = irisJson.attestation;
+        }
       }
+    } else if (irisRes.status === 404) {
+      attestationStatus = 'pending_confirmations';
+    } else {
+      attestationStatus = 'error';
     }
   } catch {
     attestationStatus = 'pending_confirmations';
@@ -169,14 +392,16 @@ export async function fetchCctpAttestationForTx(params: {
   let solanaDestinationReady: CctpAttestationResult['solanaDestinationReady'];
   if (params.solanaDestination) {
     try {
+      const usdcAta = deriveSolanaUsdcAta(params.solanaDestination).toBase58();
       const bal = await fetchSolanaWalletBalances(params.solanaDestination);
       const warning = !bal.hasUsdcAta
-        ? 'Destination Solana wallet has no USDC ATA yet — create ATA before or during receiveMessage (~0.00204 SOL rent).'
+        ? `Destination Solana wallet has no canonical USDC ATA (${usdcAta}) yet — prepend createAssociatedTokenAccountIdempotent before receiveMessage (~0.00204 SOL rent).`
         : bal.solBalance < 0.002
         ? 'Destination Solana wallet has low SOL (< 0.002 SOL) to pay receiveMessage tx fee.'
         : undefined;
       solanaDestinationReady = {
         address: bal.address,
+        usdcAta,
         hasUsdcAta: bal.hasUsdcAta,
         solBalance: bal.solBalance,
         warning,
@@ -188,18 +413,23 @@ export async function fetchCctpAttestationForTx(params: {
 
   const nextStep =
     attestationStatus === 'complete'
-      ? `Circle Iris attestation is READY. Submit MessageTransmitter.receiveMessage(messageBytes, attestation) on Solana (${SOLANA_CCTP_PROGRAMS.messageTransmitter}) to mint native USDC.`
-      : `Waiting for Circle Iris finality on ${cfg.name} (~${cfg.cctpAttestationSec}s). Poll /api/cctp/attestation again until status === "complete".`;
+      ? `Circle Iris V${cctpVersion} attestation is READY. Submit MessageTransmitter.receiveMessage(messageBytes, attestation) on Solana (${solanaProgramIds.messageTransmitter}) to mint native USDC to the canonical USDC ATA.`
+      : attestationStatus === 'error'
+      ? `Circle Iris V${cctpVersion} API returned an error for ${cfg.name}. Verify txHash and retry.`
+      : `Waiting for Circle Iris V${cctpVersion} finality on ${cfg.name} (~${cfg.cctpAttestationSec}s). Poll /api/cctp/attestation again until status === "complete".`;
 
   return {
     found: true,
     chain: params.chain,
+    cctpVersion,
     txHash: params.txHash,
     messageHash: extracted.messageHash,
     messageBytesHex: extracted.messageBytesHex,
+    messagesCount: allExtracted.length,
     attestationStatus,
     attestation,
-    solanaProgramIds: SOLANA_CCTP_PROGRAMS,
+    irisEndpoint,
+    solanaProgramIds,
     solanaDestinationReady,
     nextStep,
   };
@@ -273,7 +503,9 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     feeRecipientEvm: input.feeRecipientEvm,
   });
 
-  const solanaMintRecipientBytes32 = solanaAddressToBytes32(solanaDestination);
+  // CRIT-04: Derive canonical Solana USDC Associated Token Account (ATA) PDA bytes32 for CCTP mintRecipient!
+  const solanaUsdcAta = deriveSolanaUsdcAta(solanaDestination).toBase58();
+  const solanaMintRecipientBytes32 = solanaOwnerToUsdcAtaBytes32(solanaDestination);
   const selectedSet = Array.isArray(selectedAssetIds)
     ? new Set(selectedAssetIds)
     : new Set(scan.assets.filter((a) => a.selectedByDefault).map((a) => a.id));
@@ -373,12 +605,13 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     const rawUsdcAmount = BigInt(Math.round(bridgedUsdc * 1_000_000));
 
     const cctpCalldata =
-      evmCfg && evmCfg.cctpTokenMessenger
+      evmCfg && evmCfg.cctpTokenMessenger && rawUsdcAmount > 0n
         ? encodeCctpDepositForBurn({
             rawUsdcAmount,
             destinationDomain: SOLANA_CCTP_DOMAIN,
             solanaMintRecipientBytes32,
             usdcAddress: evmCfg.usdcAddress,
+            cctpVersion: evmCfg.cctpVersion ?? 1,
           })
         : '0x';
 
@@ -465,6 +698,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
       chainName,
       sourceDomain: cctpDomain,
       destinationDomain: SOLANA_CCTP_DOMAIN,
+      cctpVersion: evmCfg?.cctpVersion ?? null,
       tokenMessenger,
       usdcAddress,
       grossUsdc,
@@ -510,6 +744,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     createdAt: new Date().toISOString(),
     sourceWallet: scan.walletAddress,
     solanaDestination: solanaDestination.trim(),
+    solanaUsdcAta,
     solanaMintRecipientBytes32,
     usePermit2Batch,
     includeBurns,

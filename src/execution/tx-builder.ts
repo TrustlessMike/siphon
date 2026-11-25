@@ -1,4 +1,8 @@
-import { encodeCctpDepositForBurn, solanaAddressToBytes32 } from '../bridge/cctp.js';
+import {
+  encodeCctpDepositForBurn,
+  solanaAddressToBytes32,
+  solanaOwnerToUsdcAtaBytes32,
+} from '../bridge/cctp.js';
 import {
   DEAD_BURN_ADDRESS,
   EVM_CHAINS,
@@ -795,7 +799,11 @@ async function buildDirectCctpUsdcExecution(params: {
   const rawTotal = BigInt(asset.rawBalance);
   const { feeRaw, netRaw } = splitRawAmountForFee(rawTotal, feeConfig);
   const bridgeRaw = feeConfig.feeRecipientEvm ? netRaw : rawTotal;
-  const mintRecipientBytes32 = solanaAddressToBytes32(solanaDestination);
+  if (bridgeRaw <= 0n) {
+    throw new Error('Bridgeable USDC amount after protocol fee must be greater than zero.');
+  }
+  // CRIT-04: Circle CCTP Solana mintRecipient MUST be the canonical 32-byte USDC ATA PDA (not raw wallet pubkey)
+  const mintRecipientBytes32 = solanaOwnerToUsdcAtaBytes32(solanaDestination);
   const txs: ExecutableEvmTx[] = [];
   const estFeeUsd = Number(((asset.grossUsd * feeConfig.feeBps) / 10_000).toFixed(2));
   let collectionMethod: FeeBreakdown['collectionMethod'] = 'none';
@@ -837,6 +845,7 @@ async function buildDirectCctpUsdcExecution(params: {
     destinationDomain: SOLANA_CCTP_DOMAIN,
     solanaMintRecipientBytes32: mintRecipientBytes32,
     usdcAddress: cfg.usdcAddress,
+    cctpVersion: cfg.cctpVersion ?? 1,
   });
 
   txs.push({
@@ -1102,7 +1111,7 @@ export async function prepareChainBatchExecution(params: {
   const cfg = EVM_CHAINS[chain];
   if (!cfg) throw new Error(`Unsupported chain: ${chain}`);
 
-  const mintRecipientBytes32 = solanaAddressToBytes32(solanaDestination);
+  const mintRecipientBytes32 = solanaOwnerToUsdcAtaBytes32(solanaDestination);
   const chainAssets = assets.filter((a) => a.chain === chain);
 
   const actionOrder: Record<ScannedAsset['action'], number> = {
@@ -1222,6 +1231,7 @@ export async function prepareChainBatchExecution(params: {
       const rawTotal = BigInt(asset.rawBalance);
       const { feeRaw, netRaw } = splitRawAmountForFee(rawTotal, feeConfig);
       const bridgeRaw = feeConfig.feeRecipientEvm ? netRaw : rawTotal;
+      if (bridgeRaw <= 0n) return;
       const netUi = Number(bridgeRaw) / 1_000_000;
 
       if (feeConfig.feeRecipientEvm && feeRaw > 0n) {
@@ -1264,6 +1274,7 @@ export async function prepareChainBatchExecution(params: {
           destinationDomain: SOLANA_CCTP_DOMAIN,
           solanaMintRecipientBytes32: mintRecipientBytes32,
           usdcAddress: cfg.usdcAddress,
+          cctpVersion: cfg.cctpVersion ?? 1,
         }),
         value: '0x0',
       });
@@ -1425,6 +1436,9 @@ export async function checkLiveExecutionStatus(params: {
   bridgeStatus: string;
   solanaTxHash?: string;
   details?: string;
+  relayOriginTxHashes?: string[];
+  relayDestinationRecipient?: string;
+  relayBoundToTx?: boolean;
 }> {
   const cfg = EVM_CHAINS[params.chain];
   let evmConfirmed = false;
@@ -1452,23 +1466,41 @@ export async function checkLiveExecutionStatus(params: {
   let bridgeStatus = evmConfirmed ? 'confirmed' : evmFailed ? 'failed' : 'pending';
   let solanaTxHash: string | undefined;
   let details: string | undefined;
+  let relayOriginTxHashes: string[] | undefined;
+  let relayDestinationRecipient: string | undefined;
+  let relayBoundToTx = false;
 
   if (params.provider === 'relay' && params.requestId) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
     try {
       const res = await fetch(
-        `https://api.relay.link/intents/status/v2?requestId=${encodeURIComponent(params.requestId)}`
+        `https://api.relay.link/intents/status/v2?requestId=${encodeURIComponent(params.requestId)}`,
+        { signal: controller.signal }
       );
+      clearTimeout(timer);
       if (res.ok) {
         const st = (await res.json()) as {
           status?: string;
+          inTxHashes?: string[];
           txHashes?: string[];
           details?: string;
+          recipient?: string;
+          destinationAddress?: string;
         };
         if (st.status) bridgeStatus = st.status;
         if (st.txHashes && st.txHashes.length > 0) solanaTxHash = st.txHashes[0];
+        if (st.inTxHashes && st.inTxHashes.length > 0) {
+          relayOriginTxHashes = st.inTxHashes.map((h) => h.toLowerCase());
+          if (params.txHash) {
+            relayBoundToTx = relayOriginTxHashes.includes(params.txHash.toLowerCase());
+          }
+        }
+        relayDestinationRecipient = st.recipient ?? st.destinationAddress;
         if (st.details) details = st.details;
       }
     } catch {
+      clearTimeout(timer);
       // Keep polling
     }
   }
@@ -1480,5 +1512,8 @@ export async function checkLiveExecutionStatus(params: {
     bridgeStatus,
     solanaTxHash,
     details,
+    relayOriginTxHashes,
+    relayDestinationRecipient,
+    relayBoundToTx,
   };
 }
