@@ -1,7 +1,8 @@
-import { getProtocolFeeConfig } from './chains.js';
+import { EVM_CHAINS, getProtocolFeeConfig } from './chains.js';
 import type {
   AnyChainId,
   ChainRouteStrategy,
+  EvmChainId,
   RoiCostBreakdown,
   RoiVerdict,
   ScannedAsset,
@@ -99,6 +100,7 @@ export interface ChainBatchRoiReport {
   prunedNegativeRoiCount: number;
   optionalBurnCount: number;
   blockedHoneypotCount: number;
+  includedAssetIds: string[];
   unprunedGrossUsd: number;
   keptGrossUsd: number;
   /** Signed user net BEFORE pruning negative-ROI dust */
@@ -164,17 +166,107 @@ const L2_CHAINS = new Set<string>([
   'worldchain',
 ]);
 
+const CANONICAL_COSMOS_USDC_DENOMS = new Set<string>([
+  'uusdc',
+  'ibc/498a0751c798a0d9a389aa3691123dada57daa4fe165d5c75894505b876ba6e4',
+  'ibc/f663521bf1836b00f5f177680f74bfb9a8b5654a694d0d2bc249e03cf2509013',
+]);
+const CANONICAL_SUI_USDC_TYPE =
+  '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::usdc';
+const CANONICAL_APTOS_USDC_FA =
+  '0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b';
+const CANONICAL_TRON_USDC_ADDRESS = 'tekxitehnzsmse2xqrbj4w32run966rdz8';
+
 function r2(n: number): number {
+  if (!Number.isFinite(n)) return 0;
   return Number(n.toFixed(2));
 }
 
+function ceil2(n: number): number {
+  if (!Number.isFinite(n)) return Infinity;
+  return Math.ceil(n * 100 - 1e-9) / 100;
+}
+
 function r4(n: number): number {
+  if (!Number.isFinite(n)) return 0;
   return Number(n.toFixed(4));
 }
 
 function fmtSigned(n: number): string {
-  const abs = Math.abs(n).toFixed(2);
-  return n < 0 ? `-$${abs}` : `+$${abs}`;
+  const safe = Number.isFinite(n) ? n : 0;
+  const rounded = r2(safe);
+  const abs = Math.abs(rounded).toFixed(2);
+  return rounded < 0 ? `-$${abs}` : `+$${abs}`;
+}
+
+function isEvmChain(chain: AnyChainId): chain is EvmChainId {
+  return typeof chain === 'string' && Object.hasOwn(EVM_CHAINS, chain);
+}
+
+/**
+ * Returns true ONLY when the asset settles 1:1 as canonical USDC without requiring a DEX swap:
+ *  - 1:1 DeFi USDC receipts (e.g. aEthUSDC, cUSDCv3, steakUSDC, mwUSDC) whose underlying is canonical USDC
+ *  - Canonical EVM USDC matching `EVM_CHAINS[chain].usdcAddress` (never spoofed ERC-20s with symbol "USDC")
+ *  - Canonical non-EVM native/IBC USDC (Noble `uusdc`/native USDC, Osmosis/Cosmos Hub Noble IBC USDC,
+ *    Sui native USDC, Aptos native FA USDC, Tron canonical USDC, or verified non-EVM direct bridge stable)
+ */
+export function isCanonicalDirectUsdc(asset: ScannedAsset): boolean {
+  if (asset.kind === 'dead_token' || asset.action === 'BURN_ZERO_LIQUIDITY' || !asset.honeypotSafe) {
+    return false;
+  }
+
+  const addrLower = (asset.address || '').trim().toLowerCase();
+  const symUpper = (asset.symbol || '').trim().toUpperCase();
+
+  if (isEvmChain(asset.chain)) {
+    const canonicalUsdc = EVM_CHAINS[asset.chain].usdcAddress.toLowerCase();
+
+    // 1:1 DeFi USDC withdrawals redeem directly to canonical USDC without a DEX swap
+    if (asset.kind === 'defi_position') {
+      const underlyingSym = (asset.underlyingSymbol || '').trim().toUpperCase();
+      if (underlyingSym !== 'USDC') return false;
+      if (asset.underlyingAddress) {
+        return asset.underlyingAddress.trim().toLowerCase() === canonicalUsdc;
+      }
+      return true;
+    }
+
+    // For EVM tokens, strictly require the canonical chain USDC contract address (blocks spoofed "USDC" ERC-20s)
+    return asset.kind === 'erc20' && addrLower === canonicalUsdc;
+  }
+
+  // Non-EVM 1:1 DeFi USDC receipt
+  if (asset.kind === 'defi_position' && (asset.underlyingSymbol || '').trim().toUpperCase() === 'USDC') {
+    return true;
+  }
+
+  // Noble native USDC (kind: 'native', symbol: 'USDC', address: 'uusdc') & Cosmos IBC Noble USDC
+  if (asset.chain === 'noble') {
+    return addrLower === 'uusdc' || (asset.kind === 'native' && symUpper === 'USDC');
+  }
+  if (
+    asset.chain === 'cosmoshub' ||
+    asset.chain === 'osmosis' ||
+    asset.chain === 'celestia' ||
+    asset.chain === 'injective' ||
+    asset.chain === 'neutron'
+  ) {
+    return CANONICAL_COSMOS_USDC_DENOMS.has(addrLower);
+  }
+  if (asset.chain === 'sui') {
+    return addrLower === CANONICAL_SUI_USDC_TYPE;
+  }
+  if (asset.chain === 'aptos') {
+    return addrLower === CANONICAL_APTOS_USDC_FA;
+  }
+  if (asset.chain === 'tron') {
+    return addrLower === CANONICAL_TRON_USDC_ADDRESS || asset.action === 'BRIDGE_DIRECT_USDC';
+  }
+  if (asset.chain === 'ton') {
+    return asset.action === 'BRIDGE_DIRECT_USDC';
+  }
+
+  return false;
 }
 
 /**
@@ -237,6 +329,9 @@ export function estimateLiquidityScaledSlippageUsd(params: {
  *   - negative_roi:   netRoiUsd <= $0   OR  effectiveCostPct >= 65%
  */
 export function classifyRoiVerdict(netRoiUsd: number, effectiveCostPct: number): RoiVerdict {
+  if (!Number.isFinite(netRoiUsd) || !Number.isFinite(effectiveCostPct)) {
+    return 'negative_roi';
+  }
   if (netRoiUsd <= 0 || effectiveCostPct >= NEGATIVE_ROI_COST_PCT) {
     return 'negative_roi';
   }
@@ -250,6 +345,7 @@ export function classifyRoiVerdict(netRoiUsd: number, effectiveCostPct: number):
  * Live Quote Haircut Gate:
  * Re-evaluates real quoted output minus actual gas before allowing execution.
  * Drops any asset whose liveNetUsd <= 0 or liveHaircutPct > 50% (unless allowHighCost is true).
+ * Fails closed on any non-finite (NaN / Infinity) or invalid input.
  */
 export function evaluateLiveQuoteHaircut(params: {
   grossUsd: number;
@@ -258,24 +354,51 @@ export function evaluateLiveQuoteHaircut(params: {
   allowHighCost?: boolean;
   maxHaircutPct?: number;
 }): LiveQuoteHaircutResult {
-  const grossUsd = r2(Math.max(0, params.grossUsd));
-  const quoteOutUsd = r2(Math.max(0, params.quoteOutUsd));
-  const actualGasUsd = r2(Math.max(0, params.actualGasUsd));
-  const capPct = params.maxHaircutPct ?? DEFAULT_LIVE_QUOTE_HAIRCUT_CAP_PCT;
+  const rawCapPct = params.maxHaircutPct ?? DEFAULT_LIVE_QUOTE_HAIRCUT_CAP_PCT;
+  if (
+    !Number.isFinite(params.grossUsd) ||
+    !Number.isFinite(params.quoteOutUsd) ||
+    !Number.isFinite(params.actualGasUsd) ||
+    !Number.isFinite(rawCapPct) ||
+    rawCapPct <= 0 ||
+    params.grossUsd < 0 ||
+    params.quoteOutUsd < 0 ||
+    params.actualGasUsd < 0
+  ) {
+    return {
+      passed: false,
+      grossUsd: Number.isFinite(params.grossUsd) ? r2(Math.max(0, params.grossUsd)) : 0,
+      quoteOutUsd: Number.isFinite(params.quoteOutUsd) ? r2(Math.max(0, params.quoteOutUsd)) : 0,
+      actualGasUsd: Number.isFinite(params.actualGasUsd) ? r2(Math.max(0, params.actualGasUsd)) : 0,
+      liveNetUsd: 0,
+      liveHaircutPct: 100,
+      capPct: Number.isFinite(rawCapPct) && rawCapPct > 0 ? rawCapPct : DEFAULT_LIVE_QUOTE_HAIRCUT_CAP_PCT,
+      overridden: false,
+      reason: 'Dropped by Live Quote Haircut Gate: non-finite or invalid quote/gas parameters (fail-closed).',
+    };
+  }
+
+  const grossUsd = r2(params.grossUsd);
+  const quoteOutUsd = r2(params.quoteOutUsd);
+  const actualGasUsd = r2(params.actualGasUsd);
+  const capPct = rawCapPct;
   const liveNetUsd = r2(quoteOutUsd - actualGasUsd);
   const liveHaircutPct = grossUsd > 0 ? r2((1 - liveNetUsd / grossUsd) * 100) : 100;
 
-  if (liveNetUsd <= 0) {
+  if (grossUsd <= 0 || liveNetUsd <= 0 || !Number.isFinite(liveNetUsd) || !Number.isFinite(liveHaircutPct)) {
     return {
       passed: false,
       grossUsd,
       quoteOutUsd,
       actualGasUsd,
-      liveNetUsd,
-      liveHaircutPct,
+      liveNetUsd: Number.isFinite(liveNetUsd) ? liveNetUsd : 0,
+      liveHaircutPct: Number.isFinite(liveHaircutPct) ? liveHaircutPct : 100,
       capPct,
       overridden: false,
-      reason: `Dropped by Live Quote Haircut Gate: quoted net output is negative (${fmtSigned(liveNetUsd)} on $${grossUsd.toFixed(2)} gross).`,
+      reason:
+        grossUsd <= 0
+          ? 'Dropped by Live Quote Haircut Gate: gross USD value must be positive (fail-closed).'
+          : `Dropped by Live Quote Haircut Gate: quoted net output is negative (${fmtSigned(liveNetUsd)} on $${grossUsd.toFixed(2)} gross).`,
     };
   }
 
@@ -337,22 +460,23 @@ export function evaluateAssetRoi(
 ): AssetRoiEvaluation {
   const feeCfg = getProtocolFeeConfig({ feeBps: opts.protocolFeeBps });
   const isBatched = opts.isBatched ?? true;
-  const grossUsd = r2(asset.grossUsd);
-  const soloGasUsd = r4(asset.estimatedGasUsd);
-  const batchedGasUsd = r4(asset.batchedGasUsd);
-  const l1DataFeeUsd = estimateL1DataFeeUsd(asset.chain, isBatched);
-  const isDirectUsdc =
-    asset.action === 'BRIDGE_DIRECT_USDC' ||
-    (asset.symbol === 'USDC' && asset.kind === 'erc20');
+  const grossUsd = Number.isFinite(asset.grossUsd) ? r2(Math.max(0, asset.grossUsd)) : 0;
+  const soloGasUsd = Number.isFinite(asset.estimatedGasUsd) ? r4(Math.max(0, asset.estimatedGasUsd)) : 0;
+  const batchedGasUsd = Number.isFinite(asset.batchedGasUsd) ? r4(Math.max(0, asset.batchedGasUsd)) : 0;
+  const soloL1DataFeeUsd = estimateL1DataFeeUsd(asset.chain, false);
+  const batchedL1DataFeeUsd = estimateL1DataFeeUsd(asset.chain, true);
+  const l1DataFeeUsd = isBatched ? batchedL1DataFeeUsd : soloL1DataFeeUsd;
+  const isDirectUsdc = isCanonicalDirectUsdc(asset);
 
   // Use the greater of explicit asset slippage or liquidity-depth-scaled price impact
   const scaledSlippage = estimateLiquidityScaledSlippageUsd({
     grossUsd,
-    liquidityUsd: asset.liquidityUsd,
+    liquidityUsd: Number.isFinite(asset.liquidityUsd) ? asset.liquidityUsd : 0,
     isDirectUsdc,
     isDead: asset.kind === 'dead_token' || asset.action === 'BURN_ZERO_LIQUIDITY',
   });
-  const slippageUsd = r2(Math.max(asset.estimatedSlippageUsd || 0, scaledSlippage));
+  const explicitSlippage = Number.isFinite(asset.estimatedSlippageUsd) ? Math.max(0, asset.estimatedSlippageUsd) : 0;
+  const slippageUsd = isDirectUsdc ? 0 : r2(Math.max(explicitSlippage, scaledSlippage));
   const incrementalGasUsd = r4((isBatched ? batchedGasUsd : soloGasUsd) + l1DataFeeUsd);
 
   if (asset.action === 'SKIP_HONEYPOT' || !asset.honeypotSafe) {
@@ -366,16 +490,16 @@ export function evaluateAssetRoi(
       soloGasUsd,
       batchedGasUsd,
       l1DataFeeUsd,
-      signedSoloNetUsd: r2(-soloGasUsd),
-      signedBatchedNetUsd: r2(-batchedGasUsd),
+      signedSoloNetUsd: r2(-(soloGasUsd + soloL1DataFeeUsd)),
+      signedBatchedNetUsd: r2(-(batchedGasUsd + batchedL1DataFeeUsd)),
       netRoiUsd: r2(-incrementalGasUsd),
       effectiveCostPct: 100,
       roiVerdict: 'negative_roi',
       signedSponsoredNetUsd: 0,
       relayerAssetMarginUsd: r2(-incrementalGasUsd),
       costBreakdown: {
-        gasUsd: r2(incrementalGasUsd),
-        l1DataFeeUsd: r2(l1DataFeeUsd),
+        gasUsd: r2(isBatched ? batchedGasUsd : soloGasUsd),
+        l1DataFeeUsd: r4(l1DataFeeUsd),
         slippageUsd: 0,
         bridgeFeeUsd: 0,
         protocolFeeUsd: 0,
@@ -399,16 +523,16 @@ export function evaluateAssetRoi(
       soloGasUsd,
       batchedGasUsd,
       l1DataFeeUsd,
-      signedSoloNetUsd: r2(-soloGasUsd),
-      signedBatchedNetUsd: r2(-batchedGasUsd),
+      signedSoloNetUsd: r2(-(soloGasUsd + soloL1DataFeeUsd)),
+      signedBatchedNetUsd: r2(-(batchedGasUsd + batchedL1DataFeeUsd)),
       netRoiUsd: r2(-incrementalGasUsd),
       effectiveCostPct: 100,
       roiVerdict: 'negative_roi',
       signedSponsoredNetUsd: 0,
       relayerAssetMarginUsd: r2(-incrementalGasUsd),
       costBreakdown: {
-        gasUsd: r2(incrementalGasUsd),
-        l1DataFeeUsd: r2(l1DataFeeUsd),
+        gasUsd: r2(isBatched ? batchedGasUsd : soloGasUsd),
+        l1DataFeeUsd: r4(l1DataFeeUsd),
         slippageUsd: 0,
         bridgeFeeUsd: 0,
         protocolFeeUsd: 0,
@@ -421,34 +545,35 @@ export function evaluateAssetRoi(
     };
   }
 
-  // Chain-specific sub-fee dust guard (e.g., BTC dust UTXO already flagged SKIP_GAS_NEGATIVE)
+  // Chain-specific sub-fee dust guard (e.g., BTC dust UTXO or pre-skipped chain-floor dust)
   const protocolFeeUsd = r2((Math.max(0, grossUsd - slippageUsd) * feeCfg.feeBps) / 10_000);
   const bridgeShareUsd = opts.includeSingleBridgeShare
     ? r2(estimateBridgeFixedFeeUsd(asset.chain) / Math.max(1, opts.chainAssetCount ?? 1))
     : 0;
-  const ataShareUsd = r2(opts.solanaAtaRentUsd ?? 0);
+  const ataShareUsd = r2(Math.max(0, Number.isFinite(opts.solanaAtaRentUsd ?? 0) ? (opts.solanaAtaRentUsd ?? 0) : 0));
 
-  const soloTotalCostUsd = r2(soloGasUsd + l1DataFeeUsd + slippageUsd + protocolFeeUsd + bridgeShareUsd + ataShareUsd);
-  const batchedTotalCostUsd = r2(batchedGasUsd + l1DataFeeUsd + slippageUsd + protocolFeeUsd + bridgeShareUsd + ataShareUsd);
+  const soloTotalCostUsd = r2(soloGasUsd + soloL1DataFeeUsd + slippageUsd + protocolFeeUsd + bridgeShareUsd + ataShareUsd);
+  const batchedTotalCostUsd = r2(batchedGasUsd + batchedL1DataFeeUsd + slippageUsd + protocolFeeUsd + bridgeShareUsd + ataShareUsd);
   const signedSoloNetUsd = r2(grossUsd - soloTotalCostUsd);
   const signedBatchedNetUsd = r2(grossUsd - batchedTotalCostUsd);
   const netRoiUsd = isBatched ? signedBatchedNetUsd : signedSoloNetUsd;
   const totalCostUsd = isBatched ? batchedTotalCostUsd : soloTotalCostUsd;
   const effectiveCostPct = grossUsd > 0 ? r2((totalCostUsd / grossUsd) * 100) : 100;
 
-  // Respect explicit BTC/chain sub-fee dust flags
+  // Respect explicit chain-floor / BTC sub-fee dust SKIP flags so pre-skipped dust is never resurrected
   let roiVerdict = classifyRoiVerdict(netRoiUsd, effectiveCostPct);
-  if (asset.action === 'SKIP_GAS_NEGATIVE' && asset.chain === 'btc' && asset.address.startsWith('dust:')) {
+  if (asset.action === 'SKIP_GAS_NEGATIVE' || asset.action === 'SKIP_NEGATIVE_ROI') {
     roiVerdict = 'negative_roi';
   }
 
   const signedSponsoredNetUsd = r2(grossUsd - protocolFeeUsd - slippageUsd - bridgeShareUsd - ataShareUsd);
   const relayerAssetMarginUsd = r2(protocolFeeUsd - incrementalGasUsd);
 
+  const soloEffectiveCostPct = grossUsd > 0 ? r2((soloTotalCostUsd / grossUsd) * 100) : 100;
   let verdict: AssetRoiVerdict;
   if (roiVerdict === 'negative_roi') {
     verdict = 'negative_roi_skip';
-  } else if (signedSoloNetUsd > WORTH_IT_MIN_NET_USD) {
+  } else if (classifyRoiVerdict(signedSoloNetUsd, soloEffectiveCostPct) === 'worth_it') {
     verdict = 'profitable';
   } else {
     verdict = 'profitable_batched_only';
@@ -481,7 +606,7 @@ export function evaluateAssetRoi(
     relayerAssetMarginUsd,
     costBreakdown: {
       gasUsd: r2(isBatched ? batchedGasUsd : soloGasUsd),
-      l1DataFeeUsd: r2(l1DataFeeUsd),
+      l1DataFeeUsd: r4(l1DataFeeUsd),
       slippageUsd,
       bridgeFeeUsd: bridgeShareUsd,
       protocolFeeUsd,
@@ -496,8 +621,13 @@ export function evaluateAssetRoi(
 
 /**
  * Exact Relayer Break-Even Math:
- * Enforces `protocolFeeUsd + maxGasReimbursementUsd >= sponsoredGasUsd * 1.5` (or fixed overhead)
- * so Siphon's relayer never burns funds sponsoring unprofitable dust sweeps.
+ * Unifies off-chain eligibility with on-chain `SiphonRouter` / `SiphonSweepDelegate` solvency:
+ *   - Total relayer outlay `G = sponsoredGasUsd + l1DataFeeUsd + fixedRelayerOverheadUsd`
+ *   - Required coverage = `1.5 * G`
+ *   - When gas is reimbursed from proceeds (`maxGasReimbursementUsd !== undefined`),
+ *     effective reimbursement in solvency math is capped at actual outlay `min(G, maxGasReimbursementUsd)`
+ *     (never inflated by a 2.5x safety ceiling!), enforcing `protocolFeeUsd >= 0.5 * G` at full reimbursement.
+ *   - When unreimbursed (`maxGasReimbursementUsd === undefined`), enforces `protocolFeeUsd >= 1.5 * G` unconditionally.
  */
 export function computeRelayerBreakEven(params: {
   sponsoredGasUsd: number;
@@ -505,33 +635,92 @@ export function computeRelayerBreakEven(params: {
   grossUsd: number;
   maxGasReimbursementUsd?: number;
   fixedRelayerOverheadUsd?: number;
+  l1DataFeeUsd?: number;
+  slippageUsd?: number;
 }): RelayerBreakEvenResult {
   const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
   const rate = feeCfg.feeBps / 10_000;
-  const fixedRelayerOverheadUsd = r2(params.fixedRelayerOverheadUsd ?? 0.02);
+
+  const rawOverhead = params.fixedRelayerOverheadUsd ?? 0.02;
+  const rawL1Data = params.l1DataFeeUsd ?? 0;
+  const rawSlippage = params.slippageUsd ?? 0;
+  const isReimbursed = params.maxGasReimbursementUsd !== undefined;
+
+  if (
+    !Number.isFinite(params.sponsoredGasUsd) ||
+    !Number.isFinite(params.grossUsd) ||
+    !Number.isFinite(rawOverhead) ||
+    !Number.isFinite(rawL1Data) ||
+    !Number.isFinite(rawSlippage) ||
+    (isReimbursed && !Number.isFinite(params.maxGasReimbursementUsd!))
+  ) {
+    return {
+      protocolFeeBps: feeCfg.feeBps,
+      protocolFeePercent: feeCfg.feePercent,
+      grossUsd: 0,
+      protocolFeeUsd: 0,
+      sponsoredGasUsd: 0,
+      fixedRelayerOverheadUsd: 0.02,
+      effectiveRelayerCostUsd: 0.02,
+      requiredRelayerCoverageUsd: 0.03,
+      relayerNetMarginUsd: -0.02,
+      breakEvenGrossUsd: Infinity,
+      shortfallToBreakEvenUsd: Infinity,
+      isRelayerProfitable: false,
+      marginPercentOfGross: -100,
+      rejectionReason:
+        'Below gasless sponsorship break-even: non-finite gas, gross, or reimbursement inputs (fail-closed).',
+    };
+  }
+
+  const fixedRelayerOverheadUsd = r2(Math.max(0, rawOverhead));
+  const l1DataFeeUsd = r4(Math.max(0, rawL1Data));
   const sponsoredGasUsd = r2(Math.max(0, params.sponsoredGasUsd));
-  const effectiveRelayerCostUsd = r2(sponsoredGasUsd + fixedRelayerOverheadUsd);
-  const requiredRelayerCoverageUsd = r2(
-    Math.max(effectiveRelayerCostUsd, sponsoredGasUsd * RELAYER_BREAK_EVEN_MULTIPLIER)
-  );
+  const effectiveRelayerCostUsd = r2(sponsoredGasUsd + l1DataFeeUsd + fixedRelayerOverheadUsd);
+  const requiredRelayerCoverageUsd = r2(effectiveRelayerCostUsd * RELAYER_BREAK_EVEN_MULTIPLIER);
+
   const grossUsd = r2(Math.max(0, params.grossUsd));
-  const protocolFeeUsd = r2(grossUsd * rate);
-  const reimbursement = r2(Math.max(0, params.maxGasReimbursementUsd ?? 0));
-  const totalRelayerRevenueUsd = r2(protocolFeeUsd + reimbursement);
+  const slippageUsd = r2(Math.min(grossUsd, Math.max(0, rawSlippage)));
+  const netAfterSlippageUsd = r2(Math.max(0, grossUsd - slippageUsd));
+  const protocolFeeUsd = r2(netAfterSlippageUsd * rate);
 
-  const relayerNetMarginUsd = r2(protocolFeeUsd - effectiveRelayerCostUsd);
-  const breakEvenGrossUsd = rate > 0 ? r2(effectiveRelayerCostUsd / rate) : Infinity;
-  const shortfallToBreakEvenUsd = r2(Math.max(0, breakEvenGrossUsd - grossUsd));
+  // Cap effective reimbursement in solvency math at actual relayer outlay G (never 2.5x safety cap!)
+  const effectiveReimbursementUsd = isReimbursed
+    ? r2(Math.min(effectiveRelayerCostUsd, Math.max(0, params.maxGasReimbursementUsd!)))
+    : 0;
+  const totalRelayerRevenueUsd = r2(protocolFeeUsd + effectiveReimbursementUsd);
 
-  // If maxGasReimbursementUsd is explicitly supplied (gasless sponsorship check), require 1.5x coverage!
+  const relayerNetMarginUsd = r2(totalRelayerRevenueUsd - effectiveRelayerCostUsd);
+  const requiredFeeUsd = r2(Math.max(0, requiredRelayerCoverageUsd - effectiveReimbursementUsd));
+  const slippageRate = grossUsd > 0 ? Math.min(0.99, slippageUsd / grossUsd) : 0;
+  const effectiveFeeRate = rate * (1 - slippageRate);
+
+  const minGrossForFeeUsd = effectiveFeeRate > 0 ? ceil2(requiredFeeUsd / effectiveFeeRate) : Infinity;
+  const userRetentionRate = (1 - slippageRate) * (1 - rate);
+  const minGrossForUserNetUsd =
+    isReimbursed && userRetentionRate > 0
+      ? ceil2((effectiveRelayerCostUsd + 0.01) / userRetentionRate)
+      : 0;
+  const breakEvenGrossUsd = isReimbursed
+    ? Math.max(minGrossForFeeUsd, minGrossForUserNetUsd)
+    : minGrossForFeeUsd;
+
+  const shortfallToBreakEvenUsd = Number.isFinite(breakEvenGrossUsd)
+    ? r2(Math.max(0, breakEvenGrossUsd - grossUsd))
+    : Infinity;
+
+  const userProceedsPositive =
+    !isReimbursed || netAfterSlippageUsd > effectiveRelayerCostUsd + protocolFeeUsd;
   const isRelayerProfitable =
-    params.maxGasReimbursementUsd !== undefined
-      ? totalRelayerRevenueUsd >= requiredRelayerCoverageUsd && grossUsd > sponsoredGasUsd + protocolFeeUsd
-      : relayerNetMarginUsd >= 0;
+    grossUsd > 0 &&
+    totalRelayerRevenueUsd >= requiredRelayerCoverageUsd &&
+    userProceedsPositive;
 
   const marginPercentOfGross = grossUsd > 0 ? r2((relayerNetMarginUsd / grossUsd) * 100) : -100;
   const rejectionReason = !isRelayerProfitable
-    ? `Below gasless sponsorship break-even: expected fee + reimbursement ($${totalRelayerRevenueUsd.toFixed(2)}) is below 1.5x sponsored gas ($${requiredRelayerCoverageUsd.toFixed(2)}). Need ≥ $${breakEvenGrossUsd.toFixed(2)} gross on this chain.`
+    ? isReimbursed
+      ? `Below gasless sponsorship break-even: expected fee + capped gas reimbursement ($${totalRelayerRevenueUsd.toFixed(2)}) is below ${RELAYER_BREAK_EVEN_MULTIPLIER}x relayer cost ($${requiredRelayerCoverageUsd.toFixed(2)}). Need ≥ $${breakEvenGrossUsd.toFixed(2)} gross on this chain.`
+      : `Below gasless sponsorship break-even: expected protocol fee ($${protocolFeeUsd.toFixed(2)}) is below ${RELAYER_BREAK_EVEN_MULTIPLIER}x relayer cost ($${requiredRelayerCoverageUsd.toFixed(2)}). Need ≥ $${breakEvenGrossUsd.toFixed(2)} gross on this chain.`
     : undefined;
 
   return {
@@ -602,7 +791,7 @@ export function compareChainRouteStrategies(params: {
     params.evaluations.reduce((s, e) => s + e.batchedGasUsd + e.l1DataFeeUsd, 0)
   );
   const directPerTokenGasUsd = r2(
-    params.evaluations.reduce((s, e) => s + e.soloGasUsd + e.l1DataFeeUsd, 0)
+    params.evaluations.reduce((s, e) => s + e.soloGasUsd + estimateL1DataFeeUsd(e.chain, false), 0)
   );
 
   // Local batch swap + single bridge pays fixed bridge cost ONCE per chain leg!
@@ -666,19 +855,93 @@ export function evaluateChainBatchRoi(params: {
     isBatched: true,
   });
 
-  // Positive-marginal assets eligible for the chain leg (worth_it + low_efficiency if combined batch rescues them)
+  // Positive-marginal assets eligible for the chain leg (worth_it + low_efficiency if combined batch rescues/improves them)
   const sweepableAll = [...buckets.kept, ...buckets.lowEfficiency, ...buckets.prunedNegativeRoi];
-  // If individual tokens were low_efficiency solely because of solo overhead, test combining worth_it + low_efficiency in Level 2 batch!
-  const legCandidates = buckets.kept.length > 0 ? buckets.kept : buckets.lowEfficiency;
+  const evalById = new Map(buckets.evaluations.map((e) => [e.assetId, e]));
 
-  const unprunedGrossUsd = r2(sweepableAll.reduce((s, a) => s + a.grossUsd, 0));
-  const keptGrossUsd = r2(legCandidates.reduce((s, a) => s + a.grossUsd, 0));
+  const evaluateCandidateSet = (candidates: ScannedAsset[]) => {
+    const cIds = new Set(candidates.map((a) => a.id));
+    const cEvals = buckets.evaluations.filter((e) => cIds.has(e.assetId));
+    const cGross = r2(candidates.reduce((s, a) => s + (Number.isFinite(a.grossUsd) ? Math.max(0, a.grossUsd) : 0), 0));
+    const cGas = r2(cEvals.reduce((s, e) => s + e.batchedGasUsd + e.l1DataFeeUsd, 0));
+    const cSlippage = r2(cEvals.reduce((s, e) => s + e.slippageUsd, 0));
+    const cFee = r2((Math.max(0, cGross - cSlippage) * feeCfg.feeBps) / 10_000);
+    const cRoute = compareChainRouteStrategies({
+      chain: params.chain,
+      assets: candidates,
+      evaluations: cEvals,
+      protocolFeeUsd: cFee,
+      solanaAtaRentUsd,
+    });
+    const cBestNet =
+      candidates.length === 0
+        ? r2(-(estimateBridgeFixedFeeUsd(params.chain) + solanaAtaRentUsd))
+        : Math.max(cRoute.localBatchSingleBridgeNetUsd, cRoute.directPerTokenBridgeNetUsd);
+    const cBridgeFee =
+      cRoute.recommendedStrategy === 'local_batch_single_bridge'
+        ? cRoute.singleBridgeFixedFeeUsd
+        : cRoute.perTokenBridgeTotalFeeUsd;
+    const cCost = r2(cGross - cBestNet);
+    const cCostPct = cGross > 0 ? r2((cCost / cGross) * 100) : 100;
+    const cVerdict: RoiVerdict =
+      candidates.length === 0 ? 'negative_roi' : classifyRoiVerdict(cBestNet, cCostPct);
+    return {
+      candidates,
+      evals: cEvals,
+      grossUsd: cGross,
+      totalGasUsd: cGas,
+      totalSlippageUsd: cSlippage,
+      protocolFeeUsd: cFee,
+      routeComparison: cRoute,
+      bestChainLegNetUsd: cBestNet,
+      bridgeFixedFeeUsd: cBridgeFee,
+      chainLegCostPct: cCostPct,
+      roiVerdict: cVerdict,
+      skipChainNegativeRoi: cVerdict === 'negative_roi',
+    };
+  };
 
+  // Start with worth_it assets, then greedily incorporate low_efficiency assets (ordered by lowest
+  // effectiveCostPct) whenever adding them strictly increases chainLegNetUsd without pushing a valid
+  // batch into negative_roi (fixes both non-monotonic wipeout and unpriced phantom dust!).
+  const sortedLowEff = [...buckets.lowEfficiency].sort((a, b) => {
+    const ea = evalById.get(a.id);
+    const eb = evalById.get(b.id);
+    const costDiff = (ea?.effectiveCostPct ?? 100) - (eb?.effectiveCostPct ?? 100);
+    if (Math.abs(costDiff) > 1e-6) return costDiff;
+    return (eb?.netRoiUsd ?? 0) - (ea?.netRoiUsd ?? 0);
+  });
+
+  const keptOnlyResult = evaluateCandidateSet(buckets.kept);
+  let bestResult = keptOnlyResult;
+  const workingCandidates = [...buckets.kept];
+
+  for (const candidate of sortedLowEff) {
+    const trial = evaluateCandidateSet([...workingCandidates, candidate]);
+    const improvesNet = trial.bestChainLegNetUsd > bestResult.bestChainLegNetUsd;
+    const keepsValidOrRescuing =
+      !trial.skipChainNegativeRoi || bestResult.skipChainNegativeRoi;
+    if (improvesNet && keepsValidOrRescuing) {
+      workingCandidates.push(candidate);
+      bestResult = trial;
+    }
+  }
+
+  // Never choose a skipped combined batch if worth_it assets alone were valid
+  if (bestResult.skipChainNegativeRoi && !keptOnlyResult.skipChainNegativeRoi) {
+    bestResult = keptOnlyResult;
+  }
+
+  const legCandidates = bestResult.candidates;
+  const keptGrossUsd = bestResult.grossUsd;
+  const keptEvals = bestResult.evals;
+
+  const unprunedGrossUsd = r2(
+    sweepableAll.reduce((s, a) => s + (Number.isFinite(a.grossUsd) ? Math.max(0, a.grossUsd) : 0), 0)
+  );
   const unprunedEvals = buckets.evaluations.filter(
     (e) => e.verdict !== 'honeypot_blocked' && e.verdict !== 'zero_liquidity_burn'
   );
-  const candidateIds = new Set(legCandidates.map((a) => a.id));
-  const keptEvals = buckets.evaluations.filter((e) => candidateIds.has(e.assetId));
 
   const unprunedSignedUserNetUsd = r2(
     unprunedEvals.reduce((s, e) => s + e.signedBatchedNetUsd, 0)
@@ -686,7 +949,6 @@ export function evaluateChainBatchRoi(params: {
   const keptSignedUserNetUsd = r2(
     keptEvals.reduce((s, e) => s + (gasSponsored ? e.signedSponsoredNetUsd : e.signedBatchedNetUsd), 0)
   );
-  const keptBatchedUserNetUsd = r2(keptEvals.reduce((s, e) => s + e.signedBatchedNetUsd, 0));
   const prunedNegativeIds = new Set(buckets.prunedNegativeRoi.map((a) => a.id));
   const negativeBleedPreventedUsd = r2(
     buckets.evaluations
@@ -694,47 +956,31 @@ export function evaluateChainBatchRoi(params: {
       .reduce((s, e) => s + Math.max(0, -e.signedBatchedNetUsd), 0)
   );
 
-  const totalGasUsd = r2(keptEvals.reduce((s, e) => s + e.batchedGasUsd + e.l1DataFeeUsd, 0));
-  const totalSlippageUsd = r2(keptEvals.reduce((s, e) => s + e.slippageUsd, 0));
-  const protocolFeeUsd = r2((Math.max(0, keptGrossUsd - totalSlippageUsd) * feeCfg.feeBps) / 10_000);
-
-  const routeComparison = compareChainRouteStrategies({
-    chain: params.chain,
-    assets: legCandidates,
-    evaluations: keptEvals,
-    protocolFeeUsd,
-    solanaAtaRentUsd,
-  });
-
-  const bestChainLegNetUsd =
-    legCandidates.length === 0
-      ? r2(-(estimateBridgeFixedFeeUsd(params.chain) + solanaAtaRentUsd))
-      : Math.max(
-          routeComparison.localBatchSingleBridgeNetUsd,
-          routeComparison.directPerTokenBridgeNetUsd
-        );
-  const bridgeFixedFeeUsd =
-    routeComparison.recommendedStrategy === 'local_batch_single_bridge'
-      ? routeComparison.singleBridgeFixedFeeUsd
-      : routeComparison.perTokenBridgeTotalFeeUsd;
-
-  const totalLegCostUsd = r2(keptGrossUsd - bestChainLegNetUsd);
-  const chainLegCostPct = keptGrossUsd > 0 ? r2((totalLegCostUsd / keptGrossUsd) * 100) : 100;
-  const roiVerdict =
-    legCandidates.length === 0
-      ? 'negative_roi'
-      : classifyRoiVerdict(bestChainLegNetUsd, chainLegCostPct);
-  const skipChainNegativeRoi = roiVerdict === 'negative_roi';
+  const totalGasUsd = bestResult.totalGasUsd;
+  const totalSlippageUsd = bestResult.totalSlippageUsd;
+  const protocolFeeUsd = bestResult.protocolFeeUsd;
+  const routeComparison = bestResult.routeComparison;
+  const bestChainLegNetUsd = bestResult.bestChainLegNetUsd;
+  const bridgeFixedFeeUsd = bestResult.bridgeFixedFeeUsd;
+  const chainLegCostPct = bestResult.chainLegCostPct;
+  const roiVerdict = bestResult.roiVerdict;
+  const skipChainNegativeRoi = bestResult.skipChainNegativeRoi;
 
   let breakEvenHint: string | undefined;
   if (skipChainNegativeRoi) {
-    const fixedCosts = totalGasUsd + bridgeFixedFeeUsd + solanaAtaRentUsd + 0.35;
+    const representativeGasUsd =
+      totalGasUsd > 0
+        ? totalGasUsd
+        : unprunedEvals.length > 0
+        ? r2(Math.min(...unprunedEvals.map((e) => e.batchedGasUsd + e.l1DataFeeUsd)))
+        : 0;
+    const fixedCosts = representativeGasUsd + bridgeFixedFeeUsd + solanaAtaRentUsd + WORTH_IT_MIN_NET_USD;
     const neededGross = r2(fixedCosts / Math.max(0.15, 0.35 - feeCfg.feeBps / 10_000));
-    if (params.gasPriceGwei && params.gasPriceGwei > 1 && totalGasUsd > 0.5) {
+    if (isEvmChain(params.chain) && params.gasPriceGwei && params.gasPriceGwei > 1 && representativeGasUsd > 0.5) {
       const targetGwei = Math.max(0.5, Number((params.gasPriceGwei * 0.35).toFixed(1)));
       breakEvenHint = `Becomes profitable below ${targetGwei} gwei or when chain balance > $${neededGross.toFixed(2)}.`;
     } else {
-      breakEvenHint = `Becomes profitable when chain balance > $${neededGross.toFixed(2)} (fixed costs ~$${r2(totalGasUsd + bridgeFixedFeeUsd + solanaAtaRentUsd).toFixed(2)}).`;
+      breakEvenHint = `Becomes profitable when chain balance > $${neededGross.toFixed(2)} (fixed costs ~$${r2(representativeGasUsd + bridgeFixedFeeUsd + solanaAtaRentUsd).toFixed(2)}).`;
     }
   }
 
@@ -742,6 +988,7 @@ export function evaluateChainBatchRoi(params: {
     sponsoredGasUsd: totalGasUsd,
     protocolFeeBps: feeCfg.feeBps,
     grossUsd: keptGrossUsd,
+    slippageUsd: totalSlippageUsd,
     fixedRelayerOverheadUsd: params.fixedRelayerOverheadUsd,
   });
 
@@ -769,7 +1016,7 @@ export function evaluateChainBatchRoi(params: {
     warnings.push(`SKIP_CHAIN_NEGATIVE_ROI: ${breakEvenHint}`);
   } else if (legCandidates.length > 0 && !relayerBreakEven.isRelayerProfitable) {
     warnings.push(
-      `Below relayer break-even ($${relayerBreakEven.breakEvenGrossUsd.toFixed(2)} gross needed at ${feeCfg.feePercent}% fee to cover $${relayerBreakEven.effectiveRelayerCostUsd.toFixed(2)} sponsored gas; shortfall $${relayerBreakEven.shortfallToBreakEvenUsd.toFixed(2)}).`
+      `Below relayer break-even ($${relayerBreakEven.breakEvenGrossUsd.toFixed(2)} gross needed at ${feeCfg.feePercent}% fee to cover $${relayerBreakEven.requiredRelayerCoverageUsd.toFixed(2)} 1.5x relayer coverage; shortfall $${relayerBreakEven.shortfallToBreakEvenUsd.toFixed(2)}).`
     );
   }
 
@@ -782,6 +1029,7 @@ export function evaluateChainBatchRoi(params: {
     prunedNegativeRoiCount: buckets.prunedNegativeRoi.length,
     optionalBurnCount: buckets.optionalBurns.length,
     blockedHoneypotCount: buckets.blockedHoneypots.length,
+    includedAssetIds: legCandidates.map((a) => a.id),
     unprunedGrossUsd,
     keptGrossUsd,
     unprunedSignedUserNetUsd,
@@ -803,6 +1051,18 @@ export function evaluateChainBatchRoi(params: {
     warnings,
     evaluations: buckets.evaluations,
   };
+}
+
+function formatIdempotentLowEfficiencyReason(evReason: string, existingReason: string): string {
+  const existing = (existingReason || '').trim();
+  if (!existing) return evReason;
+  // Unwrap any previously prepended "High cost (...) — unchecked by default (opt-in). (...)" wrapper
+  const match = existing.match(/^High cost \([^)]+\)\s+—\s+unchecked by default \(opt-in\)\.\s*(?:\((.*)\))?$/);
+  if (match) {
+    const inner = (match[1] || '').trim();
+    return inner ? `${evReason} (${inner})` : evReason;
+  }
+  return `${evReason} (${existing})`;
 }
 
 /**
@@ -831,27 +1091,85 @@ export function applyTwoLevelRoiToReport(
     byChain.set(a.chain, arr);
   }
 
-  let ataApplied = false;
+  // Pass 1: Evaluate all chains without Solana ATA rent to determine independently executing chains
+  const chainRoiByChain = new Map<AnyChainId, ChainBatchRoiReport>();
+  for (const chainSummary of report.chains) {
+    const chainAssets = byChain.get(chainSummary.chain) ?? [];
+    if (!chainAssets.length) continue;
+
+    chainRoiByChain.set(
+      chainSummary.chain,
+      evaluateChainBatchRoi({
+        chain: chainSummary.chain,
+        chainName: chainSummary.chainName,
+        assets: chainAssets,
+        protocolFeeBps: feeBps,
+        gasSponsored: chainSummary.needsGasSponsorship,
+        hasSolanaUsdcAta: true,
+        solPriceUsd,
+        gasPriceGwei: chainSummary.gasPriceGwei,
+      })
+    );
+  }
+
+  // Pass 2: Charge Solana ATA rent EXACTLY ONCE across the entire multi-chain sweep
+  // on the highest-net executing chain (never double-counted or stamped onto skipped chains!)
+  if (ataRentTotal > 0) {
+    const executingCandidates = report.chains
+      .map((cs) => ({ cs, roi: chainRoiByChain.get(cs.chain) }))
+      .filter(
+        (entry): entry is { cs: (typeof report.chains)[number]; roi: ChainBatchRoiReport } =>
+          Boolean(entry.roi && !entry.roi.skipChainNegativeRoi && entry.roi.includedAssetIds.length > 0)
+      )
+      .sort((a, b) => b.roi.chainLegNetUsd - a.roi.chainLegNetUsd);
+
+    let ataAssigned = false;
+    for (const { cs } of executingCandidates) {
+      const chainAssets = byChain.get(cs.chain) ?? [];
+      const withAta = evaluateChainBatchRoi({
+        chain: cs.chain,
+        chainName: cs.chainName,
+        assets: chainAssets,
+        protocolFeeBps: feeBps,
+        gasSponsored: cs.needsGasSponsorship,
+        hasSolanaUsdcAta: false,
+        solPriceUsd,
+        gasPriceGwei: cs.gasPriceGwei,
+      });
+      if (!withAta.skipChainNegativeRoi) {
+        chainRoiByChain.set(cs.chain, withAta);
+        ataAssigned = true;
+        break;
+      }
+    }
+
+    // If no single chain can survive ATA rent, re-apply ATA to the single best candidate so it skips cleanly
+    if (!ataAssigned && executingCandidates.length > 0) {
+      const best = executingCandidates[0];
+      const chainAssets = byChain.get(best.cs.chain) ?? [];
+      const skippedWithAta = evaluateChainBatchRoi({
+        chain: best.cs.chain,
+        chainName: best.cs.chainName,
+        assets: chainAssets,
+        protocolFeeBps: feeBps,
+        gasSponsored: best.cs.needsGasSponsorship,
+        hasSolanaUsdcAta: false,
+        solPriceUsd,
+        gasPriceGwei: best.cs.gasPriceGwei,
+      });
+      chainRoiByChain.set(best.cs.chain, {
+        ...skippedWithAta,
+        solanaAtaRentUsd: 0,
+      });
+    }
+  }
 
   for (const chainSummary of report.chains) {
     const chainAssets = byChain.get(chainSummary.chain) ?? [];
     if (!chainAssets.length) continue;
 
-    // Count Solana ATA rent ONCE across the entire multi-chain sweep (on first profitable chain)
-    const chainHasAtaRent = !ataApplied && ataRentTotal > 0;
-    const chainRoi = evaluateChainBatchRoi({
-      chain: chainSummary.chain,
-      chainName: chainSummary.chainName,
-      assets: chainAssets,
-      protocolFeeBps: feeBps,
-      gasSponsored: chainSummary.needsGasSponsorship,
-      hasSolanaUsdcAta: chainHasAtaRent ? false : true,
-      solPriceUsd,
-      gasPriceGwei: chainSummary.gasPriceGwei,
-    });
-    if (chainHasAtaRent && !chainRoi.skipChainNegativeRoi) {
-      ataApplied = true;
-    }
+    const chainRoi = chainRoiByChain.get(chainSummary.chain);
+    if (!chainRoi) continue;
 
     const evalMap = new Map(chainRoi.evaluations.map((e) => [e.assetId, e]));
     for (const a of chainAssets) {
@@ -872,6 +1190,11 @@ export function applyTwoLevelRoiToReport(
         a.selectedByDefault = false;
         continue;
       }
+      // Never resurrect pre-skipped dust (Cosmos/Tron/TON/BTC floor skips) as selectedByDefault: true
+      if (a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_NEGATIVE_ROI') {
+        a.selectedByDefault = false;
+        continue;
+      }
 
       if (ev.roiVerdict === 'negative_roi') {
         a.action = 'SKIP_GAS_NEGATIVE';
@@ -882,12 +1205,44 @@ export function applyTwoLevelRoiToReport(
       } else if (ev.roiVerdict === 'low_efficiency') {
         // Low efficiency (35%-65% fees): keep sweepable action so user can opt in, unchecked by default!
         a.selectedByDefault = false;
-        a.actionReason = `${ev.reason} (${a.actionReason})`;
+        a.actionReason = formatIdempotentLowEfficiencyReason(ev.reason, a.actionReason);
       } else {
         // Worth it: selected by default unless the entire chain leg is negative ROI
         a.selectedByDefault = !chainRoi.skipChainNegativeRoi;
       }
     }
+
+    // Fully synchronize chainSummary aggregates from post-ROI assets
+    const activeSweep = chainAssets.filter(
+      (a) =>
+        a.action === 'WITHDRAW_AND_BRIDGE' ||
+        a.action === 'SELL_AND_BRIDGE' ||
+        a.action === 'BRIDGE_DIRECT_USDC'
+    );
+    const chainGrossUsd = r2(activeSweep.reduce((s, a) => s + a.grossUsd, 0));
+    const chainSingleGas = r4(activeSweep.reduce((s, a) => s + a.estimatedGasUsd, 0));
+    const chainBatchedGas = r4(activeSweep.reduce((s, a) => s + a.batchedGasUsd, 0));
+    const chainSlippage = r2(
+      activeSweep.reduce((s, a) => s + (a.roiCostBreakdown?.slippageUsd ?? a.estimatedSlippageUsd ?? 0), 0)
+    );
+    const chainFee = r2((Math.max(0, chainGrossUsd - chainSlippage) * feeBps) / 10_000);
+
+    chainSummary.assetCount = chainAssets.length;
+    chainSummary.defiCount = chainAssets.filter((a) => a.action === 'WITHDRAW_AND_BRIDGE').length;
+    chainSummary.liquidCount = chainAssets.filter(
+      (a) => a.action === 'SELL_AND_BRIDGE' || a.action === 'BRIDGE_DIRECT_USDC'
+    ).length;
+    chainSummary.burnCount = chainAssets.filter((a) => a.action === 'BURN_ZERO_LIQUIDITY').length;
+    chainSummary.skippedCount = chainAssets.filter(
+      (a) =>
+        a.action === 'SKIP_HONEYPOT' ||
+        a.action === 'SKIP_GAS_NEGATIVE' ||
+        a.action === 'SKIP_NEGATIVE_ROI'
+    ).length;
+    chainSummary.grossUsd = chainGrossUsd;
+    chainSummary.totalGasUsd = r2(chainBatchedGas);
+    chainSummary.gasSavedByBatchUsd = r2(Math.max(0, chainSingleGas - chainBatchedGas));
+    chainSummary.netUsdcBridged = r2(Math.max(0, chainGrossUsd - chainSlippage - chainBatchedGas - chainFee));
 
     chainSummary.chainLegNetUsd = chainRoi.chainLegNetUsd;
     chainSummary.chainLegCostPct = chainRoi.chainLegCostPct;
@@ -895,15 +1250,49 @@ export function applyTwoLevelRoiToReport(
     chainSummary.skipChainNegativeRoi = chainRoi.skipChainNegativeRoi;
     chainSummary.routeStrategy = chainRoi.routeComparison.recommendedStrategy;
     chainSummary.breakEvenHint = chainRoi.breakEvenHint;
-    chainSummary.solanaAtaRentUsd = chainRoi.solanaAtaRentUsd;
-    chainSummary.skippedCount = chainAssets.filter(
-      (a) =>
-        a.action === 'SKIP_HONEYPOT' ||
-        a.action === 'SKIP_GAS_NEGATIVE' ||
-        a.action === 'SKIP_NEGATIVE_ROI'
-    ).length;
+    chainSummary.solanaAtaRentUsd = chainRoi.skipChainNegativeRoi ? 0 : chainRoi.solanaAtaRentUsd;
   }
 
+  // Fully synchronize report.totals from post-ROI active assets
+  const activeAll = report.assets.filter(
+    (a) =>
+      a.action === 'WITHDRAW_AND_BRIDGE' ||
+      a.action === 'SELL_AND_BRIDGE' ||
+      a.action === 'BRIDGE_DIRECT_USDC'
+  );
+  const totalGrossUsd = r2(activeAll.reduce((s, a) => s + a.grossUsd, 0));
+  const defiGrossUsd = r2(
+    activeAll.filter((a) => a.action === 'WITHDRAW_AND_BRIDGE').reduce((s, a) => s + a.grossUsd, 0)
+  );
+  const liquidGrossUsd = r2(totalGrossUsd - defiGrossUsd);
+  const singleTxGasUsd = r2(activeAll.reduce((s, a) => s + a.estimatedGasUsd, 0));
+  const batchedGasUsd = r2(activeAll.reduce((s, a) => s + a.batchedGasUsd, 0));
+  const gasSavedUsd = r2(Math.max(0, singleTxGasUsd - batchedGasUsd));
+  const estimatedSlippageUsd = r2(
+    activeAll.reduce((s, a) => s + (a.roiCostBreakdown?.slippageUsd ?? a.estimatedSlippageUsd ?? 0), 0)
+  );
+  const protocolFeeUsd = r2((Math.max(0, totalGrossUsd - estimatedSlippageUsd) * feeBps) / 10_000);
+  const netSolanaUsdc = r2(
+    Math.max(0, totalGrossUsd - estimatedSlippageUsd - batchedGasUsd - protocolFeeUsd)
+  );
+
+  report.totals.grossUsd = totalGrossUsd;
+  report.totals.defiGrossUsd = defiGrossUsd;
+  report.totals.liquidGrossUsd = liquidGrossUsd;
+  report.totals.protocolFeeBps = feeBps;
+  report.totals.protocolFeeUsd = protocolFeeUsd;
+  report.totals.singleTxGasUsd = singleTxGasUsd;
+  report.totals.batchedGasUsd = batchedGasUsd;
+  report.totals.gasSavedUsd = gasSavedUsd;
+  report.totals.estimatedSlippageUsd = estimatedSlippageUsd;
+  report.totals.netSolanaUsdc = netSolanaUsdc;
+  report.totals.solEquivalent = solPriceUsd > 0 ? r4(netSolanaUsdc / solPriceUsd) : 0;
+  report.totals.defiPositionCount = report.assets.filter((a) => a.action === 'WITHDRAW_AND_BRIDGE').length;
+  report.totals.liquidDustCount = report.assets.filter(
+    (a) => a.action === 'SELL_AND_BRIDGE' || a.action === 'BRIDGE_DIRECT_USDC'
+  ).length;
+  report.totals.burnCandidateCount = report.assets.filter((a) => a.action === 'BURN_ZERO_LIQUIDITY').length;
+  report.totals.honeypotSkippedCount = report.assets.filter((a) => a.action === 'SKIP_HONEYPOT').length;
   report.totals.gasNegativeCount = report.assets.filter(
     (a) => a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_NEGATIVE_ROI'
   ).length;
@@ -937,32 +1326,83 @@ export function evaluatePortfolioRoi(
     byChain.set(a.chain, arr);
   }
 
+  // Pass 1: Evaluate all chains without ATA rent
   const chains: ChainBatchRoiReport[] = [];
-  let ataAssigned = false;
   for (const [chain, chainAssets] of byChain.entries()) {
     const meta = report.chains.find((c) => c.chain === chain);
-    const applyAtaHere = !ataAssigned && solanaAtaRentUsd > 0;
-    const chainRoi = evaluateChainBatchRoi({
-      chain,
-      chainName: meta?.chainName || chainAssets[0]?.chainName || chain,
-      assets: chainAssets,
-      protocolFeeBps: feeCfg.feeBps,
-      gasSponsored: opts.gasSponsored ?? true,
-      fixedRelayerOverheadUsd: opts.fixedRelayerOverheadUsd,
-      hasSolanaUsdcAta: applyAtaHere ? false : true,
-      solPriceUsd,
-      gasPriceGwei: meta?.gasPriceGwei,
-    });
-    if (applyAtaHere) ataAssigned = true;
-    chains.push(chainRoi);
+    chains.push(
+      evaluateChainBatchRoi({
+        chain,
+        chainName: meta?.chainName || chainAssets[0]?.chainName || chain,
+        assets: chainAssets,
+        protocolFeeBps: feeCfg.feeBps,
+        gasSponsored: opts.gasSponsored ?? true,
+        fixedRelayerOverheadUsd: opts.fixedRelayerOverheadUsd,
+        hasSolanaUsdcAta: true,
+        solPriceUsd,
+        gasPriceGwei: meta?.gasPriceGwei,
+      })
+    );
   }
 
-  const totalGrossUsd = r2(chains.reduce((s, c) => s + c.keptGrossUsd, 0));
-  const totalSignedUserNetUsd = r2(chains.reduce((s, c) => s + c.chainLegNetUsd, 0));
-  const totalProtocolFeeUsd = r2(chains.reduce((s, c) => s + c.protocolFeeUsd, 0));
-  const totalSponsoredGasUsd = r2(chains.reduce((s, c) => s + c.totalGasUsd, 0));
+  // Pass 2: Assign Solana ATA rent ONCE to the highest-net executing chain (never onto skipped chains!)
+  let appliedAtaRentUsd = 0;
+  if (solanaAtaRentUsd > 0) {
+    const candidateIndices = chains
+      .map((c, idx) => ({ c, idx }))
+      .filter(({ c }) => !c.skipChainNegativeRoi && c.includedAssetIds.length > 0)
+      .sort((a, b) => b.c.chainLegNetUsd - a.c.chainLegNetUsd);
+
+    let assigned = false;
+    for (const { c, idx } of candidateIndices) {
+      const chainAssets = byChain.get(c.chain) ?? [];
+      const meta = report.chains.find((m) => m.chain === c.chain);
+      const withAta = evaluateChainBatchRoi({
+        chain: c.chain,
+        chainName: meta?.chainName || chainAssets[0]?.chainName || c.chain,
+        assets: chainAssets,
+        protocolFeeBps: feeCfg.feeBps,
+        gasSponsored: opts.gasSponsored ?? true,
+        fixedRelayerOverheadUsd: opts.fixedRelayerOverheadUsd,
+        hasSolanaUsdcAta: false,
+        solPriceUsd,
+        gasPriceGwei: meta?.gasPriceGwei,
+      });
+      if (!withAta.skipChainNegativeRoi) {
+        chains[idx] = withAta;
+        appliedAtaRentUsd = withAta.solanaAtaRentUsd;
+        assigned = true;
+        break;
+      }
+    }
+
+    if (!assigned && candidateIndices.length > 0) {
+      const { c, idx } = candidateIndices[0];
+      const chainAssets = byChain.get(c.chain) ?? [];
+      const meta = report.chains.find((m) => m.chain === c.chain);
+      const skippedWithAta = evaluateChainBatchRoi({
+        chain: c.chain,
+        chainName: meta?.chainName || chainAssets[0]?.chainName || c.chain,
+        assets: chainAssets,
+        protocolFeeBps: feeCfg.feeBps,
+        gasSponsored: opts.gasSponsored ?? true,
+        fixedRelayerOverheadUsd: opts.fixedRelayerOverheadUsd,
+        hasSolanaUsdcAta: false,
+        solPriceUsd,
+        gasPriceGwei: meta?.gasPriceGwei,
+      });
+      chains[idx] = { ...skippedWithAta, solanaAtaRentUsd: 0 };
+    }
+  }
+
+  // Sum portfolio executing totals ONLY across non-skipped executing chains
+  const executingChains = chains.filter((c) => !c.skipChainNegativeRoi);
+  const totalGrossUsd = r2(executingChains.reduce((s, c) => s + c.keptGrossUsd, 0));
+  const totalSignedUserNetUsd = r2(executingChains.reduce((s, c) => s + c.chainLegNetUsd, 0));
+  const totalProtocolFeeUsd = r2(executingChains.reduce((s, c) => s + c.protocolFeeUsd, 0));
+  const totalSponsoredGasUsd = r2(executingChains.reduce((s, c) => s + c.totalGasUsd, 0));
   const totalRelayerNetMarginUsd = r2(
-    chains.reduce((s, c) => s + c.relayerBreakEven.relayerNetMarginUsd, 0)
+    executingChains.reduce((s, c) => s + c.relayerBreakEven.relayerNetMarginUsd, 0)
   );
   const totalPrunedNegativeRoiCount = chains.reduce((s, c) => s + c.prunedNegativeRoiCount, 0);
   const totalNegativeBleedPreventedUsd = r2(
@@ -979,8 +1419,8 @@ export function evaluatePortfolioRoi(
     totalRelayerNetMarginUsd,
     totalPrunedNegativeRoiCount,
     totalNegativeBleedPreventedUsd,
-    solanaAtaRentUsd,
-    overallRelayerProfitable: totalRelayerNetMarginUsd >= 0,
+    solanaAtaRentUsd: appliedAtaRentUsd,
+    overallRelayerProfitable: executingChains.length > 0 && totalRelayerNetMarginUsd >= 0,
     chains,
   };
 }

@@ -1029,6 +1029,9 @@ export function createSiphonServer() {
           protocolFeeBps?: number;
           feeRecipientEvm?: string | null;
           legs?: Array<{
+            legId?: string;
+            sourceWallet?: string;
+            walletAddress?: string;
             chain: AnyChainId;
             chainName?: string;
             assetCount: number;
@@ -1047,16 +1050,22 @@ export function createSiphonServer() {
           feeBps: body.protocolFeeBps,
           feeRecipientEvm: body.feeRecipientEvm,
         });
-        const job = jobStore.createJob({
-          sourceWallet: body.sourceWallet,
-          solanaDestination: body.solanaDestination,
-          outputAsset: body.outputAsset ?? 'USDC',
-          bridgePreference: body.bridgePreference ?? 'auto',
-          protocolFeeBps: feeCfg.feeBps,
-          feeRecipientEvm: feeCfg.feeRecipientEvm,
-          legs: body.legs,
-        });
-        return sendJson(res, 200, job);
+        try {
+          const job = jobStore.createJob({
+            sourceWallet: body.sourceWallet,
+            solanaDestination: body.solanaDestination,
+            outputAsset: body.outputAsset ?? 'USDC',
+            bridgePreference: body.bridgePreference ?? 'auto',
+            protocolFeeBps: feeCfg.feeBps,
+            feeRecipientEvm: feeCfg.feeRecipientEvm,
+            legs: body.legs,
+          });
+          return sendJson(res, 200, job);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Invalid background job payload',
+          });
+        }
       }
 
       if (method === 'GET' && pathname.startsWith('/api/jobs/')) {
@@ -1069,6 +1078,9 @@ export function createSiphonServer() {
       if (method === 'POST' && pathname.startsWith('/api/jobs/') && pathname.endsWith('/leg')) {
         const jobId = pathname.slice('/api/jobs/'.length, -'/leg'.length);
         const body = await readJsonBody<{
+          legId?: string;
+          sourceWallet?: string;
+          walletAddress?: string;
           chain?: AnyChainId;
           status?: JobLegStatus;
           statusText?: string;
@@ -1082,21 +1094,51 @@ export function createSiphonServer() {
           attestationStatus?: string;
         }>(req);
 
-        if (!body.chain) return sendJson(res, 400, { error: 'chain is required' });
-        const updated = jobStore.updateLeg(jobId, body.chain, {
-          status: body.status,
-          statusText: body.statusText,
-          provider: body.provider,
-          callsBatched: body.callsBatched,
-          popupsSaved: body.popupsSaved,
-          evmTxHash: body.evmTxHash,
-          solanaTxHash: body.solanaTxHash,
-          requestId: body.requestId,
-          requiresSolanaClaim: body.requiresSolanaClaim,
-          attestationStatus: body.attestationStatus,
-        });
-        if (!updated) return sendJson(res, 404, { error: 'Background job or chain leg not found' });
-        return sendJson(res, 200, updated);
+        if (!body.legId && !body.chain) {
+          return sendJson(res, 400, { error: 'legId or chain is required' });
+        }
+
+        const patch: Partial<{
+          status: JobLegStatus;
+          statusText: string;
+          provider: string;
+          callsBatched: number;
+          popupsSaved: number;
+          evmTxHash: string;
+          solanaTxHash: string;
+          requestId: string;
+          requiresSolanaClaim: boolean;
+          attestationStatus: string;
+        }> = {};
+        if (body.status !== undefined) patch.status = body.status;
+        if (body.statusText !== undefined) patch.statusText = body.statusText;
+        if (body.provider !== undefined) patch.provider = body.provider;
+        if (body.callsBatched !== undefined) patch.callsBatched = body.callsBatched;
+        if (body.popupsSaved !== undefined) patch.popupsSaved = body.popupsSaved;
+        if (body.evmTxHash !== undefined) patch.evmTxHash = body.evmTxHash;
+        if (body.solanaTxHash !== undefined) patch.solanaTxHash = body.solanaTxHash;
+        if (body.requestId !== undefined) patch.requestId = body.requestId;
+        if (body.requiresSolanaClaim !== undefined) patch.requiresSolanaClaim = body.requiresSolanaClaim;
+        if (body.attestationStatus !== undefined) patch.attestationStatus = body.attestationStatus;
+
+        try {
+          const updated = jobStore.updateLeg(
+            jobId,
+            {
+              legId: body.legId,
+              chain: body.chain,
+              sourceWallet: body.sourceWallet,
+              walletAddress: body.walletAddress,
+            },
+            patch
+          );
+          if (!updated) return sendJson(res, 404, { error: 'Background job or chain leg not found' });
+          return sendJson(res, 200, updated);
+        } catch (err) {
+          return sendJson(res, 400, {
+            error: err instanceof Error ? err.message : 'Invalid leg update payload',
+          });
+        }
       }
 
       if (method === 'POST' && pathname === '/api/simulate') {

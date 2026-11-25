@@ -867,12 +867,12 @@ test('Two-Level Signed Negative-ROI Engine & Relayer Break-Even math prunes nega
   assert.ok(margEval.signedSoloNetUsd < 0);
   assert.ok(margEval.signedBatchedNetUsd > 0);
 
-  // Relayer break-even math: at 7% fee (700 bps), $0.70 gas + $0.02 overhead = $0.72 -> break-even = $10.29 gross
+  // Relayer break-even math: at 7% fee (700 bps), $0.70 gas + $0.02 overhead = $0.72 -> 1.5x coverage = $1.08 -> break-even = $15.43 gross
   const beLow = computeRelayerBreakEven({ sponsoredGasUsd: 0.7, protocolFeeBps: 700, grossUsd: 5.0 });
   assert.equal(beLow.isRelayerProfitable, false);
   assert.ok(beLow.relayerNetMarginUsd < 0);
-  assert.ok(beLow.breakEvenGrossUsd > 10 && beLow.breakEvenGrossUsd < 10.5);
-  assert.ok(beLow.shortfallToBreakEvenUsd > 5);
+  assert.ok(beLow.breakEvenGrossUsd >= 15.4 && beLow.breakEvenGrossUsd <= 15.5);
+  assert.ok(beLow.shortfallToBreakEvenUsd > 10);
 
   const beHigh = computeRelayerBreakEven({ sponsoredGasUsd: 0.7, protocolFeeBps: 700, grossUsd: 100.0 });
   assert.equal(beHigh.isRelayerProfitable, true);
