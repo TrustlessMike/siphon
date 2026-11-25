@@ -96,6 +96,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 190_000,
     burnGasUnits: 48_000,
     bridgeGasUnits: 115_000,
+    gasReserveNative: 0.002,
     aaveV3Pool: '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2',
     compoundV3Comet: '0xc3d688B66703497DAA19211EEdff47f25384cdc3',
   },
@@ -123,6 +124,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 185_000,
     burnGasUnits: 45_000,
     bridgeGasUnits: 110_000,
+    gasReserveNative: 0.0005,
     aaveV3Pool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
     compoundV3Comet: '0xb125E6687d4313864e53df431d5425969c15Eb2F',
   },
@@ -150,6 +152,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 210_000,
     burnGasUnits: 52_000,
     bridgeGasUnits: 120_000,
+    gasReserveNative: 0.0005,
     aaveV3Pool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
     compoundV3Comet: '0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf',
   },
@@ -177,6 +180,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 185_000,
     burnGasUnits: 45_000,
     bridgeGasUnits: 110_000,
+    gasReserveNative: 0.0005,
     aaveV3Pool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
     compoundV3Comet: '0x2e44e174f7D53F0212823acC11C01A11d58c5bCB',
   },
@@ -205,6 +209,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 195_000,
     burnGasUnits: 48_000,
     bridgeGasUnits: 115_000,
+    gasReserveNative: 0.05,
     aaveV3Pool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
     compoundV3Comet: '0xF25212E676D1F7F89Cd72fFEe66158f541246445',
   },
@@ -232,6 +237,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 190_000,
     burnGasUnits: 48_000,
     bridgeGasUnits: 115_000,
+    gasReserveNative: 0.02,
     aaveV3Pool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
   },
   bnb: {
@@ -258,6 +264,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 190_000,
     burnGasUnits: 45_000,
     bridgeGasUnits: 115_000,
+    gasReserveNative: 0.003,
     aaveV3Pool: '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
   },
   sonic: {
@@ -284,6 +291,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 185_000,
     burnGasUnits: 45_000,
     bridgeGasUnits: 110_000,
+    gasReserveNative: 0.05,
     aaveV3Pool: '0x5362dBb1e601abF3a4c14c22ffEdA64042E5eAA3',
   },
   unichain: {
@@ -310,6 +318,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 185_000,
     burnGasUnits: 45_000,
     bridgeGasUnits: 110_000,
+    gasReserveNative: 0.0005,
   },
   linea: {
     id: 'linea',
@@ -335,6 +344,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 190_000,
     burnGasUnits: 45_000,
     bridgeGasUnits: 115_000,
+    gasReserveNative: 0.0008,
     aaveV3Pool: '0xc47b8C00b0f69a36fa203Ffeac0334874574a8Ac',
   },
   scroll: {
@@ -361,6 +371,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 190_000,
     burnGasUnits: 48_000,
     bridgeGasUnits: 115_000,
+    gasReserveNative: 0.0008,
     aaveV3Pool: '0x11fCfe756c05AD438e312a7fd934381537D3cFfe',
   },
   mantle: {
@@ -387,6 +398,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 195_000,
     burnGasUnits: 48_000,
     bridgeGasUnits: 115_000,
+    gasReserveNative: 0.05,
   },
   blast: {
     id: 'blast',
@@ -412,6 +424,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 190_000,
     burnGasUnits: 48_000,
     bridgeGasUnits: 115_000,
+    gasReserveNative: 0.0005,
   },
   worldchain: {
     id: 'worldchain',
@@ -437,6 +450,7 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     defiWithdrawGasUnits: 185_000,
     burnGasUnits: 45_000,
     bridgeGasUnits: 110_000,
+    gasReserveNative: 0.0005,
   },
 };
 
@@ -1145,6 +1159,46 @@ export const TOKEN_REGISTRY: TokenDescriptor[] = [
     decimals: 18,
     kind: 'erc20',
     llamaKey: 'bsc:0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82',
+  },
+  // DeFi Positions on BNB Chain (Aave v3 Pool 0x6807dc923806fE8Fd134338EABCA509979a7e0cB)
+  {
+    chain: 'bnb',
+    address: '0x00901a076785e0906d1028c7d6372d247bec7d61',
+    symbol: 'aBnbUSDC',
+    name: 'Aave v3 BNB USDC',
+    decimals: 18,
+    kind: 'defi_position',
+    protocol: 'Aave v3',
+    protocolAddress: '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
+    underlyingSymbol: 'USDC',
+    underlyingAddress: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
+    llamaKey: 'bsc:0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
+  },
+  {
+    chain: 'bnb',
+    address: '0xa9251ca9DE909CB71783723713B21E4233fbf1B1',
+    symbol: 'aBnbUSDT',
+    name: 'Aave v3 BNB USDT',
+    decimals: 18,
+    kind: 'defi_position',
+    protocol: 'Aave v3',
+    protocolAddress: '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
+    underlyingSymbol: 'USDT',
+    underlyingAddress: '0x55d398326f99059fF775485246999027B3197955',
+    llamaKey: 'bsc:0x55d398326f99059fF775485246999027B3197955',
+  },
+  {
+    chain: 'bnb',
+    address: '0x9B00a09492a626678E5A3009982191586C444Df9',
+    symbol: 'aBnbWBNB',
+    name: 'Aave v3 BNB WBNB',
+    decimals: 18,
+    kind: 'defi_position',
+    protocol: 'Aave v3',
+    protocolAddress: '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
+    underlyingSymbol: 'WBNB',
+    underlyingAddress: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
+    llamaKey: 'coingecko:binancecoin',
   },
 
   // ===================== SONIC (146) =====================

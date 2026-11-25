@@ -178,6 +178,8 @@ export interface ChainConfig {
   defiWithdrawGasUnits: number;
   burnGasUnits: number;
   bridgeGasUnits: number;
+  /** Safe native token gas reserve kept untouched so users are never stranded on follow-up txs or gas spikes */
+  gasReserveNative: number;
   aaveV3Pool?: string;
   compoundV3Comet?: string;
 }
