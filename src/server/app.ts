@@ -146,6 +146,10 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
   const headers: Record<string, string> = {
     'Content-Type': MIME_TYPES[ext] ?? 'application/octet-stream',
   };
+  if (ext === '.html' || ext === '.js' || ext === '.mjs' || ext === '.css') {
+    headers['Cache-Control'] = 'no-store, no-cache, must-revalidate';
+    headers['Pragma'] = 'no-cache';
+  }
   // Required by Coinbase Smart Wallet SDK popup communication
   if (ext === '.html') {
     headers['Cross-Origin-Opener-Policy'] = 'same-origin-allow-popups';

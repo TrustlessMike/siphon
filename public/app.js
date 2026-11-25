@@ -1,5 +1,5 @@
-import { mountSiphonFunnelScene } from './siphon-3d.js';
-import { renderConvergenceSvg } from './siphon-svg.js';
+import { mountSiphonFunnelScene } from './siphon-3d.js?v=3';
+import { renderConvergenceSvg } from './siphon-svg.js?v=3';
 import {
   connectCoinbaseSmartWallet,
   connectEvmWallet,
@@ -31,7 +31,7 @@ import {
   signGaslessTypedData,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
-} from './wallets.js';
+} from './wallets.js?v=3';
 
 let currentScan = null;
 let currentPlan = null;
