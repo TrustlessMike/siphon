@@ -1113,15 +1113,15 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           return reply(400, { error: 'Valid scan or scanId is required' });
         }
 
-        const solDest = body.solanaDestination?.trim();
-        if (!solDest) {
-          return reply(400, { error: 'solanaDestination is required' });
-        }
-
-        try {
-          solanaAddressToBytes32(solDest);
-        } catch {
-          return reply(400, { error: 'Invalid Solana destination address (expected base58 public key).' });
+        const solDestRaw = body.solanaDestination?.trim() ?? '';
+        const isPreviewPlaceholder =
+          solDestRaw === '' || solDestRaw === '11111111111111111111111111111111';
+        if (!isPreviewPlaceholder) {
+          try {
+            solanaAddressToBytes32(solDestRaw);
+          } catch {
+            return reply(400, { error: 'Invalid Solana destination address (expected base58 public key).' });
+          }
         }
 
         assertNoFeeRecipientOverride(body.feeRecipientEvm);
@@ -1129,7 +1129,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         const plan = buildMigrationPlan({
           scan,
           selectedAssetIds: body.selectedAssetIds,
-          solanaDestination: solDest,
+          solanaDestination: isPreviewPlaceholder ? '' : solDestRaw,
           usePermit2Batch: body.usePermit2Batch ?? true,
           includeBurns: body.includeBurns ?? true,
           outputAsset: body.outputAsset ?? 'USDC',

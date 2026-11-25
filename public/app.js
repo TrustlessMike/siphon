@@ -2265,6 +2265,18 @@ async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress,
       feeRecipientEvm: getActiveFeeRecipientEvm(),
     }),
   });
+  if (!isNonEvm && (intent.previewOnly || (!intent.typedData && !intent.signPayload))) {
+    const msg =
+      intent.explanation ||
+      'Gasless relayer is in preview mode (router/treasury not configured on this chain). Switch to Direct 1-Click mode.';
+    await patchJobLeg(jobId, chain, {
+      status: 'skipped',
+      provider: intent.mode,
+      statusText: msg,
+    });
+    showToast(msg);
+    return;
+  }
   await patchJobLeg(jobId, chain, {
     status: 'signing',
     provider: intent.mode,

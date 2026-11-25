@@ -151,6 +151,7 @@ test('Siphon HTTP API serves health, chains, scan, plan, simulate, contract, and
       body: JSON.stringify({ scanId: scan.scanId, solanaDestination: 'not-a-solana-key' }),
     });
     assert.equal(badPlan.status, 400);
+    await badPlan.text();
 
     // Valid plan + simulation
     const sim = await fetch(`${base}/api/simulate`, {

@@ -199,7 +199,26 @@ function assertFromMatchesConnected(expectedFrom) {
   }
 }
 
-function assertValidCallForSign(call, expectedSolanaDestination) {
+const solanaAtaBytes32Cache = new Map();
+
+async function resolveExpectedSolanaUsdcAtaBytes32Hex(ownerBase58) {
+  const trimmed = String(ownerBase58 || '').trim();
+  if (!trimmed) return null;
+  if (solanaAtaBytes32Cache.has(trimmed)) return solanaAtaBytes32Cache.get(trimmed);
+  try {
+    const mod = await loadWalletSdkBundle();
+    if (typeof mod?.deriveSolanaUsdcAtaBytes32Hex === 'function') {
+      const ataHex = mod.deriveSolanaUsdcAtaBytes32Hex(trimmed).toLowerCase();
+      solanaAtaBytes32Cache.set(trimmed, ataHex);
+      return ataHex;
+    }
+  } catch {
+    // Fallback to null if SDK bundle is unavailable in non-browser harness
+  }
+  return null;
+}
+
+function assertValidCallForSign(call, expectedSolanaDestination, expectedSolanaAtaBytes32 = null) {
   assertValidEvmAddress(call?.to, 'target contract');
   if (call?.data !== undefined && call?.data !== null && call?.data !== '') {
     if (typeof call.data !== 'string' || !/^0x([0-9a-fA-F]{2})*$/.test(call.data)) {
@@ -216,26 +235,31 @@ function assertValidCallForSign(call, expectedSolanaDestination) {
   if (
     expectedSolanaDestination &&
     typeof call?.data === 'string' &&
-    call.data.toLowerCase().startsWith('0x6fd3504e') &&
+    (call.data.toLowerCase().startsWith('0x6fd3504e') || call.data.toLowerCase().startsWith('0x05285a08')) &&
     call.data.length >= 10 + 256
   ) {
-    const expectedBytes32 = solanaBase58ToBytes32Hex(expectedSolanaDestination).toLowerCase();
+    const expectedOwnerBytes32 = solanaBase58ToBytes32Hex(expectedSolanaDestination).toLowerCase();
     const encodedRecipient = '0x' + call.data.slice(10 + 128, 10 + 192).toLowerCase();
-    if (encodedRecipient !== expectedBytes32) {
+    const expectedTarget = expectedSolanaAtaBytes32 || expectedOwnerBytes32;
+    if (encodedRecipient !== expectedTarget) {
       throw new Error(
-        'Pre-sign check failed: CCTP depositForBurn mintRecipient does not match your Solana destination.'
+        'Pre-sign check failed: CCTP depositForBurn mintRecipient does not match your Solana USDC ATA.'
       );
     }
   }
 }
 
-function assertSolanaRecipientMatch(recipientValue, expectedSolanaDestination) {
+function assertSolanaRecipientMatch(recipientValue, expectedSolanaDestination, expectedSolanaAtaBytes32 = null) {
   if (!expectedSolanaDestination || recipientValue === undefined || recipientValue === null) return;
   const expectedTrim = String(expectedSolanaDestination).trim();
-  const expectedBytes32 = solanaBase58ToBytes32Hex(expectedTrim).toLowerCase();
+  const expectedOwnerBytes32 = solanaBase58ToBytes32Hex(expectedTrim).toLowerCase();
   const raw = String(recipientValue).trim();
   if (/^0x[0-9a-fA-F]{64}$/.test(raw)) {
-    if (raw.toLowerCase() !== expectedBytes32) {
+    const lower = raw.toLowerCase();
+    const matched = expectedSolanaAtaBytes32
+      ? lower === expectedSolanaAtaBytes32 || lower === expectedOwnerBytes32
+      : lower === expectedOwnerBytes32;
+    if (!matched) {
       throw new Error(
         'Pre-sign check failed: typed-data solanaRecipient bytes32 does not match your Solana destination.'
       );
@@ -954,7 +978,10 @@ export async function sendRealEvmTransaction(tx, opts = {}) {
     throw new Error('Connect your EVM wallet before signing live transactions.');
   }
   assertFromMatchesConnected(tx?.from || opts?.expectedFrom);
-  assertValidCallForSign(tx, opts?.expectedSolanaDestination);
+  const expectedAtaBytes32 = opts?.expectedSolanaDestination
+    ? await resolveExpectedSolanaUsdcAtaBytes32Hex(opts.expectedSolanaDestination)
+    : null;
+  assertValidCallForSign(tx, opts?.expectedSolanaDestination, expectedAtaBytes32);
   await ensureEvmChain(tx.chainId);
 
   const txParams = {
@@ -1005,7 +1032,8 @@ export async function signGaslessTypedData(typedData, chainId, opts = {}) {
         'Pre-sign check failed: gasless typed-data payload is missing solanaRecipient commitment.'
       );
     }
-    assertSolanaRecipientMatch(witnessRecipient, opts.expectedSolanaDestination);
+    const expectedAtaBytes32 = await resolveExpectedSolanaUsdcAtaBytes32Hex(opts.expectedSolanaDestination);
+    assertSolanaRecipientMatch(witnessRecipient, opts.expectedSolanaDestination, expectedAtaBytes32);
   }
 
   const payload = typeof typedData === 'string' ? typedData : JSON.stringify(typedData);
@@ -1039,8 +1067,11 @@ export async function sendEip5792Batch({
     throw new Error('No calls prepared for this chain batch.');
   }
   assertFromMatchesConnected(expectedFrom);
+  const expectedAtaBytes32 = expectedSolanaDestination
+    ? await resolveExpectedSolanaUsdcAtaBytes32Hex(expectedSolanaDestination)
+    : null;
   for (const c of calls) {
-    assertValidCallForSign(c, expectedSolanaDestination);
+    assertValidCallForSign(c, expectedSolanaDestination, expectedAtaBytes32);
   }
 
   await ensureEvmChain(chainId);

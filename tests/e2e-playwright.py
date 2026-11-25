@@ -58,7 +58,12 @@ def main():
     srv = subprocess.Popen(
         ["node", "dist/src/server/index.js"],
         cwd=repo_root,
-        env={**os.environ, "PORT": str(PORT)},
+        env={
+            **os.environ,
+            "PORT": str(PORT),
+            "SIPHON_ROUTER_OPTIMISM": "0x2222222222222222222222222222222222222222",
+            "SIPHON_FEE_RECIPIENT_EVM": "0x1111111111111111111111111111111111111111",
+        },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -456,9 +461,25 @@ def main():
             assert "Matched bit-for-bit" in proofText, proofText
 
             pgD.click(".mode-opt[data-exec-mode='gasless']")
+            pgD.route(
+                "**/api/relayer/submit",
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "accepted": True,
+                        "signatureValid": True,
+                        "broadcasted": False,
+                        "mode": "intent_verified_awaiting_deployment",
+                        "settlementStatus": "intent_verified_awaiting_deployment",
+                        "nextStep": "Gasless intent verified in E2E mock (real ecrecover verified in unit suite).",
+                    }),
+                ),
+            )
             pgD.click("[data-exec-chain-batch='optimism']")
             pgD.wait_for_selector("#agentStatusCard:not(.hidden)", timeout=10000)
             pgD.wait_for_function("() => (window.__rpcD || []).some(r => r.method === 'eth_signTypedData_v4')", timeout=10000)
+            pgD.unroute("**/api/relayer/submit")
 
             pgD.click(".mode-opt[data-exec-mode='direct']")
             pgD.click("[data-exec-chain-batch='base']")

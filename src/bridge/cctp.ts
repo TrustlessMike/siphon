@@ -504,8 +504,14 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
   });
 
   // CRIT-04: Derive canonical Solana USDC Associated Token Account (ATA) PDA bytes32 for CCTP mintRecipient!
-  const solanaUsdcAta = deriveSolanaUsdcAta(solanaDestination).toBase58();
-  const solanaMintRecipientBytes32 = solanaOwnerToUsdcAtaBytes32(solanaDestination);
+  // For read-only dry-run previews before a Solana wallet is connected, emit a neutral zero placeholder (never executable).
+  const hasSolanaDest = Boolean(
+    solanaDestination && solanaDestination.trim() && solanaDestination.trim() !== '11111111111111111111111111111111'
+  );
+  const solanaUsdcAta = hasSolanaDest ? deriveSolanaUsdcAta(solanaDestination).toBase58() : '';
+  const solanaMintRecipientBytes32 = hasSolanaDest
+    ? solanaOwnerToUsdcAtaBytes32(solanaDestination)
+    : '0x' + '00'.repeat(32);
   const selectedSet = Array.isArray(selectedAssetIds)
     ? new Set(selectedAssetIds)
     : new Set(scan.assets.filter((a) => a.selectedByDefault).map((a) => a.id));
@@ -605,7 +611,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     const rawUsdcAmount = BigInt(Math.round(bridgedUsdc * 1_000_000));
 
     const cctpCalldata =
-      evmCfg && evmCfg.cctpTokenMessenger && rawUsdcAmount > 0n
+      hasSolanaDest && evmCfg && evmCfg.cctpTokenMessenger && rawUsdcAmount > 0n
         ? encodeCctpDepositForBurn({
             rawUsdcAmount,
             destinationDomain: SOLANA_CCTP_DOMAIN,
