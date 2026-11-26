@@ -1,0 +1,11 @@
+.git
+.github
+.turgalium-data
+tests
+contracts/test
+docs
+out
+cache
+broadcast
+*.log
+.DS_Store
