@@ -14,7 +14,7 @@ import {
   isValidSolanaBase58,
   sendEvmRevokeCalls,
   signAndSendSolanaVersionedTx,
-} from './wallets.js?v=7';
+} from './wallets.js?v=8';
 
 const SUPPORTED_APPROVAL_CHAINS = [
   { id: 'ethereum', label: 'Ethereum', explorer: 'https://etherscan.io/tx/' },
@@ -702,12 +702,54 @@ async function runYieldParkRequest({ buildTransaction = false } = {}) {
   }
 }
 
+function hasExtendedLogos() {
+  return Boolean(
+    typeof window !== 'undefined' &&
+      (typeof window.renderTurgaliumUiIcon === 'function' ||
+        typeof window.renderUiIcon === 'function')
+  );
+}
+
+function resolveLogo(preferred, fallback) {
+  return hasExtendedLogos() ? preferred : fallback;
+}
+
+function getYieldStrategyLogo(strategyId) {
+  const id = String(strategyId || '').toLowerCase();
+  if (id.includes('kamino')) return resolveLogo('/logos/kamino.svg', '/logos/vault.svg');
+  if (id.includes('sanctum')) return resolveLogo('/logos/sanctum.svg', '/logos/solana.svg');
+  if (id.includes('jupsol')) return resolveLogo('/logos/jupsol.svg', '/logos/solana.svg');
+  if (id.includes('jupiter')) return resolveLogo('/logos/jupiter.svg', '/logos/usdc.svg');
+  return '/logos/usdc.svg';
+}
+
+function uiIconSvg(name, size = 12) {
+  if (typeof window !== 'undefined') {
+    if (typeof window.renderTurgaliumUiIcon === 'function') {
+      return window.renderTurgaliumUiIcon(name, size);
+    }
+    if (typeof window.renderUiIcon === 'function') {
+      return window.renderUiIcon(name, size);
+    }
+  }
+  const s = Number(size) || 12;
+  if (name === 'check') {
+    return `<span class="ui-icon" aria-hidden="true"><svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>`;
+  }
+  return '';
+}
+
 function renderYieldParkCard() {
   const host = document.getElementById('yieldParkBody');
   const badge = document.getElementById('yieldApyBadge');
   const amountInput = document.getElementById('yieldAmountInput');
   const previewBtn = document.getElementById('previewYieldBtn');
+  const stratLogoEl = document.getElementById('yieldStrategyLogoImg');
   if (!host) return;
+
+  if (stratLogoEl) {
+    stratLogoEl.src = getYieldStrategyLogo(state.selectedStrategyId);
+  }
 
   if (amountInput && document.activeElement !== amountInput) {
     const formatted = Number(state.yieldAmountUsdc.toFixed(2));
@@ -1143,9 +1185,13 @@ function renderApprovalRevokerCard() {
 
     const rowBtn = el(
       'button',
-      `btn-row-exec ptool-row-btn${isRevoked ? ' is-done' : ''}`,
-      isRevoked ? 'Revoked ✓' : isBusy ? 'Signing…' : 'Revoke'
+      `btn-row-exec ptool-row-btn${isRevoked ? ' is-done' : ''}`
     );
+    if (isRevoked) {
+      rowBtn.innerHTML = `${uiIconSvg('check', 12)}<span>Revoked</span>`;
+    } else {
+      rowBtn.textContent = isBusy ? 'Signing…' : 'Revoke';
+    }
     rowBtn.type = 'button';
     rowBtn.setAttribute('data-revoke-approval-idx', String(i));
     rowBtn.disabled = isRevoked || Boolean(state.revokingKey) || state.approvalLoading;
@@ -1201,7 +1247,7 @@ function bindEvents() {
     toggleBtn.addEventListener('click', () => {
       const collapsed = grid.classList.toggle('hidden');
       toggleBtn.setAttribute('aria-expanded', String(!collapsed));
-      toggleBtn.textContent = collapsed ? 'Show Tools ▾' : 'Hide Tools ▴';
+      toggleBtn.textContent = collapsed ? 'Show Tools' : 'Hide Tools';
     });
   }
 
