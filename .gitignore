@@ -9,3 +9,5 @@ out/
 cache/
 broadcast/
 .turgalium-data/
+.vercel/
+.vercel

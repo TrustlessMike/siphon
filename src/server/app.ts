@@ -719,7 +719,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
     });
   }
 
-  const server = http.createServer(async (req, res) => {
+  const requestHandler = async (req: IncomingMessage, res: ServerResponse) => {
     runtimeMetrics.requestsTotal += 1;
     res.on('finish', () => {
       const code = res.statusCode;
@@ -2299,7 +2299,9 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         error: 'Internal server error',
       });
     }
-  });
+  };
+
+  const server = http.createServer(requestHandler);
 
   server.headersTimeout = 10_000;
   server.requestTimeout = 30_000;
@@ -2313,6 +2315,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
 
   return {
     server,
+    requestHandler,
     scanCache,
     jobStore,
     agentEngine,
