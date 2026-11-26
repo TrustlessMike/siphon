@@ -1404,21 +1404,14 @@ export const suiAdapter: ChainFamilyAdapter = {
       proof?: UniversalExecutionProof;
     } = {};
 
-    if (params.signature && params.intentId) {
-      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
-        throw new Error('Signed Sui gasless PTB intent expired. Re-sign a fresh intent.');
-      }
-      const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.TURGALIUM_SUI_SPONSOR_PRIVATE_KEY?.trim());
+    if (params.signature || params.intentId) {
       out.submitted = {
-        accepted: true,
-        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        accepted: false,
+        mode: 'unsupported_non_evm_relayer',
         broadcasted: false,
-        settlementStatus: configured ? 'queued_for_sponsor' : 'awaiting_relayer',
-        signatureFingerprint: fp,
-        nextStep: configured
-          ? `Sui gas sponsor queued PTB ${params.intentId} (${fp}) for co-signing.`
-          : `Sui 1-Sig PTB verified (${fp}). Switch to Direct Mode to execute immediately with your Slush/Phantom wallet, or configure TURGALIUM_SUI_SPONSOR_PRIVATE_KEY for $0 gas.`,
+        settlementStatus: 'rejected_unverified',
+        nextStep:
+          'Sponsored relayer submission is not enabled for Sui (requires server-issued intent verification and Sui Ed25519/Secp256k1 PTB signature validation). Use Direct Mode to sign and broadcast directly from your Slush/Phantom wallet.',
       };
     }
 

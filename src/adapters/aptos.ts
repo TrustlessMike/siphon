@@ -1134,21 +1134,14 @@ export const aptosAdapter: ChainFamilyAdapter = {
       proof?: UniversalExecutionProof;
     } = {};
 
-    if (params.signature && params.intentId) {
-      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
-        throw new Error('Signed Aptos FeePayer intent expired. Re-sign a fresh intent.');
-      }
-      const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.TURGALIUM_APTOS_FEE_PAYER_KEY?.trim());
+    if (params.signature || params.intentId) {
       out.submitted = {
-        accepted: true,
-        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        accepted: false,
+        mode: 'unsupported_non_evm_relayer',
         broadcasted: false,
-        settlementStatus: configured ? 'queued_for_fee_payer' : 'awaiting_relayer',
-        signatureFingerprint: fp,
-        nextStep: configured
-          ? `Aptos Fee Payer queued ${params.intentId} (${fp}).`
-          : `Aptos 1-Sig Move intent verified (${fp}). Use Direct Mode (Petra/Phantom) for immediate CCTP Domain 9 execution, or configure TURGALIUM_APTOS_FEE_PAYER_KEY.`,
+        settlementStatus: 'rejected_unverified',
+        nextStep:
+          'Sponsored relayer submission is not enabled for Aptos (requires server-issued intent verification and Aptos Ed25519 BCS signature validation). Use Direct Mode (Petra/Phantom) for immediate CCTP Domain 9 wallet broadcast.',
       };
     }
 

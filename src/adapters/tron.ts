@@ -1006,21 +1006,14 @@ export const tronAdapter: ChainFamilyAdapter = {
       proof?: UniversalExecutionProof;
     } = {};
 
-    if (params.signature && params.intentId) {
-      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
-        throw new Error('Signed Tron gasless intent expired. Re-sign a fresh intent.');
-      }
-      const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.TURGALIUM_TRON_RELAYER_KEY?.trim());
+    if (params.signature || params.intentId) {
       out.submitted = {
-        accepted: true,
-        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        accepted: false,
+        mode: 'unsupported_non_evm_relayer',
         broadcasted: false,
-        settlementStatus: configured ? 'queued_for_relayer' : 'awaiting_relayer',
-        signatureFingerprint: fp,
-        nextStep: configured
-          ? `Tron Energy+Bandwidth Delegator queued ${params.intentId} (${fp}).`
-          : `Tron intent verified (${fp}). Use Direct Mode (TronLink + Relay/LI.FI) to execute live TVM transactions today, or configure TURGALIUM_TRON_RELAYER_KEY.`,
+        settlementStatus: 'rejected_unverified',
+        nextStep:
+          'Sponsored relayer submission is not enabled for Tron (requires server-issued intent verification and TVM secp256k1 signature validation). Use Direct Mode (TronLink) to sign and broadcast directly from your wallet.',
       };
     }
 

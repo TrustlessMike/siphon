@@ -47,9 +47,12 @@ const publicBaseUrl =
 const instance = createTurgaliumServer({
   allowedHosts,
   allowedOrigins,
+  allowLoopbackOrigins: false,
+  allowLoopbackHosts: false,
   publicBaseUrl,
   trustProxy: true,
   enableBackgroundPollers: false,
+  dataDir: null,
 });
 
 export const config = {
@@ -64,7 +67,15 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error('[turgalium-vercel] handler error:', err);
     if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.writeHead(500, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Referrer-Policy': 'no-referrer',
+        'Cross-Origin-Resource-Policy': 'same-origin',
+        'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+      });
       res.end(JSON.stringify({ error: 'Internal server error' }));
     }
   }

@@ -950,21 +950,14 @@ export const tonAdapter: ChainFamilyAdapter = {
       proof?: UniversalExecutionProof;
     } = {};
 
-    if (params.signature && params.intentId) {
-      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
-        throw new Error('Signed TON W5 batch intent expired. Re-sign a fresh intent.');
-      }
-      const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.TURGALIUM_TON_RELAYER_KEY?.trim());
+    if (params.signature || params.intentId) {
       out.submitted = {
-        accepted: true,
-        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        accepted: false,
+        mode: 'unsupported_non_evm_relayer',
         broadcasted: false,
-        settlementStatus: configured ? 'queued_for_relayer' : 'awaiting_relayer',
-        signatureFingerprint: fp,
-        nextStep: configured
-          ? `TON W5 Gasless relayer queued BOC ${params.intentId} (${fp}).`
-          : `TON W5 1-Sig batch verified (${fp}). Use Direct Mode (TonConnect 2 sendTransaction) to execute live Relay messages immediately.`,
+        settlementStatus: 'rejected_unverified',
+        nextStep:
+          'Sponsored relayer submission is not enabled for TON (requires server-issued intent verification and TON W5 BOC signature validation). Use Direct Mode (TonConnect 2 sendTransaction) to broadcast directly from your wallet.',
       };
     }
 

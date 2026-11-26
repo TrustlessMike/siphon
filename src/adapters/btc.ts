@@ -1070,18 +1070,14 @@ export const btcAdapter: ChainFamilyAdapter = {
       proof?: UniversalExecutionProof;
     } = {};
 
-    if (params.signature && params.intentId) {
-      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
-        throw new Error('Signed Bitcoin PSBT intent expired. Re-sign a fresh intent.');
-      }
-      const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
+    if (params.signature || params.intentId) {
       out.submitted = {
-        accepted: true,
-        mode: 'intent_verified_awaiting_deployment',
+        accepted: false,
+        mode: 'unsupported_non_evm_relayer',
         broadcasted: false,
-        settlementStatus: 'awaiting_broadcast',
-        signatureFingerprint: fp,
-        nextStep: `Signed Bitcoin PSBT verified (${fp}). Use Direct Mode to sign & broadcast the live Relay PSBT directly from UniSat/Xverse/Phantom.`,
+        settlementStatus: 'rejected_unverified',
+        nextStep:
+          'Sponsored relayer submission is not enabled for Bitcoin (requires server-issued intent verification and BIP-174 PSBT cryptographic signature validation). Use Direct Mode to sign and broadcast the live Relay PSBT directly from UniSat/Xverse/Phantom.',
       };
     }
 

@@ -158,7 +158,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     symbol: 'NTRN',
     decimals: 6,
     logo: '/logos/cosmos.svg',
-    lcdUrls: ['https://rest.cosmos.directory/neutron', 'https://neutron-rest.publicnode.com'],
+    lcdUrls: ['https://rest.cosmos.directory/neutron', 'https://neutron-api.polkachu.com'],
     explorerUrl: 'https://www.mintscan.io/neutron',
     coingeckoKey: 'coingecko:neutron-3',
     cctpDomain: null,
@@ -1724,21 +1724,13 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       proof?: UniversalExecutionProof;
     } = {};
 
-    if (params.signature && params.intentId) {
-      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
-        throw new Error('Signed Cosmos gasless TxBody expired. Re-sign a fresh intent.');
-      }
-      const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.TURGALIUM_COSMOS_RELAYER_KEY?.trim());
+    if (params.signature || params.intentId) {
       out.submitted = {
-        accepted: true,
-        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        accepted: false,
+        mode: 'unsupported_non_evm_relayer',
         broadcasted: false,
-        settlementStatus: configured ? 'queued_for_relayer' : 'awaiting_relayer',
-        signatureFingerprint: fp,
-        nextStep: configured
-          ? `Cosmos x/feegrant relayer queued atomic TxBody ${params.intentId} (${fp}) on ${cfg.name}.`
-          : `Cosmos 1-Sig TxBody verified (${fp}). Use Direct Mode (Skip Go) to broadcast directly from Keplr/Leap today, or configure TURGALIUM_COSMOS_RELAYER_KEY.`,
+        settlementStatus: 'rejected_unverified',
+        nextStep: `Sponsored relayer submission is not enabled for ${cfg.name} (requires server-issued intent verification and Cosmos Amino/Direct cryptographic signature validation). Use Direct Mode (Skip Go) to sign and broadcast directly from Keplr/Leap.`,
       };
     }
 
