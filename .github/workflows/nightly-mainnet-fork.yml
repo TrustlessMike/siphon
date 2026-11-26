@@ -1,0 +1,33 @@
+name: Nightly Mainnet Fork
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  mainnet-fork:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+      - name: Run TurgaliumMainnetFork against Ethereum Mainnet fork
+        env:
+          SECRET_MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+        run: |
+          if [ -n "$SECRET_MAINNET_RPC_URL" ]; then
+            export MAINNET_RPC_URL="$SECRET_MAINNET_RPC_URL"
+            echo "Using configured MAINNET_RPC_URL secret for Ethereum Mainnet fork."
+          else
+            export MAINNET_RPC_URL="https://ethereum-rpc.publicnode.com"
+            echo "MAINNET_RPC_URL secret not configured; falling back to https://ethereum-rpc.publicnode.com."
+          fi
+          forge test --match-contract TurgaliumMainnetFork -vv

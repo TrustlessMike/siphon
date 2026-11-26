@@ -13,6 +13,8 @@ Verifies Desktop (1440x900), Tablet (900x800), and Mobile (390x844) across all 5
 import json
 import os
 import subprocess
+import sys
+import tempfile
 import time
 import urllib.request
 from playwright.sync_api import sync_playwright
@@ -26,8 +28,16 @@ SOL_PUBKEY = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
 SOL_PUBKEY_ALT = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
 
 
-def wait_ready():
-    for _ in range(40):
+def wait_ready(srv=None, log_file=None):
+    for _ in range(80):
+        if srv is not None and srv.poll() is not None:
+            err_out = ""
+            if log_file is not None:
+                log_file.seek(0)
+                err_out = log_file.read().decode("utf-8", errors="replace")[-2000:]
+            raise RuntimeError(
+                f"Turgalium server exited early (code={srv.returncode}) on {BASE}:\n{err_out}"
+            )
         try:
             with urllib.request.urlopen(f"{BASE}/api/health", timeout=1) as r:
                 if r.status == 200:
@@ -55,6 +65,7 @@ def maybe_shot(page, filename, full_page=True):
 
 def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    srv_log = tempfile.TemporaryFile()
     srv = subprocess.Popen(
         ["node", "dist/src/server/index.js"],
         cwd=repo_root,
@@ -64,17 +75,26 @@ def main():
             "TURGALIUM_ROUTER_OPTIMISM": "0x2222222222222222222222222222222222222222",
             "TURGALIUM_FEE_RECIPIENT_EVM": "0x1111111111111111111111111111111111111111",
         },
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=srv_log,
+        stderr=subprocess.STDOUT,
     )
 
     try:
-        wait_ready()
+        wait_ready(srv, srv_log)
         veteran_fixture = fetch_veteran_scan()
         results = {}
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            launch_args = []
+            if sys.platform.startswith("linux"):
+                launch_args = [
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--use-gl=angle",
+                    "--use-angle=swiftshader",
+                    "--enable-unsafe-swiftshader",
+                ]
+            browser = p.chromium.launch(headless=True, args=launch_args)
 
             # ------------------------------------------------------------------
             # 1. DESKTOP 1440px: Zero-Default-Dest Guard, 3D rAF Pause,
@@ -2297,6 +2317,7 @@ def main():
             srv.wait(timeout=3)
         except Exception:
             srv.kill()
+        srv_log.close()
 
 
 if __name__ == "__main__":
