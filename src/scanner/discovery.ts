@@ -42,6 +42,11 @@ const DEXSCREENER_CHAIN_SLUGS: Record<EvmChainId, string> = {
   mantle: 'mantle',
   blast: 'blast',
   worldchain: 'worldchain',
+  hyperevm: 'hyperevm',
+  berachain: 'berachain',
+  zksync: 'zksync',
+  ink: 'ink',
+  gnosis: 'gnosischain',
 };
 
 export const ALCHEMY_NETWORK_SUBDOMAINS: Partial<Record<EvmChainId, string>> = {
@@ -58,6 +63,10 @@ export const ALCHEMY_NETWORK_SUBDOMAINS: Partial<Record<EvmChainId, string>> = {
   blast: 'blast-mainnet',
   worldchain: 'worldchain-mainnet',
   unichain: 'unichain-mainnet',
+  berachain: 'berachain-mainnet',
+  zksync: 'zksync-mainnet',
+  ink: 'ink-mainnet',
+  gnosis: 'gnosis-mainnet',
 };
 
 const MORALIS_CHAIN_HEX: Partial<Record<EvmChainId, string>> = {
@@ -70,6 +79,7 @@ const MORALIS_CHAIN_HEX: Partial<Record<EvmChainId, string>> = {
   bnb: '0x38',
   linea: '0xe708',
   blast: '0x13e31',
+  gnosis: '0x64',
 };
 
 export const MIN_VERIFIED_DEX_LIQUIDITY_USD = 2_500;
@@ -739,6 +749,8 @@ const BLOCKSCOUT_V2_HOSTS: Partial<Record<EvmChainId, string>> = {
   scroll: 'https://scroll.blockscout.com',
   unichain: 'https://unichain.blockscout.com',
   worldchain: 'https://worldchain-mainnet.explorer.alchemy.com',
+  zksync: 'https://zksync.blockscout.com',
+  ink: 'https://explorer.inkonchain.com',
 };
 
 /**
@@ -903,6 +915,15 @@ const RABBY_CHAIN_TO_EVM: Record<string, EvmChainId> = {
   blast: 'blast',
   world: 'worldchain',
   worldchain: 'worldchain',
+  hyper: 'hyperevm',
+  hyperevm: 'hyperevm',
+  bera: 'berachain',
+  berachain: 'berachain',
+  era: 'zksync',
+  zksync: 'zksync',
+  ink: 'ink',
+  xdai: 'gnosis',
+  gnosis: 'gnosis',
 };
 
 function sanitizeHttpsUrl(raw?: string | null): string | undefined {

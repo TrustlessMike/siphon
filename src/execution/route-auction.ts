@@ -153,8 +153,10 @@ const MAYAN_CHAIN_SLUGS: Partial<Record<EvmChainId, string>> = {
   polygon: 'polygon',
   avalanche: 'avalanche',
   bnb: 'bsc',
+  sonic: 'sonic',
   unichain: 'unichain',
   linea: 'linea',
+  hyperevm: 'hyperevm',
 };
 
 const DEBRIDGE_SUPPORTED_CHAINS = new Set<EvmChainId>([
@@ -169,7 +171,13 @@ const DEBRIDGE_SUPPORTED_CHAINS = new Set<EvmChainId>([
   'sonic',
   'mantle',
   'scroll',
+  'hyperevm',
 ]);
+
+/** Chains where deBridge DLN uses an internal non-EIP-155 chain ID */
+export const DEBRIDGE_CHAIN_ID_OVERRIDE: Partial<Record<EvmChainId, number>> = {
+  hyperevm: 100000022,
+};
 
 const L2_ROLLUP_CHAINS = new Set<EvmChainId>([
   'base',
@@ -181,12 +189,18 @@ const L2_ROLLUP_CHAINS = new Set<EvmChainId>([
   'mantle',
   'blast',
   'worldchain',
+  'zksync',
+  'ink',
 ]);
 
 const STABLE_OR_MAJOR_SYMBOLS = new Set<string>([
   'USDC',
   'USDT',
+  'USDT0',
   'DAI',
+  'XDAI',
+  'WXDAI',
+  'HONEY',
   'USDS',
   'USDC.E',
   'USDBC',
@@ -194,9 +208,18 @@ const STABLE_OR_MAJOR_SYMBOLS = new Set<string>([
   'FDUSD',
   'ETH',
   'WETH',
+  'UETH',
   'WBTC',
+  'UBTC',
+  'KBTC',
   'BTC',
   'CBBTC',
+  'HYPE',
+  'WHYPE',
+  'BERA',
+  'WBERA',
+  'ZK',
+  'GNO',
   'SOL',
   'WSOL',
   'SUI',
@@ -590,6 +613,11 @@ const FALLBACK_GAS_PRICE_WEI: Record<EvmChainId, bigint> = {
   mantle: 20_000_000n, // 0.02 gwei
   blast: 50_000_000n, // 0.05 gwei
   worldchain: 50_000_000n, // 0.05 gwei
+  hyperevm: 100_000_000n, // 0.1 gwei
+  berachain: 100_000_000n, // 0.1 gwei
+  zksync: 25_000_000n, // 0.025 gwei
+  ink: 50_000_000n, // 0.05 gwei
+  gnosis: 2_000_000_000n, // 2 gwei
 };
 
 /** Per-tx L1 blob data posting floor (in native wei) for L2 chains under EIP-4844 */
@@ -603,6 +631,8 @@ const DEFAULT_L2_DATA_FEE_PER_TX_WEI: Partial<Record<EvmChainId, bigint>> = {
   blast: 4_000_000_000_000n,
   worldchain: 4_000_000_000_000n,
   mantle: 1_000_000_000_000_000n, // 0.001 MNT (~$0.001)
+  zksync: 10_000_000_000_000n, // 0.00001 ETH (~$0.025)
+  ink: 4_000_000_000_000n, // 0.000004 ETH (~$0.01)
 };
 
 export interface DynamicGasReserveOptions {
@@ -1112,7 +1142,8 @@ export async function fetchDeBridgeDlnQuote(params: {
   const dstToken = outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
 
   const url = new URL('https://dln.debridge.finance/v1.0/dln/order/create-tx');
-  url.searchParams.set('srcChainId', String(cfg.chainId));
+  const debridgeSrcChainId = DEBRIDGE_CHAIN_ID_OVERRIDE[chain] ?? cfg.chainId;
+  url.searchParams.set('srcChainId', String(debridgeSrcChainId));
   url.searchParams.set('srcChainTokenIn', srcToken);
   url.searchParams.set('srcChainTokenInAmount', bridgeRaw.toString());
   url.searchParams.set('dstChainId', String(DEBRIDGE_SOLANA_CHAIN_ID));

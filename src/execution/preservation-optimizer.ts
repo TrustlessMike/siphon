@@ -187,6 +187,11 @@ const DEFAULT_NATIVE_PRICE_USD: Partial<Record<EvmChainId, number>> = {
   mantle: 0.85,
   blast: 2500,
   worldchain: 2500,
+  hyperevm: 22,
+  berachain: 0.85,
+  zksync: 2500,
+  ink: 2500,
+  gnosis: 1,
 };
 
 function r2(n: number): number {
@@ -380,7 +385,9 @@ function buildChainRouteCandidates(params: {
     chain === 'arbitrum' ||
     chain === 'optimism' ||
     chain === 'unichain' ||
-    chain === 'worldchain';
+    chain === 'worldchain' ||
+    chain === 'ink' ||
+    chain === 'zksync';
 
   const makeCandidate = (spec: {
     route: PreservationRouteId;

@@ -26,6 +26,14 @@ export const FALLBACK_PRICES: Record<string, number> = {
   'coingecko:deep': 0.14,
   'coingecko:walrus-2': 0.45,
   'coingecko:worldcoin-wld': 1.2,
+  'coingecko:hyperliquid': 22.0,
+  'coingecko:berachain-bera': 0.85,
+  'coingecko:zksync': 0.08,
+  'coingecko:xdai': 1.0,
+  'coingecko:gnosis': 125.0,
+  'coingecko:wrapped-bitcoin': 68500,
+  'coingecko:wrapped-steth': 1985,
+  'coingecko:usdt0': 1.0,
   // Ethereum
   'ethereum:0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48': 1.0,
   'ethereum:0xdAC17F958D2ee523a2206206994597C13D831ec7': 1.0,
@@ -75,6 +83,28 @@ export const FALLBACK_PRICES: Record<string, number> = {
   'scroll:0x06eFdBFf2a14a7c8E15944D1F4A48F9F95F663A4': 1.0, // Scroll USDC
   'mantle:0x09Bc4E0D864854c6aFB6eB9A9cdF58aC190D0dF9': 1.0, // Mantle USDC
   'blast:0x4300000000000000000000000000000000000003': 1.0, // Blast USDB
+  // HyperEVM (999)
+  'hyperliquid:0xb88339CB7199b77E23DB6E890353E22632Ba630f': 1.0, // HyperEVM native USDC
+  'hyperliquid:0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb': 1.0, // HyperEVM USDT0
+  'hyperliquid:0x9FDBdA0A5e284c32744D2f17Ee5c74B284993463': 68500, // HyperEVM UBTC
+  'hyperliquid:0xBe6727B535545C67d5cAa73dEa54865B92CF7907': 1680, // HyperEVM UETH
+  // Berachain (80094)
+  'berachain:0x549943e04f40284185054145c6E4e9568C1D3241': 1.0, // Berachain USDC.e
+  'berachain:0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce': 1.0, // Berachain HONEY
+  // zkSync Era (324)
+  'era:0x1d17CBcF0D6D143135aE902365D2E5e2A16538D4': 1.0, // zkSync native USDC
+  'era:0x3355df6D4c9C3035724Fd0e3914dE96A5a83aaf4': 1.0, // zkSync USDC.e
+  'era:0x5A7d6b2F92C77FAD6CCaBd7EE0624E64907Eaf3E': 0.08, // zkSync ZK
+  // Ink (57073)
+  'ink:0x2D270e6886d130D724215A266106e6832161EAEd': 1.0, // Ink native USDC
+  'ink:0xF1815bd50389c46847f0Bda824eC8da914045D14': 1.0, // Ink USDC.e
+  'ink:0x0200C29006150606B650577BBE7B6248F58470c1': 1.0, // Ink USDT0
+  // Gnosis (100)
+  'xdai:0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d': 1.0, // Gnosis WXDAI
+  'xdai:0x2a22f9c3b484c3629090FeED35F17Ff8F88f76F0': 1.0, // Gnosis USDC.e
+  'xdai:0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83': 1.0, // Gnosis USDC
+  'xdai:0x9C58BAcC331c9aa871AFD802DB6379a98e80CEdb': 125.0, // Gnosis GNO
+  'xdai:0xaf204776c7245bF4147c2612BF6e5972Ee483701': 1.18, // Gnosis sDAI
 };
 
 const FALLBACK_PRICES_LOWER = new Map<string, number>(

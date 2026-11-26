@@ -204,7 +204,7 @@ test('CRIT-04 Backtest: solanaOwnerToUsdcAtaBytes32 derives canonical SPL USDC A
   assert.equal('0x' + burnTx.data.slice(138, 202).toLowerCase(), expectedAtaBytes32);
 });
 
-test('CRIT-05 Backtest: All 14 EVM chains route CCTP V2 (with V1 backward-compat encoder), Iris URLs, and Solana program IDs accurately', async () => {
+test('CRIT-05 Backtest: All 19 EVM chains route CCTP V2 (with V1 backward-compat encoder), Iris URLs, and Solana program IDs accurately', async () => {
   const expectedV2: EvmChainId[] = [
     'ethereum',
     'base',
@@ -216,10 +216,12 @@ test('CRIT-05 Backtest: All 14 EVM chains route CCTP V2 (with V1 backward-compat
     'unichain',
     'linea',
     'worldchain',
+    'hyperevm',
+    'ink',
   ];
-  const expectedNone: EvmChainId[] = ['bnb', 'scroll', 'mantle', 'blast'];
+  const expectedNone: EvmChainId[] = ['bnb', 'scroll', 'mantle', 'blast', 'berachain', 'zksync', 'gnosis'];
 
-  assert.equal(CHAIN_LIST.length, 14);
+  assert.equal(CHAIN_LIST.length, 19);
   const ataBytes32 = solanaOwnerToUsdcAtaBytes32(SAMPLE_SOLANA_WALLETS[0]);
 
   // Verify V1 backwards-compatible encoder, Iris V1 URL, and Solana V1 programs still work when explicitly requested

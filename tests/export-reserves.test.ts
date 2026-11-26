@@ -100,7 +100,7 @@ test('formatBurnReceiptCsv produces exact row count with neutralized malicious b
   assert.ok(lines[2].includes('"\'-1+1"'), lines[2]);
 });
 
-test('All 14 EVM chains define safe positive gasReserveNative reserves (including Polygon spike safety)', () => {
+test('All 19 EVM chains define safe positive gasReserveNative reserves (including Polygon spike safety)', () => {
   const expectedChains: EvmChainId[] = [
     'ethereum',
     'base',
@@ -116,13 +116,18 @@ test('All 14 EVM chains define safe positive gasReserveNative reserves (includin
     'mantle',
     'blast',
     'worldchain',
+    'hyperevm',
+    'berachain',
+    'zksync',
+    'ink',
+    'gnosis',
   ];
 
-  assert.equal(CHAIN_LIST.length, 14, `Expected 14 EVM chains, got ${CHAIN_LIST.length}`);
+  assert.equal(CHAIN_LIST.length, 19, `Expected 19 EVM chains, got ${CHAIN_LIST.length}`);
   assert.deepEqual(
     new Set(CHAIN_LIST.map((c) => c.id)),
     new Set(expectedChains),
-    'EVM_CHAINS keys must match all 14 supported EVM chains'
+    'EVM_CHAINS keys must match all 19 supported EVM chains'
   );
 
   for (const chain of CHAIN_LIST) {
@@ -144,12 +149,16 @@ test('All 14 EVM chains define safe positive gasReserveNative reserves (includin
   assert.ok(EVM_CHAINS.bnb.gasReserveNative >= 0.003, 'BNB Chain reserve too low');
   assert.ok(EVM_CHAINS.sonic.gasReserveNative >= 0.05, 'Sonic reserve too low');
   assert.ok(EVM_CHAINS.mantle.gasReserveNative >= 0.05, 'Mantle reserve too low');
+  assert.ok(EVM_CHAINS.hyperevm.gasReserveNative >= 0.01, 'HyperEVM reserve too low');
+  assert.ok(EVM_CHAINS.berachain.gasReserveNative >= 0.05, 'Berachain reserve too low');
+  assert.ok(EVM_CHAINS.gnosis.gasReserveNative >= 0.05, 'Gnosis reserve too low');
 
   // ETH-denominated chains
   assert.ok(EVM_CHAINS.ethereum.gasReserveNative >= 0.002, 'Ethereum L1 reserve too low');
   assert.ok(EVM_CHAINS.linea.gasReserveNative >= 0.0008, 'Linea reserve too low');
   assert.ok(EVM_CHAINS.scroll.gasReserveNative >= 0.0008, 'Scroll reserve too low');
-  for (const l2 of ['base', 'arbitrum', 'optimism', 'unichain', 'blast', 'worldchain'] as const) {
+  assert.ok(EVM_CHAINS.zksync.gasReserveNative >= 0.0008, 'zkSync Era reserve too low');
+  for (const l2 of ['base', 'arbitrum', 'optimism', 'unichain', 'blast', 'worldchain', 'ink'] as const) {
     assert.ok(EVM_CHAINS[l2].gasReserveNative >= 0.0005, `${l2} reserve too low`);
   }
 });

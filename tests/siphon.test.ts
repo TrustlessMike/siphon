@@ -88,7 +88,7 @@ test('Solana base58 pubkey converts to 32-byte Circle CCTP mintRecipient and val
 
 test('Preset multi-chain scan reconciles DeFi withdrawals, liquid dust, zero-liq burns, and honeypot skips', async () => {
   const report = await scanPresetWallet('veteran_defi');
-  assert.equal(report.chainsScanned, 14);
+  assert.equal(report.chainsScanned, 19);
   assert.ok(report.totals.defiPositionCount >= 5);
   assert.ok(report.totals.liquidDustCount >= 7);
   assert.ok(report.totals.burnCandidateCount >= 4);
@@ -582,9 +582,23 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
   }
 });
 
-test('Multi-chain expansion: 14 EVMs + 7 families registry + auto address detection', () => {
-  assert.equal(CHAIN_LIST.length, 14);
-  for (const id of ['bnb', 'sonic', 'unichain', 'linea', 'scroll', 'mantle', 'blast', 'worldchain'] as const) {
+test('Multi-chain expansion: 19 EVMs + 7 families registry + auto address detection', () => {
+  assert.equal(CHAIN_LIST.length, 19);
+  for (const id of [
+    'bnb',
+    'sonic',
+    'unichain',
+    'linea',
+    'scroll',
+    'mantle',
+    'blast',
+    'worldchain',
+    'hyperevm',
+    'berachain',
+    'zksync',
+    'ink',
+    'gnosis',
+  ] as const) {
     assert.ok(EVM_CHAINS[id], `Missing extended EVM chain ${id}`);
     assert.ok(EVM_CHAINS[id].rpcUrls.length >= 2);
     assert.match(EVM_CHAINS[id].usdcAddress, /^0x[0-9a-fA-F]{40}$/);
@@ -593,13 +607,18 @@ test('Multi-chain expansion: 14 EVMs + 7 families registry + auto address detect
   assert.equal(EVM_CHAINS.linea.cctpDomain, 11);
   assert.equal(EVM_CHAINS.sonic.cctpDomain, 13);
   assert.equal(EVM_CHAINS.worldchain.cctpDomain, 14);
+  assert.equal(EVM_CHAINS.hyperevm.cctpDomain, 19);
+  assert.equal(EVM_CHAINS.ink.cctpDomain, 21);
   assert.equal(EVM_CHAINS.bnb.cctpDomain, null);
+  assert.equal(EVM_CHAINS.berachain.cctpDomain, null);
+  assert.equal(EVM_CHAINS.zksync.cctpDomain, null);
+  assert.equal(EVM_CHAINS.gnosis.cctpDomain, null);
 
   const metas = listAllFamilyMetas();
   assert.equal(metas.length, 7);
   assert.equal(
     metas.reduce((s, m) => s + m.chains.length, 0),
-    25 // 14 EVMs + 6 Cosmos + Sui + Aptos + TON + Tron + Bitcoin
+    30 // 19 EVMs + 6 Cosmos + Sui + Aptos + TON + Tron + Bitcoin
   );
 
   // Address auto-detection across all 7 families
@@ -796,7 +815,7 @@ test('Wave 1-3 adapters build 1-sig gasless intents, pre-sign proofs, and Bitcoi
   try {
     const fams = await fetch(`${base}/api/families`).then((r) => r.json());
     assert.equal(fams.totalFamilies, 7);
-    assert.equal(fams.totalChains, 25);
+    assert.equal(fams.totalChains, 30);
 
     const httpBtcProof = await fetch(`${base}/api/tx/simulate-proof`, {
       method: 'POST',
