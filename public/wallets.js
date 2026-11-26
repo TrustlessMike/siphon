@@ -296,7 +296,7 @@ let cachedNodeSolanaWeb3 = null;
 
 async function loadSolanaWeb3Primitives() {
   try {
-    const mod = await loadWalletSdkBundle({ initCoinbase: false });
+    const mod = await loadSolanaWeb3Sdk();
     if (mod?.VersionedTransaction?.deserialize) {
       return {
         VersionedTransaction: mod.VersionedTransaction,
@@ -306,7 +306,7 @@ async function loadSolanaWeb3Primitives() {
       };
     }
   } catch {
-    // Fallback below when running in Node.js test harness where /vendor/wallet-sdks.js is an HTTP route
+    // Fallback below when running in Node.js test harness where /vendor/solana-web3.js is an HTTP route
   }
   if (typeof process !== 'undefined' && process.versions?.node) {
     if (!cachedNodeSolanaWeb3) {
@@ -492,17 +492,21 @@ let walletSdkConfig = {
   paymasterUrl: null,
   paymasterUrls: null,
   protocolFee: {
-    feeBps: 700,
-    feePercent: 7,
-    minFeeBps: 500,
+    feeBps: 0,
+    feePercent: 0,
+    minFeeBps: 0,
     maxFeeBps: 1000,
     feeRecipientEvm: null,
     feeDestinationType: 'contract',
     treasuryConfigured: false,
   },
 };
-let cachedSdkModule = null;
-let sdkPreloadPromise = null;
+let cachedSolanaSdkModule = null;
+let solanaSdkPromise = null;
+let cachedCoinbaseSdkModule = null;
+let coinbaseSdkPromise = null;
+let cachedWalletConnectSdkModule = null;
+let walletConnectSdkPromise = null;
 let cachedCoinbaseProvider = null;
 let activeEvmListeners = null;
 let activeSolanaSession = null;
@@ -533,36 +537,39 @@ export function getEffectiveWalletConnectProjectId() {
   return walletSdkConfig.walletConnectProjectId || getSavedWalletConnectProjectId();
 }
 
-async function loadWalletSdkBundle({ initCoinbase = false } = {}) {
-  if (cachedSdkModule) {
-    if (initCoinbase && !cachedCoinbaseProvider && typeof cachedSdkModule.createCoinbaseWalletSDK === 'function') {
-      try {
-        const sdk = cachedSdkModule.createCoinbaseWalletSDK({
-          appName: 'Turgalium',
-          appLogoUrl: `${window.location.origin}/logos/turgalium.svg`,
-          appChainIds: SUPPORTED_CHAIN_IDS,
-          preference: { options: 'all' },
-        });
-        cachedCoinbaseProvider = sdk.getProvider();
-      } catch {
-        // instantiate on demand
-      }
-    }
-    return cachedSdkModule;
-  }
-  if (!sdkPreloadPromise) {
-    sdkPreloadPromise = import('/vendor/wallet-sdks.js')
+async function loadSolanaWeb3Sdk() {
+  if (cachedSolanaSdkModule) return cachedSolanaSdkModule;
+  if (!solanaSdkPromise) {
+    solanaSdkPromise = import('/vendor/solana-web3.js')
       .then((mod) => {
-        cachedSdkModule = mod;
+        cachedSolanaSdkModule = mod;
         return mod;
       })
       .catch((err) => {
-        sdkPreloadPromise = null;
+        solanaSdkPromise = null;
         throw err;
       });
   }
-  const mod = await sdkPreloadPromise;
-  if (initCoinbase && !cachedCoinbaseProvider && typeof mod.createCoinbaseWalletSDK === 'function') {
+  return solanaSdkPromise;
+}
+
+async function loadCoinbaseSdk({ initCoinbase = false } = {}) {
+  if (!cachedCoinbaseSdkModule) {
+    if (!coinbaseSdkPromise) {
+      coinbaseSdkPromise = import('/vendor/coinbase-sdk.js')
+        .then((mod) => {
+          cachedCoinbaseSdkModule = mod;
+          return mod;
+        })
+        .catch((err) => {
+          coinbaseSdkPromise = null;
+          throw err;
+        });
+    }
+    await coinbaseSdkPromise;
+  }
+  const mod = cachedCoinbaseSdkModule;
+  if (initCoinbase && !cachedCoinbaseProvider && typeof mod?.createCoinbaseWalletSDK === 'function') {
     try {
       const sdk = mod.createCoinbaseWalletSDK({
         appName: 'Turgalium',
@@ -578,9 +585,27 @@ async function loadWalletSdkBundle({ initCoinbase = false } = {}) {
   return mod;
 }
 
+async function loadWalletConnectSdk() {
+  if (cachedWalletConnectSdkModule) return cachedWalletConnectSdkModule;
+  if (!walletConnectSdkPromise) {
+    walletConnectSdkPromise = import('/vendor/walletconnect-sdk.js')
+      .then((mod) => {
+        cachedWalletConnectSdkModule = mod;
+        return mod;
+      })
+      .catch((err) => {
+        walletConnectSdkPromise = null;
+        throw err;
+      });
+  }
+  return walletConnectSdkPromise;
+}
+
 export function preloadWalletSdks() {
   if (typeof window === 'undefined') return;
-  loadWalletSdkBundle({ initCoinbase: false }).catch(() => {});
+  if (walletSdkConfig.coinbaseSmartWalletEnabled) {
+    loadCoinbaseSdk({ initCoinbase: false }).catch(() => {});
+  }
 }
 
 export async function loadWalletConnectorConfig() {
@@ -1292,7 +1317,7 @@ export async function connectDualVmWallet(options = {}) {
 export async function connectCoinbaseSmartWallet(callbacks = {}) {
   let provider = cachedCoinbaseProvider;
   if (!provider) {
-    const { createCoinbaseWalletSDK } = await loadWalletSdkBundle({ initCoinbase: true });
+    const { createCoinbaseWalletSDK } = await loadCoinbaseSdk({ initCoinbase: true });
     if (cachedCoinbaseProvider) {
       provider = cachedCoinbaseProvider;
     } else {
@@ -1342,7 +1367,7 @@ export async function connectWalletConnect(callbacks = {}) {
       'Enter a free Reown / WalletConnect Project ID (cloud.reown.com) to launch the mobile QR modal.'
     );
   }
-  const { EthereumProvider } = await loadWalletSdkBundle();
+  const { EthereumProvider } = await loadWalletConnectSdk();
   const provider = await EthereumProvider.init({
     projectId,
     optionalChains: SUPPORTED_CHAIN_IDS,

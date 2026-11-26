@@ -52,6 +52,7 @@ import {
   SOLANA_CCTP_DOMAIN,
 } from '../scanner/chains.js';
 import { scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
+import { scanEvmWalletWithOptions } from '../adapters/evm.js';
 import { fetchSolanaWalletBalances, getL2IndexerProvider } from '../scanner/discovery.js';
 import {
   TurgaliumAgentEngine,
@@ -494,10 +495,13 @@ function sendJson(
   res: ServerResponse,
   status: number,
   payload: unknown,
-  corsHeaders: Record<string, string> = {}
+  corsHeaders: Record<string, string> = {},
+  isHead = false
 ): void {
+  const body = JSON.stringify(payload);
   const headers: Record<string, string> = {
     'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': String(Buffer.byteLength(body)),
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
@@ -510,7 +514,7 @@ function sendJson(
     headers.Connection = 'close';
   }
   res.writeHead(status, headers);
-  res.end(JSON.stringify(payload));
+  res.end(isHead ? undefined : body);
 }
 
 function pipeStaticFileSafely(res: ServerResponse, filePath: string): void {
@@ -539,32 +543,31 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
     'Cross-Origin-Resource-Policy': 'same-origin',
   };
 
-  if (reqPath === '/vendor/wallet-sdks.js') {
-    const bundleFile = path.join(DIST_VENDOR_DIR, 'wallet-sdks.js');
-    if (fs.existsSync(bundleFile)) {
+  const ALLOWED_VENDOR_FILES = new Set([
+    'solana-web3.js',
+    'coinbase-sdk.js',
+    'walletconnect-sdk.js',
+    'wallet-sdks.js',
+    'three.module.js',
+    'three.core.js',
+  ]);
+  if (reqPath.startsWith('/vendor/')) {
+    const fileName = reqPath.slice('/vendor/'.length);
+    if (!ALLOWED_VENDOR_FILES.has(fileName)) return false;
+    const candidates = [
+      path.join(PUBLIC_DIR, 'vendor', fileName),
+      path.join(DIST_VENDOR_DIR, fileName),
+      path.join(THREE_BUILD_DIR, fileName),
+    ];
+    const targetFile = candidates.find((p) => fs.existsSync(p));
+    if (targetFile) {
       res.writeHead(200, {
         ...baseSecurityHeaders,
         'Content-Type': 'application/javascript; charset=utf-8',
-        'Cache-Control': 'public, max-age=3600',
+        'Cache-Control': 'public, max-age=31536000, immutable',
       });
       if (isHead) res.end();
-      else pipeStaticFileSafely(res, bundleFile);
-      return true;
-    }
-    return false;
-  }
-
-  if (reqPath === '/vendor/three.module.js' || reqPath === '/vendor/three.core.js') {
-    const fileName = path.basename(reqPath);
-    const threeFile = path.join(THREE_BUILD_DIR, fileName);
-    if (fs.existsSync(threeFile)) {
-      res.writeHead(200, {
-        ...baseSecurityHeaders,
-        'Content-Type': 'application/javascript; charset=utf-8',
-        'Cache-Control': 'public, max-age=3600',
-      });
-      if (isHead) res.end();
-      else pipeStaticFileSafely(res, threeFile);
+      else pipeStaticFileSafely(res, targetFile);
       return true;
     }
     return false;
@@ -694,6 +697,11 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
   const scanCache = new BoundedTtlCache<string, ScanReport>({
     maxEntries: opts.scanCacheMaxEntries ?? DEFAULT_SCAN_CACHE_MAX,
     ttlMs: opts.scanCacheTtlMs ?? DEFAULT_SCAN_CACHE_TTL_MS,
+    nowMs: opts.nowMs,
+  });
+  const liveScanCache = new BoundedTtlCache<string, ScanReport>({
+    maxEntries: 64,
+    ttlMs: 45_000,
     nowMs: opts.nowMs,
   });
   const jobPollersEnabled = opts.enableBackgroundPollers ?? !isVercelRuntime;
@@ -835,7 +843,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
       });
       let rateLimitHeaders: Record<string, string> = {};
       const reply = (status: number, payload: unknown) =>
-        sendJson(res, status, payload, { ...corsHeaders, ...rateLimitHeaders });
+        sendJson(res, status, payload, { ...corsHeaders, ...rateLimitHeaders }, method === 'HEAD');
 
       const normalizedOrigin = originHeader ? normalizeOrigin(originHeader) : null;
       const originAllowed = !originHeader || (normalizedOrigin !== null && isAllowedOrigin(normalizedOrigin));
@@ -960,7 +968,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         }
       }
 
-      if (method === 'GET' && pathname === '/api/health') {
+      if ((method === 'GET' || method === 'HEAD') && pathname === '/api/health') {
         const protocolFee = getProtocolFeeConfig();
         return reply(200, {
           status: 'ok',
@@ -1009,11 +1017,14 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         });
       }
 
-      if (method === 'GET' && pathname === '/api/config') {
+      if ((method === 'GET' || method === 'HEAD') && pathname === '/api/config') {
         const vercelEphemeralRelayerBlocked =
           process.env.VERCEL === '1' && !stateStore.persistent;
+        const hasCoinbaseSdk =
+          fs.existsSync(path.join(PUBLIC_DIR, 'vendor', 'coinbase-sdk.js')) ||
+          fs.existsSync(path.join(DIST_VENDOR_DIR, 'wallet-sdks.js'));
         return reply(200, {
-          coinbaseSmartWalletEnabled: fs.existsSync(path.join(DIST_VENDOR_DIR, 'wallet-sdks.js')),
+          coinbaseSmartWalletEnabled: hasCoinbaseSdk,
           walletConnectProjectId: process.env.WALLETCONNECT_PROJECT_ID?.trim() || null,
           l2IndexerProvider: getL2IndexerProvider(),
           protocolFee: getProtocolFeeConfig(),
@@ -1024,7 +1035,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         });
       }
 
-      if (method === 'GET' && pathname === '/api/chains') {
+      if ((method === 'GET' || method === 'HEAD') && pathname === '/api/chains') {
         return reply(200, {
           solanaCctpDomain: SOLANA_CCTP_DOMAIN,
           burnSink: DEAD_BURN_ADDRESS,
@@ -1036,7 +1047,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         });
       }
 
-      if (method === 'GET' && pathname === '/api/families') {
+      if ((method === 'GET' || method === 'HEAD') && pathname === '/api/families') {
         const families = listAllFamilyMetas();
         const totalChains = families.reduce((s, f) => s + f.chains.length, 0);
         return reply(200, {
@@ -1428,12 +1439,73 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           family?: ChainFamily;
           presetId?: string;
           mode?: 'live' | 'preset';
+          chains?: string[];
+          refresh?: boolean;
+          stream?: boolean;
         }>(req);
+
+        const acceptHeader = typeof req.headers.accept === 'string' ? req.headers.accept.toLowerCase() : '';
+        const wantsStream =
+          body.stream === true || acceptHeader.includes('application/x-ndjson');
+
+        let requestedEvmChains: EvmChainId[] | undefined;
+        if (Array.isArray(body.chains) && body.chains.length > 0) {
+          const validIds = new Set(CHAIN_LIST.map((c) => c.id));
+          const filtered = Array.from(
+            new Set(
+              body.chains
+                .filter((c): c is string => typeof c === 'string')
+                .map((c) => c.trim().toLowerCase())
+                .filter((c): c is EvmChainId => validIds.has(c as EvmChainId))
+            )
+          );
+          if (filtered.length === 0) {
+            return reply(400, {
+              error: `No valid EVM chain IDs in chains filter. Supported: ${CHAIN_LIST.map((c) => c.id).join(', ')}.`,
+            });
+          }
+          requestedEvmChains = filtered;
+        }
+
+        const sendScanResult = (report: ScanReport, cacheHit = false) => {
+          scanCache.set(report.scanId, report);
+          if (wantsStream && !res.headersSent) {
+            res.writeHead(200, {
+              'Content-Type': 'application/x-ndjson; charset=utf-8',
+              'Cache-Control': 'no-store',
+              'X-Content-Type-Options': 'nosniff',
+              'X-Frame-Options': 'DENY',
+              'Referrer-Policy': 'no-referrer',
+              'Cross-Origin-Resource-Policy': 'same-origin',
+              'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+              ...(cacheHit ? { 'X-Turgalium-Scan-Cache': 'HIT' } : {}),
+              ...corsHeaders,
+              ...rateLimitHeaders,
+            });
+            res.end(`${JSON.stringify({ type: 'done', cached: cacheHit, report })}\n`);
+            return;
+          }
+          if (res.headersSent) {
+            res.end(`${JSON.stringify({ type: 'done', cached: cacheHit, report })}\n`);
+            return;
+          }
+          return sendJson(
+            res,
+            200,
+            report,
+            {
+              ...corsHeaders,
+              ...rateLimitHeaders,
+              ...(cacheHit ? { 'X-Turgalium-Scan-Cache': 'HIT' } : {}),
+            }
+          );
+        };
 
         let report: ScanReport;
         if (body.presetId) {
           report = await scanPresetWallet(body.presetId);
           report.family = 'evm';
+          return sendScanResult(report, false);
         } else if (body.address) {
           const detected = detectAddress(body.address, body.family);
           if (!detected) {
@@ -1442,14 +1514,56 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
                 'Invalid wallet address or checksum. Supported: EVM (0x… EIP-55 / .eth), Cosmos Bech32 (cosmos1…/osmo1…/noble1…/celestia1…/inj1…/neutron1…), Sui/Aptos (0x… Move hex), TON (EQ…/UQ…/Ef…/Uf… or -1:/0:), Tron (T… Base58Check / 41… hex), Bitcoin (bc1q…/bc1p…/1…/3…).',
             });
           }
+
+          const cacheKey = `${detected.family}:${detected.normalized.toLowerCase()}:${
+            requestedEvmChains ? requestedEvmChains.slice().sort().join(',') : 'all'
+          }`;
+          if (!body.refresh) {
+            const cached = liveScanCache.get(cacheKey);
+            if (cached) {
+              return sendScanResult(cached, true);
+            }
+          }
+
           try {
             if (detected.family === 'evm') {
-              report = await getAdapterForFamily('evm').scanWallet(body.address);
+              let streamStarted = false;
+              const startStreamHeaders = () => {
+                if (streamStarted || res.headersSent) return;
+                streamStarted = true;
+                res.writeHead(200, {
+                  'Content-Type': 'application/x-ndjson; charset=utf-8',
+                  'Cache-Control': 'no-store',
+                  'X-Content-Type-Options': 'nosniff',
+                  'X-Frame-Options': 'DENY',
+                  'Referrer-Policy': 'no-referrer',
+                  'Cross-Origin-Resource-Policy': 'same-origin',
+                  'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+                  ...corsHeaders,
+                  ...rateLimitHeaders,
+                });
+              };
+              report = await scanEvmWalletWithOptions(body.address, undefined, {
+                chains: requestedEvmChains,
+                onChainProgress: wantsStream
+                  ? (info) => {
+                      if (res.writableEnded) return;
+                      startStreamHeaders();
+                      res.write(`${JSON.stringify({ type: 'chain', ...info })}\n`);
+                    }
+                  : undefined,
+              });
               report.family = 'evm';
             } else {
               report = await getAdapterForFamily(detected.family).scanWallet(detected.normalized);
             }
+            liveScanCache.set(cacheKey, report);
           } catch (err) {
+            if (res.headersSent) {
+              const msg = err instanceof Error ? err.message : 'Wallet scan failed';
+              res.end(`${JSON.stringify({ type: 'error', error: msg })}\n`);
+              return;
+            }
             if (err instanceof EnsResolutionError) {
               return reply(err.code === 'RPC_ERROR' ? 503 : 400, { error: err.message });
             }
@@ -1459,14 +1573,12 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
             }
             throw err;
           }
+          return sendScanResult(report, false);
         } else {
           report = await scanPresetWallet('veteran_defi');
           report.family = 'evm';
+          return sendScanResult(report, false);
         }
-
-        scanCache.set(report.scanId, report);
-
-        return reply(200, report);
       }
 
       if (method === 'POST' && pathname === '/api/plan') {

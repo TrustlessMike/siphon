@@ -174,9 +174,11 @@ function classifyAndBuildReport(params: {
   rawAssets: RawAssetSeed[];
   solPriceUsd: number;
   warnings: string[];
+  scannedChains?: typeof CHAIN_LIST;
 }): ScanReport {
   const { mode, walletAddress, walletLabel, startedAtMs, chainMeta, rawAssets, solPriceUsd, warnings } =
     params;
+  const activeChainConfigs = params.scannedChains ?? CHAIN_LIST;
 
   // Group count per chain so Permit2 batching amortizes base tx overhead
   const countsPerChain = new Map<EvmChainId, number>();
@@ -422,7 +424,7 @@ function classifyAndBuildReport(params: {
   });
 
   // Build per-chain summaries
-  const chains: ChainScanSummary[] = CHAIN_LIST.map((c) => {
+  const chains: ChainScanSummary[] = activeChainConfigs.map((c) => {
     const meta = chainMeta.get(c.id) ?? {
       rpcStatus: 'preset' as const,
       blockNumber: 0,
@@ -548,11 +550,27 @@ function classifyAndBuildReport(params: {
   return applyTwoLevelRoiToReport(report);
 }
 
+export interface ScanLiveWalletOptions {
+  chains?: EvmChainId[];
+  onChainProgress?: (info: {
+    chain: EvmChainId;
+    chainName: string;
+    completed: number;
+    total: number;
+    assetCount: number;
+    ok: boolean;
+  }) => void;
+}
+
 /**
- * Runs a REAL live multi-chain EVM scan across all 6 Circle CCTP chains in parallel
- * using Multicall3 (`aggregate3`) + real DeFiLlama USD prices.
+ * Runs a REAL live multi-chain EVM scan across all configured EVM chains in parallel
+ * using Multicall3 (`aggregate3`) + real DeFiLlama USD prices + parallel per-chain enrichment.
  */
-export async function scanLiveWallet(walletAddress: string, label?: string): Promise<ScanReport> {
+export async function scanLiveWallet(
+  walletAddress: string,
+  label?: string,
+  options?: ScanLiveWalletOptions
+): Promise<ScanReport> {
   const cleanAddr = walletAddress.trim();
   if (!isValidEvmAddress(cleanAddr)) {
     throw new Error('Invalid EVM wallet address (expected 0x followed by 40 hex characters).');
@@ -561,20 +579,34 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
   const startedAtMs = performance.now();
   const warnings: string[] = [];
 
-  // 1. Parallel RPC scans across all 6 chains + live USD prices from DeFiLlama
+  const requestedSet =
+    options?.chains && options.chains.length > 0
+      ? new Set(options.chains.map((c) => c.toLowerCase() as EvmChainId))
+      : null;
+  const targetChains = requestedSet
+    ? CHAIN_LIST.filter((c) => requestedSet.has(c.id))
+    : CHAIN_LIST;
+  if (targetChains.length === 0) {
+    throw new Error('No valid EVM chains specified for scan.');
+  }
+  const targetChainSet = new Set(targetChains.map((c) => c.id));
+
+  // 1. Parallel RPC scans across all target chains + live USD prices from DeFiLlama
   const llamaKeys = [
     'coingecko:solana',
-    ...CHAIN_LIST.map((c) => c.nativeLlamaId),
-    ...TOKEN_REGISTRY.map((t) => t.llamaKey).filter((k): k is string => Boolean(k)),
+    ...targetChains.map((c) => c.nativeLlamaId),
+    ...TOKEN_REGISTRY.filter((t) => targetChainSet.has(t.chain))
+      .map((t) => t.llamaKey)
+      .filter((k): k is string => Boolean(k)),
   ];
 
   const [priceStatus, discoveredByChainArr, discoveredProtocolPositions, ...chainOutputs] = await Promise.all([
     fetchLiveUsdPricesWithStatus(llamaKeys),
     Promise.all(
-      CHAIN_LIST.map(async (c) => [c.id, await discoverChainTokens(c.id, cleanAddr, 24)] as const)
+      targetChains.map(async (c) => [c.id, await discoverChainTokens(c.id, cleanAddr, 24)] as const)
     ),
     discoverDefiProtocolPositions(cleanAddr),
-    ...CHAIN_LIST.map((c) =>
+    ...targetChains.map((c) =>
       scanSingleEvmChain(
         c,
         cleanAddr,
@@ -602,157 +634,235 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     }
   >();
 
-  const rawAssets: RawAssetSeed[] = [];
+  let completedChains = 0;
+  const totalChains = chainOutputs.length;
 
-  for (const out of chainOutputs) {
-    const c = out.chain;
-    const nativePrice = prices.get(c.nativeLlamaId) ?? 1680;
-    const gasPriceGwei = Number(out.gasPriceWei) / 1e9;
-    const nativeUi = formatUnits(out.nativeBalanceWei, 18);
+  // 2. Enrich ALL chains in parallel (DexScreener liquidity, DeFi probing, honeypot sims, Uni v3 NFTs)
+  const perChainResults = await Promise.all(
+    chainOutputs.map(async (out) => {
+      const c = out.chain;
+      const chainAssets: RawAssetSeed[] = [];
+      const chainWarnings: string[] = [];
+      const nativePrice = prices.get(c.nativeLlamaId) ?? 1680;
+      const gasPriceGwei = Number(out.gasPriceWei) / 1e9;
+      const nativeUi = formatUnits(out.nativeBalanceWei, 18);
 
-    chainMeta.set(c.id, {
-      rpcStatus: out.ok ? 'live' : 'preset',
-      blockNumber: out.blockNumber,
-      gasPriceGwei: Math.max(0.001, gasPriceGwei),
-      nativeBalance: nativeUi,
-      nativePriceUsd: nativePrice,
-    });
+      chainMeta.set(c.id, {
+        rpcStatus: out.ok ? 'live' : 'preset',
+        blockNumber: out.blockNumber,
+        gasPriceGwei: Math.max(0.001, gasPriceGwei),
+        nativeBalance: nativeUi,
+        nativePriceUsd: nativePrice,
+      });
 
-    if (!out.ok) {
-      warnings.push(`${c.name} RPC timed out (${out.error ?? 'unavailable'}).`);
-      continue;
-    }
-
-    // Reserve each chain's configured native gas buffer so users aren't stranded on follow-up txs or low-unit-price chains
-    const gasReserve = c.gasReserveNative;
-    if (nativeUi > gasReserve) {
-      const reserveWei = BigInt(Math.round(gasReserve * 1e9)) * 1_000_000_000n;
-      const sweepableWei = out.nativeBalanceWei - reserveWei;
-      if (sweepableWei > 0n) {
-        rawAssets.push({
+      if (!out.ok) {
+        chainWarnings.push(`${c.name} RPC timed out (${out.error ?? 'unavailable'}).`);
+        completedChains += 1;
+        options?.onChainProgress?.({
           chain: c.id,
-          address: 'native',
-          symbol: c.nativeSymbol,
-          name: `${c.name} Native ${c.nativeSymbol} (ex-gas reserve)`,
-          decimals: 18,
-          kind: 'native',
-          rawBalance: sweepableWei,
-          priceUsd: nativePrice,
-          liquidityUsd: 100_000_000,
+          chainName: c.name,
+          completed: completedChains,
+          total: totalChains,
+          assetCount: 0,
+          ok: false,
+        });
+        return { chainAssets, chainWarnings };
+      }
+
+      // Reserve each chain's configured native gas buffer so users aren't stranded on follow-up txs or low-unit-price chains
+      const gasReserve = c.gasReserveNative;
+      if (nativeUi > gasReserve) {
+        const reserveWei = BigInt(Math.round(gasReserve * 1e9)) * 1_000_000_000n;
+        const sweepableWei = out.nativeBalanceWei - reserveWei;
+        if (sweepableWei > 0n) {
+          chainAssets.push({
+            chain: c.id,
+            address: 'native',
+            symbol: c.nativeSymbol,
+            name: `${c.name} Native ${c.nativeSymbol} (ex-gas reserve)`,
+            decimals: 18,
+            kind: 'native',
+            rawBalance: sweepableWei,
+            priceUsd: nativePrice,
+            liquidityUsd: 100_000_000,
+          });
+        }
+      }
+
+      const chainTokens = TOKEN_REGISTRY.filter((t) => t.chain === c.id);
+      const seenAddrs = new Set<string>();
+      for (const tok of chainTokens) {
+        const rawBal = out.tokenBalances.get(tok.address.toLowerCase());
+        if (!rawBal || rawBal === 0n) continue;
+        seenAddrs.add(tok.address.toLowerCase());
+        const priceUsd = (tok.llamaKey ? prices.get(tok.llamaKey) : undefined) ?? 0;
+        const pricingUnavailable = priceUsd <= 0;
+        chainAssets.push({
+          chain: c.id,
+          address: tok.address,
+          symbol: tok.symbol,
+          name: tok.name,
+          decimals: tok.decimals,
+          kind: tok.kind,
+          protocol: tok.protocol,
+          protocolAddress: tok.protocolAddress,
+          underlyingSymbol: tok.underlyingSymbol,
+          underlyingAddress: tok.underlyingAddress,
+          rawBalance: rawBal,
+          priceUsd,
+          liquidityUsd: priceUsd > 0 ? 5_000_000 : 0,
+          isRegistryToken: true,
+          pricingUnavailable,
         });
       }
-    }
 
-    const chainTokens = TOKEN_REGISTRY.filter((t) => t.chain === c.id);
-    const seenAddrs = new Set<string>();
-    for (const tok of chainTokens) {
-      const rawBal = out.tokenBalances.get(tok.address.toLowerCase());
-      if (!rawBal || rawBal === 0n) continue;
-      seenAddrs.add(tok.address.toLowerCase());
-      const priceUsd = (tok.llamaKey ? prices.get(tok.llamaKey) : undefined) ?? 0;
-      const pricingUnavailable = priceUsd <= 0;
-      rawAssets.push({
-        chain: c.id,
-        address: tok.address,
-        symbol: tok.symbol,
-        name: tok.name,
-        decimals: tok.decimals,
-        kind: tok.kind,
-        protocol: tok.protocol,
-        protocolAddress: tok.protocolAddress,
-        underlyingSymbol: tok.underlyingSymbol,
-        underlyingAddress: tok.underlyingAddress,
-        rawBalance: rawBal,
-        priceUsd,
-        liquidityUsd: priceUsd > 0 ? 5_000_000 : 0,
-        isRegistryToken: true,
-        pricingUnavailable,
-      });
-    }
+      // Start Uniswap v3 / Aerodrome CL NFT discovery concurrently with discovered ERC-20 enrichment
+      const nftPositionsPromise = discoverUniswapV3NftPositions(c.id, cleanAddr, 4).catch(() => []);
 
-    // Merge real discovered arbitrary ERC-20s with live DexScreener liquidity verification
-    // and expanded DeFi protocol auto-probing (Aave v2/v3, ERC-4626, Compound v2/Venus/Benqi, Uni v2/Aero v2 LP)
-    const discoveredChainTokens = discoveredByChain.get(c.id) ?? [];
-    if (discoveredChainTokens.length > 0) {
-      const novelTokens = discoveredChainTokens.filter((dt) => !seenAddrs.has(dt.address.toLowerCase()));
-      const novelBalancesMap = new Map(novelTokens.map((dt) => [dt.address.toLowerCase(), dt.rawBalance]));
-      const [dexLiquidityResult, defiReceiptMap] = await Promise.all([
-        fetchDexLiquidityBatchWithStatus(
-          c.id,
-          novelTokens.map((dt) => dt.address)
-        ),
-        probeExpandedDefiContracts({
-          chain: c.id,
-          tokenAddresses: novelTokens.map((dt) => dt.address),
-          rawBalances: novelBalancesMap,
-        }),
-      ]);
-      const dexLiquidityMap = dexLiquidityResult.liquidity;
-      if (!dexLiquidityResult.ok && novelTokens.length > 0) {
-        warnings.push(
-          `${c.name} DexScreener liquidity lookup failed (${dexLiquidityResult.error ?? 'unavailable'}) — unverified tokens safely skipped instead of burned.`
+      // Merge real discovered arbitrary ERC-20s with live DexScreener liquidity verification
+      // and expanded DeFi protocol auto-probing (Aave v2/v3, ERC-4626, Compound v2/Venus/Benqi, Uni v2/Aero v2 LP)
+      const discoveredChainTokens = discoveredByChain.get(c.id) ?? [];
+      if (discoveredChainTokens.length > 0) {
+        const novelTokens = discoveredChainTokens.filter((dt) => !seenAddrs.has(dt.address.toLowerCase()));
+        const novelBalancesMap = new Map(novelTokens.map((dt) => [dt.address.toLowerCase(), dt.rawBalance]));
+        const [dexLiquidityResult, defiReceiptMap] = await Promise.all([
+          fetchDexLiquidityBatchWithStatus(
+            c.id,
+            novelTokens.map((dt) => dt.address)
+          ),
+          probeExpandedDefiContracts({
+            chain: c.id,
+            tokenAddresses: novelTokens.map((dt) => dt.address),
+            rawBalances: novelBalancesMap,
+          }),
+        ]);
+        const dexLiquidityMap = dexLiquidityResult.liquidity;
+        if (!dexLiquidityResult.ok && novelTokens.length > 0) {
+          chainWarnings.push(
+            `${c.name} DexScreener liquidity lookup failed (${dexLiquidityResult.error ?? 'unavailable'}) — unverified tokens safely skipped instead of burned.`
+          );
+        }
+
+        // Fetch prices for any auto-detected DeFi underlying assets (ERC-4626 / Yearn v2 / Aave / Compound v2 / LP token0+token1)
+        const defiUnderlyings = Array.from(defiReceiptMap.values()).flatMap((d) =>
+          d.secondaryUnderlyingAddress ? [d.underlyingAddress, d.secondaryUnderlyingAddress] : [d.underlyingAddress]
         );
-      }
+        const llamaChainSlug = DEFILLAMA_CHAIN_SLUGS[c.id] ?? c.id;
+        const [underlyingDexMap, underlyingLlamaMap] = defiUnderlyings.length
+          ? await Promise.all([
+              fetchDexLiquidityBatch(c.id, defiUnderlyings),
+              fetchLiveUsdPrices(defiUnderlyings.map((u) => `${llamaChainSlug}:${u}`)),
+            ])
+          : [new Map(), new Map<string, number>()];
 
-      // Fetch prices for any auto-detected DeFi underlying assets (ERC-4626 / Yearn v2 / Aave / Compound v2 / LP token0+token1)
-      const defiUnderlyings = Array.from(defiReceiptMap.values()).flatMap((d) =>
-        d.secondaryUnderlyingAddress ? [d.underlyingAddress, d.secondaryUnderlyingAddress] : [d.underlyingAddress]
-      );
-      const llamaChainSlug = DEFILLAMA_CHAIN_SLUGS[c.id] ?? c.id;
-      const [underlyingDexMap, underlyingLlamaMap] = defiUnderlyings.length
-        ? await Promise.all([
-            fetchDexLiquidityBatch(c.id, defiUnderlyings),
-            fetchLiveUsdPrices(defiUnderlyings.map((u) => `${llamaChainSlug}:${u}`)),
-          ])
-        : [new Map(), new Map<string, number>()];
+        const liquidCandidates: Array<{
+          dt: (typeof novelTokens)[number];
+          verifiedLiq: number;
+          verifiedPrice: number;
+          volume24hUsd: number;
+          isRegistry: boolean;
+        }> = [];
+        const extraDead: typeof novelTokens = [];
+        for (const dt of novelTokens) {
+          if (seenAddrs.has(dt.address.toLowerCase())) continue;
+          seenAddrs.add(dt.address.toLowerCase());
 
-      const liquidCandidates: Array<{
-        dt: (typeof novelTokens)[number];
-        verifiedLiq: number;
-        verifiedPrice: number;
-        volume24hUsd: number;
-        isRegistry: boolean;
-      }> = [];
-      const extraDead: typeof novelTokens = [];
-      for (const dt of novelTokens) {
-        if (seenAddrs.has(dt.address.toLowerCase())) continue;
-        seenAddrs.add(dt.address.toLowerCase());
+          const defiReceipt = defiReceiptMap.get(dt.address.toLowerCase());
+          if (defiReceipt) {
+            const isUsdcUnderlying =
+              defiReceipt.underlyingAddress.toLowerCase() === c.usdcAddress.toLowerCase();
+            const uDex = underlyingDexMap.get(defiReceipt.underlyingAddress.toLowerCase());
+            const uLlama = underlyingLlamaMap.get(`${llamaChainSlug}:${defiReceipt.underlyingAddress}`);
+            const uPriceUsd = isUsdcUnderlying ? 1.0 : uDex?.priceUsd || uLlama || 0;
 
-        const defiReceipt = defiReceiptMap.get(dt.address.toLowerCase());
-        if (defiReceipt) {
-          const isUsdcUnderlying =
-            defiReceipt.underlyingAddress.toLowerCase() === c.usdcAddress.toLowerCase();
-          const uDex = underlyingDexMap.get(defiReceipt.underlyingAddress.toLowerCase());
-          const uLlama = underlyingLlamaMap.get(`${llamaChainSlug}:${defiReceipt.underlyingAddress}`);
-          const uPriceUsd = isUsdcUnderlying ? 1.0 : uDex?.priceUsd || uLlama || 0;
+            if (defiReceipt.protocolId === 'uniswap_v2_lp' && defiReceipt.secondaryUnderlyingAddress) {
+              const isUsdc1 =
+                defiReceipt.secondaryUnderlyingAddress.toLowerCase() === c.usdcAddress.toLowerCase();
+              const u1Dex = underlyingDexMap.get(defiReceipt.secondaryUnderlyingAddress.toLowerCase());
+              const u1Llama = underlyingLlamaMap.get(`${llamaChainSlug}:${defiReceipt.secondaryUnderlyingAddress}`);
+              const u1PriceUsd = isUsdc1 ? 1.0 : u1Dex?.priceUsd || u1Llama || 0;
+              const dec0 = resolveUnderlyingDecimals({
+                chain: c.id,
+                underlyingAddress: defiReceipt.underlyingAddress,
+                fallbackDecimals: 18,
+              });
+              const dec1 = resolveUnderlyingDecimals({
+                chain: c.id,
+                underlyingAddress: defiReceipt.secondaryUnderlyingAddress,
+                fallbackDecimals: 18,
+              });
+              const ui0 = defiReceipt.expectedUnderlyingRaw
+                ? formatUnits(defiReceipt.expectedUnderlyingRaw, dec0)
+                : 0;
+              const ui1 = defiReceipt.expectedSecondaryRaw
+                ? formatUnits(defiReceipt.expectedSecondaryRaw, dec1)
+                : 0;
+              const lpTotalUsd = ui0 * uPriceUsd + ui1 * u1PriceUsd;
+              const lpUi = formatUnits(dt.rawBalance, dt.decimals);
+              const effectiveLpPrice = lpUi > 0 ? lpTotalUsd / lpUi : 0;
+              if (lpTotalUsd > 0 && effectiveLpPrice > 0) {
+                chainAssets.push({
+                  chain: c.id,
+                  address: dt.address,
+                  symbol: dt.symbol,
+                  name: dt.name,
+                  decimals: dt.decimals,
+                  kind: 'defi_position',
+                  protocol: defiReceipt.protocol,
+                  protocolAddress: defiReceipt.protocolAddress,
+                  underlyingSymbol: isUsdcUnderlying ? 'USDC' : 'TOKEN0',
+                  underlyingAddress: defiReceipt.underlyingAddress,
+                  lpToken0Address: defiReceipt.underlyingAddress,
+                  lpToken0Symbol: isUsdcUnderlying ? 'USDC' : 'TOKEN0',
+                  lpToken0Decimals: dec0,
+                  lpToken1Address: defiReceipt.secondaryUnderlyingAddress,
+                  lpToken1Symbol: isUsdc1 ? 'USDC' : 'TOKEN1',
+                  lpToken1Decimals: dec1,
+                  lpRouterAddress: defiReceipt.lpRouterAddress,
+                  lpStable: defiReceipt.lpStable,
+                  expectedUnderlyingRaw: defiReceipt.expectedUnderlyingRaw,
+                  expectedSecondaryRaw: defiReceipt.expectedSecondaryRaw,
+                  rawBalance: dt.rawBalance,
+                  priceUsd: effectiveLpPrice,
+                  liquidityUsd: Math.max(500_000, (uDex?.liquidityUsd ?? 0) + (u1Dex?.liquidityUsd ?? 0)),
+                  dexLiquidityVerified: true,
+                });
+                continue;
+              }
+            }
 
-          if (defiReceipt.protocolId === 'uniswap_v2_lp' && defiReceipt.secondaryUnderlyingAddress) {
-            const isUsdc1 =
-              defiReceipt.secondaryUnderlyingAddress.toLowerCase() === c.usdcAddress.toLowerCase();
-            const u1Dex = underlyingDexMap.get(defiReceipt.secondaryUnderlyingAddress.toLowerCase());
-            const u1Llama = underlyingLlamaMap.get(`${llamaChainSlug}:${defiReceipt.secondaryUnderlyingAddress}`);
-            const u1PriceUsd = isUsdc1 ? 1.0 : u1Dex?.priceUsd || u1Llama || 0;
-            const dec0 = resolveUnderlyingDecimals({
-              chain: c.id,
-              underlyingAddress: defiReceipt.underlyingAddress,
-              fallbackDecimals: 18,
-            });
-            const dec1 = resolveUnderlyingDecimals({
-              chain: c.id,
-              underlyingAddress: defiReceipt.secondaryUnderlyingAddress,
-              fallbackDecimals: 18,
-            });
-            const ui0 = defiReceipt.expectedUnderlyingRaw
-              ? formatUnits(defiReceipt.expectedUnderlyingRaw, dec0)
-              : 0;
-            const ui1 = defiReceipt.expectedSecondaryRaw
-              ? formatUnits(defiReceipt.expectedSecondaryRaw, dec1)
-              : 0;
-            const lpTotalUsd = ui0 * uPriceUsd + ui1 * u1PriceUsd;
-            const lpUi = formatUnits(dt.rawBalance, dt.decimals);
-            const effectiveLpPrice = lpUi > 0 ? lpTotalUsd / lpUi : 0;
-            if (lpTotalUsd > 0 && effectiveLpPrice > 0) {
-              rawAssets.push({
+            if (uPriceUsd > 0) {
+              let effectivePriceUsd = uPriceUsd;
+              let expectedUnderlyingRaw = defiReceipt.expectedUnderlyingRaw;
+              let underlyingSymbol = isUsdcUnderlying ? 'USDC' : dt.symbol.replace(/^[ascv]/i, '');
+              let underlyingDecimals = isUsdcUnderlying ? 6 : dt.decimals;
+
+              if (defiReceipt.protocolId === 'compound_v2' && defiReceipt.expectedUnderlyingRaw) {
+                const uDec = isUsdcUnderlying ? 6 : 18;
+                underlyingDecimals = uDec;
+                const expectedUi = formatUnits(defiReceipt.expectedUnderlyingRaw, uDec);
+                const cUi = formatUnits(dt.rawBalance, dt.decimals);
+                if (cUi > 0 && expectedUi > 0) {
+                  effectivePriceUsd = (expectedUi * uPriceUsd) / cUi;
+                }
+              } else if (defiReceipt.protocolId === 'yearn_v2' && defiReceipt.exchangeRateStored) {
+                underlyingSymbol = isUsdcUnderlying
+                  ? 'USDC'
+                  : dt.symbol.replace(/^yv/i, '') || dt.symbol;
+                underlyingDecimals = dt.decimals;
+                expectedUnderlyingRaw = computeYearnV2UnderlyingRaw(
+                  dt.rawBalance,
+                  defiReceipt.exchangeRateStored,
+                  dt.decimals
+                );
+                const expectedUi = formatUnits(expectedUnderlyingRaw, dt.decimals);
+                const shareUi = formatUnits(dt.rawBalance, dt.decimals);
+                if (shareUi > 0 && expectedUi > 0) {
+                  effectivePriceUsd = (expectedUi * uPriceUsd) / shareUi;
+                }
+              }
+
+              chainAssets.push({
                 chain: c.id,
                 address: dt.address,
                 symbol: dt.symbol,
@@ -761,224 +871,181 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
                 kind: 'defi_position',
                 protocol: defiReceipt.protocol,
                 protocolAddress: defiReceipt.protocolAddress,
-                underlyingSymbol: isUsdcUnderlying ? 'USDC' : 'TOKEN0',
+                underlyingSymbol,
                 underlyingAddress: defiReceipt.underlyingAddress,
-                lpToken0Address: defiReceipt.underlyingAddress,
-                lpToken0Symbol: isUsdcUnderlying ? 'USDC' : 'TOKEN0',
-                lpToken0Decimals: dec0,
-                lpToken1Address: defiReceipt.secondaryUnderlyingAddress,
-                lpToken1Symbol: isUsdc1 ? 'USDC' : 'TOKEN1',
-                lpToken1Decimals: dec1,
-                lpRouterAddress: defiReceipt.lpRouterAddress,
-                lpStable: defiReceipt.lpStable,
-                expectedUnderlyingRaw: defiReceipt.expectedUnderlyingRaw,
-                expectedSecondaryRaw: defiReceipt.expectedSecondaryRaw,
+                underlyingDecimals,
+                expectedUnderlyingRaw,
                 rawBalance: dt.rawBalance,
-                priceUsd: effectiveLpPrice,
-                liquidityUsd: Math.max(500_000, (uDex?.liquidityUsd ?? 0) + (u1Dex?.liquidityUsd ?? 0)),
+                priceUsd: effectivePriceUsd,
+                liquidityUsd: isUsdcUnderlying ? 100_000_000 : Math.max(5_000_000, uDex?.liquidityUsd ?? 5_000_000),
                 dexLiquidityVerified: true,
               });
               continue;
             }
           }
 
-          if (uPriceUsd > 0) {
-            let effectivePriceUsd = uPriceUsd;
-            let expectedUnderlyingRaw = defiReceipt.expectedUnderlyingRaw;
-            let underlyingSymbol = isUsdcUnderlying ? 'USDC' : dt.symbol.replace(/^[ascv]/i, '');
-            let underlyingDecimals = isUsdcUnderlying ? 6 : dt.decimals;
+          const addrLower = dt.address.toLowerCase();
+          const dex = dexLiquidityMap.get(addrLower);
+          const verifiedLiq = dex?.liquidityUsd ?? 0;
+          const verifiedPrice = dex && dex.priceUsd > 0 ? dex.priceUsd : 0;
+          const verifiedVol24h = dex?.volume24hUsd ?? 0;
+          const isRegistry = isCuratedRegistryToken(c.id, dt.address);
+          const dexCheckedCleanly =
+            dexLiquidityResult.ok && dexLiquidityResult.queriedAddresses.has(addrLower);
 
-            if (defiReceipt.protocolId === 'compound_v2' && defiReceipt.expectedUnderlyingRaw) {
-              const uDec = isUsdcUnderlying ? 6 : 18;
-              underlyingDecimals = uDec;
-              const expectedUi = formatUnits(defiReceipt.expectedUnderlyingRaw, uDec);
-              const cUi = formatUnits(dt.rawBalance, dt.decimals);
-              if (cUi > 0 && expectedUi > 0) {
-                effectivePriceUsd = (expectedUi * uPriceUsd) / cUi;
-              }
-            } else if (defiReceipt.protocolId === 'yearn_v2' && defiReceipt.exchangeRateStored) {
-              underlyingSymbol = isUsdcUnderlying
-                ? 'USDC'
-                : dt.symbol.replace(/^yv/i, '') || dt.symbol;
-              underlyingDecimals = dt.decimals;
-              expectedUnderlyingRaw = computeYearnV2UnderlyingRaw(
-                dt.rawBalance,
-                defiReceipt.exchangeRateStored,
-                dt.decimals
-              );
-              const expectedUi = formatUnits(expectedUnderlyingRaw, dt.decimals);
-              const shareUi = formatUnits(dt.rawBalance, dt.decimals);
-              if (shareUi > 0 && expectedUi > 0) {
-                effectivePriceUsd = (expectedUi * uPriceUsd) / shareUi;
-              }
-            }
-
-            rawAssets.push({
+          // Require verified DEX liquidity >= $2,500 before counting a discovered long-tail token as sellable USD
+          if (verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD && verifiedPrice > 0) {
+            liquidCandidates.push({
+              dt,
+              verifiedLiq,
+              verifiedPrice,
+              volume24hUsd: verifiedVol24h,
+              isRegistry,
+            });
+          } else if (!dexCheckedCleanly || isRegistry || verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD) {
+            // CRIT-08 / HIGH-07: When DexScreener lookup fails/times out, token is in curated TOKEN_REGISTRY,
+            // or verified liquidity >= $2,500 without derivable spot price,
+            // NEVER classify as BURN_ZERO_LIQUIDITY — fail closed to SKIP_UNPRICED.
+            chainAssets.push({
               chain: c.id,
               address: dt.address,
               symbol: dt.symbol,
               name: dt.name,
               decimals: dt.decimals,
-              kind: 'defi_position',
-              protocol: defiReceipt.protocol,
-              protocolAddress: defiReceipt.protocolAddress,
-              underlyingSymbol,
-              underlyingAddress: defiReceipt.underlyingAddress,
-              underlyingDecimals,
-              expectedUnderlyingRaw,
+              kind: 'erc20',
               rawBalance: dt.rawBalance,
-              priceUsd: effectivePriceUsd,
-              liquidityUsd: isUsdcUnderlying ? 100_000_000 : Math.max(5_000_000, uDex?.liquidityUsd ?? 5_000_000),
-              dexLiquidityVerified: true,
+              priceUsd: 0,
+              liquidityUsd: Math.round(verifiedLiq),
+              dexLiquidityVerified: verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD,
+              isRegistryToken: isRegistry,
+              dexLookupFailed: !dexCheckedCleanly,
+              pricingUnavailable: isRegistry || verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD,
             });
-            continue;
+          } else if (extraDead.length < 6) {
+            extraDead.push(dt);
           }
         }
 
-        const addrLower = dt.address.toLowerCase();
-        const dex = dexLiquidityMap.get(addrLower);
-        const verifiedLiq = dex?.liquidityUsd ?? 0;
-        const verifiedPrice = dex && dex.priceUsd > 0 ? dex.priceUsd : 0;
-        const verifiedVol24h = dex?.volume24hUsd ?? 0;
-        const isRegistry = isCuratedRegistryToken(c.id, dt.address);
-        const dexCheckedCleanly =
-          dexLiquidityResult.ok && dexLiquidityResult.queriedAddresses.has(addrLower);
-
-        // Require verified DEX liquidity >= $2,500 before counting a discovered long-tail token as sellable USD
-        if (verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD && verifiedPrice > 0) {
-          liquidCandidates.push({
-            dt,
-            verifiedLiq,
-            verifiedPrice,
-            volume24hUsd: verifiedVol24h,
-            isRegistry,
+        // HIGH-07: Live onchain eth_call transfer/honeypot verification across ALL novel discovered ERC-20s
+        // (both >= $2,500 LP liquid candidates AND < $2,500 LP / zero-liquidity candidates)
+        // so transfer-locked phishing tokens with >= $2,500 locked LP are caught as SKIP_HONEYPOT!
+        const simTargets = [
+          ...liquidCandidates.filter((item) => !item.isRegistry).map((item) => item.dt),
+          ...extraDead,
+        ];
+        const simByAddr = new Map<string, { safeToBurn: boolean; reason: string }>();
+        if (simTargets.length > 0) {
+          const simChecks = await Promise.all(
+            simTargets.map((dt) =>
+              simulateBurnTransferOnchain({
+                chain: c.id,
+                walletAddress: cleanAddr,
+                tokenAddress: dt.address,
+                rawAmount: dt.rawBalance,
+              })
+            )
+          );
+          simTargets.forEach((dt, idx) => {
+            simByAddr.set(dt.address.toLowerCase(), simChecks[idx]);
           });
-        } else if (!dexCheckedCleanly || isRegistry || verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD) {
-          // CRIT-08 / HIGH-07: When DexScreener lookup fails/times out, token is in curated TOKEN_REGISTRY,
-          // or verified liquidity >= $2,500 without derivable spot price,
-          // NEVER classify as BURN_ZERO_LIQUIDITY — fail closed to SKIP_UNPRICED.
-          rawAssets.push({
+        }
+
+        for (const item of liquidCandidates) {
+          const sim = simByAddr.get(item.dt.address.toLowerCase());
+          chainAssets.push({
+            chain: c.id,
+            address: item.dt.address,
+            symbol: item.dt.symbol,
+            name: item.dt.name,
+            decimals: item.dt.decimals,
+            kind: 'erc20',
+            rawBalance: item.dt.rawBalance,
+            priceUsd: item.verifiedPrice,
+            liquidityUsd: Math.round(item.verifiedLiq),
+            volume24hUsd: item.volume24hUsd,
+            honeypot: sim ? !sim.safeToBurn : false,
+            dexLiquidityVerified: true,
+            isRegistryToken: item.isRegistry,
+          });
+        }
+
+        for (const dt of extraDead) {
+          const sim = simByAddr.get(dt.address.toLowerCase());
+          chainAssets.push({
             chain: c.id,
             address: dt.address,
             symbol: dt.symbol,
             name: dt.name,
             decimals: dt.decimals,
-            kind: 'erc20',
+            kind: 'dead_token',
             rawBalance: dt.rawBalance,
             priceUsd: 0,
-            liquidityUsd: Math.round(verifiedLiq),
-            dexLiquidityVerified: verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD,
-            isRegistryToken: isRegistry,
-            dexLookupFailed: !dexCheckedCleanly,
-            pricingUnavailable: isRegistry || verifiedLiq >= MIN_VERIFIED_DEX_LIQUIDITY_USD,
+            liquidityUsd: 0,
+            honeypot: sim ? !sim.safeToBurn : false,
+            dexLiquidityVerified: false,
           });
-        } else if (extraDead.length < 6) {
-          extraDead.push(dt);
         }
       }
 
-      // HIGH-07: Live onchain eth_call transfer/honeypot verification across ALL novel discovered ERC-20s
-      // (both >= $2,500 LP liquid candidates AND < $2,500 LP / zero-liquidity candidates)
-      // so transfer-locked phishing tokens with >= $2,500 locked LP are caught as SKIP_HONEYPOT!
-      const simTargets = [
-        ...liquidCandidates.filter((item) => !item.isRegistry).map((item) => item.dt),
-        ...extraDead,
-      ];
-      const simByAddr = new Map<string, { safeToBurn: boolean; reason: string }>();
-      if (simTargets.length > 0) {
-        const simChecks = await Promise.all(
-          simTargets.map((dt) =>
-            simulateBurnTransferOnchain({
-              chain: c.id,
-              walletAddress: cleanAddr,
-              tokenAddress: dt.address,
-              rawAmount: dt.rawBalance,
-            })
-          )
-        );
-        simTargets.forEach((dt, idx) => {
-          simByAddr.set(dt.address.toLowerCase(), simChecks[idx]);
-        });
-      }
-
-      for (const item of liquidCandidates) {
-        const sim = simByAddr.get(item.dt.address.toLowerCase());
-        rawAssets.push({
+      const nftPositions = await nftPositionsPromise;
+      for (const nft of nftPositions) {
+        const t0IsUsdc = nft.position.token0.toLowerCase() === c.usdcAddress.toLowerCase();
+        const t1IsUsdc = nft.position.token1.toLowerCase() === c.usdcAddress.toLowerCase();
+        const sym0 = t0IsUsdc ? 'USDC' : 'TOKEN0';
+        const sym1 = t1IsUsdc ? 'USDC' : 'TOKEN1';
+        chainAssets.push({
           chain: c.id,
-          address: item.dt.address,
-          symbol: item.dt.symbol,
-          name: item.dt.name,
-          decimals: item.dt.decimals,
-          kind: 'erc20',
-          rawBalance: item.dt.rawBalance,
-          priceUsd: item.verifiedPrice,
-          liquidityUsd: Math.round(item.verifiedLiq),
-          volume24hUsd: item.volume24hUsd,
-          honeypot: sim ? !sim.safeToBurn : false,
-          dexLiquidityVerified: true,
-          isRegistryToken: item.isRegistry,
-        });
-      }
-
-      for (const dt of extraDead) {
-        const sim = simByAddr.get(dt.address.toLowerCase());
-        rawAssets.push({
-          chain: c.id,
-          address: dt.address,
-          symbol: dt.symbol,
-          name: dt.name,
-          decimals: dt.decimals,
-          kind: 'dead_token',
-          rawBalance: dt.rawBalance,
-          priceUsd: 0,
-          liquidityUsd: 0,
-          honeypot: sim ? !sim.safeToBurn : false,
-          dexLiquidityVerified: false,
-        });
-      }
-    }
-
-    // Discover active Uniswap v3 / Aerodrome CL NFT positions on this chain
-    const nftPositions = await discoverUniswapV3NftPositions(c.id, cleanAddr, 4).catch(() => []);
-    for (const nft of nftPositions) {
-      const t0IsUsdc = nft.position.token0.toLowerCase() === c.usdcAddress.toLowerCase();
-      const t1IsUsdc = nft.position.token1.toLowerCase() === c.usdcAddress.toLowerCase();
-      const sym0 = t0IsUsdc ? 'USDC' : 'TOKEN0';
-      const sym1 = t1IsUsdc ? 'USDC' : 'TOKEN1';
-      rawAssets.push({
-        chain: c.id,
-        address: nft.managerAddress,
-        symbol: `UNI-V3-#${nft.position.tokenId.toString()}`,
-        name: `${nft.protocol} Position #${nft.position.tokenId.toString()}`,
-        decimals: 0,
-        kind: 'defi_position',
-        protocol: nft.protocol,
-        protocolAddress: nft.managerAddress,
-        underlyingSymbol: sym0,
-        underlyingAddress: nft.position.token0,
-        lpToken0Address: nft.position.token0,
-        lpToken0Symbol: sym0,
-        lpToken0Decimals: resolveUnderlyingDecimals({
-          chain: c.id,
+          address: nft.managerAddress,
+          symbol: `UNI-V3-#${nft.position.tokenId.toString()}`,
+          name: `${nft.protocol} Position #${nft.position.tokenId.toString()}`,
+          decimals: 0,
+          kind: 'defi_position',
+          protocol: nft.protocol,
+          protocolAddress: nft.managerAddress,
+          underlyingSymbol: sym0,
           underlyingAddress: nft.position.token0,
-          fallbackDecimals: 18,
-        }),
-        lpToken1Address: nft.position.token1,
-        lpToken1Symbol: sym1,
-        lpToken1Decimals: resolveUnderlyingDecimals({
-          chain: c.id,
-          underlyingAddress: nft.position.token1,
-          fallbackDecimals: 18,
-        }),
-        nftTokenId: nft.position.tokenId.toString(),
-        nftLiquidity: nft.position.liquidity.toString(),
-        nftManagerAddress: nft.managerAddress,
-        rawBalance: nft.position.liquidity > 0n ? nft.position.liquidity : 1n,
-        priceUsd: 0,
-        liquidityUsd: 5_000_000,
-        dexLiquidityVerified: true,
+          lpToken0Address: nft.position.token0,
+          lpToken0Symbol: sym0,
+          lpToken0Decimals: resolveUnderlyingDecimals({
+            chain: c.id,
+            underlyingAddress: nft.position.token0,
+            fallbackDecimals: 18,
+          }),
+          lpToken1Address: nft.position.token1,
+          lpToken1Symbol: sym1,
+          lpToken1Decimals: resolveUnderlyingDecimals({
+            chain: c.id,
+            underlyingAddress: nft.position.token1,
+            fallbackDecimals: 18,
+          }),
+          nftTokenId: nft.position.tokenId.toString(),
+          nftLiquidity: nft.position.liquidity.toString(),
+          nftManagerAddress: nft.managerAddress,
+          rawBalance: nft.position.liquidity > 0n ? nft.position.liquidity : 1n,
+          priceUsd: 0,
+          liquidityUsd: 5_000_000,
+          dexLiquidityVerified: true,
+        });
+      }
+
+      completedChains += 1;
+      options?.onChainProgress?.({
+        chain: c.id,
+        chainName: c.name,
+        completed: completedChains,
+        total: totalChains,
+        assetCount: chainAssets.length,
+        ok: true,
       });
-    }
+
+      return { chainAssets, chainWarnings };
+    })
+  );
+
+  const rawAssets: RawAssetSeed[] = [];
+  for (const res of perChainResults) {
+    rawAssets.push(...res.chainAssets);
+    warnings.push(...res.chainWarnings);
   }
 
   // Merge protocol-indexed DeFi positions (lending, locked/veNFT, staking, margin deposits, vaults)
@@ -1008,6 +1075,7 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     };
 
     for (const pos of discoveredProtocolPositions) {
+      if (!targetChainSet.has(pos.chain)) continue;
       const poolKey = `${pos.chain}:${pos.poolAddress.toLowerCase()}`;
       const existing = existingDefiByPool.get(poolKey);
       if (existing) {
@@ -1148,8 +1216,9 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     }
   }
 
-  // Run live Aave v3 & Aave v2 getUserAccountData(user) debt safety checks on any chain with Aave positions
+  // Run Aave debt safety checks and Permit2 Multicall3 allowance checks in parallel
   const aavePoolKeys = new Map<string, { chain: EvmChainId; poolAddress?: string }>();
+  const erc20ByChain = new Map<EvmChainId, string[]>();
   for (const a of rawAssets) {
     if (a.kind === 'defi_position' && (a.protocol ?? '').toLowerCase().includes('aave')) {
       const isV2 = (a.protocol ?? '').toLowerCase().includes('aave v2');
@@ -1158,14 +1227,33 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
       const key = `${a.chain}:${(poolAddress ?? '').toLowerCase()}`;
       aavePoolKeys.set(key, { chain: a.chain, poolAddress });
     }
+    if (a.address !== 'native' && a.kind !== 'dead_token' && !a.honeypot) {
+      const list = erc20ByChain.get(a.chain) ?? [];
+      list.push(a.address);
+      erc20ByChain.set(a.chain, list);
+    }
   }
-  if (aavePoolKeys.size > 0) {
-    const aaveChecks = await Promise.all(
-      Array.from(aavePoolKeys.entries()).map(async ([key, { chain, poolAddress }]) => [
-        key,
-        await checkAaveV3AccountSafety(chain, cleanAddr, poolAddress),
-      ] as const)
-    );
+  const [aaveChecks, permit2Checks] = await Promise.all([
+    aavePoolKeys.size > 0
+      ? Promise.all(
+          Array.from(aavePoolKeys.entries()).map(async ([key, { chain, poolAddress }]) => [
+            key,
+            await checkAaveV3AccountSafety(chain, cleanAddr, poolAddress),
+          ] as const)
+        )
+      : Promise.resolve([]),
+    Promise.all(
+      Array.from(erc20ByChain.entries()).map(async ([chain, tokenAddresses]) => {
+        const approved = await detectPermit2Allowances({
+          chain,
+          owner: cleanAddr,
+          tokenAddresses,
+        });
+        return [chain, approved] as const;
+      })
+    ),
+  ]);
+  if (aaveChecks.length > 0) {
     const aaveMap = new Map(aaveChecks);
     for (const a of rawAssets) {
       if (a.kind === 'defi_position' && (a.protocol ?? '').toLowerCase().includes('aave')) {
@@ -1184,26 +1272,6 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
       }
     }
   }
-
-  // Check real onchain Permit2 allowances per chain in a single parallel Multicall3 pass
-  const erc20ByChain = new Map<EvmChainId, string[]>();
-  for (const a of rawAssets) {
-    if (a.address !== 'native' && a.kind !== 'dead_token' && !a.honeypot) {
-      const list = erc20ByChain.get(a.chain) ?? [];
-      list.push(a.address);
-      erc20ByChain.set(a.chain, list);
-    }
-  }
-  const permit2Checks = await Promise.all(
-    Array.from(erc20ByChain.entries()).map(async ([chain, tokenAddresses]) => {
-      const approved = await detectPermit2Allowances({
-        chain,
-        owner: cleanAddr,
-        tokenAddresses,
-      });
-      return [chain, approved] as const;
-    })
-  );
   const permit2Map = new Map(permit2Checks);
   for (const a of rawAssets) {
     if (a.address !== 'native') {
@@ -1220,6 +1288,7 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
     rawAssets,
     solPriceUsd,
     warnings,
+    scannedChains: targetChains,
   });
 }
 

@@ -51,6 +51,42 @@ function assertEvmChain(chain: AnyChainId): EvmChainId {
   return chain as EvmChainId;
 }
 
+export async function scanEvmWalletWithOptions(
+  address: string,
+  label?: string,
+  options?: Parameters<typeof scanLiveWallet>[2]
+): Promise<ScanReport> {
+  const clean = address.trim();
+  let targetAddress: string;
+  let resolvedLabel = label;
+
+  if (isValidEnsName(clean)) {
+    const normalizedEns = clean.toLowerCase();
+    targetAddress = await resolveEnsNameOrThrow(normalizedEns);
+    if (!resolvedLabel) resolvedLabel = normalizedEns;
+  } else {
+    const check = validateEvmHexAddress(clean);
+    if (!check.valid || !check.normalized) {
+      throw new Error(
+        check.reason ||
+          'Invalid EVM wallet address (expected 0x followed by 40 hex characters or a .eth ENS name).'
+      );
+    }
+    targetAddress = check.normalized;
+  }
+
+  const report = await scanLiveWallet(targetAddress, resolvedLabel, options);
+  report.family = 'evm';
+  for (const c of report.chains) {
+    c.family = 'evm';
+    c.sponsorshipMechanism = 'Permit2 Witness / EIP-7702 Gasless Relayer ($0 user gas)';
+  }
+  for (const a of report.assets) {
+    a.family = 'evm';
+  }
+  return report;
+}
+
 export const evmAdapter: ChainFamilyAdapter = {
   family: 'evm',
   meta: EVM_FAMILY_META,
@@ -60,35 +96,7 @@ export const evmAdapter: ChainFamilyAdapter = {
   },
 
   async scanWallet(address: string, label?: string): Promise<ScanReport> {
-    const clean = address.trim();
-    let targetAddress: string;
-    let resolvedLabel = label;
-
-    if (isValidEnsName(clean)) {
-      const normalizedEns = clean.toLowerCase();
-      targetAddress = await resolveEnsNameOrThrow(normalizedEns);
-      if (!resolvedLabel) resolvedLabel = normalizedEns;
-    } else {
-      const check = validateEvmHexAddress(clean);
-      if (!check.valid || !check.normalized) {
-        throw new Error(
-          check.reason ||
-            'Invalid EVM wallet address (expected 0x followed by 40 hex characters or a .eth ENS name).'
-        );
-      }
-      targetAddress = check.normalized;
-    }
-
-    const report = await scanLiveWallet(targetAddress, resolvedLabel);
-    report.family = 'evm';
-    for (const c of report.chains) {
-      c.family = 'evm';
-      c.sponsorshipMechanism = 'Permit2 Witness / EIP-7702 Gasless Relayer ($0 user gas)';
-    }
-    for (const a of report.assets) {
-      a.family = 'evm';
-    }
-    return report;
+    return scanEvmWalletWithOptions(address, label);
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {

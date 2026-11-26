@@ -11,3 +11,4 @@ broadcast/
 .turgalium-data/
 .vercel/
 .vercel
+public/vendor/
