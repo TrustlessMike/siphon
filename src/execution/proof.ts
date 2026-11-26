@@ -22,8 +22,8 @@ const ERC20_TRANSFER_TOPIC =
   '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const SOLANA_RPC_URLS = [
   process.env.SOLANA_RPC_URL?.trim(),
-  'https://solana-rpc.publicnode.com',
   'https://api.mainnet-beta.solana.com',
+  'https://solana.publicnode.com',
 ].filter((u): u is string => Boolean(u));
 
 const MAX_STORED_PROOFS = 2000;

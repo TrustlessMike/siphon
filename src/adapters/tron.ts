@@ -140,7 +140,6 @@ export const tronAdapter: ChainFamilyAdapter = {
   async scanWallet(address: string, label?: string): Promise<ScanReport> {
     const start = Date.now();
     const cleanAddr = address.trim();
-    const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
 
     const [acctRes, nowBlock, resources, priceMap] = await Promise.all([
@@ -316,10 +315,12 @@ export const tronAdapter: ChainFamilyAdapter = {
     }
 
     const grossUsd = Number(assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ grossUsd });
     const defiGrossUsd = Number(
       assets.filter((a) => a.kind === 'defi_position').reduce((s, a) => s + a.grossUsd, 0).toFixed(2)
     );
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const batchedGasUsd = Number(assets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(2));
     const singleTxGasUsd = Number(assets.reduce((s, a) => s + a.estimatedGasUsd, 0).toFixed(2));
     const slippageTotal = Number(assets.reduce((s, a) => s + a.estimatedSlippageUsd, 0).toFixed(2));
@@ -391,12 +392,13 @@ export const tronAdapter: ChainFamilyAdapter = {
 
   async prepareDirectBatch(params): Promise<PreparedNonEvmBatch> {
     const outputAsset = params.outputAsset ?? 'USDC';
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const feeRecipient = getNonEvmFeeRecipient('tron');
     const solanaUsdcAtaBytes32 = solanaAddressToBytes32(params.solanaDestination);
     const sweepable = filterChainSweepableAssets('tron', params.assets).filter(
       (a) => a.address !== 'stake_v2:trx'
     );
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
 
     const calls: PreparedNonEvmCall[] = [];
     const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
@@ -518,8 +520,8 @@ export const tronAdapter: ChainFamilyAdapter = {
       }
     }
 
-    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const estimatedFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     notes.push('TRC-20 USDT has no EIP-2612 permit(); Direct Mode executes standard approve + deposit TVM transactions in TronLink (like Rabby EOA).');
 
     return {
@@ -559,13 +561,14 @@ export const tronAdapter: ChainFamilyAdapter = {
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const chainAssets = filterChainSweepableAssets('tron', params.assets);
+    const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     const mintRecipientBytes32 = solanaAddressToBytes32(params.solanaDestination);
     const tronRouter =
       getNonEvmFeeRecipient('tron') || 'TTurgaliumTronRouterEnergyDelegat000';
-    const chainAssets = filterChainSweepableAssets('tron', params.assets);
-    const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const sponsoredGasEstUsd = Number(Math.max(0.35, chainAssets.length * 0.35).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - protocolFeeUsd - sponsoredGasEstUsd).toFixed(2));
     const minNetUsdcOut = BigInt(Math.round(estimatedNetUsd * 0.98 * 1_000_000)).toString();
@@ -648,7 +651,6 @@ export const tronAdapter: ChainFamilyAdapter = {
   },
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const cleanAddr = params.userAddress.trim();
     const userAddressValid = tronAdapter.matchesAddress(cleanAddr);
     let expectedBytes32 = '0x' + '00'.repeat(32);
@@ -661,6 +663,8 @@ export const tronAdapter: ChainFamilyAdapter = {
     }
 
     const sweepable = filterChainSweepableAssets('tron', params.assets);
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     const outputAsset = params.outputAsset ?? 'USDC';
 
     const [acctRes, nowBlock, resources, solSnap, priceMap] = await Promise.all([
@@ -719,8 +723,8 @@ export const tronAdapter: ChainFamilyAdapter = {
       Math.max(0, Number(resources?.NetLimit ?? 0) - Number(resources?.NetUsed ?? 0));
     const estimatedGasUsd = Number(Math.max(0.35, sweepable.length * 0.35).toFixed(2));
     const hasEnoughNativeGas = (availEnergy >= 65_000 && availBandwidth >= 350) || nativeBalanceUi >= 15;
-    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const feeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.98).toFixed(2));
     const tronReachable = blockNumber > 0;

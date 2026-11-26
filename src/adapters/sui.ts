@@ -197,10 +197,11 @@ export async function prepareSuiDirectBatch(
   }
 ): Promise<PreparedNonEvmBatch> {
   const outputAsset = params.outputAsset ?? 'USDC';
-  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
   const feeRecipient = getNonEvmFeeRecipient('sui');
   const solanaUsdcAtaBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
   const sweepable = filterChainSweepableAssets('sui', params.assets);
+  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
   const timeoutMs = params.auctionTimeoutMs ?? DEFAULT_NON_EVM_AUCTION_TIMEOUT_MS;
 
   const calls: PreparedNonEvmCall[] = [];
@@ -637,8 +638,8 @@ export async function prepareSuiDirectBatch(
     );
   }
 
-  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-  const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+  const estimatedFeeUsd =
+    feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
   if (!liveExecutable && calls.length > 0) {
     notes.push('Connect a funded Slush or Phantom (Sui) wallet to serialize and execute live PTB bytes via Wallet Standard.');
   }
@@ -691,7 +692,6 @@ export const suiAdapter: ChainFamilyAdapter = {
   async scanWallet(address: string, label?: string): Promise<ScanReport> {
     const start = Date.now();
     const cleanAddr = address.trim();
-    const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
 
     const escapedAddr = cleanAddr.replace(/[^0-9a-fA-Fx]/g, '');
@@ -880,10 +880,12 @@ export const suiAdapter: ChainFamilyAdapter = {
     }
 
     const grossUsd = Number(assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ grossUsd });
     const defiGrossUsd = Number(
       assets.filter((a) => a.kind === 'defi_position').reduce((s, a) => s + a.grossUsd, 0).toFixed(2)
     );
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const batchedGasUsd = Number(assets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(3));
     const singleTxGasUsd = Number(assets.reduce((s, a) => s + a.estimatedGasUsd, 0).toFixed(3));
     const slippageTotal = Number(assets.reduce((s, a) => s + a.estimatedSlippageUsd, 0).toFixed(2));
@@ -957,15 +959,16 @@ export const suiAdapter: ChainFamilyAdapter = {
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const chainAssets = filterChainSweepableAssets('sui', params.assets);
+    const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     // Canonical SPL USDC ATA PDA (never raw Solana owner pubkey!)
     const mintRecipientBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
     const sponsorAddress =
       getNonEvmFeeRecipient('sui') ||
       '0x00000000000000000000000000000000000000000000000000000000000051f0';
-    const chainAssets = filterChainSweepableAssets('sui', params.assets);
-    const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const sponsoredGasEstUsd = 0.01;
     const estimatedNetUsd = Number(Math.max(0, grossUsd - protocolFeeUsd - sponsoredGasEstUsd).toFixed(2));
     const minNetUsdcOut = BigInt(Math.round(estimatedNetUsd * 0.985 * 1_000_000)).toString();
@@ -1065,7 +1068,6 @@ export const suiAdapter: ChainFamilyAdapter = {
   },
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const cleanAddr = params.userAddress.trim();
     const userAddressValid = suiAdapter.matchesAddress(cleanAddr);
     let expectedBytes32 = '0x' + '00'.repeat(32);
@@ -1078,6 +1080,8 @@ export const suiAdapter: ChainFamilyAdapter = {
     }
 
     const sweepable = filterChainSweepableAssets('sui', params.assets);
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     const outputAsset = params.outputAsset ?? 'USDC';
     const escapedAddr = cleanAddr.replace(/[^0-9a-fA-Fx]/g, '');
 
@@ -1135,8 +1139,8 @@ export const suiAdapter: ChainFamilyAdapter = {
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
     const estimatedGasUsd = 0.01;
     const hasEnoughNativeGas = nativeBalanceUi >= 0.05;
-    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const feeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
     const rpcReachable = blockNumber > 0;

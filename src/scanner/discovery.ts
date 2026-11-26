@@ -21,9 +21,9 @@ import type { EvmChainId } from './types.js';
 
 export const SOLANA_USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 export const SOLANA_RPC_URLS = [
-  process.env.SOLANA_RPC_URL,
-  'https://solana-rpc.publicnode.com',
+  process.env.SOLANA_RPC_URL?.trim(),
   'https://api.mainnet-beta.solana.com',
+  'https://solana.publicnode.com',
 ].filter((u): u is string => Boolean(u));
 export const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
 

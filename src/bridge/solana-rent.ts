@@ -34,8 +34,8 @@ const SPL_CLOSE_ACCOUNT_INSTRUCTION_INDEX = 9;
 
 const DEFAULT_SOLANA_RPC_URLS = [
   process.env.SOLANA_RPC_URL?.trim(),
-  'https://solana-rpc.publicnode.com',
   'https://api.mainnet-beta.solana.com',
+  'https://solana.publicnode.com',
 ].filter((u): u is string => Boolean(u));
 
 export type SolanaTokenProgramKind = 'spl-token' | 'token-2022';

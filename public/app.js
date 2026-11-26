@@ -334,12 +334,21 @@ function formatCompactBalance(val) {
   return n.toLocaleString(undefined, { maximumFractionDigits: 4 });
 }
 
+const PRESERVATION_FEE_BRACKETS = [
+  { minGrossUsd: 0, maxGrossUsd: 50, feeBps: 500, capUsd: null, tierLabel: 'Micro-Dust (<$50)' },
+  { minGrossUsd: 50, maxGrossUsd: 500, feeBps: 100, capUsd: null, tierLabel: 'Small ($50–$500)' },
+  { minGrossUsd: 500, maxGrossUsd: 5000, feeBps: 25, capUsd: null, tierLabel: 'Mid ($500–$5k)' },
+  { minGrossUsd: 5000, maxGrossUsd: null, feeBps: 10, capUsd: 50, tierLabel: 'Principal ($5k+)' },
+];
+
 function computeTieredPreservationFee(grossUsdInput) {
-  const grossUsd = Math.max(0, Number(grossUsdInput) || 0);
+  const raw = Number(grossUsdInput);
+  const grossUsd = Number.isFinite(raw) && raw > 0 ? Number(raw.toFixed(2)) : 0;
   if (grossUsd <= 0) {
     return {
       grossUsd: 0,
       feeBps: 0,
+      effectiveFeeBps: 0,
       feePercentLabel: '0.00%',
       feeUsd: 0,
       capUsd: null,
@@ -349,38 +358,41 @@ function computeTieredPreservationFee(grossUsdInput) {
       tierLabel: 'Zero',
     };
   }
-  let feeBps = 10;
-  let capUsd = 50;
-  let tierLabel = 'Principal ($5k+)';
-  if (grossUsd < 50) {
-    feeBps = 500;
-    capUsd = null;
-    tierLabel = 'Micro-Dust (<$50)';
-  } else if (grossUsd < 500) {
-    feeBps = 100;
-    capUsd = null;
-    tierLabel = 'Small ($50–$500)';
-  } else if (grossUsd < 5000) {
-    feeBps = 25;
-    capUsd = null;
-    tierLabel = 'Mid ($500–$5k)';
+  const matchedTier =
+    PRESERVATION_FEE_BRACKETS.find(
+      (t) => grossUsd >= t.minGrossUsd && (t.maxGrossUsd === null || grossUsd < t.maxGrossUsd)
+    ) || PRESERVATION_FEE_BRACKETS[PRESERVATION_FEE_BRACKETS.length - 1];
+
+  let uncappedFeeRaw = 0;
+  for (const tier of PRESERVATION_FEE_BRACKETS) {
+    if (grossUsd <= tier.minGrossUsd) break;
+    const upper = tier.maxGrossUsd === null ? grossUsd : Math.min(grossUsd, tier.maxGrossUsd);
+    const sliceUsd = Math.max(0, upper - tier.minGrossUsd);
+    if (sliceUsd <= 0) continue;
+    uncappedFeeRaw += (sliceUsd * tier.feeBps) / 10_000;
   }
-  const uncappedFeeUsd = Number(((grossUsd * feeBps) / 10_000).toFixed(2));
-  const capApplied = capUsd !== null && uncappedFeeUsd > capUsd;
-  const feeUsd = capApplied ? capUsd : uncappedFeeUsd;
+
+  const feeBps = matchedTier.feeBps;
+  const capUsd = matchedTier.capUsd;
+  const hardCapUsd = capUsd !== null ? capUsd : 50;
+  const uncappedFeeUsd = Number(uncappedFeeRaw.toFixed(2));
+  const capApplied = uncappedFeeUsd > hardCapUsd;
+  const feeUsd = capApplied ? hardCapUsd : uncappedFeeUsd;
+  const effectiveFeeBps = Number(((feeUsd / grossUsd) * 10_000).toFixed(2));
   const legacy7PctUsd = Number(((grossUsd * 700) / 10_000).toFixed(2));
   const savedVs7PctUsd = Number(Math.max(0, legacy7PctUsd - feeUsd).toFixed(2));
   const feePercentLabel = `${(feeBps / 100).toFixed(2)}%`;
   return {
     grossUsd,
     feeBps,
+    effectiveFeeBps,
     feePercentLabel,
     feeUsd,
     capUsd,
     capApplied,
     legacy7PctUsd,
     savedVs7PctUsd,
-    tierLabel,
+    tierLabel: matchedTier.tierLabel,
   };
 }
 
@@ -518,9 +530,10 @@ function isTieredFeeMode() {
 }
 
 function getActiveProtocolFeeBps() {
+  if (isTieredFeeMode()) return undefined;
   const sel = document.getElementById('protocolFeeSelect');
   const val = String(sel?.value ?? 'tiered').trim();
-  if (!val || val === 'tiered') return 700;
+  if (!val || val === 'tiered') return undefined;
   const raw = Number(val);
   if (!Number.isFinite(raw)) return 700;
   return Math.min(1000, Math.max(500, Math.round(raw)));
@@ -838,7 +851,7 @@ function renderEmptyScanState() {
   if (feeEl) {
     feeEl.textContent = isTieredFeeMode()
       ? 'Tiered · $0.00'
-      : `${(getActiveProtocolFeeBps() / 100).toFixed(1)}% flat · $0.00`;
+      : `${((getActiveProtocolFeeBps() ?? 700) / 100).toFixed(1)}% flat · $0.00`;
   }
   const burnCount = document.getElementById('burnManifestCount');
   if (burnCount) burnCount.textContent = '0 tokens';
@@ -1146,7 +1159,7 @@ function renderAll() {
 
   const t = currentPlan.totals;
   const pref = currentPlan.bridgePreference || getActiveBridgePreference();
-  const feePct = currentPlan.protocolFeePercent ?? getActiveProtocolFeeBps() / 100;
+  const feePct = currentPlan.protocolFeePercent ?? (getActiveProtocolFeeBps() ?? 700) / 100;
   const stats = estimateChainCallCounts();
 
   // Topbar counters
@@ -2085,13 +2098,17 @@ async function extractDefiAssets(assetsToExtract, scopeTitle = 'DeFi Positions')
         legs: chains.map((c) => {
           const list = byChain.get(c);
           const gross = list.reduce((s, x) => s + safeNum(x.grossUsd), 0);
-          const feePct = getActiveProtocolFeeBps() / 10000;
+          const explicitBps = getActiveProtocolFeeBps();
+          const legFeeUsd =
+            explicitBps !== undefined
+              ? Number(((gross * explicitBps) / 10_000).toFixed(2))
+              : computeTieredPreservationFee(gross).feeUsd;
           return {
             chain: c,
             chainName: list[0]?.chainName || c,
             assetCount: list.length,
-            estimatedNetUsd: Math.max(0, Number((gross * (1 - feePct)).toFixed(2))),
-            estimatedFeeUsd: Number((gross * feePct).toFixed(2)),
+            estimatedNetUsd: Math.max(0, Number((gross - legFeeUsd).toFixed(2))),
+            estimatedFeeUsd: legFeeUsd,
           };
         }),
       }),

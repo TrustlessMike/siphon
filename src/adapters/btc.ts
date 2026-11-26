@@ -263,9 +263,10 @@ export async function prepareBtcDirectBatch(
   }
 ): Promise<PreparedNonEvmBatch> {
   const outputAsset = params.outputAsset ?? 'USDC';
-  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
   const solanaUsdcAtaBytes32 = solanaAddressToBytes32(params.solanaDestination);
   const sweepable = filterChainSweepableAssets('btc', params.assets);
+  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
 
   const calls: PreparedNonEvmCall[] = [];
   const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
@@ -407,8 +408,8 @@ export async function prepareBtcDirectBatch(
     }
   }
 
-  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-  const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+  const estimatedFeeUsd =
+    feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
   if (liveExecutable) {
     notes.push('Live BIP-174 PSBT assembled — sign once in UniSat, Xverse, or Phantom (Bitcoin) to convert directly to Solana.');
   }
@@ -465,7 +466,6 @@ export const btcAdapter: ChainFamilyAdapter = {
   async scanWallet(address: string, label?: string): Promise<ScanReport> {
     const start = Date.now();
     const cleanAddr = address.trim();
-    const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
 
     const [utxos, fees, tipHeight, priceMap] = await Promise.all([
@@ -579,7 +579,9 @@ export const btcAdapter: ChainFamilyAdapter = {
     }
 
     const spendableGross = Number(((classified.spendableSats / 1e8) * btcPrice).toFixed(2));
-    const protocolFeeUsd = Number(((spendableGross * feeCfg.feeBps) / 10_000).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ grossUsd: spendableGross });
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((spendableGross * feeCfg.feeBps) / 10_000).toFixed(2));
     const slippageTotal = Number(assets.reduce((s, a) => s + a.estimatedSlippageUsd, 0).toFixed(2));
     const netSolanaUsdc = Number(
       Math.max(0, spendableGross - protocolFeeUsd - classified.spendableFeeUsd - slippageTotal).toFixed(2)
@@ -653,11 +655,11 @@ export const btcAdapter: ChainFamilyAdapter = {
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const mintRecipientBytes32 = solanaAddressToBytes32(params.solanaDestination);
     const spendableAssets = filterChainSweepableAssets('btc', params.assets);
     const totalInputSats = spendableAssets.reduce((s, a) => s + BigInt(a.rawBalance || '0'), 0n);
     const grossUsd = Number(spendableAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     const fees = await mempoolGet<{ halfHourFee?: number }>('/v1/fees/recommended');
     const satPerVbyte = Number(fees?.halfHourFee ?? 12);
 
@@ -671,7 +673,8 @@ export const btcAdapter: ChainFamilyAdapter = {
     const vaultOutputSats = totalInputSats > minerFeeSats ? totalInputSats - minerFeeSats : 0n;
 
     const outputCode = params.outputAsset === 'SOL' ? 'SOL.SOL' : 'SOL.USDC';
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const sponsoredGasEstUsd = Number(spendableAssets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - protocolFeeUsd - sponsoredGasEstUsd).toFixed(2));
     const minNetUsdcOut = BigInt(Math.round(estimatedNetUsd * 0.98 * 1_000_000)).toString();
@@ -765,7 +768,6 @@ export const btcAdapter: ChainFamilyAdapter = {
   },
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const cleanAddr = params.userAddress.trim();
     const userAddressValid = btcAdapter.matchesAddress(cleanAddr);
     let expectedBytes32 = '0x' + '00'.repeat(32);
@@ -820,7 +822,9 @@ export const btcAdapter: ChainFamilyAdapter = {
       ? classified.spendableFeeUsd
       : Number(spendableAssets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(2));
     const grossUsd = Number(spendableAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
+    const feeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.98).toFixed(2));
     const outputAsset = params.outputAsset ?? 'USDC';

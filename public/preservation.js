@@ -53,16 +53,25 @@ function formatProviderName(raw) {
   return String(raw || 'Auto Optimal').trim() || 'Auto Optimal';
 }
 
+const PRESERVATION_FEE_BRACKETS = [
+  { minGrossUsd: 0, maxGrossUsd: 50, feeBps: 500, capUsd: null, tierLabel: 'Micro-Dust (<$50)' },
+  { minGrossUsd: 50, maxGrossUsd: 500, feeBps: 100, capUsd: null, tierLabel: 'Small ($50–$500)' },
+  { minGrossUsd: 500, maxGrossUsd: 5000, feeBps: 25, capUsd: null, tierLabel: 'Mid ($500–$5k)' },
+  { minGrossUsd: 5000, maxGrossUsd: null, feeBps: 10, capUsd: 50, tierLabel: 'Principal ($5k+)' },
+];
+
 /**
- * Mirrors src/scanner/chains.ts `computePreservationFee` progressive tier table
- * so the UI surfaces exact active bps, hard USD cap, and savings vs legacy 7% flat fee.
+ * Mirrors src/scanner/chains.ts `computePreservationFee` continuous progressive marginal brackets
+ * so the UI matches backend tiered fees to the penny across every sweep size.
  */
 function computeTieredPreservationFee(grossUsdInput) {
-  const grossUsd = Math.max(0, Number(grossUsdInput) || 0);
+  const raw = Number(grossUsdInput);
+  const grossUsd = Number.isFinite(raw) && raw > 0 ? Number(raw.toFixed(2)) : 0;
   if (grossUsd <= 0) {
     return {
       grossUsd: 0,
       feeBps: 0,
+      effectiveFeeBps: 0,
       feePercentLabel: '0.00%',
       feeUsd: 0,
       capUsd: null,
@@ -73,26 +82,27 @@ function computeTieredPreservationFee(grossUsdInput) {
     };
   }
 
-  let feeBps = 10;
-  let capUsd = 50;
-  let tierLabel = 'Principal ($5k+)';
-  if (grossUsd < 50) {
-    feeBps = 500;
-    capUsd = null;
-    tierLabel = 'Micro-Dust (<$50)';
-  } else if (grossUsd < 500) {
-    feeBps = 100;
-    capUsd = null;
-    tierLabel = 'Small ($50–$500)';
-  } else if (grossUsd < 5000) {
-    feeBps = 25;
-    capUsd = null;
-    tierLabel = 'Mid ($500–$5k)';
+  const matchedTier =
+    PRESERVATION_FEE_BRACKETS.find(
+      (t) => grossUsd >= t.minGrossUsd && (t.maxGrossUsd === null || grossUsd < t.maxGrossUsd)
+    ) || PRESERVATION_FEE_BRACKETS[PRESERVATION_FEE_BRACKETS.length - 1];
+
+  let uncappedFeeRaw = 0;
+  for (const tier of PRESERVATION_FEE_BRACKETS) {
+    if (grossUsd <= tier.minGrossUsd) break;
+    const upper = tier.maxGrossUsd === null ? grossUsd : Math.min(grossUsd, tier.maxGrossUsd);
+    const sliceUsd = Math.max(0, upper - tier.minGrossUsd);
+    if (sliceUsd <= 0) continue;
+    uncappedFeeRaw += (sliceUsd * tier.feeBps) / 10_000;
   }
 
-  const uncappedFeeUsd = Number(((grossUsd * feeBps) / 10_000).toFixed(2));
-  const capApplied = capUsd !== null && uncappedFeeUsd > capUsd;
-  const feeUsd = capApplied ? capUsd : uncappedFeeUsd;
+  const feeBps = matchedTier.feeBps;
+  const capUsd = matchedTier.capUsd;
+  const hardCapUsd = capUsd !== null ? capUsd : 50;
+  const uncappedFeeUsd = Number(uncappedFeeRaw.toFixed(2));
+  const capApplied = uncappedFeeUsd > hardCapUsd;
+  const feeUsd = capApplied ? hardCapUsd : uncappedFeeUsd;
+  const effectiveFeeBps = Number(((feeUsd / grossUsd) * 10_000).toFixed(2));
   const legacy7PctUsd = Number(((grossUsd * 700) / 10_000).toFixed(2));
   const savedVs7PctUsd = Number(Math.max(0, legacy7PctUsd - feeUsd).toFixed(2));
   const feePercentLabel = `${(feeBps / 100).toFixed(2)}%`;
@@ -100,13 +110,14 @@ function computeTieredPreservationFee(grossUsdInput) {
   return {
     grossUsd,
     feeBps,
+    effectiveFeeBps,
     feePercentLabel,
     feeUsd,
     capUsd,
     capApplied,
     legacy7PctUsd,
     savedVs7PctUsd,
-    tierLabel,
+    tierLabel: matchedTier.tierLabel,
   };
 }
 
