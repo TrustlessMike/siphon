@@ -19,6 +19,7 @@ import {
   getConnectedSolanaWalletName,
   getConnectedWalletName,
   getEffectiveWalletConnectProjectId,
+  getMobileEvmDeepLinks,
   getMobileSolanaDeepLinks,
   getWalletBatchCapabilities,
   getWalletConnectorConfig,
@@ -39,7 +40,7 @@ import {
   signGaslessTypedData,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
-} from './wallets.js?v=11';
+} from './wallets.js?v=12';
 
 let currentScan = null;
 let currentPlan = null;
@@ -843,6 +844,7 @@ function switchView(viewName) {
   if (viewName === 'contract' && !contractData) loadContract();
   if (viewName === 'agents') loadAgentsAndPlugins();
   renderBackgroundAgentUI();
+  syncMobileStickySweepBar();
 }
 
 window.showWebsite = showWebsite;
@@ -1205,9 +1207,38 @@ function updateWalletButtons() {
       ctaNote.textContent = `1 confirmation per chain · settles automatically in the background`;
     }
   }
+  syncMobileStickySweepBar();
 }
 
+let primaryCtaInView = true;
 let scanSeq = 0;
+
+function syncMobileStickySweepBar() {
+  const bar = document.getElementById('mobileStickySweepBar');
+  if (!bar) return;
+  const appVisible = !document.getElementById('appShell')?.classList.contains('hidden');
+  const isScanner = activeView === 'scanner';
+  const isNarrow = typeof window !== 'undefined' && window.innerWidth <= 720;
+  const legs = currentPlan?.legs || [];
+  const ctaBtn = document.getElementById('runLiveQueueBtn');
+  const shouldShow =
+    appVisible && isScanner && isNarrow && legs.length > 0 && !primaryCtaInView && Boolean(ctaBtn);
+  bar.classList.toggle('hidden', !shouldShow);
+  if (!shouldShow) return;
+  const fin = getEffectivePlanFinancials();
+  const valEl = document.getElementById('mobileStickySweepVal');
+  const subEl = document.getElementById('mobileStickySweepSub');
+  const btnEl = document.getElementById('mobileStickySweepBtn');
+  if (valEl) valEl.textContent = fmtUsd(fin.effectiveNetUsdc);
+  if (subEl) {
+    const assetCount = selectedAssetIds.size;
+    subEl.textContent = `${assetCount} ${assetCount === 1 ? 'asset' : 'assets'} · ${legs.length} ${legs.length === 1 ? 'chain' : 'chains'} · 0% fee`;
+  }
+  if (btnEl && ctaBtn) {
+    btnEl.textContent = isSweepQueueRunning ? 'Sweeping…' : `Sweep (${legs.length})`;
+    btnEl.disabled = Boolean(ctaBtn.disabled);
+  }
+}
 
 async function runScan({ address = null, family = null, autoOpen = false } = {}) {
   const cleanAddr = String(address || '').trim();
@@ -4585,16 +4616,17 @@ function renderWalletModalContent() {
 
     rows.push(`<div class="wallet-section-label">Universal &amp; Mobile</div>`);
     if (!detected.length && isMobileBrowser()) {
-      const mobilePhantom = getMobileSolanaDeepLinks()[0];
-      const safeMobilePhantomUrl = safeHttpUrl(mobilePhantom?.deepLinkUrl);
-      if (safeMobilePhantomUrl) {
+      const mobileLinks = getMobileEvmDeepLinks();
+      for (const link of mobileLinks) {
+        const safeUrl = safeHttpUrl(link?.deepLinkUrl);
+        if (!safeUrl) continue;
         rows.push(`
-          <a class="wallet-option-row" href="${escapeHtml(safeMobilePhantomUrl)}" rel="noopener noreferrer" data-mobile-deeplink="phantom">
+          <a class="wallet-option-row" href="${escapeHtml(safeUrl)}" rel="noopener noreferrer" data-mobile-deeplink="${escapeHtml(link.walletKey)}">
             <div class="wallet-option-left">
-              ${getWalletBrandBadge('Phantom', mobilePhantom.logo)}
+              ${getWalletBrandBadge(link.name, link.logo)}
               <div>
-                <div class="wallet-option-name">Open in Phantom Mobile</div>
-                <div class="wallet-option-meta mono">Universal Link · EVM + Solana</div>
+                <div class="wallet-option-name">${escapeHtml(link.name)}</div>
+                <div class="wallet-option-meta mono">${escapeHtml(link.subtitle)}</div>
               </div>
             </div>
             <span class="mono wallet-option-action">Open ↗</span>
@@ -5556,16 +5588,49 @@ loadWalletConnectorConfig().then((cfg) => {
     renderAgentsLockedState();
   }
 });
-const scheduleHeroScene = () => {
-  if (!document.getElementById('siteShell')?.classList.contains('hidden')) {
-    ensureHeroScene();
-  }
-};
-if (typeof window.requestIdleCallback === 'function') {
-  window.requestIdleCallback(scheduleHeroScene, { timeout: 250 });
+const heroCanvasEl = document.getElementById('turgaliumHeroCanvas');
+if (heroCanvasEl && typeof window.IntersectionObserver === 'function') {
+  const heroIo = new window.IntersectionObserver(
+    (entries) => {
+      const entry = entries[0];
+      const siteVisible = !document.getElementById('siteShell')?.classList.contains('hidden');
+      if (entry && entry.isIntersecting && siteVisible) {
+        ensureHeroScene().then((scene) => scene?.setPaused(false));
+      } else {
+        heroScene?.setPaused(true);
+      }
+    },
+    { threshold: 0.35 }
+  );
+  heroIo.observe(heroCanvasEl);
 } else {
-  setTimeout(scheduleHeroScene, 60);
+  const scheduleHeroScene = () => {
+    if (!document.getElementById('siteShell')?.classList.contains('hidden')) {
+      ensureHeroScene();
+    }
+  };
+  if (typeof window.requestIdleCallback === 'function') {
+    window.requestIdleCallback(scheduleHeroScene, { timeout: 250 });
+  } else {
+    setTimeout(scheduleHeroScene, 60);
+  }
 }
+
+const primarySweepCtaEl = document.getElementById('runLiveQueueBtn');
+if (primarySweepCtaEl && typeof window.IntersectionObserver === 'function') {
+  const ctaIo = new window.IntersectionObserver(
+    (entries) => {
+      primaryCtaInView = Boolean(entries[0]?.isIntersecting);
+      syncMobileStickySweepBar();
+    },
+    { threshold: 0.1 }
+  );
+  ctaIo.observe(primarySweepCtaEl);
+}
+document.getElementById('mobileStickySweepBtn')?.addEventListener('click', () => {
+  document.getElementById('runLiveQueueBtn')?.click();
+});
+window.addEventListener('resize', () => syncMobileStickySweepBar());
 renderEmptyScanState();
 
 async function runUnifiedScan() {

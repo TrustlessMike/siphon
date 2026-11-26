@@ -9,7 +9,7 @@ import {
   isUserRejectedError,
   isValidSolanaBase58,
   signAndSendSolanaVersionedTx,
-} from './wallets.js?v=11';
+} from './wallets.js?v=12';
 
 const DEFAULT_FALLBACK_GAME_MODES = [
   {

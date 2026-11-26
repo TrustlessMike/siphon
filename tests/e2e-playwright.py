@@ -949,7 +949,7 @@ def main():
 
             # 2D. Direct Client-Side Pre-Sign Assertions + ton_rawSign Removal + ensureEvmChain Switch Check
             wallet_safety = pgS.evaluate(f"""async () => {{
-              const w = await import('/wallets.js?v=11');
+              const w = await import('/wallets.js?v=12');
               const checks = {{}};
 
               // 1. Blind ton_rawSign must be removed and throw structured TonConnect guidance
