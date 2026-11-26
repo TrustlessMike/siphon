@@ -5,8 +5,8 @@
    - NEVER intercepts or caches /api/*, /mcp, or non-GET requests
    ===================================================================== */
 
-const SHELL_CACHE = 'turgalium-shell-v2';
-const STATIC_CACHE = 'turgalium-static-v2';
+const SHELL_CACHE = 'turgalium-shell-v3';
+const STATIC_CACHE = 'turgalium-static-v3';
 const ACTIVE_CACHES = new Set([SHELL_CACHE, STATIC_CACHE]);
 
 const PRECACHE_URLS = [

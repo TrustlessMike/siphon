@@ -84,6 +84,7 @@ import {
   buildOpenApiSpec,
   buildPluginSetupGuide,
 } from '../agent/plugin-spec.js';
+import { buildAgentReviewLink } from '../agent/review-link.js';
 import { handleMcpJsonRpc } from '../mcp/server.js';
 import { planDustConversion } from '../scanner/dust.js';
 import { scanUnifiedWallets, type UnifiedWalletInput } from '../scanner/unify.js';
@@ -1431,6 +1432,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           agentEngine,
           scanCache,
           tokenScopes: verifiedToken?.scopes,
+          publicBaseUrl: baseUrl,
         });
         if (isNotification) {
           res.writeHead(202, {
@@ -2581,6 +2583,35 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         } catch (err) {
           return reply(400, {
             error: err instanceof Error ? err.message : 'Invalid tax CSV export payload.',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/agent/review-link') {
+        const body = await readJsonBody<{
+          wallet?: string;
+          family?: ChainFamily;
+          solanaDestination?: string;
+          outputAsset?: 'USDC' | 'SOL';
+          chains?: string[];
+          agentName?: string;
+          note?: string;
+        }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
+        try {
+          const result = buildAgentReviewLink({
+            baseUrl,
+            wallet: typeof body.wallet === 'string' ? body.wallet : '',
+            family: body.family,
+            solanaDestination: body.solanaDestination,
+            outputAsset: body.outputAsset,
+            chains: body.chains,
+            agentName: body.agentName,
+            note: body.note,
+          });
+          return reply(200, result);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Invalid review-link parameters.',
           });
         }
       }

@@ -18,7 +18,7 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=12" />
+    <link rel="stylesheet" href="/styles.css?v=13" />
     <link rel="stylesheet" href="/degen.css?v=3" />
     <link rel="stylesheet" href="/preservation.css?v=6" />
   </head>
@@ -36,6 +36,7 @@
 
           <nav class="site-links" aria-label="Primary navigation">
             <button type="button" class="link-btn" data-open-app="scanner">Sweep</button>
+            <button type="button" class="link-btn" data-open-app="ai">AI</button>
             <button type="button" class="link-btn" data-open-app="activity">Activity</button>
             <button type="button" class="link-btn" data-open-app="contract">Contracts</button>
             <a
@@ -84,6 +85,10 @@
               <div class="hero-cta-row">
                 <button type="button" class="btn-pill-dark" id="heroConnectBtn">Connect Wallet</button>
                 <button type="button" class="btn-outline-dark" data-open-app="scanner">Open App</button>
+                <button type="button" class="btn-outline-dark hero-ai-btn" id="heroLaunchAiBtn" data-open-app="ai">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 19l1 2 1-2 2-1-2-1-1-2-1 2-2 1 2 1z"/></svg>
+                  <span>Launch with AI</span>
+                </button>
               </div>
             </div>
 
@@ -175,6 +180,9 @@
               Degen
               <span class="tab-count muted" id="tabDegenCount">JUP</span>
             </button>
+            <button type="button" class="app-tab" data-view="ai" role="tab">
+              AI
+            </button>
             <button type="button" class="app-tab pro-only" data-view="agents" role="tab">
               Agents &amp; AI
               <span class="tab-count muted" id="tabApprovalCount">0</span>
@@ -198,6 +206,9 @@
       <main class="app-container">
         <!-- PERSISTENT IN-FLIGHT BRIDGE TRACKER (Restored from localStorage < 24h) -->
         <section class="inflight-bridge-banner hidden" id="inflightBridgeBanner" aria-label="In-flight bridge transfers" aria-live="polite"></section>
+
+        <!-- NON-CUSTODIAL AI AGENT HANDOFF BANNER (Hydrated from ?wallet=...&agent=...) -->
+        <section class="agent-handoff-banner hidden" id="agentHandoffBanner" aria-label="AI Agent review handoff" aria-live="polite"></section>
 
         <!-- ======================================================= -->
         <!-- VIEW 1: SWEEP WORKSPACE                                 -->
@@ -1016,6 +1027,159 @@
         <section class="view-pane" id="view-degen" aria-label="Degen Jupiter Prediction Markets">
           <div id="degenRoot" class="degen-root"></div>
         </section>
+
+        <!-- ======================================================= -->
+        <!-- VIEW 6: ZERO-KEY AI AGENT LAUNCHPAD (CHATGPT / CLAUDE)  -->
+        <!-- ======================================================= -->
+        <section class="view-pane" id="view-ai" aria-label="Launch with AI Agent">
+          <div class="ai-launchpad-shell">
+            <div class="view-header">
+              <div>
+                <div class="ai-kicker-row">
+                  <span class="ai-kicker-pill">Zero Private Keys</span>
+                  <span class="ai-kicker-pill is-ice">0% Protocol Fee · MIT</span>
+                </div>
+                <h1>Let your AI Agent prepare the sweep</h1>
+                <p>Point ChatGPT, Claude, Cursor, or OpenClaw at Turgalium with only your <strong>public address</strong>. Your agent scans 30 chains, compares bridge routes, and hands you a 1-click link to sign locally in your own wallet.</p>
+              </div>
+            </div>
+
+            <div class="ai-trust-strip" aria-label="Non-custodial AI workflow">
+              <div class="ai-trust-step">
+                <span class="ai-trust-num">1</span>
+                <div>
+                  <strong>Public address only</strong>
+                  <span>Never share a seed phrase or private key with any AI assistant.</span>
+                </div>
+              </div>
+              <div class="ai-trust-step">
+                <span class="ai-trust-num">2</span>
+                <div>
+                  <strong>Agent audits 30 chains</strong>
+                  <span>Finds DeFi deposits, skips honeypots, and picks the highest net route to Solana.</span>
+                </div>
+              </div>
+              <div class="ai-trust-step">
+                <span class="ai-trust-num">3</span>
+                <div>
+                  <strong>You sign in 1 click</strong>
+                  <span>Open the agent's review link and approve transactions locally in your wallet.</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="ai-launchpad-grid">
+              <div class="card ai-builder-card">
+                <div class="card-head">
+                  <div>
+                    <h2>1. Configure your AI handoff</h2>
+                    <p class="muted-xs" style="margin:2px 0 0;">Auto-fills from your connected wallet, or paste any public address below.</p>
+                  </div>
+                </div>
+
+                <div class="ai-builder-body">
+                  <div class="ai-agent-picker" role="group" aria-label="Choose AI assistant">
+                    <button type="button" class="ai-agent-chip active" data-ai-agent="ChatGPT" aria-pressed="true">ChatGPT</button>
+                    <button type="button" class="ai-agent-chip" data-ai-agent="Claude" aria-pressed="false">Claude</button>
+                    <button type="button" class="ai-agent-chip" data-ai-agent="Cursor / OpenClaw" aria-pressed="false">Cursor / OpenClaw</button>
+                    <button type="button" class="ai-agent-chip" data-ai-agent="Custom Agent" aria-pressed="false">Custom Agent</button>
+                  </div>
+
+                  <div class="ai-form-grid">
+                    <label class="ai-field">
+                      <span class="ai-field-label">Public Source Wallet (EVM, .eth, Cosmos, Sui, Aptos, TON, Tron, BTC)</span>
+                      <input type="text" id="aiWalletInput" class="field-input mono" maxlength="160" placeholder="0x… or vitalik.eth (public address only)" autocomplete="off" />
+                    </label>
+                    <div class="ai-form-row-2">
+                      <label class="ai-field">
+                        <span class="ai-field-label">Solana Destination (optional)</span>
+                        <input type="text" id="aiSolDestInput" class="field-input mono" maxlength="64" placeholder="Paste public Solana address" autocomplete="off" />
+                      </label>
+                      <div class="ai-field">
+                        <span class="ai-field-label">Receive on Solana</span>
+                        <div class="ai-output-toggle" role="group" aria-label="Solana output asset">
+                          <button type="button" class="ai-out-btn active" data-ai-output="USDC" aria-pressed="true">USDC</button>
+                          <button type="button" class="ai-out-btn" data-ai-output="SOL" aria-pressed="false">SOL</button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="ai-prompt-wrap">
+                    <div class="ai-prompt-head">
+                      <span class="ai-field-label">Ready-to-send prompt (zero private key guardrail included)</span>
+                      <button type="button" class="text-action" id="copyAiPromptBtn">Copy prompt</button>
+                    </div>
+                    <pre class="ai-prompt-box mono" id="aiPromptPreview"></pre>
+                  </div>
+
+                  <div class="ai-actions-row">
+                    <a id="openChatGptBtn" class="btn-pill-dark ai-launch-btn" href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer">
+                      <span>Open in ChatGPT</span>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
+                    </a>
+                    <a id="openClaudeBtn" class="btn-outline-dark ai-launch-btn" href="https://claude.ai/new" target="_blank" rel="noopener noreferrer">
+                      <span>Open in Claude</span>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M7 7h10v10"/></svg>
+                    </a>
+                    <button type="button" class="btn-outline-dark ai-launch-btn" id="copyAiReviewLinkBtn">Copy Review &amp; Sign Link</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card ai-endpoints-card">
+                <div class="card-head">
+                  <div>
+                    <h2>2. Direct API &amp; MCP Endpoints</h2>
+                    <p class="muted-xs" style="margin:2px 0 0;">Connect any custom GPT, Claude Desktop, Cursor, or OpenClaw agent directly.</p>
+                  </div>
+                </div>
+
+                <div class="ai-endpoints-body">
+                  <div class="ai-endpoint-row">
+                    <div>
+                      <div class="ai-endpoint-label">ChatGPT Actions / OpenAPI 3.1</div>
+                      <code class="ai-endpoint-val mono" id="aiOpenApiUrl">https://turgalium.vercel.app/openapi.json</code>
+                    </div>
+                    <button type="button" class="btn-outline-sm" data-copy-el="aiOpenApiUrl">Copy</button>
+                  </div>
+
+                  <div class="ai-endpoint-row">
+                    <div>
+                      <div class="ai-endpoint-label">Streamable HTTP MCP Endpoint</div>
+                      <code class="ai-endpoint-val mono" id="aiMcpUrl">https://turgalium.vercel.app/mcp</code>
+                    </div>
+                    <button type="button" class="btn-outline-sm" data-copy-el="aiMcpUrl">Copy</button>
+                  </div>
+
+                  <div class="ai-endpoint-row">
+                    <div>
+                      <div class="ai-endpoint-label">Local Stdio MCP (Claude Desktop / Cursor)</div>
+                      <code class="ai-endpoint-val mono" id="aiMcpCli">npx turgalium-mcp</code>
+                    </div>
+                    <button type="button" class="btn-outline-sm" data-copy-el="aiMcpCli">Copy</button>
+                  </div>
+
+                  <div class="ai-endpoint-row">
+                    <div>
+                      <div class="ai-endpoint-label">Non-Custodial Review Link API</div>
+                      <code class="ai-endpoint-val mono" id="aiReviewApiUrl">POST /api/agent/review-link</code>
+                    </div>
+                    <button type="button" class="btn-outline-sm" data-copy-el="aiReviewApiUrl">Copy</button>
+                  </div>
+
+                  <div class="ai-pro-callout">
+                    <div>
+                      <strong>Self-Hosted Autonomous Mandates (Pro)</strong>
+                      <p class="muted-xs" style="margin:3px 0 0;">Running your own Docker/Fly instance? Configure on-chain spending caps, approval queues, and gas-window watchdogs.</p>
+                    </div>
+                    <button type="button" class="btn-outline-sm" data-open-app="agents">Open Pro Agents</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
       </main>
     </div>
 
@@ -1108,7 +1272,7 @@
 
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>
 
-    <script type="module" src="/app.js?v=14"></script>
+    <script type="module" src="/app.js?v=15"></script>
     <script type="module" src="/preservation.js?v=4"></script>
   </body>
 </html>
