@@ -1,11 +1,15 @@
 import {
+  type CctpTransferMode,
   encodeCctpDepositForBurn,
+  fetchCctpV2BurnFee,
+  getCctpEstimatedSeconds,
   solanaAddressToBytes32,
   solanaOwnerToUsdcAtaBytes32,
 } from '../bridge/cctp.js';
 import {
   AAVE_V2_LENDING_POOLS,
   checkCompoundAccountSafety,
+  COMPOUND_V3_COMETS,
   type CompoundAccountSafety,
   computeAaveSafePartialWithdrawal,
   identifyProtocolExtractorId,
@@ -20,6 +24,7 @@ import {
 import {
   DEAD_BURN_ADDRESS,
   EVM_CHAINS,
+  getChainUsdcDecimals,
   getProtocolFeeConfig,
   isCuratedRegistryToken,
   type ProtocolFeeConfig,
@@ -78,30 +83,8 @@ const LIFI_SOLANA_CHAIN_ID = 1151111081099710;
 const SOLANA_NATIVE_MINT = '11111111111111111111111111111111';
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
-const ALLOWED_COMPOUND_V3_COMETS: Partial<Record<EvmChainId, string[]>> = {
-  ethereum: [
-    '0xc3d688b66703497daa19211eedff47f25384cdc3', // cUSDCv3
-    '0xa17581a9e3356d9a858b789d68b4d866e593ae94', // cWETHv3
-    '0x3afdc9bca9213a35503b077a6072f3d0d5ab0840', // cUSDTv3
-  ],
-  base: [
-    '0xb125e6687d4313864e53df431d5425969c15eb2f', // cUSDCv3
-    '0x46e6b214b524310239732d51387075e0e70970bf', // cWETHv3
-    '0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf',
-  ],
-  arbitrum: [
-    '0x9c4ec768c28520b50860ea7a15bd7213a9ff58bf', // cUSDCv3
-    '0xa5edbdd9646f8dff606d7448e414884c7d905dca', // cUSDC.e v3
-    '0x6f7d514bbd4aff3bcd1140b7344b32f063dee486', // cWETHv3
-  ],
-  optimism: [
-    '0x2e44e174f7d53f0212823acc11c01a11d58c5bcb', // cUSDCv3
-    '0xe36a30d249f7761327fd973001a32010b521b6fd', // cWETHv3
-  ],
-  polygon: [
-    '0xf25212e676d1f7f89cd72ffee66158f541246445', // cUSDCv3
-  ],
-};
+// Canonical Compound v3 Comet allowlist synced directly from src/defi/extractors.ts
+const ALLOWED_COMPOUND_V3_COMETS = COMPOUND_V3_COMETS;
 
 function assertEvmAddress(val: string | undefined | null, label: string, allowZero = false): string {
   if (typeof val !== 'string') {
@@ -236,6 +219,7 @@ export interface PreparedExecution {
     | 'yearn_v2'
     | 'uniswap_v2_lp'
     | 'uniswap_v3_nft'
+    | 'balancer_v2_lp'
     | 'erc20_burn';
   chain: EvmChainId;
   chainId: number;
@@ -638,6 +622,28 @@ async function buildDefiWithdrawExecution(params: {
       if (compSafety.hasActiveBorrow) {
         throw new Error(`Compound safety guard: ${compSafety.reason}`);
       }
+      if (
+        protocolId === 'compound_v3' &&
+        (!compSafety.safeForWithdraw ||
+          (compSafety.suppliedBalanceRaw !== undefined && compSafety.suppliedBalanceRaw <= 0n))
+      ) {
+        throw new Error(
+          `Compound safety guard: ${compSafety.reason || 'Zero supplied base balance verified onchain via Comet.balanceOf(user) — withdrawal blocked to prevent opening a borrow.'}`
+        );
+      }
+      const preSuppliedExpectedRaw =
+        protocolId === 'compound_v2' && asset.defiExitPlan?.expectedUnderlyingRaw
+          ? BigInt(asset.defiExitPlan.expectedUnderlyingRaw)
+          : undefined;
+      resolvedExitPlan = resolveDefiExitPlan({
+        asset,
+        outputAsset,
+        compoundSafety: compSafety,
+        expectedUnderlyingRaw: preSuppliedExpectedRaw,
+        expectedUnderlyingUi:
+          preSuppliedExpectedRaw !== undefined ? asset.defiExitPlan?.expectedUnderlyingUi : undefined,
+        simulatedLive: true,
+      });
     }
   }
 
@@ -1144,6 +1150,8 @@ async function buildDirectCctpUsdcExecution(params: {
   userAddress: string;
   solanaDestination: string;
   feeConfig: ProtocolFeeConfig;
+  cctpTransferMode?: CctpTransferMode;
+  fetcher?: RouteAuctionFetcher;
   allowanceCheckFn?: Erc20AllowanceCheckFn;
 }): Promise<PreparedExecution> {
   const {
@@ -1151,6 +1159,8 @@ async function buildDirectCctpUsdcExecution(params: {
     userAddress,
     solanaDestination,
     feeConfig,
+    cctpTransferMode,
+    fetcher,
     allowanceCheckFn = checkErc20Allowance,
   } = params;
   const cfg = EVM_CHAINS[asset.chain as EvmChainId];
@@ -1202,18 +1212,42 @@ async function buildDirectCctpUsdcExecution(params: {
     });
   }
 
+  const effectiveCctpVersion = cfg.cctpVersion ?? 1;
+  const effectiveTransferMode: CctpTransferMode =
+    effectiveCctpVersion === 2 ? cctpTransferMode ?? 'fast' : 'standard';
+  const v2FeeQuote =
+    effectiveCctpVersion === 2 && cfg.cctpDomain !== null
+      ? await fetchCctpV2BurnFee({
+          sourceDomain: cfg.cctpDomain,
+          destinationDomain: SOLANA_CCTP_DOMAIN,
+          mode: effectiveTransferMode,
+          rawUsdcAmount: bridgeRaw,
+          timeoutMs: 2500,
+          fetcher: fetcher
+            ? ((input: RequestInfo | URL, init?: RequestInit) =>
+                fetcher(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url, init)) as typeof fetch
+            : undefined,
+        })
+      : null;
+
   const calldata = encodeCctpDepositForBurn({
     rawUsdcAmount: bridgeRaw,
     destinationDomain: SOLANA_CCTP_DOMAIN,
     solanaMintRecipientBytes32: mintRecipientBytes32,
     usdcAddress: cfg.usdcAddress,
-    cctpVersion: cfg.cctpVersion ?? 1,
+    cctpVersion: effectiveCctpVersion,
+    transferMode: effectiveTransferMode,
+    fastFeeBps: v2FeeQuote?.feeBps,
+    maxFee: v2FeeQuote?.maxFeeRaw,
+    minFinalityThreshold: v2FeeQuote?.minFinalityThreshold,
   });
+
+  const cctpEstimatedSec = getCctpEstimatedSeconds(cfg.id, effectiveTransferMode);
 
   txs.push({
     stepId: 'cctp_deposit_for_burn',
-    label: `Circle CCTP depositForBurn (${netUiUsdc.toFixed(2)} USDC → Solana)`,
-    description: `Native 1:1 burn on ${cfg.name} (Domain ${cfg.cctpDomain} → Domain 5 Solana)`,
+    label: `Circle CCTP ${effectiveCctpVersion === 2 && effectiveTransferMode === 'fast' ? 'V2 Fast ' : ''}depositForBurn (${netUiUsdc.toFixed(2)} USDC → Solana)`,
+    description: `Native 1:1 burn on ${cfg.name} (Domain ${cfg.cctpDomain} → Domain 5 Solana${v2FeeQuote ? ` · ${effectiveTransferMode === 'fast' ? `Fast ${v2FeeQuote.feeBps} bps` : 'Standard 0 bps'}` : ''})`,
     chain: asset.chain as EvmChainId,
     chainId: cfg.chainId,
     chainName: cfg.name,
@@ -1225,9 +1259,13 @@ async function buildDirectCctpUsdcExecution(params: {
   });
 
   const cctpActualGasUsd = asset.batchedGasUsd || asset.estimatedGasUsd || 0;
+  const fastBurnFeeUsd =
+    v2FeeQuote?.maxFeeRaw && v2FeeQuote.maxFeeRaw > 0n
+      ? Number(v2FeeQuote.maxFeeRaw) / 1_000_000
+      : 0;
   const cctpHaircut = evaluateLiveQuoteHaircut({
     grossUsd: asset.grossUsd,
-    quoteOutUsd: netUiUsdc,
+    quoteOutUsd: Math.max(0, netUiUsdc - fastBurnFeeUsd),
     actualGasUsd: cctpActualGasUsd,
   });
 
@@ -1239,8 +1277,8 @@ async function buildDirectCctpUsdcExecution(params: {
     chainId: cfg.chainId,
     chainName: cfg.name,
     explorerUrl: cfg.explorerUrl,
-    estimatedOutput: `${netUiUsdc.toFixed(2)} USDC (1:1 Native CCTP)`,
-    estimatedSeconds: cfg.cctpAttestationSec,
+    estimatedOutput: `${Math.max(0, netUiUsdc - fastBurnFeeUsd).toFixed(2)} USDC (1:1 Native CCTP${effectiveCctpVersion === 2 && effectiveTransferMode === 'fast' ? ' V2 Fast' : ''})`,
+    estimatedSeconds: cctpEstimatedSec,
     quotedOutUsd: cctpHaircut.quoteOutUsd,
     liveNetUsd: cctpHaircut.liveNetUsd,
     liveHaircutPct: cctpHaircut.liveHaircutPct,
@@ -1295,6 +1333,7 @@ async function buildBridgeExecution(
   options?: {
     routeAuctionOptions?: RouteAuctionExecutionOptions;
     allowanceCheckFn?: Erc20AllowanceCheckFn;
+    cctpTransferMode?: CctpTransferMode;
   }
 ): Promise<PreparedExecution> {
   const evmChain = asEvmChain(asset.chain);
@@ -1312,6 +1351,8 @@ async function buildBridgeExecution(
       userAddress,
       solanaDestination,
       feeConfig,
+      cctpTransferMode: options?.cctpTransferMode,
+      fetcher: auctionOpts?.fetcher,
       allowanceCheckFn,
     });
   }
@@ -1422,6 +1463,8 @@ async function buildBridgeExecution(
                 userAddress,
                 solanaDestination,
                 feeConfig,
+                cctpTransferMode: options?.cctpTransferMode,
+                fetcher: auctionOpts?.fetcher,
                 allowanceCheckFn,
               });
               return preparedToAuctionQuote(res, 'circle_cctp', {
@@ -1613,7 +1656,7 @@ export async function tryEnsoMultiInputDustSwap(params: {
       value: toHexWei(json.tx?.value),
       gas: json.gas ? toHexWei(String(json.gas)) : undefined,
       outUsdcRaw,
-      outUsdcDecimals: cfg.id === 'bnb' ? 18 : 6,
+      outUsdcDecimals: getChainUsdcDecimals(cfg.id),
       estimatedSeconds: 12,
     };
   } catch {
@@ -1655,6 +1698,7 @@ export async function prepareRealExecution(params: {
   solanaDestination: string;
   outputAsset?: 'USDC' | 'SOL';
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+  cctpTransferMode?: CctpTransferMode;
   protocolFeeBps?: number;
   feeRecipientEvm?: string | null;
   followUpQuoteFn?: FollowUpQuoteFn;
@@ -1669,6 +1713,7 @@ export async function prepareRealExecution(params: {
     solanaDestination,
     outputAsset = 'USDC',
     bridgePreference = 'auto',
+    cctpTransferMode,
     protocolFeeBps,
     feeRecipientEvm,
     followUpQuoteFn,
@@ -1677,7 +1722,11 @@ export async function prepareRealExecution(params: {
     allowanceCheckFn,
     routeAuctionOptions,
   } = params;
-  const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
+  const feeConfig = getProtocolFeeConfig({
+    feeBps: protocolFeeBps,
+    feeRecipientEvm,
+    grossUsd: asset.grossUsd,
+  });
 
   const evmChain = asEvmChain(asset.chain);
   const cfg = EVM_CHAINS[evmChain];
@@ -1776,7 +1825,7 @@ export async function prepareRealExecution(params: {
     outputAsset,
     bridgePreference,
     feeConfig,
-    { routeAuctionOptions, allowanceCheckFn }
+    { routeAuctionOptions, allowanceCheckFn, cctpTransferMode }
   );
 }
 
@@ -1907,6 +1956,7 @@ export async function prepareChainBatchExecution(params: {
   solanaDestination: string;
   outputAsset?: 'USDC' | 'SOL';
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+  cctpTransferMode?: CctpTransferMode;
   bundleDefiCctp?: boolean;
   protocolFeeBps?: number;
   feeRecipientEvm?: string | null;
@@ -1929,6 +1979,7 @@ export async function prepareChainBatchExecution(params: {
     solanaDestination,
     outputAsset = 'USDC',
     bridgePreference = 'auto',
+    cctpTransferMode,
     bundleDefiCctp = true,
     protocolFeeBps,
     feeRecipientEvm,
@@ -1949,7 +2000,20 @@ export async function prepareChainBatchExecution(params: {
     : allowHighCost
     ? { allowHighCost }
     : undefined;
-  const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
+  const preBatchGrossUsd = assets
+    .filter(
+      (a) =>
+        a.chain === chain &&
+        a.action !== 'SKIP_HONEYPOT' &&
+        a.action !== 'SKIP_UNPRICED' &&
+        a.action !== 'BURN_ZERO_LIQUIDITY'
+    )
+    .reduce((sum, a) => sum + (Number.isFinite(a.grossUsd) ? Math.max(0, a.grossUsd) : 0), 0);
+  const feeConfig = getProtocolFeeConfig({
+    feeBps: protocolFeeBps,
+    feeRecipientEvm,
+    grossUsd: preBatchGrossUsd,
+  });
 
   const cfg = EVM_CHAINS[chain];
   if (!cfg) throw new Error(`Unsupported chain: ${chain}`);
@@ -2018,6 +2082,7 @@ export async function prepareChainBatchExecution(params: {
       buildBridgeExecution(a, u, s, o, b, f, {
         routeAuctionOptions: effectiveAuctionOptions,
         allowanceCheckFn,
+        cctpTransferMode,
       }));
   const checkAllowance = allowanceCheckFn ?? checkErc20Allowance;
 
@@ -2065,7 +2130,7 @@ export async function prepareChainBatchExecution(params: {
         })
       ) {
         const outUsdcRaw = BigInt(multiQuote.outUsdcRaw);
-        const usdcDecimals = multiQuote.outUsdcDecimals || (cfg.id === 'bnb' ? 18 : 6);
+        const usdcDecimals = multiQuote.outUsdcDecimals || getChainUsdcDecimals(cfg.id);
         const quotedUsdcUi = Number(outUsdcRaw) / 10 ** usdcDecimals;
         const combinedGrossUsd = multiInputCandidates.reduce((s, a) => s + a.grossUsd, 0);
         const combinedGasUsd =
@@ -2230,6 +2295,7 @@ export async function prepareChainBatchExecution(params: {
       solanaDestination,
       outputAsset,
       bridgePreference,
+      cctpTransferMode,
       protocolFeeBps: feeConfig.feeBps,
       feeRecipientEvm: feeConfig.feeRecipientEvm,
       followUpQuoteFn,
@@ -2249,6 +2315,7 @@ export async function prepareChainBatchExecution(params: {
     'yearn_v2',
     'uniswap_v2_lp',
     'uniswap_v3_nft',
+    'balancer_v2_lp',
   ]);
 
   for (let idx = 0; idx < results.length; idx++) {
@@ -2335,7 +2402,7 @@ export async function prepareChainBatchExecution(params: {
           if (unlockedRaw <= 0n || !unlocked.address) continue;
 
           const isNativeUsdc = unlocked.address.toLowerCase() === cfg.usdcAddress.toLowerCase();
-          const expectedUsdcDecimals = cfg.id === 'bnb' ? 18 : 6;
+          const expectedUsdcDecimals = getChainUsdcDecimals(cfg.id);
           // CRIT-02: Never size bundled CCTP transfers (which spend user's real USDC in the same atomic batch)
           // from an unverified/uncurated ERC-4626 or receipt balance!
           const erc4626CctpAllowed =
@@ -2404,13 +2471,40 @@ export async function prepareChainBatchExecution(params: {
               data: encodeErc20Approve(cfg.cctpTokenMessenger, bridgeRaw),
               value: '0x0',
             });
+            const effectiveCctpVersion = cfg.cctpVersion ?? 1;
+            const effectiveBundleTransferMode: CctpTransferMode =
+              effectiveCctpVersion === 2 ? cctpTransferMode ?? 'fast' : 'standard';
+            const bundleFetcher = effectiveAuctionOptions?.fetcher;
+            const bundleFeeQuote =
+              effectiveCctpVersion === 2 && cfg.cctpDomain !== null
+                ? await fetchCctpV2BurnFee({
+                    sourceDomain: cfg.cctpDomain,
+                    destinationDomain: SOLANA_CCTP_DOMAIN,
+                    mode: effectiveBundleTransferMode,
+                    rawUsdcAmount: bridgeRaw,
+                    timeoutMs: 2500,
+                    fetcher: bundleFetcher
+                      ? ((input: RequestInfo | URL, init?: RequestInit) =>
+                          bundleFetcher(
+                            typeof input === 'string'
+                              ? input
+                              : input instanceof URL
+                              ? input.toString()
+                              : input.url,
+                            init
+                          )) as typeof fetch
+                      : undefined,
+                  })
+                : null;
+            const bundleEstSec = getCctpEstimatedSeconds(cfg.id, effectiveBundleTransferMode);
+
             rawCalls.push({
               stepId: 'cctp_deposit_for_burn_after_defi',
               assetId: asset.id,
               assetSymbol: asset.symbol,
               action: asset.action,
               provider: 'circle_cctp',
-              label: `Bridge withdrawn ${netUi.toFixed(2)} USDC → Solana (Circle CCTP)`,
+              label: `Bridge withdrawn ${netUi.toFixed(2)} USDC → Solana (Circle CCTP${effectiveCctpVersion === 2 && effectiveBundleTransferMode === 'fast' ? ' V2 Fast' : ''})`,
               description: `Native 1:1 Circle CCTP burn (Domain ${cfg.cctpDomain} → Domain 5 Solana) in the same click`,
               to: cfg.cctpTokenMessenger,
               data: encodeCctpDepositForBurn({
@@ -2418,17 +2512,21 @@ export async function prepareChainBatchExecution(params: {
                 destinationDomain: SOLANA_CCTP_DOMAIN,
                 solanaMintRecipientBytes32: mintRecipientBytes32,
                 usdcAddress: cfg.usdcAddress,
-                cctpVersion: cfg.cctpVersion ?? 1,
+                cctpVersion: effectiveCctpVersion,
+                transferMode: effectiveBundleTransferMode,
+                fastFeeBps: bundleFeeQuote?.feeBps,
+                maxFee: bundleFeeQuote?.maxFeeRaw,
+                minFinalityThreshold: bundleFeeQuote?.minFinalityThreshold,
               }),
               value: '0x0',
             });
-            maxSeconds = Math.max(maxSeconds, cfg.cctpAttestationSec);
+            maxSeconds = Math.max(maxSeconds, bundleEstSec);
             bridgeTrackers.push({
               assetId: asset.id,
               assetSymbol: asset.symbol,
               provider: 'circle_cctp',
               estimatedOutput: `${netUi.toFixed(2)} USDC (Atomic DeFi Exit + CCTP)`,
-              estimatedSeconds: cfg.cctpAttestationSec,
+              estimatedSeconds: bundleEstSec,
               requiresSolanaClaim: true,
             });
             notes.push(
@@ -2525,7 +2623,9 @@ export async function prepareChainBatchExecution(params: {
               if (
                 followUpPrep.provider === 'relay' ||
                 followUpPrep.provider === 'lifi' ||
-                followUpPrep.provider === 'circle_cctp'
+                followUpPrep.provider === 'circle_cctp' ||
+                followUpPrep.provider === 'mayan_swift' ||
+                followUpPrep.provider === 'debridge_dln'
               ) {
                 lastBundledProvider = followUpPrep.provider;
               }

@@ -1,10 +1,12 @@
 import crypto from 'node:crypto';
 import {
   CHAIN_LIST,
+  computePreservationFee,
   DEAD_BURN_ADDRESS,
   EVM_CHAINS,
   isCuratedRegistryToken,
   PROTOCOL_FEE_BPS,
+  resolveUnderlyingDecimals,
   TOKEN_REGISTRY,
 } from './chains.js';
 import { fetchLiveUsdPrices, fetchLiveUsdPricesWithStatus } from './prices.js';
@@ -40,6 +42,16 @@ import type {
   ScannedAsset,
   ScanReport,
 } from './types.js';
+
+export const DEFILLAMA_CHAIN_SLUGS: Partial<Record<EvmChainId, string>> = {
+  avalanche: 'avax',
+  bnb: 'bsc',
+  hyperevm: 'hyperliquid',
+  zksync: 'era',
+  gnosis: 'xdai',
+  berachain: 'berachain',
+  ink: 'ink',
+};
 
 export interface WalletPreset {
   id: string;
@@ -429,7 +441,11 @@ function classifyAndBuildReport(params: {
     const singleGas = round4(chainAssets.reduce((s, a) => s + a.estimatedGasUsd, 0));
     const batchedGas = round4(chainAssets.reduce((s, a) => s + a.batchedGasUsd, 0));
     const slippage = round2(activeSweep.reduce((s, a) => s + a.estimatedSlippageUsd, 0));
-    const fee = round2((Math.max(0, grossUsd - slippage) * PROTOCOL_FEE_BPS) / 10_000);
+    const chainFeeBase = Math.max(0, grossUsd - slippage);
+    const useEnvFlatFee = Boolean(process.env.TURGALIUM_FEE_BPS?.trim());
+    const fee = useEnvFlatFee
+      ? round2((chainFeeBase * PROTOCOL_FEE_BPS) / 10_000)
+      : computePreservationFee(chainFeeBase).feeUsd;
     const netUsdcBridged = round2(Math.max(0, grossUsd - slippage - batchedGas - fee));
 
     return {
@@ -482,9 +498,15 @@ function classifyAndBuildReport(params: {
   const batchedGasUsd = round2(assets.reduce((s, a) => s + a.batchedGasUsd, 0));
   const gasSavedUsd = round2(Math.max(0, singleTxGasUsd - batchedGasUsd));
   const estimatedSlippageUsd = round2(activeAll.reduce((s, a) => s + a.estimatedSlippageUsd, 0));
-  const protocolFeeUsd = round2(
-    (Math.max(0, grossUsd - estimatedSlippageUsd) * PROTOCOL_FEE_BPS) / 10_000
-  );
+  const useEnvFlatFee = Boolean(process.env.TURGALIUM_FEE_BPS?.trim());
+  const totalFeeBase = Math.max(0, grossUsd - estimatedSlippageUsd);
+  const totalPreservation = useEnvFlatFee ? null : computePreservationFee(totalFeeBase);
+  const protocolFeeUsd = totalPreservation
+    ? totalPreservation.feeUsd
+    : round2((totalFeeBase * PROTOCOL_FEE_BPS) / 10_000);
+  const effectiveReportFeeBps = totalPreservation
+    ? Math.max(0, Math.round(totalPreservation.effectiveFeeBps))
+    : PROTOCOL_FEE_BPS;
   const netSolanaUsdc = round2(
     Math.max(0, grossUsd - estimatedSlippageUsd - batchedGasUsd - protocolFeeUsd)
   );
@@ -503,7 +525,7 @@ function classifyAndBuildReport(params: {
       grossUsd,
       defiGrossUsd,
       liquidGrossUsd,
-      protocolFeeBps: PROTOCOL_FEE_BPS,
+      protocolFeeBps: effectiveReportFeeBps,
       protocolFeeUsd,
       singleTxGasUsd,
       batchedGasUsd,
@@ -601,10 +623,11 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
       continue;
     }
 
-    // Reserve a tiny gas buffer on native token so user isn't stranded
-    const gasReserve = c.id === 'ethereum' ? 0.002 : 0.0005;
+    // Reserve each chain's configured native gas buffer so users aren't stranded on follow-up txs or low-unit-price chains
+    const gasReserve = c.gasReserveNative;
     if (nativeUi > gasReserve) {
-      const sweepableWei = out.nativeBalanceWei - BigInt(Math.round(gasReserve * 1e18));
+      const reserveWei = BigInt(Math.round(gasReserve * 1e9)) * 1_000_000_000n;
+      const sweepableWei = out.nativeBalanceWei - reserveWei;
       if (sweepableWei > 0n) {
         rawAssets.push({
           chain: c.id,
@@ -675,7 +698,7 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
       const defiUnderlyings = Array.from(defiReceiptMap.values()).flatMap((d) =>
         d.secondaryUnderlyingAddress ? [d.underlyingAddress, d.secondaryUnderlyingAddress] : [d.underlyingAddress]
       );
-      const llamaChainSlug = c.id === 'avalanche' ? 'avax' : c.id === 'bnb' ? 'bsc' : c.id;
+      const llamaChainSlug = DEFILLAMA_CHAIN_SLUGS[c.id] ?? c.id;
       const [underlyingDexMap, underlyingLlamaMap] = defiUnderlyings.length
         ? await Promise.all([
             fetchDexLiquidityBatch(c.id, defiUnderlyings),
@@ -709,8 +732,16 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
             const u1Dex = underlyingDexMap.get(defiReceipt.secondaryUnderlyingAddress.toLowerCase());
             const u1Llama = underlyingLlamaMap.get(`${llamaChainSlug}:${defiReceipt.secondaryUnderlyingAddress}`);
             const u1PriceUsd = isUsdc1 ? 1.0 : u1Dex?.priceUsd || u1Llama || 0;
-            const dec0 = isUsdcUnderlying ? 6 : 18;
-            const dec1 = isUsdc1 ? 6 : 18;
+            const dec0 = resolveUnderlyingDecimals({
+              chain: c.id,
+              underlyingAddress: defiReceipt.underlyingAddress,
+              fallbackDecimals: 18,
+            });
+            const dec1 = resolveUnderlyingDecimals({
+              chain: c.id,
+              underlyingAddress: defiReceipt.secondaryUnderlyingAddress,
+              fallbackDecimals: 18,
+            });
             const ui0 = defiReceipt.expectedUnderlyingRaw
               ? formatUnits(defiReceipt.expectedUnderlyingRaw, dec0)
               : 0;
@@ -927,10 +958,18 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
         underlyingAddress: nft.position.token0,
         lpToken0Address: nft.position.token0,
         lpToken0Symbol: sym0,
-        lpToken0Decimals: t0IsUsdc ? 6 : 18,
+        lpToken0Decimals: resolveUnderlyingDecimals({
+          chain: c.id,
+          underlyingAddress: nft.position.token0,
+          fallbackDecimals: 18,
+        }),
         lpToken1Address: nft.position.token1,
         lpToken1Symbol: sym1,
-        lpToken1Decimals: t1IsUsdc ? 6 : 18,
+        lpToken1Decimals: resolveUnderlyingDecimals({
+          chain: c.id,
+          underlyingAddress: nft.position.token1,
+          fallbackDecimals: 18,
+        }),
         nftTokenId: nft.position.tokenId.toString(),
         nftLiquidity: nft.position.liquidity.toString(),
         nftManagerAddress: nft.managerAddress,
@@ -1065,9 +1104,12 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
             address: s.protocolAddress || s.address,
             rawBalance: s.rawBalance,
             decimals: s.decimals,
-            underlyingDecimals:
-              s.underlyingDecimals ??
-              (s.underlyingAddress?.toLowerCase() === cfg.usdcAddress.toLowerCase() ? 6 : s.decimals),
+            underlyingDecimals: resolveUnderlyingDecimals({
+              chain,
+              underlyingAddress: s.underlyingAddress,
+              explicitDecimals: s.underlyingDecimals,
+              fallbackDecimals: s.decimals,
+            }),
           })),
         });
         return [chain, map] as const;
@@ -1082,9 +1124,12 @@ export async function scanLiveWallet(walletAddress: string, label?: string): Pro
       a.expectedUnderlyingRaw = vState.expectedUnderlyingRaw;
       // Re-price share value accurately using convertToAssets/previewRedeem when priced from underlying token
       const cfg = EVM_CHAINS[a.chain];
-      const uDec =
-        a.underlyingDecimals ??
-        (a.underlyingAddress?.toLowerCase() === cfg.usdcAddress.toLowerCase() ? 6 : a.decimals);
+      const uDec = resolveUnderlyingDecimals({
+        chain: a.chain,
+        underlyingAddress: a.underlyingAddress,
+        explicitDecimals: a.underlyingDecimals,
+        fallbackDecimals: a.decimals,
+      });
       const regEntry = TOKEN_REGISTRY.find(
         (t) => t.chain === a.chain && t.address.toLowerCase() === a.address.toLowerCase()
       );

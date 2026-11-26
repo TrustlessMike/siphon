@@ -217,16 +217,25 @@ export function computePreservationFee(
   }
 
   const tiers = opts.tiers && opts.tiers.length > 0 ? opts.tiers : PRESERVATION_FEE_TIERS;
+  const sortedTiers = [...tiers].sort((a, b) => a.minGrossUsd - b.minGrossUsd);
   const matchedTier =
-    tiers.find(
+    sortedTiers.find(
       (t) => grossUsd >= t.minGrossUsd && (t.maxGrossUsd === null || grossUsd < t.maxGrossUsd)
-    ) ?? tiers[tiers.length - 1];
+    ) ?? sortedTiers[sortedTiers.length - 1];
 
   const nominalFeeBps =
     opts.overrideFeeBps !== undefined
       ? resolvePreservationFeeBps(opts.overrideFeeBps)
       : resolvePreservationFeeBps(matchedTier.feeBps);
 
+  // Resolve the active hard USD cap (explicit override, or lowest finite cap from matched/top tier)
+  const defaultCapUsd =
+    matchedTier.maxFeeUsdCap ??
+    sortedTiers.reduce<number | null>(
+      (acc, t) =>
+        t.maxFeeUsdCap !== null && (acc === null || t.maxFeeUsdCap < acc) ? t.maxFeeUsdCap : acc,
+      null
+    );
   const resolvedCapUsd =
     opts.maxFeeUsdCap === null
       ? null
@@ -235,9 +244,25 @@ export function computePreservationFee(
         Number.isFinite(opts.maxFeeUsdCap) &&
         opts.maxFeeUsdCap >= 0
       ? round2(opts.maxFeeUsdCap)
-      : matchedTier.maxFeeUsdCap;
+      : defaultCapUsd;
 
-  const uncappedFeeUsd = round2((grossUsd * nominalFeeBps) / 10_000);
+  // Progressive marginal bracket calculation: guarantees fee(x) is continuous and monotonically
+  // non-decreasing with ZERO downward cliffs at tier boundaries ($50, $500, $5,000), while preserving
+  // the dust-friendly small tier and hard $50 whale cap!
+  let uncappedFeeRaw = 0;
+  if (opts.overrideFeeBps !== undefined) {
+    uncappedFeeRaw = (grossUsd * nominalFeeBps) / 10_000;
+  } else {
+    for (const tier of sortedTiers) {
+      if (grossUsd <= tier.minGrossUsd) break;
+      const upper = tier.maxGrossUsd === null ? grossUsd : Math.min(grossUsd, tier.maxGrossUsd);
+      const sliceUsd = Math.max(0, upper - tier.minGrossUsd);
+      if (sliceUsd <= 0) continue;
+      const tierBps = resolvePreservationFeeBps(tier.feeBps);
+      uncappedFeeRaw += (sliceUsd * tierBps) / 10_000;
+    }
+  }
+  const uncappedFeeUsd = round2(uncappedFeeRaw);
   const capApplied = resolvedCapUsd !== null && uncappedFeeUsd > resolvedCapUsd;
   const feeUsd = capApplied ? resolvedCapUsd : uncappedFeeUsd;
   const netAfterFeeUsd = round2(Math.max(0, grossUsd - feeUsd));
@@ -288,13 +313,58 @@ export interface ProtocolFeeConfig {
   feeRecipientSol: string | null;
   feeDestinationType: 'contract' | 'wallet';
   treasuryConfigured: boolean;
+  feeSchedule?: 'tiered' | 'flat';
+  preservationFee?: PreservationFeeResult;
 }
 
 export function getProtocolFeeConfig(overrides?: {
   feeBps?: number | string | null;
   feeRecipientEvm?: string | null;
+  grossUsd?: number;
+  feeSchedule?: 'tiered' | 'flat';
+  preservationFeeOpts?: PreservationFeeOptions;
 }): ProtocolFeeConfig {
-  const feeBps = resolveProtocolFeeBps(overrides?.feeBps ?? process.env.TURGALIUM_FEE_BPS);
+  const hasExplicitBpsOverride =
+    overrides?.feeBps !== undefined && overrides?.feeBps !== null && overrides?.feeBps !== '';
+  const hasEnvFlatOverride = Boolean(process.env.TURGALIUM_FEE_BPS?.trim());
+  const useTieredForGross =
+    !hasExplicitBpsOverride &&
+    overrides?.feeSchedule !== 'flat' &&
+    !hasEnvFlatOverride &&
+    typeof overrides?.grossUsd === 'number' &&
+    Number.isFinite(overrides.grossUsd) &&
+    overrides.grossUsd > 0;
+
+  let preservationFee: PreservationFeeResult | undefined;
+  let feeBps: number;
+  let feePercent: number;
+  let feeSchedule: 'tiered' | 'flat';
+
+  if (useTieredForGross) {
+    preservationFee = computePreservationFee(overrides!.grossUsd!, overrides?.preservationFeeOpts);
+    feeBps = Math.max(0, Math.round(preservationFee.effectiveFeeBps));
+    feePercent = Number((preservationFee.effectiveFeeBps / 100).toFixed(4));
+    feeSchedule = 'tiered';
+  } else if (hasExplicitBpsOverride && overrides?.feeSchedule === 'tiered') {
+    feeBps = resolvePreservationFeeBps(overrides.feeBps);
+    feePercent = Number((feeBps / 100).toFixed(2));
+    feeSchedule = 'tiered';
+  } else if (
+    hasExplicitBpsOverride &&
+    Number.isFinite(Number(overrides?.feeBps)) &&
+    Number(overrides?.feeBps) >= 0 &&
+    Number(overrides?.feeBps) < MIN_PROTOCOL_FEE_BPS
+  ) {
+    // Allow explicit preservation-range bps overrides (0..499 bps) while keeping legacy [500..1000] intact
+    feeBps = resolvePreservationFeeBps(overrides?.feeBps);
+    feePercent = Number((feeBps / 100).toFixed(2));
+    feeSchedule = 'flat';
+  } else {
+    feeBps = resolveProtocolFeeBps(overrides?.feeBps ?? process.env.TURGALIUM_FEE_BPS);
+    feePercent = Number((feeBps / 100).toFixed(2));
+    feeSchedule = 'flat';
+  }
+
   // HIGH-01: When server treasury is configured via environment, never allow client overrides to hijack fees.
   const serverTreasury = process.env.TURGALIUM_FEE_RECIPIENT_EVM?.trim() || null;
   const candidateEvm = isValidFeeRecipientEvm(serverTreasury)
@@ -307,14 +377,58 @@ export function getProtocolFeeConfig(overrides?: {
 
   return {
     feeBps,
-    feePercent: Number((feeBps / 100).toFixed(2)),
+    feePercent,
     minFeeBps: MIN_PROTOCOL_FEE_BPS,
     maxFeeBps: MAX_PROTOCOL_FEE_BPS,
     feeRecipientEvm,
     feeRecipientSol,
     feeDestinationType,
     treasuryConfigured: Boolean(feeRecipientEvm),
+    feeSchedule,
+    ...(preservationFee ? { preservationFee } : {}),
   };
+}
+
+/**
+ * Returns the canonical decimals for `EVM_CHAINS[chain].usdcAddress`
+ * (18 decimals for BNB Chain USDC & Blast USDB; 6 decimals for all other EVM chains).
+ */
+export function getChainUsdcDecimals(chain: EvmChainId): number {
+  return chain === 'bnb' || chain === 'blast' ? 18 : 6;
+}
+
+/**
+ * Resolves exact underlying ERC-20 token decimals for DeFi positions (ERC-4626, Compound, LP, etc.)
+ * without blindly assuming 6 decimals for BNB (18-dec USDC), Blast (18-dec USDB), WBTC (8), or WETH (18).
+ */
+export function resolveUnderlyingDecimals(params: {
+  chain: EvmChainId;
+  underlyingAddress?: string | null;
+  explicitDecimals?: number | null;
+  fallbackDecimals?: number;
+}): number {
+  if (
+    typeof params.explicitDecimals === 'number' &&
+    Number.isInteger(params.explicitDecimals) &&
+    params.explicitDecimals >= 0 &&
+    params.explicitDecimals <= 36
+  ) {
+    return params.explicitDecimals;
+  }
+  const addrLower = params.underlyingAddress?.trim().toLowerCase();
+  const cfg = EVM_CHAINS[params.chain];
+  if (addrLower && cfg) {
+    if (addrLower === cfg.usdcAddress.toLowerCase()) {
+      return getChainUsdcDecimals(params.chain);
+    }
+    const reg = TOKEN_REGISTRY.find(
+      (t) => t.chain === params.chain && t.address.toLowerCase() === addrLower
+    );
+    if (reg && Number.isInteger(reg.decimals)) {
+      return reg.decimals;
+    }
+  }
+  return params.fallbackDecimals ?? 18;
 }
 
 function buildRpcUrls(envUrl: string | undefined, fallbacks: string[]): string[] {
@@ -443,9 +557,9 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     rpcUrl: process.env.POLYGON_RPC_URL ?? 'https://137.rpc.thirdweb.com',
     rpcUrls: buildRpcUrls(process.env.POLYGON_RPC_URL, [
       'https://137.rpc.thirdweb.com',
-      'https://polygon-bor-rpc.publicnode.com',
-      'https://polygon.drpc.org',
+      'https://gateway.tenderly.co/public/polygon',
       'https://1rpc.io/matic',
+      'https://api.zan.top/polygon-mainnet',
     ]),
     explorerUrl: 'https://polygonscan.com',
     multicall3: MULTICALL3_ADDRESS,
@@ -500,7 +614,8 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     rpcUrls: buildRpcUrls(process.env.BNB_RPC_URL, [
       'https://bsc-rpc.publicnode.com',
       'https://bsc.drpc.org',
-      'https://bsc-dataseed.binance.org',
+      'https://bsc-dataseed1.binance.org',
+      'https://bsc-dataseed1.defibit.io',
     ]),
     explorerUrl: 'https://bscscan.com',
     multicall3: MULTICALL3_ADDRESS,
@@ -656,11 +771,10 @@ export const EVM_CHAINS: Record<EvmChainId, ChainConfig> = {
     chainId: 81457,
     nativeSymbol: 'ETH',
     nativeLlamaId: 'coingecko:ethereum',
-    rpcUrl: process.env.BLAST_RPC_URL ?? 'https://rpc.blast.io',
+    rpcUrl: process.env.BLAST_RPC_URL ?? 'https://blast.api.pocket.network',
     rpcUrls: buildRpcUrls(process.env.BLAST_RPC_URL, [
-      'https://rpc.blast.io',
-      'https://blast-rpc.publicnode.com',
-      'https://blast.drpc.org',
+      'https://blast.api.pocket.network',
+      'https://rpc.driftguard.live/blast',
     ]),
     explorerUrl: 'https://blastscan.io',
     multicall3: MULTICALL3_ADDRESS,

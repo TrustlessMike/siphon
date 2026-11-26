@@ -99,6 +99,7 @@ export type DefiProtocolExtractorId =
   | 'compound_v2'
   | 'uniswap_v2_lp'
   | 'uniswap_v3_nft'
+  | 'balancer_v2_lp'
   | 'liquid_receipt'
   | 'external_protocol';
 
@@ -157,7 +158,7 @@ export interface ChainedFollowUpPlan {
   chain: EvmChainId;
   unlockedAssets: ChainedFollowUpAsset[];
   bundledInCurrentBatch: boolean;
-  bridgeProvider: 'relay' | 'lifi' | 'circle_cctp' | 'pending_after_unwind';
+  bridgeProvider: 'relay' | 'lifi' | 'circle_cctp' | 'mayan_swift' | 'debridge_dln' | 'pending_after_unwind';
   solanaDestination: string;
   outputAsset: 'USDC' | 'SOL';
   autoAdvanceAction: 'complete_in_single_batch' | 'auto_quote_and_bridge_unlocked';
@@ -267,6 +268,7 @@ export interface ScannedAsset {
   nftTokenId?: string;
   nftLiquidity?: string;
   nftManagerAddress?: string;
+  balancerPoolId?: string;
   /** Optional protocol-indexed DeFi metadata (e.g. 40 Acres, Wayfinder, Carbon, Velodrome veNFT) */
   protocolUrl?: string;
   protocolLogoUrl?: string;

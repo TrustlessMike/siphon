@@ -646,10 +646,12 @@ export function evaluateAssetRoi(
 
   // Chain-specific sub-fee dust guard (e.g., BTC dust UTXO or pre-skipped chain-floor dust)
   const netAfterSlippageUsd = Math.max(0, grossUsd - slippageUsd);
-  const protocolFeeUsd =
-    opts.feeSchedule === 'tiered'
-      ? computePreservationFee(netAfterSlippageUsd, opts.preservationFeeOpts).feeUsd
-      : r2((netAfterSlippageUsd * effectiveFeeBps) / 10_000);
+  const useTieredFee =
+    opts.feeSchedule === 'tiered' ||
+    (opts.feeSchedule !== 'flat' && opts.protocolFeeBps === undefined && !process.env.TURGALIUM_FEE_BPS?.trim());
+  const protocolFeeUsd = useTieredFee
+    ? computePreservationFee(netAfterSlippageUsd, opts.preservationFeeOpts).feeUsd
+    : r2((netAfterSlippageUsd * effectiveFeeBps) / 10_000);
   const bridgeShareUsd = opts.includeSingleBridgeShare
     ? r2(estimateBridgeFixedFeeUsd(asset.chain) / Math.max(1, opts.chainAssetCount ?? 1))
     : 0;
@@ -961,7 +963,12 @@ export function evaluateChainBatchRoi(params: {
   gasPriceGwei?: number;
 }): ChainBatchRoiReport {
   const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
-  const useTieredFee = params.feeSchedule === 'tiered';
+  const useTieredFee =
+    params.feeSchedule === 'tiered' ||
+    (params.feeSchedule !== 'flat' &&
+      params.protocolFeeBps === undefined &&
+      !process.env.TURGALIUM_FEE_BPS?.trim());
+  const effectiveSchedule: 'flat' | 'tiered' = useTieredFee ? 'tiered' : 'flat';
   const gasSponsored = params.gasSponsored ?? true;
   const solanaAtaRentUsd = estimateSolanaAtaRentUsd({
     hasUsdcAta: params.hasSolanaUsdcAta,
@@ -969,8 +976,8 @@ export function evaluateChainBatchRoi(params: {
   });
 
   const buckets = pruneNegativeRoiAssets(params.assets, {
-    protocolFeeBps: feeCfg.feeBps,
-    feeSchedule: params.feeSchedule,
+    protocolFeeBps: useTieredFee ? undefined : feeCfg.feeBps,
+    feeSchedule: effectiveSchedule,
     preservationFeeOpts: params.preservationFeeOpts,
     isBatched: true,
   });
@@ -1203,10 +1210,14 @@ export function applyTwoLevelRoiToReport(
   report: ScanReport,
   opts: {
     protocolFeeBps?: number;
+    feeSchedule?: 'flat' | 'tiered';
+    preservationFeeOpts?: PreservationFeeOptions;
     hasSolanaUsdcAta?: boolean;
   } = {}
 ): ScanReport {
-  const feeBps = opts.protocolFeeBps ?? report.totals.protocolFeeBps;
+  const explicitFeeBps = opts.protocolFeeBps;
+  const feeSchedule: 'flat' | 'tiered' =
+    opts.feeSchedule ?? (explicitFeeBps !== undefined ? 'flat' : 'tiered');
   const solPriceUsd = report.totals.solPriceUsd || 70;
   const ataRentTotal = estimateSolanaAtaRentUsd({
     hasUsdcAta: opts.hasSolanaUsdcAta,
@@ -1263,7 +1274,9 @@ export function applyTwoLevelRoiToReport(
         sourceWallet: wGroup.sourceWallet,
         sourceWalletLabel: wGroup.sourceWalletLabel,
         assets: wGroup.assets,
-        protocolFeeBps: feeBps,
+        protocolFeeBps: explicitFeeBps,
+        feeSchedule,
+        preservationFeeOpts: opts.preservationFeeOpts,
         gasSponsored: chainSummary.needsGasSponsorship,
         hasSolanaUsdcAta: true,
         solPriceUsd,
@@ -1298,7 +1311,9 @@ export function applyTwoLevelRoiToReport(
         sourceWallet: g.sourceWallet,
         sourceWalletLabel: g.sourceWalletLabel,
         assets: g.assets,
-        protocolFeeBps: feeBps,
+        protocolFeeBps: explicitFeeBps,
+        feeSchedule,
+        preservationFeeOpts: opts.preservationFeeOpts,
         gasSponsored: g.chainSummary.needsGasSponsorship,
         hasSolanaUsdcAta: false,
         solPriceUsd,
@@ -1319,7 +1334,9 @@ export function applyTwoLevelRoiToReport(
         sourceWallet: best.sourceWallet,
         sourceWalletLabel: best.sourceWalletLabel,
         assets: best.assets,
-        protocolFeeBps: feeBps,
+        protocolFeeBps: explicitFeeBps,
+        feeSchedule,
+        preservationFeeOpts: opts.preservationFeeOpts,
         gasSponsored: best.chainSummary.needsGasSponsorship,
         hasSolanaUsdcAta: false,
         solPriceUsd,
@@ -1400,7 +1417,12 @@ export function applyTwoLevelRoiToReport(
     const chainSlippage = r2(
       activeSweep.reduce((s, a) => s + (a.roiCostBreakdown?.slippageUsd ?? a.estimatedSlippageUsd ?? 0), 0)
     );
-    const chainFee = r2((Math.max(0, chainGrossUsd - chainSlippage) * feeBps) / 10_000);
+    const flatFeeBps = explicitFeeBps ?? report.totals.protocolFeeBps;
+    const chainFeeBase = Math.max(0, chainGrossUsd - chainSlippage);
+    const chainFee =
+      feeSchedule === 'tiered'
+        ? computePreservationFee(chainFeeBase, opts.preservationFeeOpts).feeUsd
+        : r2((chainFeeBase * flatFeeBps) / 10_000);
 
     chainSummary.assetCount = chainAssets.length;
     chainSummary.defiCount = chainAssets.filter((a) => a.action === 'WITHDRAW_AND_BRIDGE').length;
@@ -1469,7 +1491,18 @@ export function applyTwoLevelRoiToReport(
   const estimatedSlippageUsd = r2(
     activeAll.reduce((s, a) => s + (a.roiCostBreakdown?.slippageUsd ?? a.estimatedSlippageUsd ?? 0), 0)
   );
-  const protocolFeeUsd = r2((Math.max(0, totalGrossUsd - estimatedSlippageUsd) * feeBps) / 10_000);
+  const totalFeeBase = Math.max(0, totalGrossUsd - estimatedSlippageUsd);
+  const flatTotalFeeBps = explicitFeeBps ?? report.totals.protocolFeeBps;
+  const totalPreservation =
+    feeSchedule === 'tiered'
+      ? computePreservationFee(totalFeeBase, opts.preservationFeeOpts)
+      : null;
+  const protocolFeeUsd = totalPreservation
+    ? totalPreservation.feeUsd
+    : r2((totalFeeBase * flatTotalFeeBps) / 10_000);
+  const reportedFeeBps = totalPreservation
+    ? Math.max(0, Math.round(totalPreservation.effectiveFeeBps))
+    : flatTotalFeeBps;
   const netSolanaUsdc = r2(
     Math.max(0, totalGrossUsd - estimatedSlippageUsd - batchedGasUsd - protocolFeeUsd)
   );
@@ -1477,7 +1510,7 @@ export function applyTwoLevelRoiToReport(
   report.totals.grossUsd = totalGrossUsd;
   report.totals.defiGrossUsd = defiGrossUsd;
   report.totals.liquidGrossUsd = liquidGrossUsd;
-  report.totals.protocolFeeBps = feeBps;
+  report.totals.protocolFeeBps = reportedFeeBps;
   report.totals.protocolFeeUsd = protocolFeeUsd;
   report.totals.singleTxGasUsd = singleTxGasUsd;
   report.totals.batchedGasUsd = batchedGasUsd;
@@ -1515,6 +1548,12 @@ export function evaluatePortfolioRoi(
     hasSolanaUsdcAta?: boolean;
   } = {}
 ): PortfolioRoiReport {
+  const useTieredFee =
+    opts.feeSchedule === 'tiered' ||
+    (opts.feeSchedule !== 'flat' &&
+      opts.protocolFeeBps === undefined &&
+      !process.env.TURGALIUM_FEE_BPS?.trim());
+  const effectiveSchedule: 'flat' | 'tiered' = useTieredFee ? 'tiered' : 'flat';
   const feeCfg = getProtocolFeeConfig({ feeBps: opts.protocolFeeBps ?? report.totals.protocolFeeBps });
   const solPriceUsd = report.totals.solPriceUsd || 70;
   const solanaAtaRentUsd = estimateSolanaAtaRentUsd({
@@ -1554,8 +1593,8 @@ export function evaluatePortfolioRoi(
       sourceWallet: group.sourceWallet,
       sourceWalletLabel: group.sourceWalletLabel,
       assets: group.assets,
-      protocolFeeBps: feeCfg.feeBps,
-      feeSchedule: opts.feeSchedule,
+      protocolFeeBps: useTieredFee ? undefined : feeCfg.feeBps,
+      feeSchedule: effectiveSchedule,
       preservationFeeOpts: opts.preservationFeeOpts,
       gasSponsored: opts.gasSponsored ?? true,
       fixedRelayerOverheadUsd: opts.fixedRelayerOverheadUsd,
@@ -1583,8 +1622,8 @@ export function evaluatePortfolioRoi(
         sourceWallet: group.sourceWallet,
         sourceWalletLabel: group.sourceWalletLabel,
         assets: group.assets,
-        protocolFeeBps: feeCfg.feeBps,
-        feeSchedule: opts.feeSchedule,
+        protocolFeeBps: useTieredFee ? undefined : feeCfg.feeBps,
+        feeSchedule: effectiveSchedule,
         preservationFeeOpts: opts.preservationFeeOpts,
         gasSponsored: opts.gasSponsored ?? true,
         fixedRelayerOverheadUsd: opts.fixedRelayerOverheadUsd,

@@ -875,6 +875,7 @@ interface MayanRawQuotePayload {
   expectedAmountOutBaseUnits?: string | number;
   minAmountOut?: string | number;
   toTokenPrice?: number;
+  toPrice?: number;
   toToken?: { decimals?: number; symbol?: string };
   clientRelayerFeeSuccess?: number;
   swapRelayerFee?: number;
@@ -902,7 +903,10 @@ export async function quoteMayanSwiftNonEvm(params: {
   timeoutMs?: number;
   fetcher?: RouteAuctionFetcher;
 }): Promise<MayanSwiftNonEvmQuoteResult | null> {
-  const toToken = params.outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
+  const toToken =
+    params.outputAsset === 'SOL'
+      ? '0x0000000000000000000000000000000000000000'
+      : SOLANA_USDC_MINT;
   const slippagePlan = computeTierScaledSlippageBps({
     tradeUsd: params.tradeUsd,
     liquidityUsd: params.liquidityUsd,
@@ -929,8 +933,16 @@ export async function quoteMayanSwiftNonEvm(params: {
   url.searchParams.set('toChain', 'solana');
   url.searchParams.set('slippageBps', String(slippagePlan.slippageBps));
   url.searchParams.set('swift', 'true');
+  url.searchParams.set('mctp', 'true');
+  url.searchParams.set('fastMctp', 'true');
+  url.searchParams.set('gasless', 'false');
+  url.searchParams.set('solanaProgram', 'FC4eXxkyrMPTjiYUpp4EAnkmwMbQyZ6NDCh1kfLn6vsf');
+  url.searchParams.set('forwarderAddress', '0x337685fdaB40D39bd02028545a4FfA7D287cC3E2');
+  url.searchParams.set('sdkVersion', '16_1_0');
   url.searchParams.set('fromAddress', params.fromAddress);
   url.searchParams.set('destAddress', params.solanaDestination);
+  url.searchParams.set('destinationAddress', params.solanaDestination);
+  url.searchParams.set('swapperAddress', params.fromAddress);
   url.searchParams.set('gasDrop', '0');
 
   const timeoutMs = params.timeoutMs ?? DEFAULT_NON_EVM_AUCTION_TIMEOUT_MS;
@@ -987,8 +999,8 @@ export async function quoteMayanSwiftNonEvm(params: {
   const outPrice =
     params.outputAsset === 'USDC'
       ? 1.0
-      : Number(best.toTokenPrice ?? 0) > 0
-      ? Number(best.toTokenPrice)
+      : Number(best.toTokenPrice ?? best.toPrice ?? 0) > 0
+      ? Number(best.toTokenPrice ?? best.toPrice)
       : 150;
   const quotedOutUsd = Number((outUi * outPrice).toFixed(2));
   const bridgeFeeUsd = Number(
