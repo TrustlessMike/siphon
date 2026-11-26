@@ -1733,6 +1733,522 @@ def main():
             }
             ctxE.close()
 
+            # ------------------------------------------------------------------
+            # 7. PRESERVATION TOOLS (RENT VACUUM, YIELD PARK, APPROVAL REVOKER),
+            #    TIERED FEE & ROUTE AUCTION CLARITY, GAS WATCHDOG, & DEGEN TAB
+            #    ACROSS DESKTOP (1440px), TABLET (900px), AND MOBILE (390px)
+            # ------------------------------------------------------------------
+            ctxP = browser.new_context(viewport={"width": 1440, "height": 900})
+            pgP = ctxP.new_page()
+            errsP = []
+            badHttpP = []
+            pgP.on("pageerror", lambda e: errsP.append(f"pageerror: {e}"))
+            pgP.on("console", lambda m: errsP.append(f"console.{m.type}: {m.text}") if m.type == "error" else None)
+            pgP.on(
+                "response",
+                lambda r: badHttpP.append(f"{r.status} {r.request.method} {r.url}")
+                if r.status >= 400 and "/api/solana/balance" not in r.url
+                else None,
+            )
+
+            pgP.add_init_script(f"""
+              window.__xssP = false;
+              window.__evmRpcP = [];
+              window.__solSignCallsP = [];
+              let chainHex = '0x1';
+              window.ethereum = {{
+                isMetaMask: true,
+                on() {{}},
+                removeListener() {{}},
+                async request({{ method, params }}) {{
+                  window.__evmRpcP.push({{ method, params }});
+                  if (method === 'eth_requestAccounts') return ['{VITALIK}'];
+                  if (method === 'eth_chainId') return chainHex;
+                  if (method === 'wallet_switchEthereumChain') {{ chainHex = params[0].chainId; return null; }}
+                  if (method === 'wallet_getCapabilities') {{
+                    return {{
+                      '0x1': {{ atomic: {{ status: 'supported' }} }},
+                      '0x2105': {{ atomic: {{ status: 'supported' }} }},
+                    }};
+                  }}
+                  if (method === 'wallet_sendCalls') return {{ id: '0xrevoke_batch_p' }};
+                  if (method === 'wallet_getCallsStatus') {{
+                    return {{ status: 200, receipts: [{{ transactionHash: '0x' + 'fa'.repeat(32), status: '0x1' }}] }};
+                  }}
+                  if (method === 'eth_sendTransaction') {{
+                    return '0x' + 'be'.repeat(32);
+                  }}
+                  return null;
+                }},
+              }};
+              window.phantom = {{
+                solana: {{
+                  isPhantom: true,
+                  isConnected: true,
+                  publicKey: {{ toString: () => '{SOL_PUBKEY}' }},
+                  on() {{}},
+                  removeListener() {{}},
+                  async connect() {{ return {{ publicKey: {{ toString: () => '{SOL_PUBKEY}' }} }}; }},
+                  async disconnect() {{}},
+                  async signAndSendTransaction(tx) {{
+                    window.__solSignCallsP.push({{
+                      hasSerialize: typeof tx?.serialize === 'function',
+                      b64Len: (tx?.serializedTransactionBase64 || '').length,
+                    }});
+                    return {{ signature: '5wHu1qwD7q4s8kN2p9mX6vY3zB1cR4tG8jL2nP5qS7uV' }};
+                  }},
+                }},
+              }};
+            """)
+
+            pgP.route("**/api/scan", route_scan_deterministic)
+            pgP.route("**/api/solana/balance*", route_sol_balance)
+
+            # Valid base64 dummy bytes (>=16 bytes) for Solana VersionedTransaction signing mock
+            dummy_sol_tx_b64 = "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAED"
+
+            def route_rent_scan_mock(route):
+                body = route.request.post_data_json or {}
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "ownerAddress": body.get("ownerAddress", SOL_PUBKEY),
+                        "scannedPrograms": ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"],
+                        "totalTokenAccountsScanned": 14,
+                        "reclaimableCount": 3,
+                        "skippedNonZeroCount": 11,
+                        "skippedFrozenCount": 0,
+                        "skippedUncloseableCount": 0,
+                        "rentPerEmptyAccountSol": 0.00203928,
+                        "reclaimableLamports": 6117840,
+                        "reclaimableSol": 0.00611784,
+                        "solPriceUsd": 150,
+                        "solPriceSource": "explicit",
+                        "reclaimableUsd": 0.92,
+                        "maxAccountsPerTx": 20,
+                        "batchesRequired": 1,
+                        "reclaimableAccounts": [
+                            {
+                                "tokenAccount": "8xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAs1",
+                                "mint": "EPjFWdd5<img src=x onerror=\"window.__xssP=true\">",
+                                "owner": body.get("ownerAddress", SOL_PUBKEY),
+                                "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                                "programKind": "spl-token",
+                                "amount": "0",
+                                "uiAmount": 0,
+                                "decimals": 6,
+                                "state": "initialized",
+                                "frozen": False,
+                                "closeable": True,
+                                "closeAuthority": None,
+                                "rentLamports": 2039280,
+                                "rentSol": 0.00203928,
+                            },
+                            {
+                                "tokenAccount": "8xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAs2",
+                                "mint": "So11111111111111111111111111111111111111112",
+                                "owner": body.get("ownerAddress", SOL_PUBKEY),
+                                "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                                "programKind": "spl-token",
+                                "amount": "0",
+                                "uiAmount": 0,
+                                "decimals": 9,
+                                "state": "initialized",
+                                "frozen": False,
+                                "closeable": True,
+                                "closeAuthority": None,
+                                "rentLamports": 2039280,
+                                "rentSol": 0.00203928,
+                            },
+                            {
+                                "tokenAccount": "8xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAs3",
+                                "mint": "jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v",
+                                "owner": body.get("ownerAddress", SOL_PUBKEY),
+                                "programId": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+                                "programKind": "token-2022",
+                                "amount": "0",
+                                "uiAmount": 0,
+                                "decimals": 9,
+                                "state": "initialized",
+                                "frozen": False,
+                                "closeable": True,
+                                "closeAuthority": None,
+                                "rentLamports": 2039280,
+                                "rentSol": 0.00203928,
+                            },
+                        ],
+                        "unsignedCloseTx": {
+                            "version": 0,
+                            "ownerAddress": body.get("ownerAddress", SOL_PUBKEY),
+                            "destination": body.get("ownerAddress", SOL_PUBKEY),
+                            "authority": body.get("ownerAddress", SOL_PUBKEY),
+                            "recentBlockhash": "11111111111111111111111111111111",
+                            "accountCount": 3,
+                            "closedAccounts": [
+                                "8xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAs1",
+                                "8xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAs2",
+                                "8xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAs3",
+                            ],
+                            "reclaimedLamports": 6117840,
+                            "reclaimedSol": 0.00611784,
+                            "serializedTransactionBase64": dummy_sol_tx_b64,
+                            "serializedMessageBase64": dummy_sol_tx_b64,
+                        },
+                        "txBuildWarning": None,
+                    }),
+                )
+
+            def route_yield_park_mock(route):
+                body = route.request.post_data_json or {}
+                total = float(body.get("totalUsdcAmount", 100))
+                pct = float(body.get("preservePct", 90))
+                yield_usdc = round(total * pct / 100.0, 2)
+                degen_usdc = round(total - yield_usdc, 2)
+                build_tx = bool(body.get("buildTransaction", False))
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "planVersion": "siphon-solana-yield-park-v1",
+                        "ownerAddress": body.get("ownerAddress", SOL_PUBKEY),
+                        "strategy": {
+                            "id": "jupsol",
+                            "name": "Jupiter Staked SOL (JupSOL)",
+                            "protocol": "Jupiter / Sanctum LST",
+                            "symbol": "JupSOL",
+                            "executionMode": "jupiter_swap_v0",
+                            "baselineApyPct": 7.1,
+                            "preservesUsdPeg": False,
+                            "appUrl": "https://jup.ag/swap/USDC-JupSOL",
+                        },
+                        "split": {
+                            "totalUsdcAmount": total,
+                            "preservePct": pct,
+                            "degenPct": round(100.0 - pct, 2),
+                            "yieldUsdc": yield_usdc,
+                            "degenSidePocketUsdc": degen_usdc,
+                        },
+                        "apy": {
+                            "estimatedApyPct": 7.45,
+                            "source": "live",
+                            "apyRangePct": [6.0, 8.2],
+                        },
+                        "projections": {
+                            "projectedAnnualYieldUsd": round(yield_usdc * 0.0745, 2),
+                            "projectedMonthlyYieldUsd": round(yield_usdc * 0.0745 / 12.0, 2),
+                            "projectedDailyYieldUsd": round(yield_usdc * 0.0745 / 365.0, 4),
+                            "yieldFundedDegenMonthlyBudgetUsd": round(yield_usdc * 0.0745 / 12.0, 2),
+                        },
+                        "jupiterQuote": {
+                            "estimatedOutputUi": round(yield_usdc / 150.0, 6),
+                            "minOutputUi": round(yield_usdc / 151.0, 6),
+                            "slippageBps": 50,
+                            "priceImpactPct": 0.012,
+                            "routeLabels": ["Orca Whirlpool", "Sanctum"],
+                        },
+                        "transaction": (
+                            {
+                                "version": 0,
+                                "feePayer": body.get("ownerAddress", SOL_PUBKEY),
+                                "serializedByteLength": 64,
+                                "swapTransactionBase64": dummy_sol_tx_b64,
+                            }
+                            if build_tx
+                            else None
+                        ),
+                        "warnings": [],
+                    }),
+                )
+
+            def route_approvals_scan_mock(route):
+                body = route.request.post_data_json or {}
+                chain = body.get("chain", "ethereum")
+                chain_id = 8453 if chain == "base" else 1
+                revoke_data_1 = "0x095ea7b3" + ("0" * 24) + "6b7a87899490ece95443e979ca9485cbe7e71522" + ("0" * 64)
+                revoke_data_2 = "0x095ea7b3" + ("0" * 24) + "1111111254eeb25477b68fb85ed929f73a960582" + ("0" * 64)
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "chain": chain,
+                        "chainName": "Base" if chain == "base" else "Ethereum",
+                        "chainId": chain_id,
+                        "walletAddress": body.get("walletAddress", VITALIK),
+                        "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11",
+                        "tokensScanned": 18,
+                        "spendersScanned": 12,
+                        "scannedPairs": 216,
+                        "failedPairs": 0,
+                        "activeApprovalsCount": 2,
+                        "unlimitedCount": 2,
+                        "highRiskCount": 2,
+                        "findings": [
+                            {
+                                "chain": chain,
+                                "chainId": chain_id,
+                                "token": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                                "tokenSymbol": "USDC",
+                                "tokenDecimals": 6,
+                                "spender": "0x6b7a87899490EcE95443e979cA9485CBE7E71522",
+                                "spenderLabel": "Multichain v4 (Exploited)<img src=x onerror=\"window.__xssP=true\">",
+                                "spenderProtocol": "Multichain",
+                                "spenderCategory": "legacy_high_risk",
+                                "spenderRiskLevel": "high",
+                                "allowanceRaw": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                                "allowanceFormatted": "UNLIMITED",
+                                "isUnlimited": True,
+                                "isMaxUint256": True,
+                                "severity": "critical",
+                                "riskReason": "Compromised legacy bridge router — revoke immediately.",
+                                "revokeCall": {
+                                    "to": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                                    "data": revoke_data_1,
+                                    "value": "0x0",
+                                    "chainId": chain_id,
+                                    "label": "Revoke USDC approval",
+                                },
+                            },
+                            {
+                                "chain": chain,
+                                "chainId": chain_id,
+                                "token": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+                                "tokenSymbol": "WETH",
+                                "tokenDecimals": 18,
+                                "spender": "0x1111111254EEB25477B68fb85Ed929f73A960582",
+                                "spenderLabel": "1inch Aggregation Router v5 (Legacy)",
+                                "spenderProtocol": "1inch",
+                                "spenderCategory": "legacy_high_risk",
+                                "spenderRiskLevel": "high",
+                                "allowanceRaw": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                                "allowanceFormatted": "UNLIMITED",
+                                "isUnlimited": True,
+                                "isMaxUint256": True,
+                                "severity": "critical",
+                                "riskReason": "Legacy aggregator router — revoke lingering unlimited allowance.",
+                                "revokeCall": {
+                                    "to": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+                                    "data": revoke_data_2,
+                                    "value": "0x0",
+                                    "chainId": chain_id,
+                                    "label": "Revoke WETH approval",
+                                },
+                            },
+                        ],
+                        "revokes": [],
+                        "warnings": [],
+                        "scannedAt": "2026-11-25T20:00:00.000Z",
+                    }),
+                )
+
+            def route_degen_markets_mock(route):
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "ok": True,
+                        "live": True,
+                        "cached": False,
+                        "fetchedAt": "2026-11-25T20:00:00.000Z",
+                        "apiKeyConfigured": True,
+                        "geoBlocked": False,
+                        "events": [
+                            {
+                                "eventId": "evt-sol-e2e-1",
+                                "title": "Will SOL close above $250 this month?",
+                                "slug": "sol-above-250",
+                                "category": "crypto",
+                                "isLive": True,
+                                "volumeUsd": 1425000,
+                                "volume24hrUsd": 325000,
+                                "closeTime": "2026-12-31T00:00:00.000Z",
+                                "jupiterUrl": "https://jup.ag/prediction/sol-above-250",
+                                "markets": [
+                                    {
+                                        "marketId": "mkt-sol-250-yes",
+                                        "title": "SOL > $250",
+                                        "yes": {
+                                            "priceUsd": 0.42,
+                                            "cents": 42.0,
+                                            "impliedProbPct": 42.0,
+                                            "payoutMultiplier": 2.38,
+                                        },
+                                        "no": {
+                                            "priceUsd": 0.58,
+                                            "cents": 58.0,
+                                            "impliedProbPct": 58.0,
+                                            "payoutMultiplier": 1.72,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                        "gameModes": [],
+                    }),
+                )
+
+            def route_degen_positions_mock(route):
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "ok": True,
+                        "owner": SOL_PUBKEY,
+                        "positions": [],
+                        "summary": {
+                            "openCount": 0,
+                            "claimableCount": 0,
+                            "totalClaimablePayoutUsd": 0,
+                            "totalUnrealizedPnlUsd": 0,
+                        },
+                    }),
+                )
+
+            pgP.route("**/api/solana/rent-scan", route_rent_scan_mock)
+            pgP.route("**/api/solana/yield-park", route_yield_park_mock)
+            pgP.route("**/api/approvals/scan", route_approvals_scan_mock)
+            pgP.route("**/api/degen/markets*", route_degen_markets_mock)
+            pgP.route("**/api/degen/positions*", route_degen_positions_mock)
+
+            pgP.goto(BASE, wait_until="networkidle")
+            pgP.wait_for_timeout(300)
+
+            # Connect EVM wallet to launch Migrator & trigger scan + Preservation Strip
+            pgP.click("#heroConnectBtn")
+            pgP.wait_for_selector("#walletModalBackdrop:not(.hidden)")
+            pgP.click("[data-pick-evm]")
+            pgP.wait_for_selector("#appShell:not(.hidden)", timeout=15000)
+            pgP.wait_for_selector("#preservationStripCard", timeout=15000)
+
+            # 7A. Verify Preservation Strip surfaces Tiered Preservation Fee + Route Auction Winner
+            strip_info = pgP.evaluate("""() => ({
+              feeText: document.getElementById('preservationTieredFeePill')?.textContent?.trim() || '',
+              routeText: document.getElementById('preservationRouteWinnerPill')?.textContent?.trim() || '',
+              stripText: document.getElementById('preservationStripCard')?.innerText || '',
+            })""")
+            assert "Tiered Fee:" in strip_info["feeText"] and "vs 7%" in strip_info["feeText"], strip_info
+            assert "Route Winner:" in strip_info["routeText"], strip_info
+
+            # Connect Phantom Solana wallet for Rent Reclaim + Yield Park signing
+            pgP.click("#connectSolBtn")
+            pgP.wait_for_selector("[data-pick-sol]")
+            pgP.click("[data-pick-sol]")
+            pgP.wait_for_selector("#walletModalBackdrop", state="hidden")
+            pgP.wait_for_function(f"() => document.getElementById('solanaDestInput')?.value === '{SOL_PUBKEY}'", timeout=10000)
+
+            # 7B. Empty-ATA Rent Reclaim: scan + verify 0.00611784 SOL + 1-Click Reclaim signing
+            pgP.click("#scanSolanaRentBtn")
+            pgP.wait_for_selector("#reclaimSolBtn", timeout=8000)
+            rent_text = pgP.locator("#rentVacuumCard").inner_text()
+            assert "0.00611784 SOL" in rent_text and "$0.92" in rent_text, rent_text
+            pgP.click("#reclaimSolBtn")
+            pgP.wait_for_function("() => (window.__solSignCallsP || []).length === 1", timeout=8000)
+            pgP.wait_for_function(
+                "() => (document.getElementById('rentVacuumBody')?.innerText || '').includes('Reclaimed')",
+                timeout=8000,
+            )
+
+            # 7C. 1-Click Post-Arrival Solana Yield Park: strategies loaded, split toggle, preview + 1-Click Park
+            pgP.wait_for_function(
+                "() => (document.querySelectorAll('#yieldStrategySelect option').length) >= 3",
+                timeout=8000,
+            )
+            pgP.click("[data-yield-split='100']")
+            pgP.click("[data-yield-split='90']")
+            pgP.fill("#yieldAmountInput", "500")
+            pgP.locator("#yieldAmountInput").dispatch_event("input")
+            pgP.click("#previewYieldBtn")
+            pgP.wait_for_function(
+                "() => (document.getElementById('yieldParkBody')?.innerText || '').includes('Orca Whirlpool')",
+                timeout=8000,
+            )
+            yield_preview_text = pgP.locator("#yieldParkCard").inner_text()
+            assert "7.45%" in yield_preview_text and "$450.00" in yield_preview_text, yield_preview_text
+            pgP.click("#parkYieldBtn")
+            pgP.wait_for_function("() => (window.__solSignCallsP || []).length === 2", timeout=8000)
+            pgP.wait_for_function(
+                "() => (document.getElementById('yieldParkBody')?.innerText || '').includes('Parked')",
+                timeout=8000,
+            )
+
+            # 7D. 1-Click Stale ERC-20 Approval Revoker: scan + single revoke + batch revoke all
+            pgP.click("#scanApprovalsBtn")
+            pgP.wait_for_selector("#revokeAllApprovalsBtn", timeout=8000)
+            appr_text = pgP.locator("#approvalRevokerCard").inner_text()
+            assert "USDC" in appr_text and "UNLIMITED" in appr_text and "Multichain v4" in appr_text, appr_text
+            pgP.click("[data-revoke-approval-idx='0']")
+            pgP.wait_for_function(
+                "() => (window.__evmRpcP || []).some(r => r.method === 'eth_sendTransaction')",
+                timeout=8000,
+            )
+            # Re-scan and trigger 1-Click Revoke All (EIP-5792 batch)
+            pgP.click("#scanApprovalsBtn")
+            pgP.wait_for_selector("#revokeAllApprovalsBtn", timeout=8000)
+            pgP.click("#revokeAllApprovalsBtn")
+            pgP.wait_for_function(
+                "() => (window.__evmRpcP || []).some(r => r.method === 'wallet_sendCalls')",
+                timeout=8000,
+            )
+
+            # 7E. Verify Gas-Window Watchdog in Pro -> Agents view
+            pgP.click(".ui-mode-btn[data-ui-mode='pro']")
+            pgP.click(".app-tab[data-view='agents']")
+            pgP.wait_for_selector("#createGasWatchForm", timeout=8000)
+            pgP.fill("#gasWatchMaxGweiInput", "12")
+            pgP.click("#createGasWatchForm button[type='submit']")
+            pgP.wait_for_selector("[data-cancel-gas-watch]", timeout=8000)
+            pgP.click("[data-cancel-gas-watch]")
+            pgP.wait_for_timeout(200)
+
+            # Return to Sweep for multi-viewport overflow check
+            pgP.click(".app-tab[data-view='scanner']")
+            pgP.wait_for_timeout(150)
+
+            # 7F. Degen Tab: mocked live markets + side-pocket cap (default 10%, clamped max 50%)
+            pgP.click(".app-tab[data-view='degen']")
+            pgP.wait_for_selector("#degenCustomPctInput", timeout=10000)
+            pgP.wait_for_function(
+                "() => (document.getElementById('degenRoot')?.innerText || '').includes('SOL close above $250')",
+                timeout=10000,
+            )
+            degen_default_pct = pgP.evaluate("() => Number(document.getElementById('degenCustomPctInput')?.value)")
+            assert degen_default_pct == 10, f"Expected default Degen side-pocket cap 10%, got {degen_default_pct}"
+            pgP.fill("#degenCustomPctInput", "85")
+            pgP.locator("#degenCustomPctInput").dispatch_event("change")
+            pgP.wait_for_timeout(150)
+            degen_clamped_pct = pgP.evaluate("() => Number(document.getElementById('degenCustomPctInput')?.value)")
+            assert degen_clamped_pct == 50, f"Expected Degen side-pocket cap clamped to 50%, got {degen_clamped_pct}"
+
+            # 7G. Verify 0px horizontal overflow across Desktop (1440px), Tablet (900px), Mobile (390px)
+            # on BOTH Sweep (with Preservation Tools populated) and Degen views
+            overflowP = {}
+            for label, vp in [("1440", {"width": 1440, "height": 900}), ("900", {"width": 900, "height": 800}), ("390", {"width": 390, "height": 844})]:
+                pgP.set_viewport_size(vp)
+                pgP.click(".app-tab[data-view='scanner']")
+                pgP.wait_for_timeout(180)
+                overflowP[f"scanner_{label}"] = pgP.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
+                pgP.click(".app-tab[data-view='degen']")
+                pgP.wait_for_timeout(180)
+                overflowP[f"degen_{label}"] = pgP.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
+
+            xss_p = pgP.evaluate("() => Boolean(window.__xssP)")
+            assert not xss_p, "XSS payload executed in Preservation Tools!"
+            assert all(v <= 0 for v in overflowP.values()), f"Preservation/Degen overflow: {overflowP}"
+            assert not errsP, f"Preservation/Degen errors: {errsP}"
+            assert not badHttpP, f"Preservation/Degen bad HTTP: {badHttpP}"
+            results["preservation_tools_and_degen_ux"] = {
+                "ok": True,
+                "tieredFeeAndRouteWinnerVerified": True,
+                "rentReclaimSigned": True,
+                "yieldParkQuotedAndSigned": True,
+                "approvalsSingleAndBatchRevoked": True,
+                "gasWatchdogCreatedAndCancelled": True,
+                "degenCapDefault10Clamped50": True,
+                "xssBlocked": True,
+                "overflowPx": overflowP,
+            }
+            ctxP.close()
+
             browser.close()
 
         print(json.dumps(results, indent=2))

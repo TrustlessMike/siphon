@@ -2153,6 +2153,235 @@ export async function claimCctpOnSolana(claimPlan, options = {}) {
   throw unsupportedErr;
 }
 
+/**
+ * Signs and submits an arbitrary server-built Solana VersionedTransaction (base64),
+ * such as Empty-ATA Rent Reclaim or Jupiter Swap Yield Park, using the connected
+ * Solana wallet (Wallet Standard `solana:signAndSendTransaction`, legacy provider
+ * `signAndSendTransaction`, or JSON-RPC `request`).
+ */
+export async function signAndSendSolanaVersionedTx(base64Tx, options = {}) {
+  const cleanB64 = String(base64Tx || '').trim();
+  const txBytes = base64ToUint8Array(cleanB64);
+  if (!txBytes || txBytes.length < 16) {
+    throw new Error('Invalid or empty Solana VersionedTransaction payload.');
+  }
+
+  if (!activeSolanaSession || !connectedSolanaAddress) {
+    if (options.autoConnect === false) {
+      throw new Error('Connect your Solana wallet (Phantom, Backpack, or Solflare) before signing.');
+    }
+    await connectSolanaWallet({ walletId: options.walletId });
+  }
+
+  if (
+    options.expectedFeePayer &&
+    connectedSolanaAddress &&
+    String(options.expectedFeePayer).trim() !== String(connectedSolanaAddress).trim()
+  ) {
+    throw new Error(
+      `Pre-sign check failed: connected Solana wallet (${connectedSolanaAddress.slice(0, 6)}…) does not match transaction fee payer (${String(options.expectedFeePayer).slice(0, 6)}…).`
+    );
+  }
+
+  let versionedTx = null;
+  try {
+    const sdkMod = await loadWalletSdkBundle({ initCoinbase: false });
+    if (sdkMod?.VersionedTransaction?.deserialize) {
+      versionedTx = sdkMod.VersionedTransaction.deserialize(txBytes);
+    }
+  } catch {
+    versionedTx = null;
+  }
+
+  const walletName = connectedSolanaWalletName || 'Solana Wallet';
+  const serialized = versionedTx ? versionedTx.serialize() : txBytes;
+
+  // 1. Wallet Standard (`solana:signAndSendTransaction`)
+  if (activeSolanaSession?.kind === 'standard') {
+    const stdFeature = activeSolanaSession.wallet?.features?.['solana:signAndSendTransaction'];
+    if (typeof stdFeature?.signAndSendTransaction === 'function') {
+      const account = pickSolanaStandardAccount(activeSolanaSession.wallet.accounts);
+      if (!account) {
+        throw new Error(`No active Solana account exposed by ${walletName}.`);
+      }
+      const res = await stdFeature.signAndSendTransaction({
+        transaction: serialized,
+        account,
+        chain: 'solana:mainnet',
+      });
+      const signature = extractSolanaSignature(res);
+      if (!signature) {
+        throw new Error(`${walletName} did not return a Solana transaction signature.`);
+      }
+      return {
+        signature,
+        walletName,
+        mode: 'wallet_standard_sign_and_send',
+        explorerUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
+      };
+    }
+  }
+
+  // 2. Legacy injected provider (`signAndSendTransaction` / `request`)
+  const provider =
+    activeSolanaSession?.provider ||
+    (typeof window !== 'undefined'
+      ? window.phantom?.solana ||
+        window.backpack?.solana ||
+        window.backpack ||
+        window.solflare ||
+        window.solana
+      : null);
+
+  if (provider && typeof provider.signAndSendTransaction === 'function') {
+    const txArg =
+      versionedTx || {
+        version: 0,
+        serialize: () => serialized,
+        serializedTransactionBase64: cleanB64,
+      };
+    try {
+      const res = await provider.signAndSendTransaction(txArg, {
+        skipPreflight: false,
+        preflightCommitment: 'confirmed',
+      });
+      const signature = extractSolanaSignature(res);
+      if (!signature) {
+        throw new Error(`${walletName} did not return a Solana transaction signature.`);
+      }
+      return {
+        signature,
+        walletName,
+        mode: 'legacy_sign_and_send',
+        explorerUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
+      };
+    } catch (err) {
+      if (isUserRejectedError(err)) throw err;
+      if (typeof provider.request === 'function') {
+        const rpcRes = await provider.request({
+          method: 'signAndSendTransaction',
+          params: { message: bytesToBase58(serialized) },
+        });
+        const signature = extractSolanaSignature(rpcRes);
+        if (signature) {
+          return {
+            signature,
+            walletName,
+            mode: 'provider_request_sign_and_send',
+            explorerUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
+          };
+        }
+      }
+      throw err;
+    }
+  }
+
+  if (provider && typeof provider.request === 'function') {
+    const rpcRes = await provider.request({
+      method: 'signAndSendTransaction',
+      params: { message: bytesToBase58(serialized) },
+    });
+    const signature = extractSolanaSignature(rpcRes);
+    if (!signature) {
+      throw new Error(`${walletName} did not return a Solana transaction signature.`);
+    }
+    return {
+      signature,
+      walletName,
+      mode: 'provider_request_sign_and_send',
+      explorerUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
+    };
+  }
+
+  throw new Error(
+    `${walletName} does not expose signAndSendTransaction. Connect Phantom, Backpack, or Solflare to sign.`
+  );
+}
+
+/**
+ * Validates and submits one or more ERC-20 `approve(spender, 0)` revoke calls on an EVM chain.
+ * Uses EIP-5792 `wallet_sendCalls` batching when available and cleanly falls back to sequential
+ * `eth_sendTransaction` if the wallet does not support EIP-5792 (never falling back on 4001 rejection).
+ */
+export async function sendEvmRevokeCalls({ chainId, calls, expectedFrom } = {}) {
+  if (!activeEvmProvider || !connectedEvmAddress) {
+    throw new Error('Connect your EVM wallet before signing approval revocations.');
+  }
+  if (!Array.isArray(calls) || !calls.length) {
+    throw new Error('No revoke calls provided.');
+  }
+  assertFromMatchesConnected(expectedFrom);
+
+  const normalizedCalls = calls.map((raw) => {
+    const to = String(raw?.to || '').trim();
+    const data = String(raw?.data || '').trim();
+    const value = String(raw?.value || '0x0').trim().toLowerCase();
+    assertValidEvmAddress(to, 'ERC-20 token contract');
+    if (value !== '0x0' && value !== '0x00') {
+      throw new Error('Pre-sign check failed: ERC-20 revoke call must have value 0x0.');
+    }
+    const cleanHex = data.toLowerCase();
+    // Must be strict approve(address,uint256(0)): 0x095ea7b3 + 24 zero nibbles + 40 addr nibbles + 64 zero nibbles
+    if (
+      cleanHex.length !== 138 ||
+      !cleanHex.startsWith('0x095ea7b3' + '0'.repeat(24)) ||
+      !cleanHex.endsWith('0'.repeat(64)) ||
+      !/^0x[0-9a-f]{136}$/.test(cleanHex)
+    ) {
+      throw new Error(
+        'Pre-sign check failed: calldata is not a strict ERC-20 approve(spender, 0) revocation.'
+      );
+    }
+    return {
+      to,
+      data: cleanHex,
+      value: '0x0',
+      chainId: Number(raw?.chainId || chainId),
+    };
+  });
+
+  const targetChainId = Number(chainId || normalizedCalls[0].chainId);
+  await ensureEvmChain(targetChainId);
+
+  // Use EIP-5792 batch when revoking multiple approvals and wallet supports it (or single call if batch supported)
+  if (normalizedCalls.length > 1) {
+    try {
+      const batchRes = await sendEip5792Batch({
+        chainId: targetChainId,
+        calls: normalizedCalls,
+        atomicRequired: false,
+        expectedFrom: expectedFrom || connectedEvmAddress,
+      });
+      return {
+        mode: 'eip5792',
+        batchId: batchRes.batchId,
+        txHashes: [],
+        revokedCount: normalizedCalls.length,
+      };
+    } catch (err) {
+      if (isUserRejectedError(err) || !err?.unsupportedEip5792) {
+        throw err;
+      }
+      // Fall through cleanly to sequential eth_sendTransaction
+    }
+  }
+
+  const txHashes = [];
+  for (const call of normalizedCalls) {
+    const hash = await sendRealEvmTransaction(
+      { ...call, chainId: targetChainId },
+      { expectedFrom: expectedFrom || connectedEvmAddress }
+    );
+    if (hash) txHashes.push(String(hash));
+  }
+  return {
+    mode: 'sequential',
+    batchId: null,
+    txHashes,
+    revokedCount: txHashes.length || normalizedCalls.length,
+  };
+}
+
 // =====================================================================
 // MULTI-FAMILY WALLET CONNECTORS (Cosmos, Sui, Aptos, TON, Tron, Bitcoin)
 // =====================================================================
