@@ -89,17 +89,9 @@ contract SiphonMainnetForkTest is TestBase {
         vm.startPrank(user);
         require(IERC20(MAINNET_USDC).approve(address(router), sweepAmount), "APPROVE_FAILED");
 
-        SiphonRouter.SwapStep[] memory swaps = new SiphonRouter.SwapStep[](1);
-        swaps[0] = SiphonRouter.SwapStep({
-            tokenIn: MAINNET_USDC,
-            amountIn: sweepAmount,
-            pullFromUser: true,
-            aggregator: address(0),
-            swapCalldata: ""
-        });
-
         SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
             solanaRecipient: SOLANA_USDC_ATA,
+            directUsdcAmount: sweepAmount,
             minNetUsdcOut: 19_985e6,
             maxFeeUsdcCap: 15e6,
             deadline: block.timestamp + 600,
@@ -110,7 +102,7 @@ contract SiphonMainnetForkTest is TestBase {
                 hookData: ""
             }),
             defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: swaps,
+            swaps: new SiphonRouter.SwapStep[](0),
             burns: new SiphonRouter.BurnStep[](0)
         });
 
@@ -168,12 +160,13 @@ contract SiphonMainnetForkTest is TestBase {
 
         SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
             solanaRecipient: SOLANA_USDC_ATA,
+            directUsdcAmount: 0,
             minNetUsdcOut: 3_980e6,
             maxFeeUsdcCap: 15e6,
             deadline: block.timestamp + 600,
             cctp: SiphonRouter.CctpV2Options({
                 destinationCaller: bytes32(0),
-                maxFee: 20e6, // 0.5% fast fee ceiling (well under 5% guard)
+                maxFee: 5e6, // 0.125% fast fee ceiling (total 25 bps protocol + 12.5 bps CCTP = 38 bps <= 50 bps mandate cap)
                 minFinalityThreshold: 1000, // CCTP V2 Fast Transfer
                 hookData: ""
             }),

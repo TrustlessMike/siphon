@@ -58,6 +58,7 @@ interface ITokenMessengerV2Delegate {
 }
 
 interface ISiphonDelegateRegistry {
+    function paused() external view returns (bool);
     function isAllowedFeeRecipient(address recipient) external view returns (bool);
     function isAllowedRelayer(address relayer) external view returns (bool);
     function isAllowedSwapRouter(address router) external view returns (bool);
@@ -101,10 +102,13 @@ interface IAavePoolDelegate {
 }
 
 interface ICompoundCometDelegate {
+    function baseToken() external view returns (address);
+    function balanceOf(address account) external view returns (uint256);
     function withdraw(address asset, uint256 amount) external;
 }
 
 interface IERC4626Delegate {
+    function asset() external view returns (address);
     function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
 }
 
@@ -180,6 +184,15 @@ contract SiphonSweepDelegate {
     bytes32 public constant SWEEP_INTENT_V2_TYPEHASH = keccak256(
         "SweepIntentV2(bytes32 solanaRecipient,address usdc,address cctpMessenger,address feeRecipient,uint16 feeBps,uint256 maxFeeUsdcCap,uint256 directUsdcAmount,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint256 nonce,uint256 deadline,bytes32 callsHash,bytes32 cctpOptionsHash)"
     );
+    bytes32 public constant MANDATE_SWEEP_INTENT_TYPEHASH = keccak256(
+        "MandateSweepIntent(bytes32 solanaRecipient,address usdc,address cctpMessenger,address feeRecipient,uint16 feeBps,uint256 maxFeeUsdcCap,uint256 directUsdcAmount,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint256 nonce,uint256 deadline,bytes32 callsHash,bytes32 cctpOptionsHash,address agentVault,bytes32 mandateId,uint8 actionBit)"
+    );
+
+    /// @notice Immutable canonical native USDC contract pinned in delegate bytecode.
+    address public immutable usdc;
+
+    /// @notice Immutable canonical Circle CCTP TokenMessenger pinned in delegate bytecode.
+    address public immutable cctpMessenger;
 
     /// @notice Immutable deployment-level protocol fee treasury (lives in delegate bytecode, safe under EIP-7702).
     address public immutable protocolFeeRecipient;
@@ -187,7 +200,7 @@ contract SiphonSweepDelegate {
     /// @notice Circle CCTP version deployed on this chain: 1 (4-arg) or 2 (7/8-arg TokenMessengerV2).
     uint8 public immutable cctpVersion;
 
-    /// @notice Optional policy registry enforcing allowlisted fee recipients, relayers, swap routers, DeFi protocols, & agent vaults.
+    /// @notice Mandatory policy registry enforcing kill-switch, fee recipients, relayers, swap routers, DeFi protocols, & agent vaults.
     address public immutable policyRegistry;
 
     /// @notice Optional immutable protocol fee cap in USDC base units (0 = uncapped beyond feeBps; e.g. 25e6 = $25 whale cap).
@@ -298,7 +311,14 @@ contract SiphonSweepDelegate {
     error UnauthorizedFeeRecipient(address recipient);
     error UnauthorizedRelayer(address relayer);
     error TargetNotAllowed(address target);
+    error ProtocolPaused();
     error MandateActionNotPermitted(uint8 requiredBit);
+    error AgentArbitrarySwapsForbidden();
+    error AgentNonUsdcDefiExitForbidden(address underlyingAsset);
+    error AgentBurnsForbidden();
+    error AgentCctpOverrideForbidden();
+    error InvalidBurnToken(address token);
+    error InsufficientSuppliedBalance();
     error InsufficientDirectUsdc(uint256 available, uint256 required);
     error InsufficientNativeBalance(uint256 available, uint256 required);
     error GasReimbursementTooHigh(uint256 requested, uint256 maxAllowed);
@@ -309,13 +329,30 @@ contract SiphonSweepDelegate {
     error Reentrancy();
 
     constructor(
+        address _usdc,
+        address _cctpMessenger,
         address _protocolFeeRecipient,
         uint8 _cctpVersion,
         address _policyRegistry,
         uint256 _protocolMaxFeeUsdcCap
     ) {
-        if (_protocolFeeRecipient == address(0)) revert InvalidAddress();
+        if (
+            _usdc == address(0) ||
+            _usdc.code.length == 0 ||
+            _cctpMessenger == address(0) ||
+            _cctpMessenger.code.length == 0 ||
+            _protocolFeeRecipient == address(0) ||
+            _policyRegistry == address(0) ||
+            _policyRegistry.code.length == 0 ||
+            _usdc == _cctpMessenger ||
+            _usdc == _policyRegistry ||
+            _cctpMessenger == _policyRegistry
+        ) {
+            revert InvalidAddress();
+        }
         if (_cctpVersion != 1 && _cctpVersion != 2) revert InvalidCctpVersion(_cctpVersion);
+        usdc = _usdc;
+        cctpMessenger = _cctpMessenger;
         protocolFeeRecipient = _protocolFeeRecipient;
         cctpVersion = _cctpVersion;
         policyRegistry = _policyRegistry;
@@ -411,6 +448,40 @@ contract SiphonSweepDelegate {
         return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
     }
 
+    function hashMandateIntent(
+        SweepIntent calldata intent,
+        uint256 maxFeeUsdcCap,
+        CctpV2Options calldata cctpOpts,
+        address agentVault,
+        bytes32 mandateId,
+        uint8 actionBit
+    ) public view returns (bytes32) {
+        bytes32 callsHash = computeCallsHash(intent);
+        bytes32 cctpOptionsHash = computeCctpOptionsHash(cctpOpts);
+        bytes32 structHash = keccak256(
+            abi.encode(
+                MANDATE_SWEEP_INTENT_TYPEHASH,
+                intent.solanaRecipient,
+                intent.usdc,
+                intent.cctpMessenger,
+                intent.feeRecipient,
+                intent.feeBps,
+                maxFeeUsdcCap,
+                intent.directUsdcAmount,
+                intent.minNetUsdcOut,
+                intent.maxGasReimbursementUsdc,
+                intent.nonce,
+                intent.deadline,
+                callsHash,
+                cctpOptionsHash,
+                agentVault,
+                mandateId,
+                actionBit
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
+    }
+
     function _safeRevoke(address token, address spender) private {
         if (token == address(0) || spender == address(0) || token.code.length == 0) return;
         bytes memory payload = abi.encodeWithSelector(IERC20Delegate.approve.selector, spender, 0);
@@ -421,6 +492,7 @@ contract SiphonSweepDelegate {
     }
 
     function _safeBurnTransfer(address token, uint256 amount) private returns (bool succeeded) {
+        if (token == usdc) revert InvalidBurnToken(token);
         if (token == address(0) || token.code.length == 0) return false;
         bytes memory payload = abi.encodeWithSelector(IERC20Delegate.transfer.selector, DEAD_ADDRESS, amount);
         uint256 gasCap = BURN_GAS_STIPEND;
@@ -436,6 +508,22 @@ contract SiphonSweepDelegate {
         }
     }
 
+    function _validateCctpAndComputeMinReceived(
+        uint256 amount,
+        CctpV2Options memory opts
+    ) private view returns (uint256 minSolanaReceived) {
+        if (cctpVersion == 2) {
+            uint256 maxAllowedCctpFee = (amount * MAX_CCTP_FEE_BPS) / 10_000;
+            if (opts.maxFee >= amount || opts.maxFee > maxAllowedCctpFee) {
+                revert CctpMaxFeeTooHigh(opts.maxFee, maxAllowedCctpFee);
+            }
+            minSolanaReceived = amount - opts.maxFee;
+        } else {
+            if (opts.hookData.length > 0 || opts.maxFee > 0) revert CctpV2Required();
+            minSolanaReceived = amount;
+        }
+    }
+
     function _bridgeUsdcViaCctp(
         address usdcToken,
         address messenger,
@@ -443,15 +531,12 @@ contract SiphonSweepDelegate {
         bytes32 solanaUsdcAta,
         CctpV2Options memory opts
     ) private returns (uint64 cctpNonce) {
+        _validateCctpAndComputeMinReceived(amount, opts);
         usdcToken.forceApprove(messenger, amount);
         if (cctpVersion == 2) {
             uint32 finality = opts.minFinalityThreshold == 0
                 ? CCTP_V2_STANDARD_FINALITY
                 : opts.minFinalityThreshold;
-            uint256 maxAllowedCctpFee = (amount * MAX_CCTP_FEE_BPS) / 10_000;
-            if (opts.maxFee >= amount || opts.maxFee > maxAllowedCctpFee) {
-                revert CctpMaxFeeTooHigh(opts.maxFee, maxAllowedCctpFee);
-            }
             if (opts.hookData.length > 0) {
                 ITokenMessengerV2Delegate(messenger).depositForBurnWithHook(
                     amount,
@@ -476,7 +561,6 @@ contract SiphonSweepDelegate {
             }
             cctpNonce = 0;
         } else {
-            if (opts.hookData.length > 0 || opts.maxFee > 0) revert CctpV2Required();
             cctpNonce = ITokenMessengerDelegate(messenger).depositForBurn(
                 amount,
                 SOLANA_CCTP_DOMAIN,
@@ -492,17 +576,27 @@ contract SiphonSweepDelegate {
         for (uint256 i = 0; i < intent.defiExits.length; i++) {
             DefiExit calldata ex = intent.defiExits[i];
             if (ex.amount == 0) continue;
+            if (ex.underlyingAsset == address(0)) revert InvalidAddress();
             if (ex.protocol == address(0) || ex.protocol.code.length == 0) {
                 revert TargetNotAllowed(ex.protocol);
             }
-            if (policyRegistry != address(0) && !ISiphonDelegateRegistry(policyRegistry).isAllowedDefiProtocol(ex.protocol)) {
+            if (!ISiphonDelegateRegistry(policyRegistry).isAllowedDefiProtocol(ex.protocol)) {
                 revert TargetNotAllowed(ex.protocol);
             }
             if (ex.kind == ExitKind.AAVE_V3) {
                 IAavePoolDelegate(ex.protocol).withdraw(ex.underlyingAsset, ex.amount, address(this));
             } else if (ex.kind == ExitKind.COMPOUND_V3) {
-                ICompoundCometDelegate(ex.protocol).withdraw(ex.underlyingAsset, ex.amount);
+                uint256 withdrawAmt = ex.amount;
+                if (ex.underlyingAsset == ICompoundCometDelegate(ex.protocol).baseToken()) {
+                    uint256 supplied = ICompoundCometDelegate(ex.protocol).balanceOf(address(this));
+                    if (supplied == 0) revert InsufficientSuppliedBalance();
+                    if (withdrawAmt > supplied) withdrawAmt = supplied;
+                }
+                ICompoundCometDelegate(ex.protocol).withdraw(ex.underlyingAsset, withdrawAmt);
             } else if (ex.kind == ExitKind.ERC4626) {
+                if (IERC4626Delegate(ex.protocol).asset() != ex.underlyingAsset) {
+                    revert InvalidAddress();
+                }
                 IERC4626Delegate(ex.protocol).redeem(ex.amount, address(this), address(this));
             }
         }
@@ -510,11 +604,11 @@ contract SiphonSweepDelegate {
         // 3. Swap liquid ERC-20s (or native ETH when tokenIn == address(0)) directly into native USDC
         for (uint256 i = 0; i < intent.swaps.length; i++) {
             TokenSwap calldata sw = intent.swaps[i];
-            if (sw.tokenIn == intent.usdc) continue;
-            if (sw.router == address(0) || sw.router.code.length == 0 || sw.router == intent.usdc) {
+            if (sw.tokenIn == usdc) continue;
+            if (sw.router == address(0) || sw.router.code.length == 0 || sw.router == usdc) {
                 revert TargetNotAllowed(sw.router);
             }
-            if (policyRegistry != address(0) && !ISiphonDelegateRegistry(policyRegistry).isAllowedSwapRouter(sw.router)) {
+            if (!ISiphonDelegateRegistry(policyRegistry).isAllowedSwapRouter(sw.router)) {
                 revert TargetNotAllowed(sw.router);
             }
 
@@ -539,7 +633,8 @@ contract SiphonSweepDelegate {
         SweepIntent calldata intent,
         uint256 usdcBefore,
         uint256 gasReimbursementUsdc,
-        uint256 userMaxFeeUsdcCap
+        uint256 userMaxFeeUsdcCap,
+        CctpV2Options memory cctpOpts
     )
         private
         view
@@ -547,12 +642,13 @@ contract SiphonSweepDelegate {
             uint256 grossUsdc,
             uint256 protocolFeeUsdc,
             uint16 effectiveFeeBps,
-            uint256 netBridgedUsdc
+            uint256 netBridgedUsdc,
+            uint256 minSolanaReceived
         )
     {
         // 4. Exact USDC output accounting: NEVER fall back to usdcAfter when swaps yield 0 USDC!
         //    grossUsdc = explicit signed directUsdcAmount + strictly measured positive swap delta (usdcAfter - usdcBefore).
-        uint256 usdcAfter = IERC20Delegate(intent.usdc).balanceOf(address(this));
+        uint256 usdcAfter = IERC20Delegate(usdc).balanceOf(address(this));
         if (usdcAfter < usdcBefore) revert SlippageFloorNotMet(0, intent.minNetUsdcOut);
         uint256 swappedUsdc = usdcAfter - usdcBefore;
         grossUsdc = intent.directUsdcAmount + swappedUsdc;
@@ -565,12 +661,6 @@ contract SiphonSweepDelegate {
         }
         if (userMaxFeeUsdcCap > 0 && protocolFeeUsdc > userMaxFeeUsdcCap) {
             revert FeeCapExceeded(protocolFeeUsdc, userMaxFeeUsdcCap);
-        }
-        if (protocolFeeUsdc < uncappedFee) {
-            uint256 ceilBps = (protocolFeeUsdc * 10_000 + grossUsdc - 1) / grossUsdc;
-            effectiveFeeBps = ceilBps > MAX_FEE_BPS ? MAX_FEE_BPS : uint16(ceilBps);
-        } else {
-            effectiveFeeBps = intent.feeBps;
         }
 
         // Onchain Relayer Break-Even Protection: require protocolFee + gasReimbursement >= ceil(1.5x sponsored gas)
@@ -585,9 +675,13 @@ contract SiphonSweepDelegate {
         if (grossUsdc <= totalDeductions) revert SlippageFloorNotMet(0, intent.minNetUsdcOut);
 
         netBridgedUsdc = grossUsdc - totalDeductions;
-        if (netBridgedUsdc < intent.minNetUsdcOut) {
-            revert SlippageFloorNotMet(netBridgedUsdc, intent.minNetUsdcOut);
+        minSolanaReceived = _validateCctpAndComputeMinReceived(netBridgedUsdc, cctpOpts);
+        if (minSolanaReceived < intent.minNetUsdcOut) {
+            revert SlippageFloorNotMet(minSolanaReceived, intent.minNetUsdcOut);
         }
+
+        uint256 allDeductions = grossUsdc - minSolanaReceived;
+        effectiveFeeBps = uint16((allDeductions * 10_000 + grossUsdc - 1) / grossUsdc);
     }
 
     function _settleAndBridge(
@@ -597,24 +691,25 @@ contract SiphonSweepDelegate {
         uint256 userMaxFeeUsdcCap,
         CctpV2Options memory cctpOpts
     ) private returns (uint256 grossUsdc, uint256 protocolFeeUsdc, uint256 netBridgedUsdc, uint64 cctpNonce) {
-        (grossUsdc, protocolFeeUsdc, , netBridgedUsdc) = _computeAmounts(
+        (grossUsdc, protocolFeeUsdc, , netBridgedUsdc, ) = _computeAmounts(
             intent,
             usdcBefore,
             gasReimbursementUsdc,
-            userMaxFeeUsdcCap
+            userMaxFeeUsdcCap,
+            cctpOpts
         );
 
         if (gasReimbursementUsdc > 0) {
-            intent.usdc.safeTransfer(msg.sender, gasReimbursementUsdc);
+            usdc.safeTransfer(msg.sender, gasReimbursementUsdc);
         }
         if (protocolFeeUsdc > 0) {
-            intent.usdc.safeTransfer(intent.feeRecipient, protocolFeeUsdc);
+            usdc.safeTransfer(intent.feeRecipient, protocolFeeUsdc);
         }
 
         // 5. Bridge net USDC 1:1 to Solana canonical USDC ATA PDA via Circle CCTP (V1 or V2) BEFORE untrusted burns
         cctpNonce = _bridgeUsdcViaCctp(
-            intent.usdc,
-            intent.cctpMessenger,
+            usdc,
+            cctpMessenger,
             netBridgedUsdc,
             intent.solanaRecipient,
             cctpOpts
@@ -626,6 +721,8 @@ contract SiphonSweepDelegate {
         SweepIntent calldata intent,
         uint256 gasReimbursementUsdc
     ) private view {
+        // Unconditional kill-switch: halts ALL delegated sweeps (direct USDC, revokes, burns, 0-gas) immediately on pause
+        if (ISiphonDelegateRegistry(policyRegistry).paused()) revert ProtocolPaused();
         if (block.timestamp > intent.deadline) revert ExpiredIntent();
         if (intent.minNetUsdcOut == 0) revert ZeroMinNetOutput();
         if (ds.usedNonces[intent.nonce]) revert NonceAlreadyUsed(intent.nonce);
@@ -633,26 +730,23 @@ contract SiphonSweepDelegate {
             revert InvalidFeeBps(intent.feeBps);
         }
         if (
-            intent.usdc == address(0) ||
-            intent.cctpMessenger == address(0) ||
+            intent.usdc != usdc ||
+            intent.cctpMessenger != cctpMessenger ||
             intent.feeRecipient == address(0) ||
             intent.solanaRecipient == bytes32(0)
         ) {
             revert InvalidAddress();
         }
-        if (intent.cctpMessenger.code.length == 0 || intent.usdc.code.length == 0) {
-            revert InvalidAddress();
-        }
 
         // Enforce protocol fee recipient invariant (eliminates 100% fee bypass via attacker-controlled feeRecipient)
         bool feeRecipientValid = intent.feeRecipient == protocolFeeRecipient ||
-            (policyRegistry != address(0) &&
-                ISiphonDelegateRegistry(policyRegistry).isAllowedFeeRecipient(intent.feeRecipient));
+            ISiphonDelegateRegistry(policyRegistry).isAllowedFeeRecipient(intent.feeRecipient);
         if (!feeRecipientValid) {
             revert UnauthorizedFeeRecipient(intent.feeRecipient);
         }
 
-        if (gasReimbursementUsdc > 0 && policyRegistry != address(0)) {
+        // Require allowlisted relayer for BOTH gas-reimbursed sweeps AND 0-bps fee tiers (blocks third-party 0-fee bypass)
+        if (gasReimbursementUsdc > 0 || intent.feeBps == 0) {
             if (!ISiphonDelegateRegistry(policyRegistry).isAllowedRelayer(msg.sender)) {
                 revert UnauthorizedRelayer(msg.sender);
             }
@@ -728,6 +822,7 @@ contract SiphonSweepDelegate {
         uint256 burnedCount = 0;
         for (uint256 i = 0; i < intent.burns.length; i++) {
             DeadBurn calldata b = intent.burns[i];
+            if (b.token == usdc) revert InvalidBurnToken(b.token);
             if (b.amount == 0) continue;
             if (_safeBurnTransfer(b.token, b.amount)) {
                 burnedCount++;
@@ -776,7 +871,7 @@ contract SiphonSweepDelegate {
             _safeRevoke(rv.token, rv.spender);
         }
 
-        uint256 usdcBefore = IERC20Delegate(intent.usdc).balanceOf(address(this));
+        uint256 usdcBefore = IERC20Delegate(usdc).balanceOf(address(this));
         if (usdcBefore < intent.directUsdcAmount) {
             revert InsufficientDirectUsdc(usdcBefore, intent.directUsdcAmount);
         }
@@ -796,6 +891,7 @@ contract SiphonSweepDelegate {
         uint256 burnedCount = 0;
         for (uint256 i = 0; i < intent.burns.length; i++) {
             DeadBurn calldata b = intent.burns[i];
+            if (b.token == usdc) revert InvalidBurnToken(b.token);
             if (b.amount == 0) continue;
             if (_safeBurnTransfer(b.token, b.amount)) {
                 burnedCount++;
@@ -819,8 +915,10 @@ contract SiphonSweepDelegate {
 
     /**
      * @notice Mandate-gated EIP-7702 sponsored sweep integrated with on-chain `SiphonAgentVault.authorizeAgentAction`.
-     * @dev Accepts signatures from either the delegated EOA (`address(this)`) or the mandate's authorized `agentKey`
-     *      (when `mandate.owner == address(this)`), then verifies actual post-swap USDC deltas against `SiphonAgentVault`.
+     * @dev Accepts `MANDATE_SWEEP_INTENT_TYPEHASH` signatures from either the delegated EOA (`address(this)`) or the
+     *      mandate's authorized `agentKey` (when `mandate.owner == address(this)`), then verifies actual post-exit USDC
+     *      deltas (after CCTP maxFee) against `SiphonAgentVault`. Autonomous agent signatures strictly forbid arbitrary
+     *      swap calldata, non-USDC DeFi exits, arbitrary burns, and CCTP destinationCaller/hookData overrides.
      */
     function executeSponsoredSweepWithMandate(
         SweepIntent calldata intent,
@@ -841,17 +939,33 @@ contract SiphonSweepDelegate {
         if (agentVault == address(0) || agentVault.code.length == 0) {
             revert TargetNotAllowed(agentVault);
         }
-        if (policyRegistry != address(0) && !ISiphonDelegateRegistry(policyRegistry).isAllowedAgentVault(agentVault)) {
+        if (!ISiphonDelegateRegistry(policyRegistry).isAllowedAgentVault(agentVault)) {
             revert TargetNotAllowed(agentVault);
         }
 
         _validateCommonIntent(ds, intent, gasReimbursementUsdc);
 
         ISiphonAgentVaultDelegate.AgentMandate memory m = ISiphonAgentVaultDelegate(agentVault).getMandate(mandateId);
-        bytes32 digest = hashIntentV2(intent, maxFeeUsdcCap, cctpOpts);
+        if (m.owner != address(this)) revert InvalidSignature();
+
+        bytes32 digest = hashMandateIntent(intent, maxFeeUsdcCap, cctpOpts, agentVault, mandateId, actionBit);
         address signer = _recoverSigner(digest, v, r, s);
-        bool validSigner = (signer == address(this)) || (m.owner == address(this) && signer == m.agentKey);
+        bool validSigner = (signer == address(this)) || (signer == m.agentKey);
         if (!validSigner) revert InvalidSignature();
+
+        bool isAutonomousAgent = (signer != address(this));
+        if (isAutonomousAgent) {
+            if (intent.swaps.length > 0) revert AgentArbitrarySwapsForbidden();
+            if (intent.burns.length > 0) revert AgentBurnsForbidden();
+            if (cctpOpts.destinationCaller != bytes32(0) || cctpOpts.hookData.length != 0) {
+                revert AgentCctpOverrideForbidden();
+            }
+            for (uint256 i = 0; i < intent.defiExits.length; i++) {
+                if (intent.defiExits[i].underlyingAsset != usdc) {
+                    revert AgentNonUsdcDefiExitForbidden(intent.defiExits[i].underlyingAsset);
+                }
+            }
+        }
 
         if ((m.allowedActionsMask & ACTION_BRIDGE_SOLANA) == 0) {
             revert MandateActionNotPermitted(ACTION_BRIDGE_SOLANA);
@@ -873,7 +987,7 @@ contract SiphonSweepDelegate {
             _safeRevoke(rv.token, rv.spender);
         }
 
-        uint256 usdcBefore = IERC20Delegate(intent.usdc).balanceOf(address(this));
+        uint256 usdcBefore = IERC20Delegate(usdc).balanceOf(address(this));
         if (usdcBefore < intent.directUsdcAmount) {
             revert InsufficientDirectUsdc(usdcBefore, intent.directUsdcAmount);
         }
@@ -883,11 +997,13 @@ contract SiphonSweepDelegate {
         uint256 grossUsdc;
         uint256 protocolFeeUsdc;
         uint16 effectiveFeeBps;
-        (grossUsdc, protocolFeeUsdc, effectiveFeeBps, netBridgedUsdc) = _computeAmounts(
+        uint256 minSolanaReceived;
+        (grossUsdc, protocolFeeUsdc, effectiveFeeBps, netBridgedUsdc, minSolanaReceived) = _computeAmounts(
             intent,
             usdcBefore,
             gasReimbursementUsdc,
-            maxFeeUsdcCap
+            maxFeeUsdcCap,
+            cctpOpts
         );
 
         // Enforce on-chain SiphonAgentVault policy caps & locked Solana recipient BEFORE moving fees or bridging
@@ -897,21 +1013,21 @@ contract SiphonSweepDelegate {
             actionBit,
             intent.solanaRecipient,
             grossUsdc,
-            netBridgedUsdc,
+            minSolanaReceived,
             effectiveFeeBps,
             digest
         );
 
         if (gasReimbursementUsdc > 0) {
-            intent.usdc.safeTransfer(msg.sender, gasReimbursementUsdc);
+            usdc.safeTransfer(msg.sender, gasReimbursementUsdc);
         }
         if (protocolFeeUsdc > 0) {
-            intent.usdc.safeTransfer(intent.feeRecipient, protocolFeeUsdc);
+            usdc.safeTransfer(intent.feeRecipient, protocolFeeUsdc);
         }
 
         cctpNonce = _bridgeUsdcViaCctp(
-            intent.usdc,
-            intent.cctpMessenger,
+            usdc,
+            cctpMessenger,
             netBridgedUsdc,
             intent.solanaRecipient,
             cctpOpts
@@ -920,6 +1036,7 @@ contract SiphonSweepDelegate {
         uint256 burnedCount = 0;
         for (uint256 i = 0; i < intent.burns.length; i++) {
             DeadBurn calldata b = intent.burns[i];
+            if (b.token == usdc) revert InvalidBurnToken(b.token);
             if (b.amount == 0) continue;
             if (_safeBurnTransfer(b.token, b.amount)) {
                 burnedCount++;

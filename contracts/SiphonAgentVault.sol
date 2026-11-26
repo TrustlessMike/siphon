@@ -192,6 +192,9 @@ contract SiphonAgentVault {
         uint8 allowedActionsMask
     ) public returns (bytes32 mandateId) {
         if (mandateRouter == address(0)) revert RouterNotConfigured();
+        if (mandateRouter != msg.sender && !authorizedRouters[mandateRouter]) {
+            revert UnauthorizedRouter(mandateRouter, authorizedRouter);
+        }
         if (
             agentKey == address(0) ||
             lockedSolanaRecipient == bytes32(0) ||
@@ -245,6 +248,9 @@ contract SiphonAgentVault {
         AgentMandate storage m = mandates[mandateId];
         if (m.owner != msg.sender) revert Unauthorized();
         if (newRouter == address(0)) revert RouterNotConfigured();
+        if (newRouter != msg.sender && !authorizedRouters[newRouter]) {
+            revert UnauthorizedRouter(newRouter, authorizedRouter);
+        }
         m.authorizedRouter = newRouter;
         emit MandateRouterUpdated(mandateId, msg.sender, newRouter);
     }
@@ -289,12 +295,22 @@ contract SiphonAgentVault {
         if (!m.active || block.timestamp > m.expiresAt) revert MandateInactiveOrExpired();
 
         // Only the owner-approved execution router/delegate may consume mandate budget.
+        // - If msg.sender == m.owner (EIP-7702 self-delegated EOA), allow ONLY when m.authorizedRouter == m.owner
+        //   without ever adding EOAs to the global `authorizedRouters` allowlist.
+        // - Otherwise require BOTH global router authorization (so revoking a compromised router immediately
+        //   halts existing mandates too) AND matching the mandate's pinned/default router.
         address expectedRouter = m.authorizedRouter != address(0) ? m.authorizedRouter : authorizedRouter;
         if (expectedRouter == address(0)) revert RouterNotConfigured();
-        bool callerAllowed = (msg.sender == expectedRouter) ||
-            (m.authorizedRouter == authorizedRouter && authorizedRouters[msg.sender]);
+        bool callerAllowed;
+        if (msg.sender == m.owner) {
+            callerAllowed = (expectedRouter == m.owner);
+        } else {
+            callerAllowed = authorizedRouters[msg.sender] &&
+                ((msg.sender == expectedRouter) || (m.authorizedRouter == authorizedRouter));
+        }
         if (!callerAllowed) {
             if (msg.sender != expectedRouter) revert UnauthorizedRouter(msg.sender, expectedRouter);
+            revert UnauthorizedRouter(msg.sender, expectedRouter);
         }
 
         if (agentCaller != m.agentKey && agentCaller != m.owner) revert Unauthorized();

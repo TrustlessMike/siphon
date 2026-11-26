@@ -61,7 +61,7 @@ contract SiphonRouterTest is TestBase {
         aggregator = new MockSwapAggregator(address(usdc));
         aavePool = new MockAaveV3Pool();
         aavePool.setReserve(address(usdc), address(aUsdc));
-        comet = new MockCompoundV3Comet();
+        comet = new MockCompoundV3Comet(address(usdc));
         vault4626 = new MockERC4626Vault(address(usdc));
 
         // Seed aggregator liquidity
@@ -153,6 +153,7 @@ contract SiphonRouterTest is TestBase {
 
         SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 0,
             minNetUsdcOut: 1490e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
@@ -188,23 +189,15 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV2), 10_000e6);
 
-        SiphonRouter.SwapStep[] memory directSwap = new SiphonRouter.SwapStep[](1);
-        directSwap[0] = SiphonRouter.SwapStep({
-            tokenIn: address(usdc),
-            amountIn: 10_000e6,
-            pullFromUser: true,
-            aggregator: address(0),
-            swapCalldata: ""
-        });
-
         SiphonRouter.SweepParams memory zeroFeeParams = SiphonRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 10_000e6,
             minNetUsdcOut: 10_000e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
             defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: directSwap,
+            swaps: new SiphonRouter.SwapStep[](0),
             burns: new SiphonRouter.BurnStep[](0)
         });
         (uint256 bridged0, ) = routerV2.sweepAndBridgeToSolana(zeroFeeParams);
@@ -221,15 +214,15 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV2), 100_000e6);
 
-        directSwap[0].amountIn = 100_000e6;
         SiphonRouter.SweepParams memory whaleParams = SiphonRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 100_000e6,
             minNetUsdcOut: 99_975e6,
             maxFeeUsdcCap: 25e6, // User-side ceiling agrees with $25 cap
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
             defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: directSwap,
+            swaps: new SiphonRouter.SwapStep[](0),
             burns: new SiphonRouter.BurnStep[](0)
         });
         (uint256 bridgedWhale, ) = routerV2.sweepAndBridgeToSolana(whaleParams);
@@ -254,23 +247,15 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV1), 1_000e6);
 
-        SiphonRouter.SwapStep[] memory swaps = new SiphonRouter.SwapStep[](1);
-        swaps[0] = SiphonRouter.SwapStep({
-            tokenIn: address(usdc),
-            amountIn: 500e6,
-            pullFromUser: true,
-            aggregator: address(0),
-            swapCalldata: ""
-        });
-
         SiphonRouter.SweepParams memory v1Params = SiphonRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 500e6,
             minNetUsdcOut: 400e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
             defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: swaps,
+            swaps: new SiphonRouter.SwapStep[](0),
             burns: new SiphonRouter.BurnStep[](0)
         });
         (uint256 bridgedV1, uint64 nonceV1) = routerV1.sweepAndBridgeToSolana(v1Params);
@@ -289,9 +274,9 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV2), 2_000e6);
 
-        swaps[0].amountIn = 1_000e6;
         SiphonRouter.SweepParams memory fastParams = SiphonRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 1_000e6,
             minNetUsdcOut: 990e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
@@ -302,7 +287,7 @@ contract SiphonRouterTest is TestBase {
                 hookData: ""
             }),
             defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: swaps,
+            swaps: new SiphonRouter.SwapStep[](0),
             burns: new SiphonRouter.BurnStep[](0)
         });
         routerV2.sweepAndBridgeToSolana(fastParams);
@@ -355,24 +340,16 @@ contract SiphonRouterTest is TestBase {
         vm.prank(user);
         usdc.approve(address(routerV2), 3_000e6);
 
-        SiphonRouter.SwapStep[] memory swaps = new SiphonRouter.SwapStep[](1);
-        swaps[0] = SiphonRouter.SwapStep({
-            tokenIn: address(usdc),
-            amountIn: 450e6,
-            pullFromUser: true,
-            aggregator: address(0),
-            swapCalldata: ""
-        });
-
         uint256 startTs = block.timestamp;
         SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 450e6,
             minNetUsdcOut: 440e6,
             maxFeeUsdcCap: 0,
             deadline: startTs + 3600,
             cctp: _emptyCctp(),
             defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: swaps,
+            swaps: new SiphonRouter.SwapStep[](0),
             burns: new SiphonRouter.BurnStep[](0)
         });
 
@@ -386,6 +363,7 @@ contract SiphonRouterTest is TestBase {
         );
         assertEq(bridged1, 448_875_000); // 450 - 0.25% (1.125 USDC)
         assertEq(cctpV2.lastMintRecipient(), SOLANA_ATA);
+        assertEq(routerV2.mandateExecutionNonce(), 1);
 
         // 2. Wrong Solana recipient -> REVERTS with RecipientMismatch!
         params.solanaRecipient = WRONG_SOLANA_ATA;
@@ -411,7 +389,7 @@ contract SiphonRouterTest is TestBase {
 
         // 4. Excessive fee (raise router feeBps to 100 > mandate maxFeeBps 50) -> REVERTS with FeeAboveCap!
         routerV2.setFeeParams(feeRecipient, 100);
-        swaps[0].amountIn = 200e6;
+        params.directUsdcAmount = 200e6;
         params.minNetUsdcOut = 190e6;
         vm.prank(agent);
         vm.expectRevert(abi.encodeWithSelector(SiphonAgentVault.FeeAboveCap.selector, 100, 50));
@@ -443,9 +421,9 @@ contract SiphonRouterTest is TestBase {
         );
         params.defiExits = new SiphonRouter.DefiExitStep[](0);
 
-        // 6. Warp +24 hours -> daily cap resets cleanly and $450 sweep succeeds!
+        // 6. Warp +24 hours -> daily cap resets cleanly and $450 sweep succeeds (monotonic nonce increments)!
         vm.warp(startTs + 1 days);
-        swaps[0].amountIn = 450e6;
+        params.directUsdcAmount = 450e6;
         params.deadline = startTs + 1 days + 3600;
         params.minNetUsdcOut = 440e6;
         vm.prank(agent);
@@ -456,12 +434,13 @@ contract SiphonRouterTest is TestBase {
             params
         );
         assertEq(bridged2, 448_875_000);
+        assertEq(routerV2.mandateExecutionNonce(), 2);
 
         // 7. Revoke mandate -> immediately reverts with MandateInactiveOrExpired!
         vm.prank(user);
         agentVault.revokeMandate(mandateId);
 
-        swaps[0].amountIn = 100e6;
+        params.directUsdcAmount = 100e6;
         params.minNetUsdcOut = 90e6;
         vm.prank(agent);
         vm.expectRevert(SiphonAgentVault.MandateInactiveOrExpired.selector);
@@ -549,6 +528,7 @@ contract SiphonRouterTest is TestBase {
 
         SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 0,
             minNetUsdcOut: 1,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
@@ -561,6 +541,368 @@ contract SiphonRouterTest is TestBase {
         vm.prank(user);
         vm.expectRevert(SiphonRouter.InvalidAddress.selector);
         routerV2.sweepAndBridgeToSolana(params);
+    }
+
+    // =========================================================================
+    // Wave 8A Adversarial Regression Proofs (C-2, C-4, H-1, H-2, H-3, M-4, L-2)
+    // =========================================================================
+
+    function test_RevertRogueAgentArbitrarySwapCalldata() public {
+        uint8 allMask = agentVault.ALL_ACTIONS_MASK();
+        uint8 actionDust = agentVault.ACTION_DUST_CONVERT();
+        uint8 actionDefi = agentVault.ACTION_DEFI_WITHDRAW();
+        vm.prank(user);
+        bytes32 mandateId = agentVault.grantMandate(
+            agent,
+            SOLANA_ATA,
+            1_000e6,
+            5_000e6,
+            7 days,
+            100,
+            9500,
+            allMask
+        );
+
+        dustToken.mint(user, 100e18);
+        vm.prank(user);
+        dustToken.approve(address(routerV2), 100e18);
+
+        // 1. Rogue agent tries executing arbitrary swapCalldata -> REVERTS AgentArbitrarySwapsForbidden!
+        SiphonRouter.SwapStep[] memory rogueSwaps = new SiphonRouter.SwapStep[](1);
+        rogueSwaps[0] = SiphonRouter.SwapStep({
+            tokenIn: address(dustToken),
+            amountIn: 100e18,
+            pullFromUser: true,
+            aggregator: address(aggregator),
+            swapCalldata: abi.encodeWithSelector(
+                MockSwapAggregator.swapExactToUsdc.selector,
+                address(dustToken),
+                100e18,
+                500e6
+            )
+        });
+
+        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+            solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 0,
+            minNetUsdcOut: 1,
+            maxFeeUsdcCap: 0,
+            deadline: block.timestamp + 600,
+            cctp: _emptyCctp(),
+            defiExits: new SiphonRouter.DefiExitStep[](0),
+            swaps: rogueSwaps,
+            burns: new SiphonRouter.BurnStep[](0)
+        });
+
+        vm.prank(agent);
+        vm.expectRevert(SiphonRouter.AgentArbitrarySwapsForbidden.selector);
+        routerV2.sweepWithMandate(address(agentVault), mandateId, actionDust, params);
+
+        // 2. Rogue agent tries non-USDC DeFi exit (underlyingAsset != usdc) -> REVERTS AgentNonUsdcDefiExitForbidden!
+        SiphonRouter.DefiExitStep[] memory nonUsdcExit = new SiphonRouter.DefiExitStep[](1);
+        nonUsdcExit[0] = SiphonRouter.DefiExitStep({
+            kind: SiphonRouter.DefiKind.COMPOUND_V3_WITHDRAW,
+            protocol: address(comet),
+            receiptToken: address(0),
+            underlyingAsset: address(dustToken),
+            amount: 10e18
+        });
+        params.swaps = new SiphonRouter.SwapStep[](0);
+        params.defiExits = nonUsdcExit;
+
+        vm.prank(agent);
+        vm.expectRevert(
+            abi.encodeWithSelector(SiphonRouter.AgentNonUsdcDefiExitForbidden.selector, address(dustToken))
+        );
+        routerV2.sweepWithMandate(address(agentVault), mandateId, actionDefi, params);
+
+        // 3. Capital owner themselves CAN still execute swaps via sweepWithMandate!
+        params.defiExits = new SiphonRouter.DefiExitStep[](0);
+        params.swaps = rogueSwaps;
+        params.minNetUsdcOut = 490e6;
+        vm.prank(user);
+        (uint256 ownerBridged, ) = routerV2.sweepWithMandate(address(agentVault), mandateId, actionDust, params);
+        assertEq(ownerBridged, 498_750_000, "Owner-executed mandate swap must still succeed");
+    }
+
+    function test_MandateDirectUsdcBridgeWithoutDustConvert() public {
+        // Mandate grants ONLY ACTION_BRIDGE_SOLANA (no ACTION_DUST_CONVERT!)
+        uint8 actionBridge = agentVault.ACTION_BRIDGE_SOLANA();
+        vm.prank(user);
+        bytes32 mandateId = agentVault.grantMandate(
+            agent,
+            SOLANA_ATA,
+            500e6,
+            1_000e6,
+            7 days,
+            50,
+            9900,
+            actionBridge
+        );
+
+        usdc.mint(user, 400e6);
+        vm.prank(user);
+        usdc.approve(address(routerV2), 400e6);
+
+        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+            solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 400e6,
+            minNetUsdcOut: 398e6,
+            maxFeeUsdcCap: 0,
+            deadline: block.timestamp + 600,
+            cctp: _emptyCctp(),
+            defiExits: new SiphonRouter.DefiExitStep[](0),
+            swaps: new SiphonRouter.SwapStep[](0),
+            burns: new SiphonRouter.BurnStep[](0)
+        });
+
+        vm.prank(agent);
+        (uint256 bridged, ) = routerV2.sweepWithMandate(address(agentVault), mandateId, actionBridge, params);
+        assertEq(bridged, 399e6, "Direct USDC bridge should succeed with ACTION_BRIDGE_SOLANA alone");
+        assertEq(usdc.balanceOf(user), 0);
+        assertEq(usdc.balanceOf(address(routerV2)), 0);
+    }
+
+    function test_RevertRogueAgentBurnAndUsdcBurn() public {
+        uint8 allMask = agentVault.ALL_ACTIONS_MASK();
+        uint8 actionBridge = agentVault.ACTION_BRIDGE_SOLANA();
+        vm.prank(user);
+        bytes32 mandateId = agentVault.grantMandate(
+            agent,
+            SOLANA_ATA,
+            1_000e6,
+            5_000e6,
+            7 days,
+            100,
+            9500,
+            allMask
+        );
+
+        usdc.mint(user, 500e6);
+        deadToken.mint(user, 100e18);
+        vm.startPrank(user);
+        usdc.approve(address(routerV2), 500e6);
+        deadToken.approve(address(routerV2), 100e18);
+        vm.stopPrank();
+
+        // 1. Rogue agent tries burning tokens inside mandate sweep -> REVERTS AgentBurnsForbidden!
+        SiphonRouter.BurnStep[] memory burns = new SiphonRouter.BurnStep[](1);
+        burns[0] = SiphonRouter.BurnStep({ token: address(deadToken), amount: 100e18 });
+
+        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+            solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 200e6,
+            minNetUsdcOut: 190e6,
+            maxFeeUsdcCap: 0,
+            deadline: block.timestamp + 600,
+            cctp: _emptyCctp(),
+            defiExits: new SiphonRouter.DefiExitStep[](0),
+            swaps: new SiphonRouter.SwapStep[](0),
+            burns: burns
+        });
+
+        vm.prank(agent);
+        vm.expectRevert(SiphonRouter.AgentBurnsForbidden.selector);
+        routerV2.sweepWithMandate(address(agentVault), mandateId, actionBridge, params);
+
+        // 2. Even direct owner sweep attempting to burn USDC -> REVERTS InvalidBurnToken(usdc)!
+        burns[0] = SiphonRouter.BurnStep({ token: address(usdc), amount: 100e6 });
+        vm.prank(user);
+        vm.expectRevert(abi.encodeWithSelector(SiphonRouter.InvalidBurnToken.selector, address(usdc)));
+        routerV2.sweepAndBridgeToSolana(params);
+    }
+
+    function test_RevertCctpMaxFeeViolatingMinNetUsdcOutOrMandate() public {
+        uint8 actionBridge = agentVault.ACTION_BRIDGE_SOLANA();
+        vm.prank(user);
+        bytes32 mandateId = agentVault.grantMandate(
+            agent,
+            SOLANA_ATA,
+            1_000e6,
+            5_000e6,
+            7 days,
+            50,   // max 0.50% total fee bps
+            9900, // min 99.0% net received on Solana
+            actionBridge
+        );
+
+        usdc.mint(user, 2_000e6);
+        vm.prank(user);
+        usdc.approve(address(routerV2), 2_000e6);
+
+        // 1. Direct sweep: 1000 USDC gross, 2.5 USDC protocol fee -> 997.5 bridged, but cctp.maxFee = 10 USDC
+        //    -> minSolanaReceived = 987.5 < minNetUsdcOut (995) -> REVERTS SlippageExceeded(987.5e6, 995e6)!
+        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+            solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 1_000e6,
+            minNetUsdcOut: 995e6,
+            maxFeeUsdcCap: 0,
+            deadline: block.timestamp + 600,
+            cctp: SiphonRouter.CctpV2Options({
+                destinationCaller: bytes32(0),
+                maxFee: 10e6, // 1% CCTP fee
+                minFinalityThreshold: 1000,
+                hookData: ""
+            }),
+            defiExits: new SiphonRouter.DefiExitStep[](0),
+            swaps: new SiphonRouter.SwapStep[](0),
+            burns: new SiphonRouter.BurnStep[](0)
+        });
+
+        vm.prank(user);
+        vm.expectRevert(abi.encodeWithSelector(SiphonRouter.SlippageExceeded.selector, 987_500_000, 995e6));
+        routerV2.sweepAndBridgeToSolana(params);
+
+        // 2. Mandate sweep: lower minNetUsdcOut to 900e6 so SlippageExceeded doesn't fire,
+        //    but 25 bps protocol + 100 bps CCTP = 125 bps > mandate maxFeeBps (50) -> REVERTS FeeAboveCap(125, 50)!
+        params.minNetUsdcOut = 900e6;
+        vm.prank(agent);
+        vm.expectRevert(abi.encodeWithSelector(SiphonAgentVault.FeeAboveCap.selector, 125, 50));
+        routerV2.sweepWithMandate(address(agentVault), mandateId, actionBridge, params);
+
+        // 3. Mandate sweep with higher maxFeeBps (200) but cctp.maxFee pushing minSolanaReceived below minNetOutBps (9900)
+        //    -> REVERTS NegativeOrLowRoiBlocked(987.5e6, 990e6)!
+        vm.prank(user);
+        bytes32 strictRoiMandate = agentVault.grantMandate(
+            agent,
+            SOLANA_ATA,
+            1_000e6,
+            5_000e6,
+            7 days,
+            200,  // allow up to 2% fee
+            9900, // require >= 99.0% net received on Solana (990e6 on 1000e6)
+            actionBridge
+        );
+        vm.prank(agent);
+        vm.expectRevert(abi.encodeWithSelector(SiphonAgentVault.NegativeOrLowRoiBlocked.selector, 987_500_000, 990e6));
+        routerV2.sweepWithMandate(address(agentVault), strictRoiMandate, actionBridge, params);
+    }
+
+    function test_RevertRogueAgentDestinationCallerOrHookData() public {
+        uint8 actionBridge = agentVault.ACTION_BRIDGE_SOLANA();
+        vm.prank(user);
+        bytes32 mandateId = agentVault.grantMandate(
+            agent,
+            SOLANA_ATA,
+            1_000e6,
+            5_000e6,
+            7 days,
+            100,
+            9500,
+            actionBridge
+        );
+
+        usdc.mint(user, 500e6);
+        vm.prank(user);
+        usdc.approve(address(routerV2), 500e6);
+
+        // 1. Rogue agent sets non-zero destinationCaller (ransom lock on Solana) -> REVERTS!
+        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+            solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 200e6,
+            minNetUsdcOut: 190e6,
+            maxFeeUsdcCap: 0,
+            deadline: block.timestamp + 600,
+            cctp: SiphonRouter.CctpV2Options({
+                destinationCaller: bytes32(uint256(0xBAD)),
+                maxFee: 0,
+                minFinalityThreshold: 1000,
+                hookData: ""
+            }),
+            defiExits: new SiphonRouter.DefiExitStep[](0),
+            swaps: new SiphonRouter.SwapStep[](0),
+            burns: new SiphonRouter.BurnStep[](0)
+        });
+
+        vm.prank(agent);
+        vm.expectRevert(SiphonRouter.AgentCctpOverrideForbidden.selector);
+        routerV2.sweepWithMandate(address(agentVault), mandateId, actionBridge, params);
+
+        // 2. Rogue agent injects arbitrary hookData -> REVERTS!
+        params.cctp.destinationCaller = bytes32(0);
+        params.cctp.hookData = hex"deadbeef";
+        vm.prank(agent);
+        vm.expectRevert(SiphonRouter.AgentCctpOverrideForbidden.selector);
+        routerV2.sweepWithMandate(address(agentVault), mandateId, actionBridge, params);
+    }
+
+    function test_CompoundV3CapsWithdrawToSuppliedBalanceNoBorrow() public {
+        // User has only 300 USDC supplied in Compound v3 Comet, requests withdrawing 1,000 USDC
+        comet.creditUser(user, address(usdc), 300e6);
+
+        SiphonRouter.DefiExitStep[] memory exits = new SiphonRouter.DefiExitStep[](1);
+        exits[0] = SiphonRouter.DefiExitStep({
+            kind: SiphonRouter.DefiKind.COMPOUND_V3_WITHDRAW,
+            protocol: address(comet),
+            receiptToken: address(0),
+            underlyingAsset: address(usdc),
+            amount: 1_000e6 // Over-withdrawal attempt!
+        });
+
+        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+            solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 0,
+            minNetUsdcOut: 290e6,
+            maxFeeUsdcCap: 0,
+            deadline: block.timestamp + 600,
+            cctp: _emptyCctp(),
+            defiExits: exits,
+            swaps: new SiphonRouter.SwapStep[](0),
+            burns: new SiphonRouter.BurnStep[](0)
+        });
+
+        vm.prank(user);
+        (uint256 bridged, ) = routerV2.sweepAndBridgeToSolana(params);
+
+        // Capped cleanly to 300 USDC supplied; ZERO borrow debt created!
+        assertEq(comet.borrowBalanceOf(user), 0, "MUST NEVER create leveraged borrow debt on Compound v3");
+        assertEq(comet.balanceOf(user), 0, "Supplied balance withdrawn cleanly");
+        assertEq(bridged, 299_250_000, "Bridged must reflect capped 300 USDC minus 25 bps fee");
+
+        // Second attempt when supplied == 0 -> REVERTS InsufficientSuppliedBalance!
+        vm.prank(user);
+        vm.expectRevert(SiphonRouter.InsufficientSuppliedBalance.selector);
+        routerV2.sweepAndBridgeToSolana(params);
+    }
+
+    function test_PullFromUserPartialSwapRefundsResidualTokens() public {
+        // User approves 100 DUST; aggregator only pulls 60 DUST (partial fill) -> 40 DUST MUST be refunded!
+        dustToken.mint(user, 100e18);
+        vm.prank(user);
+        dustToken.approve(address(routerV2), 100e18);
+
+        SiphonRouter.SwapStep[] memory swaps = new SiphonRouter.SwapStep[](1);
+        swaps[0] = SiphonRouter.SwapStep({
+            tokenIn: address(dustToken),
+            amountIn: 100e18,
+            pullFromUser: true,
+            aggregator: address(aggregator),
+            swapCalldata: abi.encodeWithSelector(
+                MockSwapAggregator.swapPartialToUsdc.selector,
+                address(dustToken),
+                60e18,
+                300e6
+            )
+        });
+
+        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+            solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: 0,
+            minNetUsdcOut: 295e6,
+            maxFeeUsdcCap: 0,
+            deadline: block.timestamp + 600,
+            cctp: _emptyCctp(),
+            defiExits: new SiphonRouter.DefiExitStep[](0),
+            swaps: swaps,
+            burns: new SiphonRouter.BurnStep[](0)
+        });
+
+        vm.prank(user);
+        (uint256 bridged, ) = routerV2.sweepAndBridgeToSolana(params);
+
+        assertEq(bridged, 299_250_000);
+        assertEq(dustToken.balanceOf(user), 40e18, "Unspent 40 DUST MUST be refunded to capitalOwner");
+        assertEq(dustToken.balanceOf(address(routerV2)), 0, "Zero residual DUST stranded on router");
     }
 
     function testFuzz_FeeBoundsAndZeroResidualStranding(
@@ -581,23 +923,15 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV2), gross);
 
-        SiphonRouter.SwapStep[] memory swaps = new SiphonRouter.SwapStep[](1);
-        swaps[0] = SiphonRouter.SwapStep({
-            tokenIn: address(usdc),
-            amountIn: gross,
-            pullFromUser: true,
-            aggregator: address(0),
-            swapCalldata: ""
-        });
-
         SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
+            directUsdcAmount: gross,
             minNetUsdcOut: 1,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
             defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: swaps,
+            swaps: new SiphonRouter.SwapStep[](0),
             burns: new SiphonRouter.BurnStep[](0)
         });
 
