@@ -478,7 +478,7 @@ async function loadWalletSdkBundle({ initCoinbase = false } = {}) {
     if (initCoinbase && !cachedCoinbaseProvider && typeof cachedSdkModule.createCoinbaseWalletSDK === 'function') {
       try {
         const sdk = cachedSdkModule.createCoinbaseWalletSDK({
-          appName: 'Siphon',
+          appName: 'Turgalium',
           appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
           appChainIds: SUPPORTED_CHAIN_IDS,
           preference: { options: 'all' },
@@ -505,7 +505,7 @@ async function loadWalletSdkBundle({ initCoinbase = false } = {}) {
   if (initCoinbase && !cachedCoinbaseProvider && typeof mod.createCoinbaseWalletSDK === 'function') {
     try {
       const sdk = mod.createCoinbaseWalletSDK({
-        appName: 'Siphon',
+        appName: 'Turgalium',
         appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
         appChainIds: SUPPORTED_CHAIN_IDS,
         preference: { options: 'all' },
@@ -1237,7 +1237,7 @@ export async function connectCoinbaseSmartWallet(callbacks = {}) {
       provider = cachedCoinbaseProvider;
     } else {
       const sdk = createCoinbaseWalletSDK({
-        appName: 'Siphon',
+        appName: 'Turgalium',
         appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
         appChainIds: SUPPORTED_CHAIN_IDS,
         preference: { options: 'all' },
@@ -1288,7 +1288,7 @@ export async function connectWalletConnect(callbacks = {}) {
     optionalChains: SUPPORTED_CHAIN_IDS,
     showQrModal: true,
     metadata: {
-      name: 'Siphon',
+      name: 'Turgalium',
       description: 'Move fragmented EVM positions and tokens to Solana.',
       url: window.location.origin,
       icons: [`${window.location.origin}/logos/siphon.svg`],
@@ -1961,7 +1961,7 @@ export async function connectSolanaWallet(options = {}) {
     if (isMobileBrowser(options.userAgent)) {
       const deepLinks = getMobileSolanaDeepLinks(options.targetUrl, options.refUrl);
       const mobileErr = new Error(
-        'Open Siphon inside Phantom or Solflare mobile browser to connect your Solana wallet, or paste any Solana address manually.'
+        'Open Turgalium inside Phantom or Solflare mobile browser to connect your Solana wallet, or paste any Solana address manually.'
       );
       mobileErr.code = 'MOBILE_DEEP_LINK_REQUIRED';
       mobileErr.isMobile = true;
@@ -4667,7 +4667,7 @@ export async function fetchCosmosAccountFromLcds(lcdUrls, signerAddr, fetchFn = 
     }
   }
   throw new Error(
-    `Failed to fetch live Cosmos account_number/sequence for ${signerAddr} from chain LCD (${lastErr || 'unreachable'}). Verify the account is funded on-chain and retry — Siphon refuses to sign with placeholder 0/0.`
+    `Failed to fetch live Cosmos account_number/sequence for ${signerAddr} from chain LCD (${lastErr || 'unreachable'}). Verify the account is funded on-chain and retry — Turgalium refuses to sign with placeholder 0/0.`
   );
 }
 
@@ -5310,7 +5310,7 @@ export async function executeNonEvmDirectBatch(family, batch, opts = {}) {
             gas: String(gasLimit),
           },
           msgs: aminoMsgs,
-          memo: call.provider === 'noble_cctp' ? 'Siphon Noble CCTP → Solana' : 'Siphon Skip Go → Solana',
+          memo: call.provider === 'noble_cctp' ? 'Turgalium Noble CCTP → Solana' : 'Turgalium Skip Go → Solana',
         };
         const signed = await prov.signAmino(chainId, signerAddr, signDoc);
         if (!signed?.signature?.signature) {

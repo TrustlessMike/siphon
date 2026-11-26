@@ -273,7 +273,7 @@ function computeLocalSidePocket(
   let highRiskWarning = null;
   if (wasClamped) {
     highRiskWarning =
-      `Requested ${reqPct.toFixed(0)}% exceeds Siphon's 50% preservation hard cap and was clamped to 50%. ` +
+      `Requested ${reqPct.toFixed(0)}% exceeds Turgalium's 50% preservation hard cap and was clamped to 50%. ` +
       'Binary prediction contracts can settle to $0.';
   } else if (effectiveRiskPct > HIGH_RISK_WARN_PCT) {
     highRiskWarning =
@@ -498,7 +498,7 @@ async function fetchMarkets({ forceSearch = false } = {}) {
       fetchedAt: new Date().toISOString(),
       apiKeyConfigured: false,
       geoBlocked: false,
-      error: err instanceof Error ? err.message : 'Network error contacting Siphon Degen API.',
+      error: err instanceof Error ? err.message : 'Network error contacting Turgalium Degen API.',
     };
     updateTabBadge();
     renderAll();
@@ -1036,7 +1036,7 @@ function renderPocketBar() {
       ${warningHtml}
 
       <div class="degen-pocket-foot">
-        <span>Non-custodial guard: Siphon caps optional Degen sizing so your migrated Solana principal stays untouched. Binary contracts can settle to $0.</span>
+        <span>Non-custodial guard: Turgalium caps optional Degen sizing so your migrated Solana principal stays untouched. Binary contracts can settle to $0.</span>
         ${detected ? `<button type="button" class="degen-sync-btn" id="degenSyncBalanceBtn">Sync ${esc(fmtUsd(detected.amount))} (${esc(detected.source)})</button>` : `<span class="mono">Min order $5 · Hard ceiling 50%</span>`}
       </div>
     </div>
@@ -1366,7 +1366,7 @@ function renderMarketsSection() {
       <div class="degen-empty-state">
         <strong>${state.feedMeta.geoBlocked ? 'Jupiter Prediction API geo-restricted in this region' : 'Live Jupiter markets temporarily unreachable'}</strong>
         <span>${esc(state.feedMeta.error || 'Unable to fetch live events from Jupiter Prediction API.')}</span>
-        <span class="muted-xs">Siphon never fabricates placeholder markets when live odds are unavailable.</span>
+        <span class="muted-xs">Turgalium never fabricates placeholder markets when live odds are unavailable.</span>
         <button type="button" class="btn-outline-sm" id="degenRetryFeedBtn">Retry Live Feed</button>
       </div>
     `;
@@ -1722,7 +1722,7 @@ function renderSlip() {
       ${state.liveTxStatus ? `<div class="degen-slip-note mono">${esc(state.liveTxStatus)}</div>` : ''}
 
       <div class="degen-slip-note">
-        ${state.orderPreviewLoading ? 'Verifying side-pocket cap & $5 min order…' : 'Non-custodial payout calculator verified against Siphon side-pocket cap. Settlement uses Solana USDC directly on Jupiter.'}
+        ${state.orderPreviewLoading ? 'Verifying side-pocket cap & $5 min order…' : 'Non-custodial payout calculator verified against Turgalium side-pocket cap. Settlement uses Solana USDC directly on Jupiter.'}
       </div>
     </div>
   `;

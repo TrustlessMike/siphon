@@ -1,40 +1,44 @@
-# Siphon — Multi-Chain DeFi & Dust Migrator to Solana
+# Turgalium — Multi-Chain Capital Preservation & Solana Migrator
 
-**One Chain. Fresh Start.**
+**One Chain. Fresh Start. Bring Every Chain Home to Solana.**
+*Named after Turgalium — the ancient homeland of Maximus Decimus Meridius.*
 
-Siphon is an open-source, multi-ecosystem portfolio migration engine that scans wallets across **25 chains / 7 ecosystems** (14 EVMs, 6 Cosmos/IBC chains, Sui, Aptos, TON, Tron, and Bitcoin), unwinds DeFi positions with 1-click guided extraction, rescues batchable dust under a signed Two-Level Negative-ROI Guard, bridges assets into native Solana **USDC** or **SOL**, and exposes policy-bounded smart-contract agent mandates with **Claude MCP** and **ChatGPT Action** support.
+Turgalium is an open-source, preservation-first multi-ecosystem portfolio migration engine that scans wallets across **30 live chains / 7 ecosystems** (**19 EVMs**, **6 Cosmos/IBC chains**, **Sui**, **Aptos**, **TON**, **Tron**, and **Bitcoin**), unwinds DeFi positions in 1 click, auctions cross-chain routes in parallel for maximum net arrival, rescues batchable dust under a signed Two-Level Negative-ROI Guard, settles natively on **Solana (USDC / SOL)**, and pairs 90% principal yield preservation with an optional capped **Jupiter Degen Tab** plus policy-bounded smart-contract agent mandates (**Claude MCP** & **ChatGPT Actions**).
 
 ---
 
 ## Core Capabilities
 
-### 1. Simple 1-Click DeFi Protocol Asset Extraction (`src/defi/`, `src/execution/tx-builder.ts`)
-- **Modular Protocol Extractors:** Aave v3 & v2 (including safe partial exits maintaining Health Factor ≥ 1.6 when active debt exists and fail-closed RPC borrow guards), Compound v3 & v2 (`Comet.withdraw` / `cToken.redeem` with borrow guards), ERC-4626 vaults (Morpho, Yearn v3, Spark, Sky, Fluid, Euler with `convertToAssets`/`previewRedeem`/`maxRedeem` pricing), and Uniswap v2/v3 & Aerodrome LP position extractors.
-- **Smart Exit Router (Direct Swap vs Protocol Unwind):** Automatically routes liquid yield receipts (`sUSDe`, `wstETH`, `rETH`, `cbETH`, `weETH`, `ezETH`, `sDAI`, `sUSDS`) through direct swap & bridge to bypass withdrawal cooldowns (like Ethena's 7-day unstake lock) and minimize gas.
-- **Live `eth_call` Pre-Flight Verification & 1-Click Chaining:** Simulates DeFi exits before signing and chains Withdraw → Swap → Bridge atomically in EIP-5792 batches (with a guided auto-advancing stepper for legacy wallets and protocol-grouped quick-unwind cards in the UI).
+### 1. Capital-Preservation Routing, Tiered Fees & 1-Click Solana Post-Arrival Tools
+- **Live Parallel Route Auction (`src/execution/route-auction.ts`)**: Races **Circle CCTP V2 Fast Transfer / Standard (`0–1.4 bps`)**, **Mayan Swift**, **deBridge DLN**, **Relay**, and **LI.FI** in parallel, selecting strictly by highest net USD.
+- **Preservation-First Progressive Fee Schedule (`src/scanner/chains.ts`)**: Preserves **99.5%+** on principal migrations (`0.10%` capped at `$50`, `0.25%` mid-tier, `0 bps` self-custody option; `5%` only on `<$50` micro-dust gasless rescue).
+- **1-Click Empty-ATA SOL Rent Vacuum (`src/bridge/solana-rent.ts`)**: Reclaims `0.00203928 SOL` per empty SPL / Token-2022 account via compiled `VersionedTransaction` (`MessageV0`) with strict client-side `CloseAccount` & fee-payer verification.
+- **1-Click Post-Arrival Yield Park (`src/solana/yield-park.ts`)**: Parks 90% (or 100%) into **JupSOL**, **Jupiter Lend (`jlUSDC`)**, or **Kamino USDC**, paired with an optional **Jupiter Prediction Markets & Arcade Degen Tab** (`src/degen/jupiter-markets.ts`) capped at 10% default / 50% hard max.
+- **1-Click Stale ERC-20 Approval Revoker (`src/scanner/approvals.ts`)**: Multicall3 allowance scan + EIP-5792 batch `approve(spender, 0)` revocation.
 
-### 2. 25-Chain / 7-Ecosystem Discovery & Unified Multi-Wallet Scanning (`src/scanner/`, `src/adapters/`)
-- **14 EVM Chains:** Ethereum, Base, Arbitrum, Optimism, Polygon, Avalanche, BNB Chain, Sonic, Unichain, Linea, Scroll, Mantle, Blast, and World Chain with multi-RPC failover and Multicall3 scanning.
-- **6 Non-EVM Ecosystems:** Cosmos/IBC (Cosmos Hub, Osmosis, Noble, Celestia, Injective, Neutron), Sui, Aptos, TON, Tron, and Bitcoin.
-- **Multi-Wallet Unification (`src/scanner/unify.ts`):** Scan and unify multiple wallets across ecosystems in one view while keeping per-`(sourceWallet, chain)` atomic batching boundaries intact.
+### 2. 30-Chain / 7-Ecosystem Discovery & Live Non-EVM Execution (`src/scanner/`, `src/adapters/`)
+- **19 EVM Chains (12 on live Circle CCTP V2)**: Ethereum, Base, Arbitrum, Optimism, Polygon, Avalanche, Sonic, Unichain, Linea, World Chain, **HyperEVM (`999`, CCTP V2 Domain 19)**, **Ink (`57073`, CCTP V2 Domain 21)**, plus BNB Chain, Scroll, Mantle, Blast, **Berachain (`80094`)**, **zkSync Era (`324`)**, and **Gnosis (`100`)**.
+- **11 Non-EVM Chains across 6 Families**:
+  - **Cosmos/IBC (6)**: Cosmos Hub, Osmosis, Noble (`0 bps` CCTP vs Skip Go auction), Celestia, Injective, Neutron — live LCD `account_number`/`sequence` + `signDirect`/Amino + real on-chain broadcast (`sendTx`/LCD).
+  - **Bitcoin**: BIP-174 PSBT input parsing, UniSat / Xverse / Phantom BTC signing + `mempool.space` broadcast.
+  - **Sui**: Parallel LI.FI + Mayan Swift + Circle CCTP Domain 8 auction.
+  - **Aptos**: Panora DEX pre-swap chained into Circle CCTP Domain 9.
+  - **TON & Tron**: Live TonConnect 2 & TronLink TVM execution.
 
-### 3. Signed Two-Level Negative-ROI Guard & Dust Converter (`src/scanner/roi.ts`, `src/scanner/dust.ts`)
-- Preserves **signed** `netRoiUsd` (`worth_it` / `low_efficiency` / `negative_roi`) across Level 1 marginal per-asset ROI and Level 2 monotonic chain-batch rescue economics.
-- Accounts for swap gas, L1 data/blob fees, liquidity-scaled slippage, bridge fixed fees, one-time Solana USDC ATA rent, live-quote >50% haircut gates, and 1.5× relayer break-even solvency.
-- Dedicated **Dust Converter** identifies batch-rescuable small balances and skips value-destroying micro-dust automatically.
+### 3. 1-Click DeFi Protocol Extraction & Live Unlock-Queue Readers (`src/defi/`)
+- **Extractors**: Aave v3 & v2 (safe partial exits keeping Health Factor ≥ 1.6), Compound v3 & v2 (supplied-balance capped so over-withdrawals can never open debt), ERC-4626 vaults (Morpho, Yearn, Spark `sDAI`, Sky, Fluid, Euler), and Uniswap v2/v3 / Aerodrome / Kodiak LPs.
+- **Smart Exit Router & Live Unlock Readers**: Routes liquid yield receipts (`sUSDe`, `wstETH`, `rETH`, `cbETH`, `weETH`, `sDAI`, `sUSDS`) through direct swap to bypass cooldowns, and reads live on-chain **Lido Withdrawal Queue**, **Ethena `sUSDe` cooldowns**, and **Cosmos unbonding delegations**.
 
-### 4. Hardened Smart Contracts, Circle CCTP & Real-Time Proofs (`contracts/`, `src/bridge/`, `src/execution/`, `src/relayer/`)
-- **`SiphonRouter.sol`**: Split swap-aggregator vs DeFi-protocol allowlists, Permit2 witness-bound sweeps, isolated burn calls, and bounded 5–10% (`500–1000 bps`) protocol fee routing.
-- **`SiphonSweepDelegate.sol`**: EIP-7702 EOA delegation target with EIP-712 `SweepIntent` (`callsHash` bound), slippage protection against pre-existing EOA USDC cannibalization, and approval revocation hygiene.
-- **`SiphonAgentVault.sol`**: Policy-bounded agent mandates with immutable locked Solana recipient, per-tx & rolling 24h USD caps, single-bit action bitmask validation, and authorized router guards.
-- **`SiphonFeeVault.sol`**: Reentrancy-guarded multi-payee basis-point fee splitter.
-- **Circle CCTP Bridge (`src/bridge/cctp.ts`)**: Derives the canonical 32-byte **Solana USDC Associated Token Account (ATA) PDA** for `mintRecipient` and handles CCTP V1 & V2 chain configurations.
-- **Pre-Sign & Post-Execution Proof Engine (`src/execution/proof.ts`)**: Live `eth_call` pre-sign simulation checking JSON-RPC revert errors and on-chain receipt + Solana balance verification.
+### 4. Hardened Solidity v2 Contracts & Foundry Mainnet-Fork Verification (`contracts/`)
+- **`SiphonRouter.sol`**: Disjoint swap-aggregator vs DeFi-protocol allowlists, Permit2 witness sweeps, explicit `directUsdcAmount`, `MIN_FEE_BPS = 0` + whale `maxFeeUsdcCap`, CCTP V2 Fast Transfer & hooks, and `SiphonAgentVault` mandate linkage.
+- **`SiphonSweepDelegate.sol`**: EIP-7702 EOA delegation target with immutable canonical `usdc`/`cctpMessenger`, mandatory `policyRegistry` kill-switch, domain-separated `MANDATE_SWEEP_INTENT_TYPEHASH`, and approval revocations.
+- **`SiphonAgentVault.sol`**: Policy-bounded agent mandates with immutable locked Solana recipient, per-tx & 24h USD caps, single-bit action bitmask, and global router revocation.
+- **`SiphonDelegateRegistry.sol` & `SiphonFeeVault.sol`**: Two-step governed allowlist & emergency pause kill-switch; push-DoS & blacklist-isolated multi-payee fee vault.
+- Verified with **37 Foundry unit/fuzz/exploit-proof tests** + **3 live Ethereum Mainnet-fork tests**.
 
 ### 5. Permissioned AI Agents: Claude MCP & ChatGPT Actions (`src/agent/`, `src/mcp/`)
-- **Claude MCP (`POST /mcp` & `npm run mcp` stdio proxy):** Exposes read-only scanning, dust planning, mandate inspection, and human-permissioned sweep proposals (mandate creation is strictly owner-only in the UI/on-chain — never exposed to AI tool calls).
-- **ChatGPT Action Spec:** Serves `/.well-known/ai-plugin.json` and `/openapi.json` (OpenAPI 3.1.0 with `x-openai-isConsequential` annotations).
-- **Localhost Security Hardening:** Loopback CORS/Host validation (DNS-rebinding defense), `Content-Type` CSRF checks, owner admin session & scoped Bearer token authentication, bounded LRU/TTL caches, and strict DOM XSS escaping.
+- **Claude MCP (`POST /mcp` & `npm run mcp`)**: Exposes 10 scoped tools (`scan:read`, `dust:plan`, `agent:propose`) including `siphon_preservation_audit`, `siphon_list_unlock_schedule`, `siphon_solana_rent_scan`, `siphon_solana_yield_preview`, and read-only `siphon_degen_markets`.
+- **Production Hardening**: Atomic file-backed persistence (`SIPHON_DATA_DIR`) with corrupt-file quarantine, sliding-window rate limiter, RPC circuit breaker with URL redaction, fail-closed non-loopback admin auth, strict HTML `Content-Security-Policy`, `Dockerfile`, and `fly.toml`.
 
 ---
 
@@ -49,9 +53,16 @@ npm run start
 # Open http://127.0.0.1:4420
 ```
 
-### Run End-to-End Headless Browser Tests (Playwright)
+### Run Smart Contract Foundry Tests & Headless Browser E2E
 
 ```bash
+# Solidity unit + 256-run fuzz + adversarial proofs
+forge build --sizes && forge test --no-match-contract SiphonMainnetFork -vv
+
+# Optional live Ethereum Mainnet fork test
+MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test --match-contract SiphonMainnetFork -vv
+
+# 8-suite Playwright E2E (desktop 1440px, tablet 900px, mobile 390px)
 pip install playwright && playwright install chromium
 python3 tests/e2e-playwright.py
 ```
@@ -59,58 +70,24 @@ python3 tests/e2e-playwright.py
 ### Connect Claude Code / Claude Desktop via MCP
 
 ```bash
-# HTTP MCP (while Siphon server is running on 127.0.0.1:4420)
-claude mcp add --transport http siphon http://127.0.0.1:4420/mcp
+# HTTP MCP (while Turgalium server is running on 127.0.0.1:4420)
+claude mcp add --transport http turgalium http://127.0.0.1:4420/mcp
 
-# Or stdio MCP proxy pointing to the running Siphon server
+# Or stdio MCP proxy pointing to the running Turgalium server
 SIPHON_API_URL=http://127.0.0.1:4420 npm run mcp
 ```
 
 ---
 
-## Configuration (Optional Environment Variables)
+## Configuration
 
-All variables are optional for local inspection and recommended for production deployments:
-
-- **Server & Auth:**
-  - `PORT` (default `4420`), `HOST` (default `127.0.0.1`)
-  - `SIPHON_ADMIN_SESSION_TOKEN` — enforces `X-Siphon-Admin-Session` on owner admin endpoints
-  - `SIPHON_REQUIRE_PLUGIN_AUTH` — require scoped Bearer token on `/mcp` and plugin endpoints
-  - `SIPHON_ALLOWED_ORIGIN` — additional allowed CORS origin beyond loopback
-- **EVM & Solana RPCs:** `ETH_RPC_URL`, `BASE_RPC_URL`, `ARB_RPC_URL`, `OP_RPC_URL`, `POLYGON_RPC_URL`, `AVAX_RPC_URL`, `SOLANA_RPC_URL`
-- **L2 Arbitrary Token Indexers:** `SIM_API_KEY` (Dune Sim), `MORALIS_API_KEY`, or `ALCHEMY_API_KEY`
-- **Bridge & Wallet SDKs:** `LIFI_API_KEY`, `WALLETCONNECT_PROJECT_ID`
-- **Protocol Fee & Router Deployment:**
-  - `SIPHON_FEE_BPS` — clamped to `500–1000` (5%–10%, default `700`)
-  - `SIPHON_FEE_RECIPIENT_EVM` — server-configured treasury wallet or `SiphonFeeVault` address (client overrides rejected)
-  - `SIPHON_FEE_DESTINATION_TYPE` — `contract` (default) or `wallet`
-  - `SIPHON_ROUTER_<CHAIN>` — deployed `SiphonRouter` address per EVM chain (e.g., `SIPHON_ROUTER_BASE`)
-
----
-
-## Project Structure
-
-```text
-contracts/          Solidity smart contracts (SiphonRouter, SiphonSweepDelegate, SiphonAgentVault, SiphonFeeVault)
-public/             Frontend web console, multi-ecosystem wallet connectors, 3D/SVG visuals, protocol logos
-src/adapters/       7-ecosystem chain adapters (EVM, Cosmos, Sui, Aptos, TON, Tron, Bitcoin)
-src/agent/          Off-chain mandate policy engine & OpenAPI/ChatGPT plugin specs
-src/bridge/         Circle CCTP ATA PDA derivation, V1/V2 calldata & Iris attestation tracking
-src/client/         Bundled browser wallet SDK entrypoint (Coinbase Smart Wallet + WalletConnect)
-src/defi/           Modular DeFi protocol extractors & live eth_call pre-flight verifier
-src/execution/      Transaction builder, EIP-5792 batching & pre/post proof engine
-src/mcp/            Claude MCP JSON-RPC 2.0 server (HTTP + stdio proxy)
-src/relayer/        Gasless EIP-712 Permit2 / EIP-7702 intent builder & ecrecover verifier
-src/scanner/        Multicall3 scanner, discovery, Two-Level ROI engine, dust converter & wallet unifier
-src/server/         HTTP API server, bounded LRU/TTL cache & background settlement job store
-tests/              Unit, adversarial security, DeFi backtest, ROI/job stress & Playwright E2E suites
-```
+See [`.env.example`](.env.example) for all optional production environment variables (server/auth `SIPHON_ADMIN_SESSION_TOKEN`, persistence `SIPHON_DATA_DIR`, RPC URLs, indexers, `JUPITER_API_KEY`, `ENSO_API_KEY`, `SIPHON_PAYMASTER_URL`, and treasury recipients). Internal `SIPHON_*` environment variable names and contract identifiers are preserved for full backward compatibility.
 
 ---
 
 ## Security Notice
 
-Siphon interacts with real on-chain assets and smart contracts. While the codebase includes extensive automated adversarial backtests and security hardening, **the Solidity contracts have not yet undergone an independent external third-party audit**. Always verify transactions in your wallet and test with small amounts before deploying or executing large mainnet migrations. See [SECURITY.md](SECURITY.md) for responsible disclosure.
+Turgalium interacts with real on-chain assets and smart contracts. While the codebase includes extensive automated adversarial backtests, 204 Node/TS tests, 37 Foundry unit/fuzz/fork proofs, and 8 Playwright E2E suites, **the Solidity contracts have not yet undergone an independent external third-party audit**. Always verify transactions in your wallet and test with small amounts before executing large mainnet migrations. See [SECURITY.md](SECURITY.md) for responsible disclosure.
 
 ## License
 

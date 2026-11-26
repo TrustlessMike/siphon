@@ -4,12 +4,12 @@ export function buildAiPluginManifest(baseUrl: string) {
   const cleanBase = baseUrl.replace(/\/$/, '');
   return {
     schema_version: 'v1',
-    name_for_human: 'Siphon Multi-Chain Sweep & Preservation Agent',
+    name_for_human: 'Turgalium Multi-Chain Sweep & Preservation Agent',
     name_for_model: 'siphon_migrator',
     description_for_human:
-      'Scan unified wallets across 25 chains, run capital-preservation route audits, track live Lido/Ethena/Cosmos unlocks, reclaim Solana empty-ATA rent, preview 90/10 Solana yield splits, research Jupiter Prediction Markets, and propose permission-gated sweeps to Solana.',
+      'Scan unified wallets across 30 chains, run capital-preservation route audits, track live Lido/Ethena/Cosmos unlocks, reclaim Solana empty-ATA rent, preview 90/10 Solana yield splits, research Jupiter Prediction Markets, and propose permission-gated sweeps to Solana.',
     description_for_model:
-      'Use Siphon to inspect unified multi-chain wallets, run capital-preservation audits, inspect live Lido/Ethena/Cosmos unlock queues and CCTP claims, scan Solana empty-ATA rent recovery, preview 90% yield + 10% Degen side-pocket splits, research trending Jupiter Prediction Markets (read-only), and submit permission-gated sweep requests. NEVER assume funds move or bets are placed without explicit user approval or an active SiphonAgentVault mandate.',
+      'Use Turgalium to inspect unified multi-chain wallets across 30 chains, run capital-preservation audits, inspect live Lido/Ethena/Cosmos unlock queues and CCTP claims, scan Solana empty-ATA rent recovery, preview 90% yield + 10% Degen side-pocket splits, research trending Jupiter Prediction Markets (read-only), and submit permission-gated sweep requests. NEVER assume funds move or bets are placed without explicit user approval or an active SiphonAgentVault mandate.',
     auth: {
       type: 'user_http',
       authorization_type: 'bearer',
@@ -30,18 +30,18 @@ export function buildOpenApiSpec(baseUrl: string) {
   return {
     openapi: '3.1.0',
     info: {
-      title: 'Siphon Multi-Chain Migrator & Preservation Agent API',
+      title: 'Turgalium Multi-Chain Migrator & Preservation Agent API',
       version: '2.0.0',
       description:
-        'ChatGPT Action & AI Agent API (v2) for unifying multi-chain wallets across 25 chains, running capital-preservation route audits, reading live on-chain Lido/Ethena/Cosmos unlock queues, scanning Solana empty-ATA rent, previewing 90/10 Solana yield splits, researching Jupiter Prediction Markets (read-only), and submitting human-permissioned sweep requests to Solana.',
+        'ChatGPT Action & AI Agent API (v2) for Turgalium — unifying multi-chain wallets across 30 chains, running capital-preservation route audits, reading live on-chain Lido/Ethena/Cosmos unlock queues, scanning Solana empty-ATA rent, previewing 90/10 Solana yield splits, researching Jupiter Prediction Markets (read-only), and submitting human-permissioned sweep requests to Solana.',
     },
-    servers: [{ url: cleanBase, description: 'Siphon Local / Hosted Server' }],
+    servers: [{ url: cleanBase, description: 'Turgalium Local / Hosted Server' }],
     components: {
       securitySchemes: {
         BearerAuth: {
           type: 'http',
           scheme: 'bearer',
-          description: 'Scoped Siphon AI Plugin token generated in the Agents & AI tab.',
+          description: 'Scoped Turgalium AI Plugin token generated in the Agents & AI tab.',
         },
       },
     },
@@ -50,7 +50,7 @@ export function buildOpenApiSpec(baseUrl: string) {
         post: {
           operationId: 'scanUnifiedWallets',
           'x-openai-isConsequential': false,
-          summary: 'Scan & unify one or more wallets across 25 chains (EVM, Cosmos, Sui, Aptos, TON, Tron, Bitcoin)',
+          summary: 'Scan & unify one or more wallets across 30 chains (19 EVMs, Cosmos, Sui, Aptos, TON, Tron, Bitcoin)',
           requestBody: {
             required: true,
             content: {
@@ -407,6 +407,6 @@ export function buildPluginSetupGuide(params: { baseUrl: string; rootDir: string
     chatgptPluginManifestUrl: `${cleanBase}/.well-known/ai-plugin.json`,
     chatgptOpenApiUrl: `${cleanBase}/openapi.json`,
     chatgptCustomGptInstructions:
-      'You are Siphon Assistant. Scan wallets via scanUnifiedWallets, audit exact capital savings via siphon_preservation_audit, inspect live Lido/Ethena/Cosmos unlocks via siphon_list_unlock_schedule, check free Solana rent recovery via siphon_solana_rent_scan, preview 90/10 yield splits via siphon_solana_yield_preview, and research Jupiter Prediction Markets read-only via siphon_degen_markets. Always submit value-moving sweeps via requestSweepPermission (with authentic scanned assetIds) and NEVER place bets or move funds autonomously without explicit user approval or an active owner-created SiphonAgentVault mandate.',
+      'You are Turgalium Assistant. Scan wallets via scanUnifiedWallets, audit exact capital savings via siphon_preservation_audit, inspect live Lido/Ethena/Cosmos unlocks via siphon_list_unlock_schedule, check free Solana rent recovery via siphon_solana_rent_scan, preview 90/10 yield splits via siphon_solana_yield_preview, and research Jupiter Prediction Markets read-only via siphon_degen_markets. Always submit value-moving sweeps via requestSweepPermission (with authentic scanned assetIds) and NEVER place bets or move funds autonomously without explicit user approval or an active owner-created SiphonAgentVault mandate.',
   };
 }
