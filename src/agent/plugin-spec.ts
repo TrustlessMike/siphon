@@ -377,6 +377,51 @@ export function buildOpenApiSpec(baseUrl: string) {
           },
         },
       },
+      '/api/agent/review-link': {
+        post: {
+          operationId: 'buildReviewLink',
+          'x-openai-isConsequential': false,
+          summary:
+            'Build a non-custodial Turgalium review & sign URL for a public wallet address so the user signs locally in their own wallet (zero private keys)',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['wallet'],
+                  properties: {
+                    wallet: {
+                      type: 'string',
+                      maxLength: 160,
+                      description: 'Public source wallet address (0x…, .eth, cosmos1…, bc1…, EQ…, T…). NEVER a private key.',
+                    },
+                    family: {
+                      type: 'string',
+                      enum: ['evm', 'cosmos', 'sui', 'aptos', 'ton', 'tron', 'btc'],
+                    },
+                    solanaDestination: {
+                      type: 'string',
+                      minLength: 32,
+                      maxLength: 64,
+                      description: 'Optional public Solana base58 destination address',
+                    },
+                    outputAsset: { type: 'string', enum: ['USDC', 'SOL'], default: 'USDC' },
+                    chains: { type: 'array', maxItems: 19, items: { type: 'string', maxLength: 32 } },
+                    agentName: { type: 'string', maxLength: 40, default: 'ChatGPT' },
+                    note: { type: 'string', maxLength: 160 },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Non-custodial reviewUrl for 1-click local wallet signing',
+            },
+          },
+        },
+      },
     },
   };
 }
@@ -407,6 +452,6 @@ export function buildPluginSetupGuide(params: { baseUrl: string; rootDir: string
     chatgptPluginManifestUrl: `${cleanBase}/.well-known/ai-plugin.json`,
     chatgptOpenApiUrl: `${cleanBase}/openapi.json`,
     chatgptCustomGptInstructions:
-      'You are Turgalium Assistant. Scan wallets via scanUnifiedWallets, audit exact capital savings via turgalium_preservation_audit, inspect live Lido/Ethena/Cosmos unlocks via turgalium_list_unlock_schedule, check free Solana rent recovery via turgalium_solana_rent_scan, preview 90/10 yield splits via turgalium_solana_yield_preview, and research Jupiter Prediction Markets read-only via turgalium_degen_markets. Always submit value-moving sweeps via requestSweepPermission (with authentic scanned assetIds) and NEVER place bets or move funds autonomously without explicit user approval or an active owner-created TurgaliumAgentVault mandate.',
+      'You are Turgalium Assistant (0% protocol fee, MIT open-source). NEVER ask the user for a private key, seed phrase, or wallet signature. Scan public wallets via scanUnifiedWallets, audit exact capital savings via turgalium_preservation_audit, inspect live Lido/Ethena/Cosmos unlocks via turgalium_list_unlock_schedule, check free Solana rent recovery via turgalium_solana_rent_scan, preview 90/10 yield splits via turgalium_solana_yield_preview, and research Jupiter Prediction Markets read-only via turgalium_degen_markets. Always finish by calling buildReviewLink so the user gets a 1-click non-custodial Turgalium Review & Sign URL to inspect and sign locally in their own wallet.',
   };
 }

@@ -853,6 +853,7 @@ function switchView(viewName) {
     pane.classList.toggle('active', pane.id === `view-${viewName}`);
   });
   if (viewName === 'degen') ensureDegenLoaded().catch(() => {});
+  if (viewName === 'ai') syncZeroKeyAiFromAppState();
   if (viewName === 'contract' && !contractData) loadContract();
   if (viewName === 'agents') loadAgentsAndPlugins();
   renderBackgroundAgentUI();
@@ -5804,8 +5805,14 @@ document.getElementById('mobileStickySweepBtn')?.addEventListener('click', () =>
 });
 window.addEventListener('resize', () => syncMobileStickySweepBar());
 renderEmptyScanState();
+let zeroKeyAiAgent = 'ChatGPT';
+let zeroKeyAiOutput = 'USDC';
+let zeroKeyAiInitialized = false;
+
 initInflightBridgeTracker();
 registerServiceWorker();
+initZeroKeyAiLaunchpad();
+hydrateFromReviewLink();
 
 async function runUnifiedScan() {
   if (!unifiedWallets.length) return;
@@ -7449,4 +7456,258 @@ function registerServiceWorker() {
   } else {
     window.addEventListener('load', registerNow, { once: true });
   }
+}
+
+// =====================================================================
+// WAVE 21: ZERO-KEY AI LAUNCHPAD & NON-CUSTODIAL REVIEW-LINK HANDOFF
+// =====================================================================
+function getTurgaliumPublicOrigin() {
+  const origin = typeof window !== 'undefined' ? window.location?.origin || '' : '';
+  return origin && origin !== 'null' ? origin.replace(/\/$/, '') : 'https://turgalium.vercel.app';
+}
+
+function buildZeroKeyAgentPrompt() {
+  const origin = getTurgaliumPublicOrigin();
+  const walletVal = document.getElementById('aiWalletInput')?.value.trim() || '<MY_PUBLIC_WALLET_ADDRESS>';
+  const solDestVal = document.getElementById('aiSolDestInput')?.value.trim() || '';
+  const destClause = solDestVal
+    ? `Target Solana destination: ${solDestVal} (receive ${zeroKeyAiOutput}).`
+    : `Receive ${zeroKeyAiOutput} on Solana.`;
+  const toolHint =
+    zeroKeyAiAgent === 'Claude' || zeroKeyAiAgent === 'Cursor / OpenClaw'
+      ? `Connect via Turgalium MCP (${origin}/mcp or \`npx turgalium-mcp\`) or REST API (${origin}/openapi.json).`
+      : `Use Turgalium's public OpenAPI (${origin}/openapi.json) or live endpoints at ${origin}.`;
+
+  return [
+    `Use Turgalium (0% protocol fee, MIT open-source) to audit my public wallet across 30 chains and prepare a sweep to Solana.`,
+    toolHint,
+    `Public source wallet: ${walletVal}`,
+    destClause,
+    `Steps:`,
+    `1. Scan my public address via POST /api/scan (or turgalium_scan_wallets) and identify DeFi deposits, liquid tokens, profitable dust, and traps to skip.`,
+    `2. Summarize the highest-net bridge route and any free Solana ATA rent or SPL dust I can reclaim.`,
+    `3. Call POST /api/agent/review-link (or turgalium_build_review_link) and return the clickable Turgalium Review & Sign Link so I can inspect and sign locally in my own wallet.`,
+    `Security rule: NEVER ask me for a private key, seed phrase, or wallet signature.`,
+  ].join('\n');
+}
+
+function buildLocalZeroKeyReviewUrl() {
+  const origin = getTurgaliumPublicOrigin();
+  const walletVal = document.getElementById('aiWalletInput')?.value.trim() || '';
+  const solDestVal = document.getElementById('aiSolDestInput')?.value.trim() || '';
+  const u = new URL('/', origin);
+  u.searchParams.set('view', 'scanner');
+  if (walletVal) {
+    const fam = detectAddressFamily(walletVal);
+    if (fam) u.searchParams.set('family', fam);
+    u.searchParams.set('wallet', walletVal);
+  }
+  if (solDestVal && isValidSolanaBase58(solDestVal)) {
+    u.searchParams.set('dest', solDestVal);
+  }
+  if (zeroKeyAiOutput === 'SOL') {
+    u.searchParams.set('output', 'SOL');
+  }
+  u.searchParams.set('agent', zeroKeyAiAgent);
+  return u.toString();
+}
+
+function renderZeroKeyAiPrompt() {
+  const origin = getTurgaliumPublicOrigin();
+  const openApiEl = document.getElementById('aiOpenApiUrl');
+  const mcpUrlEl = document.getElementById('aiMcpUrl');
+  const reviewApiEl = document.getElementById('aiReviewApiUrl');
+  if (openApiEl) openApiEl.textContent = `${origin}/openapi.json`;
+  if (mcpUrlEl) mcpUrlEl.textContent = `${origin}/mcp`;
+  if (reviewApiEl) reviewApiEl.textContent = `POST ${origin}/api/agent/review-link`;
+
+  const prompt = buildZeroKeyAgentPrompt();
+  const box = document.getElementById('aiPromptPreview');
+  if (box) box.textContent = prompt;
+
+  const gptBtn = document.getElementById('openChatGptBtn');
+  if (gptBtn) {
+    gptBtn.href = `https://chatgpt.com/?q=${encodeURIComponent(prompt)}`;
+  }
+  const claudeBtn = document.getElementById('openClaudeBtn');
+  if (claudeBtn) {
+    claudeBtn.href = `https://claude.ai/new?q=${encodeURIComponent(prompt)}`;
+  }
+}
+
+function syncZeroKeyAiFromAppState() {
+  const walletIn = document.getElementById('aiWalletInput');
+  const solIn = document.getElementById('aiSolDestInput');
+  if (walletIn && !walletIn.value.trim()) {
+    const candidate =
+      getActiveSourceWallet()?.address ||
+      currentScan?.walletAddress ||
+      document.getElementById('appEvmInput')?.value.trim() ||
+      document.getElementById('heroWalletInput')?.value.trim() ||
+      '';
+    if (candidate) walletIn.value = candidate;
+  }
+  if (solIn && !solIn.value.trim()) {
+    const solCandidate =
+      getConnectedSolanaAddress() ||
+      document.getElementById('solanaDestInput')?.value.trim() ||
+      '';
+    if (solCandidate) solIn.value = solCandidate;
+  }
+  renderZeroKeyAiPrompt();
+}
+
+function initZeroKeyAiLaunchpad() {
+  if (zeroKeyAiInitialized) return;
+  zeroKeyAiInitialized = true;
+
+  document.querySelectorAll('.ai-agent-chip[data-ai-agent]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      zeroKeyAiAgent = btn.dataset.aiAgent || 'ChatGPT';
+      document.querySelectorAll('.ai-agent-chip[data-ai-agent]').forEach((b) => {
+        const active = b === btn;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-pressed', String(active));
+      });
+      renderZeroKeyAiPrompt();
+    });
+  });
+
+  document.querySelectorAll('.ai-out-btn[data-ai-output]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      zeroKeyAiOutput = btn.dataset.aiOutput === 'SOL' ? 'SOL' : 'USDC';
+      document.querySelectorAll('.ai-out-btn[data-ai-output]').forEach((b) => {
+        const active = b === btn;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-pressed', String(active));
+      });
+      renderZeroKeyAiPrompt();
+    });
+  });
+
+  document.getElementById('aiWalletInput')?.addEventListener('input', renderZeroKeyAiPrompt);
+  document.getElementById('aiSolDestInput')?.addEventListener('input', renderZeroKeyAiPrompt);
+
+  document.getElementById('copyAiPromptBtn')?.addEventListener('click', async () => {
+    const prompt = buildZeroKeyAgentPrompt();
+    await navigator.clipboard?.writeText(prompt).catch(() => {});
+    showToast(`Copied zero-key ${zeroKeyAiAgent} prompt.`);
+  });
+
+  document.getElementById('copyAiReviewLinkBtn')?.addEventListener('click', async () => {
+    const walletVal = document.getElementById('aiWalletInput')?.value.trim() || '';
+    if (!walletVal) {
+      showToast('Enter a public wallet address first to generate a Review & Sign Link.');
+      document.getElementById('aiWalletInput')?.focus();
+      return;
+    }
+    const solDestVal = document.getElementById('aiSolDestInput')?.value.trim() || '';
+    try {
+      const res = await api('/api/agent/review-link', {
+        method: 'POST',
+        body: JSON.stringify({
+          wallet: walletVal,
+          solanaDestination: solDestVal || undefined,
+          outputAsset: zeroKeyAiOutput,
+          agentName: zeroKeyAiAgent,
+        }),
+      });
+      const url = res?.reviewUrl || buildLocalZeroKeyReviewUrl();
+      await navigator.clipboard?.writeText(url).catch(() => {});
+      showToast('Copied non-custodial Review & Sign Link.');
+    } catch (err) {
+      showToast(err?.message || 'Enter a valid public wallet address.');
+    }
+  });
+
+  document.querySelectorAll('[data-copy-el]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const targetId = btn.dataset.copyEl;
+      const text = document.getElementById(targetId)?.textContent?.trim() || '';
+      if (!text) return;
+      await navigator.clipboard?.writeText(text).catch(() => {});
+      showToast('Copied to clipboard.');
+    });
+  });
+
+  renderZeroKeyAiPrompt();
+}
+
+function renderAgentHandoffBanner({ agentName, wallet, note }) {
+  const host = document.getElementById('agentHandoffBanner');
+  if (!host) return;
+  const safeAgent = escapeHtml(agentName || 'AI Agent');
+  const safeWallet = escapeHtml(shortAddr(wallet || ''));
+  const safeNote = note ? escapeHtml(note) : 'Review scanned assets & sign locally in your own wallet — zero private keys shared.';
+  host.innerHTML = `
+    <div class="agent-handoff-main">
+      <span class="agent-handoff-pill">Prepared via ${safeAgent}</span>
+      <div class="agent-handoff-copy">
+        <strong>Non-custodial review for ${safeWallet}</strong>
+        <span>${safeNote}</span>
+      </div>
+    </div>
+    <button type="button" class="btn-outline-sm" id="dismissAgentHandoffBtn">Dismiss</button>
+  `;
+  host.classList.remove('hidden');
+  document.getElementById('dismissAgentHandoffBtn')?.addEventListener('click', () => {
+    host.classList.add('hidden');
+  });
+}
+
+function hydrateFromReviewLink() {
+  if (typeof window === 'undefined' || !window.location?.search) return;
+  let params;
+  try {
+    params = new URLSearchParams(window.location.search);
+  } catch {
+    return;
+  }
+  const viewParam = (params.get('view') || '').trim().toLowerCase();
+  const rawWallet = (params.get('wallet') || '').trim();
+  const rawFamily = (params.get('family') || '').trim().toLowerCase();
+  const rawDest = (params.get('dest') || '').trim();
+  const rawOutput = (params.get('output') || '').trim().toUpperCase();
+  const rawAgent = (params.get('agent') || '').trim().slice(0, 40);
+  const rawNote = (params.get('note') || '').trim().slice(0, 160);
+
+  if (viewParam === 'ai') {
+    if (rawWallet) {
+      const aiW = document.getElementById('aiWalletInput');
+      if (aiW) aiW.value = rawWallet;
+    }
+    if (rawDest && isValidSolanaBase58(rawDest)) {
+      const aiD = document.getElementById('aiSolDestInput');
+      if (aiD) aiD.value = rawDest;
+    }
+    openApp('ai');
+    renderZeroKeyAiPrompt();
+    return;
+  }
+
+  if (!rawWallet) return;
+  const detectedFam = detectAddressFamily(rawWallet, rawFamily || undefined);
+  if (!detectedFam) return;
+
+  if (rawOutput === 'SOL' || rawOutput === 'USDC') {
+    outputAsset = rawOutput;
+    document.querySelectorAll('.out-btn[data-output]').forEach((b) => {
+      b.classList.toggle('active', b.dataset.output === outputAsset);
+    });
+  }
+  if (rawDest && isValidSolanaBase58(rawDest)) {
+    const destInput = document.getElementById('solanaDestInput');
+    if (destInput) destInput.value = rawDest;
+    syncDestinationUiState();
+  }
+
+  activeFamily = detectedFam;
+  updateFamilyChrome();
+  openApp('scanner');
+  renderAgentHandoffBanner({
+    agentName: rawAgent || 'AI Agent',
+    wallet: rawWallet,
+    note: rawNote,
+  });
+  runScan({ address: rawWallet, family: detectedFam, autoOpen: true });
 }

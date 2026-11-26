@@ -1,6 +1,7 @@
 import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { TurgaliumAgentEngine, type AgentActionType } from '../agent/mandate-engine.js';
+import { buildAgentReviewLink } from '../agent/review-link.js';
 import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import {
   scanReclaimableSolanaRent,
@@ -64,6 +65,8 @@ export interface McpToolContext {
   gasPriceFetcher?: (chain: EvmChainId) => Promise<number | null>;
   solanaRentScanner?: typeof scanReclaimableSolanaRent;
   solanaYieldPlanner?: typeof buildSolanaYieldParkPlan;
+  /** Optional public base URL for non-custodial review links */
+  publicBaseUrl?: string;
   nowMs?: () => number;
 }
 
@@ -78,6 +81,7 @@ const MCP_TOOL_REQUIRED_SCOPE: Record<string, string> = {
   turgalium_solana_rent_scan: 'scan:read',
   turgalium_solana_yield_preview: 'scan:read',
   turgalium_degen_markets: 'scan:read',
+  turgalium_build_review_link: 'scan:read',
 };
 
 export interface JsonRpcRequest {
@@ -416,6 +420,60 @@ export const TURGALIUM_MCP_TOOLS = [
           minimum: 1,
           maximum: 25,
           default: 10,
+        },
+      },
+    },
+  },
+  {
+    name: 'turgalium_build_review_link',
+    description:
+      'Build a non-custodial Turgalium review & sign URL for a public wallet address so the user can inspect the live scan and sign locally in their own wallet — zero private keys ever shared.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['wallet'],
+      properties: {
+        wallet: {
+          type: 'string',
+          minLength: 3,
+          maxLength: 160,
+          description: 'Public source wallet address (0x…, .eth, cosmos1…, bc1…, EQ…, T…). NEVER a private key.',
+        },
+        family: {
+          type: 'string',
+          enum: ['evm', 'cosmos', 'sui', 'aptos', 'ton', 'tron', 'btc'],
+        },
+        solanaDestination: {
+          type: 'string',
+          minLength: 32,
+          maxLength: 64,
+          description: 'Optional public Solana base58 destination address',
+        },
+        outputAsset: {
+          type: 'string',
+          enum: ['USDC', 'SOL'],
+          default: 'USDC',
+        },
+        chains: {
+          type: 'array',
+          maxItems: 19,
+          items: { type: 'string', maxLength: 32 },
+        },
+        agentName: {
+          type: 'string',
+          maxLength: 40,
+          description: 'Label for the assisting agent (e.g. Claude, ChatGPT, Cursor)',
+        },
+        note: {
+          type: 'string',
+          maxLength: 160,
+          description: 'Short plain-English summary shown in the Turgalium review banner',
         },
       },
     },
@@ -1280,6 +1338,25 @@ export async function handleMcpJsonRpc(
           })),
           error: feed.error ? sanitizeFreeText(feed.error, 200) : undefined,
         };
+      } else if (toolName === 'turgalium_build_review_link') {
+        const baseUrl =
+          ctx.publicBaseUrl ||
+          process.env.TURGALIUM_PUBLIC_BASE_URL?.trim() ||
+          'https://turgalium.vercel.app';
+        result = buildAgentReviewLink({
+          baseUrl,
+          wallet: typeof args.wallet === 'string' ? args.wallet : '',
+          family: typeof args.family === 'string' ? (args.family as ChainFamily) : undefined,
+          solanaDestination:
+            typeof args.solanaDestination === 'string' ? args.solanaDestination : undefined,
+          outputAsset:
+            args.outputAsset === 'SOL' || args.outputAsset === 'USDC' ? args.outputAsset : undefined,
+          chains: Array.isArray(args.chains)
+            ? args.chains.filter((c): c is string => typeof c === 'string')
+            : undefined,
+          agentName: typeof args.agentName === 'string' ? args.agentName : 'Claude MCP',
+          note: typeof args.note === 'string' ? args.note : undefined,
+        });
       }
 
       return {
