@@ -612,6 +612,36 @@ contract TurgaliumSweepDelegateTest is TestBase {
             25,
             keccak256("eip7702-self-delegated")
         );
+
+        // 5. Strict router pinning: another globally authorized router MUST NOT execute a default-router mandate!
+        address secondaryRouter = address(0x5EC0);
+        agentVault.setAuthorizedRouter(secondaryRouter, true);
+        vm.prank(eoa);
+        bytes32 defaultMandateId = agentVault.grantMandate(
+            agent,
+            SOLANA_ATA,
+            500e6,
+            1_000e6,
+            7 days,
+            50,
+            9800,
+            actionBridge
+        );
+        address defaultRouter = agentVault.authorizedRouter();
+        vm.prank(secondaryRouter);
+        vm.expectRevert(
+            abi.encodeWithSelector(TurgaliumAgentVault.UnauthorizedRouter.selector, secondaryRouter, defaultRouter)
+        );
+        agentVault.authorizeAgentAction(
+            defaultMandateId,
+            agent,
+            actionBridge,
+            SOLANA_ATA,
+            100e6,
+            99e6,
+            25,
+            keccak256("cross-router-blocked")
+        );
     }
 
     function test_DelegateBlocksAgentSwapsBurnsUsdcBurnCctpOverrideAndCometBorrow() public {

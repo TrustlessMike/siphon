@@ -1,4 +1,9 @@
-import { EVM_CHAINS, TOKEN_REGISTRY } from '../scanner/chains.js';
+import {
+  EVM_CHAINS,
+  getChainUsdcDecimals,
+  resolveUnderlyingDecimals,
+  TOKEN_REGISTRY,
+} from '../scanner/chains.js';
 import {
   decodeMulticall3Aggregate3,
   encodeMulticall3Aggregate3,
@@ -64,8 +69,15 @@ export const DEFI_SELECTORS = {
   compoundV2ExchangeRateStored: '0x182df0f5', // exchangeRateStored()
   compoundV2Comptroller: '0x5fe3b567', // comptroller()
   compoundV2Redeem: '0xdb006a75', // redeem(uint256)
+  compoundV2RedeemUnderlying: '0x852a12e3', // redeemUnderlying(uint256)
   compoundV2BorrowBalanceStored: '0x95dd9193', // borrowBalanceStored(address)
   compoundV2GetAccountLiquidity: '0x5ec88c79', // getAccountLiquidity(address)
+
+  // Balancer v2 / Berachain BEX Vault
+  balancerGetPoolId: '0x38fff2d0', // getPoolId()
+  balancerGetVault: '0x8d928af8', // getVault()
+  balancerGetPoolTokens: '0xf94d4668', // getPoolTokens(bytes32)
+  balancerExitPool: '0x8bdb3913', // exitPool(bytes32,address,address,(address[],uint256[],bytes,bool))
 
   // Uniswap v2 / Sushi / Aerodrome v2 LP
   token0: '0x0dfe1681',
@@ -151,7 +163,7 @@ export const COMPOUND_V3_COMETS: Partial<Record<EvmChainId, string[]>> = {
   ],
   optimism: [
     '0x2e44e174f7D53F0212823acC11C01A11d58c5bCB', // cUSDCv3
-    '0x995E394b8B2437aC8Ce61Ee0bC610D617962B2Ac', // cUSDTv3
+    '0xE36A30D249f7761327fd973001A32010b521b6Fd', // cWETHv3 (bytecode-verified live on Optimism)
   ],
   polygon: [
     '0xF25212E676D1F7F89Cd72fFEe66158f541246445', // cUSDCv3
@@ -163,6 +175,20 @@ export const COMPOUND_V2_COMPTROLLERS: Partial<Record<EvmChainId, string[]>> = {
   bnb: ['0xfD36E2c2a6789Db23113685031d7F16329158384'], // Venus Unitroller
   avalanche: ['0x486Af39519B4Dc9a7fCcd318217352830E8AD9b4'], // Benqi Comptroller
   base: ['0xfBb21d0380beE3312B33c4353c8936a0F13EF26C'], // Moonwell Comptroller
+};
+
+export interface BalancerV2VaultConfig {
+  name: string;
+  vault: string;
+}
+
+export const BALANCER_V2_VAULTS: Partial<Record<EvmChainId, BalancerV2VaultConfig[]>> = {
+  berachain: [
+    {
+      name: 'BEX Vault',
+      vault: '0x4Be03f781C497A489E3cB0287833452cA9B9E80B',
+    },
+  ],
 };
 
 /**
@@ -236,7 +262,18 @@ export function validateTrustedProtocolTarget(params: {
     if (!allowed.has(targetLower)) {
       return {
         trusted: false,
-        reason: `Blocked untrusted NFT Position Manager address — does not match a verified Uniswap v3 / Aerodrome CL manager on ${cfg.name}.`,
+        reason: `Blocked untrusted NFT Position Manager address — does not match a verified Uniswap v3 / Aerodrome CL / Kodiak v3 manager on ${cfg.name}.`,
+      };
+    }
+    return { trusted: true };
+  }
+
+  if (protocolId === 'balancer_v2_lp') {
+    const allowed = new Set((BALANCER_V2_VAULTS[chain] ?? []).map((v) => v.vault.toLowerCase()));
+    if (!allowed.has(targetLower)) {
+      return {
+        trusted: false,
+        reason: `Blocked untrusted Balancer v2 / BEX Vault address — does not match a verified Vault on ${cfg.name}.`,
       };
     }
     return { trusted: true };
@@ -1118,6 +1155,16 @@ export interface CompoundAccountSafety {
   protocolId: 'compound_v3' | 'compound_v2';
   hasActiveBorrow: boolean;
   borrowBalanceRaw: bigint;
+  /** Onchain supplied base-asset balance from Comet.balanceOf(user) (Compound v3) */
+  suppliedBalanceRaw?: bigint;
+  /** Onchain cToken.exchangeRateStored() scaled by 1e18 (Compound v2 / Venus / Benqi / Moonwell) */
+  exchangeRateStoredRaw?: bigint;
+  /** Onchain cToken.balanceOf(user) (Compound v2) */
+  cTokenBalanceRaw?: bigint;
+  /** Onchain cToken.underlying() (Compound v2) */
+  underlyingAddress?: string;
+  /** Resolved underlying token decimals (Compound v2) */
+  underlyingDecimals?: number;
   isCollateralized: boolean;
   accountLiquidityUsd?: number;
   shortfallUsd?: number;
@@ -1126,8 +1173,63 @@ export interface CompoundAccountSafety {
 }
 
 /**
- * Fail-closed live borrow safety check for Compound v3 (Comet `borrowBalanceOf` + `isBorrowCollateralized`)
- * and Compound v2 / Venus / Benqi (`cToken.borrowBalanceStored` + `Comptroller.getAccountLiquidity`).
+ * Encodes Balancer V2 / Berachain BEX `Vault.exitPool(bytes32 poolId, address sender, address recipient, ExitPoolRequest request)`
+ * using proportional exit (`EXACT_BPT_IN_FOR_TOKENS_OUT = 1`, `userData = abi.encode(uint256(1), uint256(bptAmountIn))`).
+ */
+export function encodeBalancerV2ExitPool(params: {
+  poolId: string;
+  sender: string;
+  recipient: string;
+  assets: string[];
+  minAmountsOut: bigint[];
+  bptAmountIn: bigint;
+  toInternalBalance?: boolean;
+}): string {
+  const cleanPoolId = strip0x(params.poolId).toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(cleanPoolId)) {
+    throw new Error('Invalid 32-byte Balancer v2 / BEX poolId');
+  }
+  if (!params.assets.length || params.assets.length !== params.minAmountsOut.length) {
+    throw new Error('Balancer v2 / BEX exitPool requires matching non-empty assets and minAmountsOut arrays');
+  }
+  // userData = abi.encode(uint256(1) /* EXACT_BPT_IN_FOR_TOKENS_OUT */, uint256(bptAmountIn))
+  const userDataHex = `${padUint256(1n)}${padUint256(params.bptAmountIn)}`;
+  const userDataByteLen = 64;
+
+  // ExitPoolRequest tuple dynamic encoding:
+  //   word 0: offset to assets[] = 4 * 32 = 128
+  //   word 1: offset to minAmountsOut[] = 128 + 32 * (1 + assets.length)
+  //   word 2: offset to userData bytes = minAmountsOutOffset + 32 * (1 + minAmountsOut.length)
+  //   word 3: toInternalBalance (bool)
+  const assetsOffset = 4 * 32;
+  const minAmountsOffset = assetsOffset + (1 + params.assets.length) * 32;
+  const userDataOffset = minAmountsOffset + (1 + params.minAmountsOut.length) * 32;
+
+  const requestTuple = [
+    padUint256(BigInt(assetsOffset)),
+    padUint256(BigInt(minAmountsOffset)),
+    padUint256(BigInt(userDataOffset)),
+    padUint256(params.toInternalBalance ? 1n : 0n),
+    // assets[]
+    padUint256(BigInt(params.assets.length)),
+    ...params.assets.map((a) => pad32Hex(a)),
+    // minAmountsOut[]
+    padUint256(BigInt(params.minAmountsOut.length)),
+    ...params.minAmountsOut.map((m) => padUint256(m)),
+    // userData bytes
+    padUint256(BigInt(userDataByteLen)),
+    userDataHex,
+  ].join('');
+
+  // Top-level head: poolId (32), sender (32), recipient (32), offset to request tuple = 4 * 32 = 128
+  return `${DEFI_SELECTORS.balancerExitPool}${cleanPoolId}${pad32Hex(params.sender)}${pad32Hex(params.recipient)}${padUint256(128n)}${requestTuple}`;
+}
+
+/**
+ * Fail-closed live borrow & supplied-balance safety check for Compound v3
+ * (Comet `borrowBalanceOf` + `isBorrowCollateralized` + `balanceOf` supplied cap)
+ * and Compound v2 / Venus / Benqi / Moonwell
+ * (`cToken.borrowBalanceStored` + `comptroller` + `exchangeRateStored` + `underlying` + `balanceOf`).
  */
 export async function checkCompoundAccountSafety(params: {
   chain: EvmChainId;
@@ -1160,6 +1262,11 @@ export async function checkCompoundAccountSafety(params: {
           allowFailure: true,
           callData: `${DEFI_SELECTORS.compoundV3IsBorrowCollateralized}${userPad}`,
         },
+        {
+          target: targetAddress,
+          allowFailure: true,
+          callData: `${DEFI_SELECTORS.balanceOf}${userPad}`,
+        },
       ]);
       const res = await evmJsonRpcCall<string>(
         cfg.rpcUrls,
@@ -1181,6 +1288,7 @@ export async function checkCompoundAccountSafety(params: {
       const dec = decodeMulticall3Aggregate3(res.result);
       const borrowRaw = dec[0]?.success ? decodeAbiUint256Word(dec[0].returnData) : null;
       const collat = dec[1]?.success ? decodeAbiBoolWord(dec[1].returnData) : null;
+      const suppliedRaw = dec[2]?.success ? decodeAbiUint256Word(dec[2].returnData) : null;
       if (borrowRaw === null) {
         return {
           checked: false,
@@ -1192,17 +1300,32 @@ export async function checkCompoundAccountSafety(params: {
           reason: 'Compound v3 borrowBalanceOf check failed — pausing withdrawal to prevent liquidation.',
         };
       }
+      if (suppliedRaw === null) {
+        return {
+          checked: false,
+          protocolId,
+          hasActiveBorrow: borrowRaw > 0n,
+          borrowBalanceRaw: borrowRaw,
+          isCollateralized: collat !== false,
+          safeForWithdraw: false,
+          reason: 'Could not verify onchain Comet.balanceOf(user) supplied balance — pausing withdrawal to prevent accidentally opening a borrow.',
+        };
+      }
       const hasActiveBorrow = borrowRaw > 0n;
+      const hasSupplied = suppliedRaw > 0n;
       return {
         checked: true,
         protocolId,
         hasActiveBorrow,
         borrowBalanceRaw: borrowRaw,
+        suppliedBalanceRaw: suppliedRaw,
         isCollateralized: collat !== false,
         safeForWithdraw: !hasActiveBorrow,
         reason: hasActiveBorrow
           ? 'Active Compound v3 borrow detected on this market. Repay your borrow before withdrawing collateral to avoid revert or liquidation.'
-          : 'Verified onchain: zero active Compound v3 borrow on this market.',
+          : !hasSupplied
+          ? 'Zero supplied base balance verified onchain via Comet.balanceOf(user) — withdrawal blocked to prevent opening a borrow against collateral.'
+          : 'Verified onchain: zero active Compound v3 borrow and positive supplied base balance on this market.',
       };
     } catch {
       return {
@@ -1217,7 +1340,7 @@ export async function checkCompoundAccountSafety(params: {
     }
   }
 
-  // Compound v2 / Venus / Benqi
+  // Compound v2 / Venus / Benqi / Moonwell
   try {
     const mc = encodeMulticall3Aggregate3([
       {
@@ -1226,6 +1349,9 @@ export async function checkCompoundAccountSafety(params: {
         callData: `${DEFI_SELECTORS.compoundV2BorrowBalanceStored}${userPad}`,
       },
       { target: targetAddress, allowFailure: true, callData: DEFI_SELECTORS.compoundV2Comptroller },
+      { target: targetAddress, allowFailure: true, callData: DEFI_SELECTORS.compoundV2ExchangeRateStored },
+      { target: targetAddress, allowFailure: true, callData: DEFI_SELECTORS.compoundV2Underlying },
+      { target: targetAddress, allowFailure: true, callData: `${DEFI_SELECTORS.balanceOf}${userPad}` },
     ]);
     const res = await evmJsonRpcCall<string>(
       cfg.rpcUrls,
@@ -1247,6 +1373,9 @@ export async function checkCompoundAccountSafety(params: {
     const dec = decodeMulticall3Aggregate3(res.result);
     const borrowRaw = dec[0]?.success ? decodeAbiUint256Word(dec[0].returnData) : null;
     const comptroller = dec[1]?.success ? decodeAbiAddressWord(dec[1].returnData) : null;
+    const exchangeRateStoredRaw = dec[2]?.success ? decodeAbiUint256Word(dec[2].returnData) : null;
+    const underlyingAddress = dec[3]?.success ? decodeAbiAddressWord(dec[3].returnData) : null;
+    const cTokenBalanceRaw = dec[4]?.success ? decodeAbiUint256Word(dec[4].returnData) : null;
     if (borrowRaw === null) {
       return {
         checked: false,
@@ -1257,6 +1386,32 @@ export async function checkCompoundAccountSafety(params: {
         safeForWithdraw: false,
         reason: 'Could not read Compound v2 borrow balance — pausing withdrawal for safety.',
       };
+    }
+
+    // Resolve underlying token decimals accurately (e.g. USDC 6 on Eth vs 18 on BNB, WBTC 8, WETH 18)
+    let underlyingDecimals: number | undefined;
+    if (underlyingAddress) {
+      const regMatch = TOKEN_REGISTRY.find(
+        (t) => t.chain === chain && t.address.toLowerCase() === underlyingAddress.toLowerCase()
+      );
+      if (regMatch) {
+        underlyingDecimals = regMatch.decimals;
+      } else if (underlyingAddress.toLowerCase() === cfg.usdcAddress.toLowerCase()) {
+        underlyingDecimals = getChainUsdcDecimals(chain);
+      } else {
+        const decRes = await evmJsonRpcCall<string>(
+          cfg.rpcUrls,
+          'eth_call',
+          [{ to: underlyingAddress, data: DEFI_SELECTORS.decimals }, 'latest'],
+          2500
+        ).catch(() => ({ result: undefined }));
+        if (decRes.result && decRes.result !== '0x') {
+          const dVal = decodeAbiUint256Word(decRes.result);
+          if (dVal !== null && dVal <= 36n) {
+            underlyingDecimals = Number(dVal);
+          }
+        }
+      }
     }
 
     let accountLiquidityUsd: number | undefined;
@@ -1286,6 +1441,12 @@ export async function checkCompoundAccountSafety(params: {
       protocolId,
       hasActiveBorrow,
       borrowBalanceRaw: borrowRaw,
+      ...(exchangeRateStoredRaw !== null && exchangeRateStoredRaw > 0n
+        ? { exchangeRateStoredRaw }
+        : {}),
+      ...(cTokenBalanceRaw !== null ? { cTokenBalanceRaw } : {}),
+      ...(underlyingAddress ? { underlyingAddress } : {}),
+      ...(underlyingDecimals !== undefined ? { underlyingDecimals } : {}),
       isCollateralized: !hasShortfall,
       accountLiquidityUsd,
       shortfallUsd,
@@ -1899,6 +2060,7 @@ export function identifyProtocolExtractorId(asset: Pick<
   | 'symbol'
   | 'address'
   | 'nftTokenId'
+  | 'balancerPoolId'
   | 'lpToken0Address'
   | 'lpToken1Address'
   | 'defiPositionType'
@@ -1908,8 +2070,21 @@ export function identifyProtocolExtractorId(asset: Pick<
     return 'external_protocol';
   }
   const proto = (asset.protocol ?? '').toLowerCase();
-  if (asset.nftTokenId || proto.includes('uniswap v3') || proto.includes('aerodrome cl')) {
+  if (
+    asset.nftTokenId ||
+    proto.includes('uniswap v3') ||
+    proto.includes('aerodrome cl') ||
+    proto.includes('kodiak v3')
+  ) {
     return 'uniswap_v3_nft';
+  }
+  if (
+    asset.balancerPoolId ||
+    proto.includes('bex') ||
+    proto.includes('balancer v2') ||
+    proto.includes('balancer')
+  ) {
+    return 'balancer_v2_lp';
   }
   if (
     (asset.lpToken0Address && asset.lpToken1Address) ||
@@ -1919,6 +2094,8 @@ export function identifyProtocolExtractorId(asset: Pick<
     proto.includes('velodrome') ||
     proto.includes('pancakeswap') ||
     proto.includes('quickswap') ||
+    proto.includes('kodiak v2') ||
+    proto.includes('kodiak') ||
     proto.includes(' lp')
   ) {
     if (asset.defiPositionType && !(asset.lpToken0Address && asset.lpToken1Address)) {
@@ -1928,8 +2105,13 @@ export function identifyProtocolExtractorId(asset: Pick<
   }
   if (proto.includes('yearn v2') || proto.includes('yearn2')) return 'yearn_v2';
   if (proto.includes('aave v2')) return 'aave_v2';
-  if (proto.includes('aave')) return 'aave_v3';
-  if (proto.includes('compound v2') || proto.includes('venus') || proto.includes('benqi')) {
+  if (proto.includes('aave') || proto.includes('hyperlend')) return 'aave_v3';
+  if (
+    proto.includes('compound v2') ||
+    proto.includes('venus') ||
+    proto.includes('benqi') ||
+    proto.includes('moonwell')
+  ) {
     return 'compound_v2';
   }
   if (proto.includes('compound')) return 'compound_v3';
@@ -1990,6 +2172,7 @@ export interface ResolveDefiExitPlanInput {
     | 'nftTokenId'
     | 'nftLiquidity'
     | 'nftManagerAddress'
+    | 'balancerPoolId'
     | 'defiPositionType'
     | 'defiDebtUsd'
     | 'defiHealthFactor'
@@ -2029,8 +2212,15 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
   const protocolName = asset.protocol || 'DeFi Protocol';
   const rawBal = BigInt(asset.rawBalance || '0');
   const liquidReceipt = getLiquidReceiptInfo(asset.symbol, asset.address);
+  // Treat omitted/undefined liquidityUsd safely for known deep-liquidity receipt tokens (wstETH, sUSDe, etc.)
+  // while still respecting explicit low-liquidity signals (0 < liquidityUsd < 50_000).
   const hasDeepDexLiquidity =
-    Boolean(liquidReceipt) && (asset.liquidityUsd >= 50_000 || asset.liquidityUsd === 0);
+    Boolean(liquidReceipt) &&
+    (asset.liquidityUsd === undefined ||
+      asset.liquidityUsd === null ||
+      !Number.isFinite(asset.liquidityUsd) ||
+      asset.liquidityUsd >= 50_000 ||
+      asset.liquidityUsd === 0);
 
   // 0. Protocol-indexed external positions (e.g. 40 Acres lending, Wayfinder lock, Carbon deposit, Velodrome veNFT)
   // Always surfaced transparently with exact debt/lock/value metadata — never blindly executed with synthetic calldata.
@@ -2225,6 +2415,32 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
       shareExchangeRate: vaultState?.shareExchangeRate,
       maxRedeemRaw: vaultState?.maxRedeemRaw?.toString(),
       supportsAtomicBatch: true,
+      simulatedLive: input.simulatedLive,
+      simulatedAtBlock: input.simulatedAtBlock,
+    };
+  }
+
+  // 1b. Non-ERC-4626 liquid staking receipts (wstETH, stETH, rETH, cbETH, weETH, ezETH) must NEVER
+  // fall through to ERC-4626 redeem() even if liquidityUsd is explicitly marked low.
+  if (protocolId === 'liquid_receipt') {
+    const uSym = asset.underlyingSymbol ?? liquidReceipt?.underlyingSymbol ?? 'ETH';
+    return {
+      protocolId: 'liquid_receipt',
+      protocolName,
+      routeKind: 'unbonding_required',
+      exitStrategy: 'cooldown_blocked',
+      preflightStatus: 'blocked',
+      preflightReason:
+        input.preflightReason ||
+        `${protocolName} (${asset.symbol}) is not an ERC-4626 vault and reported insufficient DEX liquidity ($${Number(asset.liquidityUsd || 0).toFixed(0)}) for instant Direct Swap.`,
+      plainEnglishSteps: [
+        `Wait for deeper DEX liquidity or unstake ${asset.uiBalance} ${asset.symbol} natively via ${protocolName}`,
+      ],
+      cooldownDetected: Boolean(liquidReceipt?.hasNativeCooldown),
+      underlyingSymbol: uSym,
+      underlyingAddress: asset.underlyingAddress,
+      underlyingDecimals: asset.decimals,
+      supportsAtomicBatch: false,
       simulatedLive: input.simulatedLive,
       simulatedAtBlock: input.simulatedAtBlock,
     };
@@ -2433,9 +2649,89 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
       };
     }
 
-    const expectedUi = vaultState
-      ? Number(formatUnits(vaultState.expectedUnderlyingRaw, asset.decimals).toFixed(6))
-      : asset.uiBalance;
+    const uAddr = asset.underlyingAddress ?? compoundSafety?.underlyingAddress;
+    const uDec =
+      asset.chain in EVM_CHAINS
+        ? resolveUnderlyingDecimals({
+            chain: asset.chain as EvmChainId,
+            underlyingAddress: uAddr,
+            explicitDecimals: compoundSafety?.underlyingDecimals,
+            fallbackDecimals: asset.decimals,
+          })
+        : compoundSafety?.underlyingDecimals ?? asset.decimals;
+
+    if (protocolId === 'compound_v3' && compoundSafety?.checked && compoundSafety.suppliedBalanceRaw !== undefined) {
+      if (compoundSafety.suppliedBalanceRaw <= 0n) {
+        return {
+          protocolId: 'compound_v3',
+          protocolName,
+          routeKind: 'partial_unwind',
+          exitStrategy: 'cooldown_blocked',
+          preflightStatus: 'blocked',
+          preflightReason:
+            compoundSafety.reason ||
+            `Zero supplied base balance verified onchain via Comet.balanceOf(user) — withdrawal blocked to prevent opening a borrow against collateral.`,
+          plainEnglishSteps: [
+            `Refresh your wallet scan: no withdrawable ${uSym} base supply exists on ${protocolName}.`,
+          ],
+          expectedUnderlyingRaw: '0',
+          expectedUnderlyingUi: 0,
+          safeMaxWithdrawRaw: '0',
+          underlyingSymbol: uSym,
+          underlyingAddress: uAddr,
+          underlyingDecimals: uDec,
+          supportsAtomicBatch: false,
+          simulatedLive: input.simulatedLive,
+          simulatedAtBlock: input.simulatedAtBlock,
+        };
+      }
+      const cappedRaw =
+        rawBal < compoundSafety.suppliedBalanceRaw ? rawBal : compoundSafety.suppliedBalanceRaw;
+      const cappedUi = Number(formatUnits(cappedRaw, uDec).toFixed(6));
+      return {
+        protocolId: 'compound_v3',
+        protocolName,
+        routeKind: 'protocol_unwind',
+        exitStrategy: 'instant_1click_unwind',
+        preflightStatus: input.preflightStatus ?? 'verified',
+        preflightReason:
+          input.preflightReason ||
+          (cappedRaw < rawBal
+            ? `${protocolName} withdrawal capped at verified onchain supplied balance (${cappedUi} ${uSym}) to prevent opening a borrow.`
+            : `${protocolName} position has zero active borrow and verified onchain supplied balance — ready for 1-click withdrawal and Solana bridging.`),
+        plainEnglishSteps: [
+          `Withdraw ${cappedUi} ${uSym} from ${protocolName}`,
+          uSym === 'USDC' && outputAsset === 'USDC'
+            ? `Bridge USDC directly to Solana USDC`
+            : `Swap & bridge ${uSym} to Solana ${outputAsset}`,
+        ],
+        expectedUnderlyingRaw: cappedRaw.toString(),
+        expectedUnderlyingUi: cappedUi,
+        safeMaxWithdrawRaw: cappedRaw.toString(),
+        underlyingSymbol: uSym,
+        underlyingAddress: uAddr,
+        underlyingDecimals: uDec,
+        supportsAtomicBatch: true,
+        simulatedLive: input.simulatedLive,
+        simulatedAtBlock: input.simulatedAtBlock,
+      };
+    }
+
+    let expectedRaw = vaultState?.expectedUnderlyingRaw ?? input.expectedUnderlyingRaw ?? rawBal;
+    if (
+      protocolId === 'compound_v2' &&
+      !vaultState?.expectedUnderlyingRaw &&
+      input.expectedUnderlyingRaw === undefined &&
+      compoundSafety?.exchangeRateStoredRaw !== undefined &&
+      compoundSafety.exchangeRateStoredRaw > 0n
+    ) {
+      expectedRaw = (rawBal * compoundSafety.exchangeRateStoredRaw) / 10n ** 18n;
+    }
+    const expectedUi =
+      vaultState || (protocolId === 'compound_v2' && compoundSafety?.exchangeRateStoredRaw)
+        ? Number(formatUnits(expectedRaw, uDec).toFixed(6))
+        : input.expectedUnderlyingUi ?? asset.uiBalance;
+
     return {
       protocolId,
       protocolName,
@@ -2447,17 +2743,17 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
         `${protocolName} position has zero active borrow — ready for 1-click withdrawal and Solana bridging.`,
       plainEnglishSteps: [
         protocolId === 'compound_v2'
-          ? `Redeem ${asset.uiBalance} ${asset.symbol} from ${protocolName} into ${uSym}`
+          ? `Redeem ${asset.uiBalance} ${asset.symbol} from ${protocolName} into ~${expectedUi} ${uSym}`
           : `Withdraw ${expectedUi} ${uSym} from ${protocolName}`,
         uSym === 'USDC' && outputAsset === 'USDC'
           ? `Bridge USDC directly to Solana USDC`
           : `Swap & bridge ${uSym} to Solana ${outputAsset}`,
       ],
-      expectedUnderlyingRaw: vaultState?.expectedUnderlyingRaw?.toString() ?? rawBal.toString(),
+      expectedUnderlyingRaw: expectedRaw.toString(),
       expectedUnderlyingUi: expectedUi,
       underlyingSymbol: uSym,
-      underlyingAddress: asset.underlyingAddress,
-      underlyingDecimals: asset.decimals,
+      underlyingAddress: uAddr,
+      underlyingDecimals: uDec,
       supportsAtomicBatch: true,
       simulatedLive: input.simulatedLive,
       simulatedAtBlock: input.simulatedAtBlock,
@@ -2480,6 +2776,39 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
       plainEnglishSteps: [
         `Approve and remove ${asset.uiBalance} ${asset.symbol} LP shares on ${protocolName}`,
         `Receive ${sym0} and ${sym1} in your wallet`,
+        `Swap & bridge ${sym0} + ${sym1} to Solana ${outputAsset}`,
+      ],
+      expectedUnderlyingRaw: vaultState?.expectedUnderlyingRaw?.toString(),
+      underlyingSymbol: sym0,
+      underlyingAddress: asset.lpToken0Address ?? asset.underlyingAddress,
+      underlyingDecimals: asset.lpToken0Decimals ?? 18,
+      secondaryUnderlyingSymbol: sym1,
+      secondaryUnderlyingAddress: asset.lpToken1Address,
+      secondaryUnderlyingDecimals: asset.lpToken1Decimals ?? 18,
+      expectedSecondaryRaw: input.expectedSecondaryRaw?.toString(),
+      expectedSecondaryUi: input.expectedSecondaryUi,
+      supportsAtomicBatch: true,
+      simulatedLive: input.simulatedLive,
+      simulatedAtBlock: input.simulatedAtBlock,
+    };
+  }
+
+  // 5b. Balancer v2 / Berachain BEX Vault LP
+  if (protocolId === 'balancer_v2_lp') {
+    const sym0 = asset.lpToken0Symbol ?? asset.underlyingSymbol ?? 'Token A';
+    const sym1 = asset.lpToken1Symbol ?? 'Token B';
+    return {
+      protocolId: 'balancer_v2_lp',
+      protocolName,
+      routeKind: 'protocol_unwind',
+      exitStrategy: 'instant_1click_unwind',
+      preflightStatus: input.preflightStatus ?? 'verified',
+      preflightReason:
+        input.preflightReason ||
+        `${protocolName} Balancer v2 Vault LP shares can be exited proportionally via Vault.exitPool and bridged to Solana.`,
+      plainEnglishSteps: [
+        `Exit ${asset.uiBalance} ${asset.symbol} BPT shares via ${protocolName} Vault.exitPool`,
+        `Receive ${sym0} and ${sym1} directly into your wallet`,
         `Swap & bridge ${sym0} + ${sym1} to Solana ${outputAsset}`,
       ],
       expectedUnderlyingRaw: vaultState?.expectedUnderlyingRaw?.toString(),
@@ -2577,9 +2906,12 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
   // 7. Standard ERC-4626 Vault (Morpho, Yearn v3, Fluid, Euler, etc.)
   const uSym = asset.underlyingSymbol ?? 'underlying';
   const uDec =
-    asset.chain in EVM_CHAINS &&
-    asset.underlyingAddress?.toLowerCase() === EVM_CHAINS[asset.chain as EvmChainId].usdcAddress.toLowerCase()
-      ? 6
+    asset.chain in EVM_CHAINS
+      ? resolveUnderlyingDecimals({
+          chain: asset.chain as EvmChainId,
+          underlyingAddress: asset.underlyingAddress,
+          fallbackDecimals: asset.decimals,
+        })
       : asset.decimals;
 
   if (vaultState && (vaultState.verifiedUnderlyingOutput === false || vaultState.expectedUnderlyingRaw <= 0n)) {
@@ -2668,6 +3000,7 @@ export interface DefiExtractorBuildResult {
     | 'yearn_v2'
     | 'uniswap_v2_lp'
     | 'uniswap_v3_nft'
+    | 'balancer_v2_lp'
     | 'direct_swap';
   transactions: BuiltDefiExtractionTx[];
   unlockedAssets: Array<{
@@ -2867,7 +3200,7 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
     matches: (asset) =>
       (asset.protocol ?? '').toLowerCase().includes('compound') &&
       !(asset.protocol ?? '').toLowerCase().includes('compound v2'),
-    buildExtraction: ({ asset, chain }) => {
+    buildExtraction: ({ asset, chain, exitPlan }) => {
       const cfg = EVM_CHAINS[chain];
       const cometTarget = asset.protocolAddress || asset.address || cfg.compoundV3Comet;
       const trust = validateTrustedProtocolTarget({
@@ -2879,9 +3212,37 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
       if (!trust.trusted || !cometTarget) {
         throw new Error(trust.reason || `Missing Compound v3 Comet address on ${cfg.name}.`);
       }
+      if (exitPlan?.preflightStatus === 'blocked') {
+        throw new Error(
+          exitPlan.preflightReason ||
+            `Compound v3 withdrawal blocked to prevent opening a borrow or liquidation.`
+        );
+      }
       const rawBal = BigInt(asset.rawBalance);
-      const underlying = asset.underlyingAddress || cfg.usdcAddress;
+      const suppliedCapRaw = exitPlan?.safeMaxWithdrawRaw
+        ? BigInt(exitPlan.safeMaxWithdrawRaw)
+        : exitPlan?.expectedUnderlyingRaw
+        ? BigInt(exitPlan.expectedUnderlyingRaw)
+        : rawBal;
+      const withdrawRaw = rawBal < suppliedCapRaw ? rawBal : suppliedCapRaw;
+      if (withdrawRaw <= 0n) {
+        throw new Error(
+          `Compound v3 withdrawal blocked: verified supplied balance is 0 (preventing accidental Comet borrow).`
+        );
+      }
+      const underlying = asset.underlyingAddress || exitPlan?.underlyingAddress || cfg.usdcAddress;
       const uSym = asset.underlyingSymbol ?? 'USDC';
+      const uDec = resolveUnderlyingDecimals({
+        chain,
+        underlyingAddress: underlying,
+        explicitDecimals: exitPlan?.underlyingDecimals,
+        fallbackDecimals: asset.decimals,
+      });
+      const withdrawUi = Number(formatUnits(withdrawRaw, uDec).toFixed(6));
+      const withdrawUsd =
+        rawBal > 0n
+          ? Number(((asset.grossUsd * Number(withdrawRaw)) / Number(rawBal)).toFixed(2))
+          : asset.grossUsd;
 
       return {
         protocolId: 'compound_v3',
@@ -2890,9 +3251,9 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
           {
             stepId: 'compound_withdraw',
             label: `Withdraw ${asset.symbol} from Compound v3`,
-            description: `Calls Compound v3 Comet.withdraw(${uSym}, ${asset.uiBalance})`,
+            description: `Calls Compound v3 Comet.withdraw(${uSym}, ${withdrawUi})`,
             to: cometTarget,
-            data: encodeCompoundV3Withdraw(underlying, rawBal),
+            data: encodeCompoundV3Withdraw(underlying, withdrawRaw),
             value: '0x0',
           },
         ],
@@ -2900,15 +3261,16 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
           {
             address: underlying,
             symbol: uSym,
-            decimals: asset.decimals,
-            expectedRawAmount: rawBal,
-            expectedUiAmount: asset.uiBalance,
-            estimatedUsd: asset.grossUsd,
+            decimals: uDec,
+            expectedRawAmount: withdrawRaw,
+            expectedUiAmount: withdrawUi,
+            estimatedUsd: withdrawUsd,
           },
         ],
-        estimatedOutput: `${asset.uiBalance} ${uSym} withdrawn to wallet`,
+        estimatedOutput: `${withdrawUi} ${uSym} withdrawn to wallet`,
         estimatedSeconds: 12,
         notes: [
+          'Withdrawal amount is strictly capped at verified onchain Comet.balanceOf(user) so stale balances can never open a borrow.',
           'After Compound withdrawal confirms, bridge the unlocked asset directly to Solana via Relay or Circle CCTP.',
         ],
       };
@@ -2917,10 +3279,15 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
 
   compound_v2: {
     id: 'compound_v2',
-    name: 'Compound v2 / Venus / Benqi',
+    name: 'Compound v2 / Venus / Benqi / Moonwell',
     matches: (asset) => {
       const p = (asset.protocol ?? '').toLowerCase();
-      return p.includes('compound v2') || p.includes('venus') || p.includes('benqi');
+      return (
+        p.includes('compound v2') ||
+        p.includes('venus') ||
+        p.includes('benqi') ||
+        p.includes('moonwell')
+      );
     },
     buildExtraction: ({ asset, chain, exitPlan }) => {
       const cfg = EVM_CHAINS[chain];
@@ -3218,6 +3585,96 @@ export const PROTOCOL_EXTRACTOR_REGISTRY: Record<DefiProtocolExtractorId, Protoc
         estimatedSeconds: 15,
         notes: [
           `Executes decreaseLiquidity + collect + burn atomically in a single NonfungiblePositionManager.multicall transaction.`,
+        ],
+      };
+    },
+  },
+
+  balancer_v2_lp: {
+    id: 'balancer_v2_lp',
+    name: 'Balancer v2 / Berachain BEX Vault LP',
+    matches: (asset) => identifyProtocolExtractorId(asset) === 'balancer_v2_lp',
+    buildExtraction: ({ asset, userAddress, chain, exitPlan }) => {
+      const cfg = EVM_CHAINS[chain];
+      const vaults = BALANCER_V2_VAULTS[chain] ?? [];
+      const vaultAddr = asset.protocolAddress || vaults[0]?.vault;
+      const trust = validateTrustedProtocolTarget({
+        chain,
+        protocolId: 'balancer_v2_lp',
+        assetAddress: asset.address,
+        protocolAddress: vaultAddr,
+      });
+      if (!trust.trusted || !vaultAddr) {
+        throw new Error(trust.reason || `No verified Balancer v2 / BEX Vault configured on ${cfg.name}.`);
+      }
+      const tokenA = asset.lpToken0Address || asset.underlyingAddress || exitPlan?.underlyingAddress;
+      const tokenB = asset.lpToken1Address || exitPlan?.secondaryUnderlyingAddress;
+      if (!tokenA || !tokenB) {
+        throw new Error(`Cannot build BEX/Balancer v2 exitPool for ${asset.symbol}: missing pool token addresses.`);
+      }
+      const poolId = asset.balancerPoolId;
+      if (!poolId || !/^0x[0-9a-fA-F]{64}$/.test(poolId)) {
+        throw new Error(`Cannot build BEX/Balancer v2 exitPool for ${asset.symbol}: missing 32-byte balancerPoolId.`);
+      }
+      const rawBpt = BigInt(asset.rawBalance);
+      const expected0 = exitPlan?.expectedUnderlyingRaw ? BigInt(exitPlan.expectedUnderlyingRaw) : 0n;
+      const expected1 = exitPlan?.expectedSecondaryRaw ? BigInt(exitPlan.expectedSecondaryRaw) : 0n;
+      const minOut0 = (expected0 * 99n) / 100n;
+      const minOut1 = (expected1 * 99n) / 100n;
+
+      const sym0 = asset.lpToken0Symbol ?? asset.underlyingSymbol ?? 'Token0';
+      const sym1 = asset.lpToken1Symbol ?? exitPlan?.secondaryUnderlyingSymbol ?? 'Token1';
+      const dec0 = asset.lpToken0Decimals ?? exitPlan?.underlyingDecimals ?? 18;
+      const dec1 = asset.lpToken1Decimals ?? exitPlan?.secondaryUnderlyingDecimals ?? 18;
+
+      const unlocked: DefiExtractorBuildResult['unlockedAssets'] = [];
+      if (expected0 > 0n) {
+        unlocked.push({
+          address: tokenA,
+          symbol: sym0,
+          decimals: dec0,
+          expectedRawAmount: expected0,
+          expectedUiAmount: Number(formatUnits(expected0, dec0).toFixed(6)),
+          estimatedUsd: Number((asset.grossUsd / 2).toFixed(2)),
+        });
+      }
+      if (expected1 > 0n) {
+        unlocked.push({
+          address: tokenB,
+          symbol: sym1,
+          decimals: dec1,
+          expectedRawAmount: expected1,
+          expectedUiAmount: Number(formatUnits(expected1, dec1).toFixed(6)),
+          estimatedUsd: Number((asset.grossUsd / 2).toFixed(2)),
+        });
+      }
+
+      return {
+        protocolId: 'balancer_v2_lp',
+        provider: 'balancer_v2_lp',
+        transactions: [
+          {
+            stepId: 'balancer_v2_exit_pool',
+            label: `Exit ${asset.protocol || 'BEX'} Pool (${sym0} / ${sym1})`,
+            description: `Calls Balancer v2 / BEX Vault.exitPool proportional exit on ${vaultAddr}`,
+            to: vaultAddr,
+            data: encodeBalancerV2ExitPool({
+              poolId,
+              sender: userAddress,
+              recipient: userAddress,
+              assets: [tokenA, tokenB],
+              minAmountsOut: [minOut0, minOut1],
+              bptAmountIn: rawBpt,
+              toInternalBalance: false,
+            }),
+            value: '0x0',
+          },
+        ],
+        unlockedAssets: unlocked,
+        estimatedOutput: `Exit ${asset.symbol} BPT → unlock ${sym0} + ${sym1}`,
+        estimatedSeconds: 15,
+        notes: [
+          `Exits ${asset.symbol} proportionally via ${asset.protocol || 'BEX'} Vault.exitPool (0x8bdb3913) directly to your wallet.`,
         ],
       };
     },

@@ -442,29 +442,29 @@ test('Preservation Fee Engine: preserves >= 99.5% on $10k and $100k (saving +$67
   assert.equal(dust.netAfterFeeUsd, 19.0);
   assert.equal(dust.capitalPreservedPct, 95);
 
-  // Tier 2: Small ($50–$500) -> 100 bps (1%)
+  // Tier 2: Small ($50–$500) -> marginal progressive ($50*5% + $200*1% = $4.50, zero cliff at $50!)
   const small = computePreservationFee(250);
   assert.equal(small.tierId, 'small');
   assert.equal(small.nominalFeeBps, 100);
-  assert.equal(small.feeUsd, 2.5);
-  assert.equal(small.capitalPreservedPct, 99);
+  assert.equal(small.feeUsd, 4.5);
+  assert.equal(small.capitalPreservedPct, 98.2);
 
-  // Tier 3: Mid ($500–$5,000) -> 25 bps (0.25%)
+  // Tier 3: Mid ($500–$5,000) -> marginal progressive ($2.50 + $4.50 + $1,500*0.25% = $10.75)
   const mid = computePreservationFee(2_000);
   assert.equal(mid.tierId, 'growth');
   assert.equal(mid.nominalFeeBps, 25);
-  assert.equal(mid.feeUsd, 5.0);
-  assert.equal(mid.capitalPreservedPct, 99.75);
+  assert.equal(mid.feeUsd, 10.75);
+  assert.equal(mid.capitalPreservedPct, 99.4625);
 
-  // Tier 4a: Principal $10,000 -> 10 bps = $10 (99.9% preserved, +$690 saved vs flat 7% $700)
+  // Tier 4a: Principal $10,000 -> marginal progressive ($18.25 + $5,000*0.10% = $23.25; 99.7675% preserved, +$676.75 saved vs flat 7% $700)
   const p10k = computePreservationFee(10_000);
   assert.equal(p10k.tierId, 'principal');
   assert.equal(p10k.nominalFeeBps, 10);
-  assert.equal(p10k.feeUsd, 10);
+  assert.equal(p10k.feeUsd, 23.25);
   assert.equal(p10k.capApplied, false);
   assert.ok(p10k.capitalPreservedPct >= 99.5, `Expected >= 99.5% preserved on $10k, got ${p10k.capitalPreservedPct}%`);
   assert.equal(p10k.baselineFlatFeeUsd, 700);
-  assert.equal(p10k.savingsVsFlat7PctUsd, 690);
+  assert.equal(p10k.savingsVsFlat7PctUsd, 676.75);
   assert.ok(p10k.savingsVsFlat7PctUsd >= 675);
 
   // Tier 4b: Principal $100,000 -> 10 bps ($100) capped at $50 hard ceiling (99.95% preserved, +$6,950 saved vs flat 7% $7,000!)
@@ -530,8 +530,8 @@ test('ROI Engine integration: feeSchedule "tiered" preserves >= 99.5% net on $10
   const flatEv = evaluateAssetRoi(usdc10k, { protocolFeeBps: 700 });
   const tieredEv = evaluateAssetRoi(usdc10k, { feeSchedule: 'tiered' });
   assert.equal(flatEv.protocolFeeUsd, 700);
-  assert.equal(tieredEv.protocolFeeUsd, 10);
-  assert.ok(tieredEv.netRoiUsd > 9_980, `Expected >$9,980 net on $10k tiered, got $${tieredEv.netRoiUsd}`);
+  assert.equal(tieredEv.protocolFeeUsd, 23.25);
+  assert.ok(tieredEv.netRoiUsd > 9_970, `Expected >$9,970 net on $10k tiered, got $${tieredEv.netRoiUsd}`);
   assert.ok(tieredEv.effectiveCostPct < 0.5, `Expected <0.5% total cost on $10k tiered, got ${tieredEv.effectiveCostPct}%`);
 
   // Level 2 chain batch ROI on $100k Ethereum USDC with tiered fee (capped at $50)
@@ -631,6 +631,6 @@ test('ROI Engine integration: feeSchedule "tiered" preserves >= 99.5% net on $10
     feeSchedule: 'tiered',
     hasSolanaUsdcAta: true,
   });
-  assert.equal(portfolio.totalProtocolFeeUsd, 60); // $10 on $10k Base + $50 capped on $100k ETH
+  assert.equal(portfolio.totalProtocolFeeUsd, 73.25); // $23.25 on $10k Base + $50 capped on $100k ETH
   assert.ok(portfolio.totalSignedUserNetUsd / portfolio.totalGrossUsd >= 0.995);
 });

@@ -2,10 +2,12 @@ import crypto from 'node:crypto';
 import { keccak_256 } from '@noble/hashes/sha3';
 import { PublicKey } from '@solana/web3.js';
 import {
+  computePreservationFee,
   DEAD_BURN_ADDRESS,
   EVM_CHAINS,
   getProtocolFeeConfig,
   SOLANA_CCTP_DOMAIN,
+  type PreservationFeeOptions,
 } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { evaluateChainBatchRoi } from '../scanner/roi.js';
@@ -33,12 +35,43 @@ export const CCTP_V2_FALLBACK_FAST_FEE_BPS: Record<number, number> = {
   6: 1.3,  // Base
   7: 1.3,  // Polygon
   10: 1.3, // Unichain
-  11: 1.4, // Linea
+  11: 15.0, // Linea (live Circle Iris V2 fast fee is ~13 bps; 15 bps covers with safe headroom)
   13: 1.0, // Sonic
   14: 1.3, // World Chain
   19: 1.0, // HyperEVM
   21: 2.0, // Ink
 };
+
+/**
+ * Standard finality attestation ETAs (seconds) for CCTP V2 Standard Transfer (`minFinalityThreshold = 2000`, 0 bps)
+ * vs Fast Transfer (`minFinalityThreshold = 1000`, `cfg.cctpAttestationSec`).
+ */
+export const CCTP_V2_STANDARD_FINALITY_SEC: Partial<Record<EvmChainId, number>> = {
+  ethereum: 780,   // ~13 min Ethereum L1 finality
+  base: 900,       // ~15 min OP-Stack L1 finality
+  arbitrum: 900,   // ~15 min Arbitrum L1 finality
+  optimism: 900,   // ~15 min OP-Stack L1 finality
+  unichain: 900,   // ~15 min OP-Stack L1 finality
+  linea: 900,      // ~15 min Linea L1 finality
+  worldchain: 900, // ~15 min OP-Stack L1 finality
+  ink: 900,        // ~15 min OP-Stack L1 finality
+  polygon: 20,
+  avalanche: 12,
+  sonic: 12,
+  hyperevm: 15,
+};
+
+export function getCctpEstimatedSeconds(
+  chain: EvmChainId,
+  transferMode: CctpTransferMode = 'fast'
+): number {
+  const cfg = EVM_CHAINS[chain];
+  if (!cfg) return 20;
+  if (cfg.cctpVersion === 2 && transferMode === 'standard') {
+    return CCTP_V2_STANDARD_FINALITY_SEC[chain] ?? Math.max(cfg.cctpAttestationSec, 780);
+  }
+  return cfg.cctpAttestationSec;
+}
 
 export type CctpTransferMode = 'fast' | 'standard';
 
@@ -730,6 +763,8 @@ export interface BuildPlanInput {
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
   cctpTransferMode?: CctpTransferMode;
   protocolFeeBps?: number;
+  feeSchedule?: 'tiered' | 'flat';
+  preservationFeeOpts?: PreservationFeeOptions;
   feeRecipientEvm?: string | null;
   hasSolanaUsdcAta?: boolean;
 }
@@ -784,10 +819,18 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
   const rawPref = input.bridgePreference ?? 'auto';
   const bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp' =
     outputAsset === 'SOL' && rawPref === 'cctp' ? 'auto' : rawPref;
+  const useTieredFee =
+    input.feeSchedule === 'tiered' ||
+    (input.feeSchedule !== 'flat' &&
+      input.protocolFeeBps === undefined &&
+      !process.env.TURGALIUM_FEE_BPS?.trim());
   const feeConfig = getProtocolFeeConfig({
     feeBps: input.protocolFeeBps,
     feeRecipientEvm: input.feeRecipientEvm,
+    feeSchedule: useTieredFee ? 'tiered' : 'flat',
+    preservationFeeOpts: input.preservationFeeOpts,
   });
+  const effectiveCctpTransferMode: CctpTransferMode = input.cctpTransferMode ?? 'fast';
 
   // CRIT-04: Derive canonical Solana USDC Associated Token Account (ATA) PDA bytes32 for CCTP mintRecipient!
   // For read-only dry-run previews before a Solana wallet is connected, emit a neutral zero placeholder (never executable).
@@ -876,7 +919,9 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     const cctpDomain = evmCfg ? evmCfg.cctpDomain : chainSummary?.cctpDomain ?? null;
     const tokenMessenger = evmCfg?.cctpTokenMessenger ?? 'Relayer / Bridge Router';
     const usdcAddress = evmCfg?.usdcAddress ?? 'native_usdc';
-    const estSec = evmCfg?.cctpAttestationSec ?? chainSummary?.cctpAttestationSec ?? 20;
+    const estSec = evmCfg
+      ? getCctpEstimatedSeconds(evmCfg.id, effectiveCctpTransferMode)
+      : chainSummary?.cctpAttestationSec ?? 20;
 
     const defiItems = chainAssets.filter((a) => a.action === 'WITHDRAW_AND_BRIDGE');
     const swapItems = chainAssets.filter((a) => a.action === 'SELL_AND_BRIDGE');
@@ -897,7 +942,19 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     const activeGas = round4(
       chainAssets.reduce((s, a) => s + (usePermit2Batch ? a.batchedGasUsd : a.estimatedGasUsd), 0)
     );
-    const feeUsdc = round2((Math.max(0, grossUsdc - slippage) * feeConfig.feeBps) / 10_000);
+    const feeBaseUsd = Math.max(0, grossUsdc - slippage);
+    const legPreservationFee = useTieredFee
+      ? computePreservationFee(feeBaseUsd, input.preservationFeeOpts)
+      : null;
+    const feeUsdc = legPreservationFee
+      ? legPreservationFee.feeUsd
+      : round2((feeBaseUsd * feeConfig.feeBps) / 10_000);
+    const legFeeBps = legPreservationFee
+      ? Math.max(0, Math.round(legPreservationFee.effectiveFeeBps))
+      : feeConfig.feeBps;
+    const legFeePercent = legPreservationFee
+      ? Number((legPreservationFee.effectiveFeeBps / 100).toFixed(2))
+      : feeConfig.feePercent;
     const bridgedUsdc = round2(Math.max(0, grossUsdc - slippage - activeGas - feeUsdc));
     const rawUsdcAmount = BigInt(Math.round(bridgedUsdc * 1_000_000));
 
@@ -909,7 +966,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
             solanaMintRecipientBytes32,
             usdcAddress: evmCfg.usdcAddress,
             cctpVersion: evmCfg.cctpVersion ?? 1,
-            transferMode: input.cctpTransferMode,
+            transferMode: effectiveCctpTransferMode,
             fastFeeBps:
               evmCfg.cctpDomain !== null
                 ? CCTP_V2_FALLBACK_FAST_FEE_BPS[evmCfg.cctpDomain]
@@ -983,8 +1040,8 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
         ? `${feeConfig.feeRecipientEvm.slice(0, 6)}…${feeConfig.feeRecipientEvm.slice(-4)} (${feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'TurgaliumFeeVault'})`
         : 'TurgaliumFeeVault / Treasury (set recipient)';
       steps.push({
-        step: `Protocol Fee (${feeConfig.feePercent}%)`,
-        detail: `Routes $${feeUsdc.toFixed(2)} (${feeConfig.feeBps} bps) atomically to ${destLabel}`,
+        step: `Protocol Fee (${legFeePercent}%)`,
+        detail: `Routes $${feeUsdc.toFixed(2)} (${legFeeBps} bps${useTieredFee ? ' tiered' : ''}) atomically to ${destLabel}`,
         target: feeConfig.feeRecipientEvm ?? 'TurgaliumFeeVault',
       });
     }
@@ -1003,7 +1060,9 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
       chain: chainId,
       chainName,
       assets: chainAssets,
-      protocolFeeBps: feeConfig.feeBps,
+      protocolFeeBps: useTieredFee ? undefined : feeConfig.feeBps,
+      feeSchedule: useTieredFee ? 'tiered' : 'flat',
+      preservationFeeOpts: input.preservationFeeOpts,
       gasSponsored: Boolean(usePermit2Batch && chainSummary?.needsGasSponsorship),
       hasSolanaUsdcAta: legs.length === 0 ? input.hasSolanaUsdcAta : true,
       solPriceUsd: scan.totals.solPriceUsd || 70,
@@ -1071,6 +1130,15 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     }))
   );
 
+  const effectivePlanFeeBps =
+    useTieredFee && totalGross > 0
+      ? Math.max(0, Math.round((totalFee / totalGross) * 10_000))
+      : feeConfig.feeBps;
+  const effectivePlanFeePercent =
+    useTieredFee && totalGross > 0
+      ? Number(((totalFee / totalGross) * 100).toFixed(2))
+      : feeConfig.feePercent;
+
   return {
     planId: `plan_${crypto.randomBytes(5).toString('hex')}`,
     family: scan.family ?? 'evm',
@@ -1084,8 +1152,8 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     outputAsset,
     bridgePreference,
     activeBridgeLabel: activeBridgeMeta.label,
-    protocolFeeBps: feeConfig.feeBps,
-    protocolFeePercent: feeConfig.feePercent,
+    protocolFeeBps: effectivePlanFeeBps,
+    protocolFeePercent: effectivePlanFeePercent,
     feeRecipientEvm: feeConfig.feeRecipientEvm,
     feeDestinationType: feeConfig.feeDestinationType,
     legs,

@@ -301,15 +301,8 @@ contract TurgaliumAgentVault {
         //   halts existing mandates too) AND matching the mandate's pinned/default router.
         address expectedRouter = m.authorizedRouter != address(0) ? m.authorizedRouter : authorizedRouter;
         if (expectedRouter == address(0)) revert RouterNotConfigured();
-        bool callerAllowed;
-        if (msg.sender == m.owner) {
-            callerAllowed = (expectedRouter == m.owner);
-        } else {
-            callerAllowed = authorizedRouters[msg.sender] &&
-                ((msg.sender == expectedRouter) || (m.authorizedRouter == authorizedRouter));
-        }
-        if (!callerAllowed) {
-            if (msg.sender != expectedRouter) revert UnauthorizedRouter(msg.sender, expectedRouter);
+        if (msg.sender != expectedRouter) revert UnauthorizedRouter(msg.sender, expectedRouter);
+        if (msg.sender != m.owner && !authorizedRouters[msg.sender]) {
             revert UnauthorizedRouter(msg.sender, expectedRouter);
         }
 

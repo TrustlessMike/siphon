@@ -154,7 +154,6 @@ export const tonAdapter: ChainFamilyAdapter = {
   async scanWallet(address: string, label?: string): Promise<ScanReport> {
     const start = Date.now();
     const cleanAddr = address.trim();
-    const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
 
     const [account, jettons, head, priceMap] = await Promise.all([
@@ -332,10 +331,12 @@ export const tonAdapter: ChainFamilyAdapter = {
     }
 
     const grossUsd = Number(assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ grossUsd });
     const defiGrossUsd = Number(
       assets.filter((a) => a.kind === 'defi_position').reduce((s, a) => s + a.grossUsd, 0).toFixed(2)
     );
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const batchedGasUsd = Number(assets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(2));
     const singleTxGasUsd = Number(assets.reduce((s, a) => s + a.estimatedGasUsd, 0).toFixed(2));
     const slippageTotal = Number(assets.reduce((s, a) => s + a.estimatedSlippageUsd, 0).toFixed(2));
@@ -408,10 +409,11 @@ export const tonAdapter: ChainFamilyAdapter = {
 
   async prepareDirectBatch(params): Promise<PreparedNonEvmBatch> {
     const outputAsset = params.outputAsset ?? 'USDC';
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const feeRecipient = getNonEvmFeeRecipient('ton');
     const solanaUsdcAtaBytes32 = solanaAddressToBytes32(params.solanaDestination);
     const sweepable = filterChainSweepableAssets('ton', params.assets);
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
 
     const [gaslessCfg] = await Promise.all([fetchTonGaslessConfig()]);
 
@@ -500,8 +502,8 @@ export const tonAdapter: ChainFamilyAdapter = {
       notes.push(`TonAPI W5 Gasless relayer active (${gaslessCfg.relayAddress.slice(0, 14)}…) — supports $0 TON Jetton-paid batching.`);
     }
 
-    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const estimatedFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
 
     return {
       family: 'ton',
@@ -540,16 +542,17 @@ export const tonAdapter: ChainFamilyAdapter = {
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const chainAssets = filterChainSweepableAssets('ton', params.assets);
+    const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     const mintRecipientBytes32 = solanaAddressToBytes32(params.solanaDestination);
     const gaslessCfg = await fetchTonGaslessConfig();
     const relayerTonAddr =
       getNonEvmFeeRecipient('ton') ||
       gaslessCfg?.relayAddress ||
       'EQCturgaliumRelayerW5GaslessBattery0000000000000';
-    const chainAssets = filterChainSweepableAssets('ton', params.assets);
-    const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const sponsoredGasEstUsd = Number(Math.max(0.03, chainAssets.length * 0.015).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - protocolFeeUsd - sponsoredGasEstUsd).toFixed(2));
     const minNetUsdcOut = BigInt(Math.round(estimatedNetUsd * 0.98 * 1_000_000)).toString();
@@ -635,7 +638,6 @@ export const tonAdapter: ChainFamilyAdapter = {
   },
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const cleanAddr = params.userAddress.trim();
     const userAddressValid = tonAdapter.matchesAddress(cleanAddr);
     let expectedBytes32 = '0x' + '00'.repeat(32);
@@ -648,6 +650,8 @@ export const tonAdapter: ChainFamilyAdapter = {
     }
 
     const sweepable = filterChainSweepableAssets('ton', params.assets);
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     const outputAsset = params.outputAsset ?? 'USDC';
     const hasJettonsToSweep = sweepable.some((a) => a.address !== 'native');
 
@@ -676,8 +680,8 @@ export const tonAdapter: ChainFamilyAdapter = {
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
     const estimatedGasUsd = Number(Math.max(0.03, sweepable.length * 0.015).toFixed(2));
     const hasEnoughNativeGas = nativeBalanceUi >= 0.25;
-    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const feeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.98).toFixed(2));
     const tonReachable = Boolean(account && seqno > 0);
@@ -950,21 +954,14 @@ export const tonAdapter: ChainFamilyAdapter = {
       proof?: UniversalExecutionProof;
     } = {};
 
-    if (params.signature && params.intentId) {
-      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
-        throw new Error('Signed TON W5 batch intent expired. Re-sign a fresh intent.');
-      }
-      const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.TURGALIUM_TON_RELAYER_KEY?.trim());
+    if (params.signature || params.intentId) {
       out.submitted = {
-        accepted: true,
-        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        accepted: false,
+        mode: 'unsupported_non_evm_relayer',
         broadcasted: false,
-        settlementStatus: configured ? 'queued_for_relayer' : 'awaiting_relayer',
-        signatureFingerprint: fp,
-        nextStep: configured
-          ? `TON W5 Gasless relayer queued BOC ${params.intentId} (${fp}).`
-          : `TON W5 1-Sig batch verified (${fp}). Use Direct Mode (TonConnect 2 sendTransaction) to execute live Relay messages immediately.`,
+        settlementStatus: 'rejected_unverified',
+        nextStep:
+          'Sponsored relayer submission is not enabled for TON (requires server-issued intent verification and TON W5 BOC signature validation). Use Direct Mode (TonConnect 2 sendTransaction) to broadcast directly from your wallet.',
       };
     }
 

@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+import { PublicKey } from '@solana/web3.js';
 import {
   DEAD_BURN_ADDRESS,
   EVM_CHAINS,
@@ -15,6 +17,9 @@ import type { EvmChainId, ScannedAsset } from '../scanner/types.js';
 
 export const SOLANA_NATIVE_MINT = '11111111111111111111111111111111';
 export const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+export const MAYAN_FORWARDER_CONTRACT = '0x337685fdaB40D39bd02028545a4FfA7D287cC3E2';
+export const MAYAN_SOLANA_PROGRAM_ID = 'FC4eXxkyrMPTjiYUpp4EAnkmwMbQyZ6NDCh1kfLn6vsf';
+export const MAYAN_SDK_VERSION = '16_1_0';
 export const DEBRIDGE_SOLANA_CHAIN_ID = 7565164;
 export const DEFAULT_AUCTION_TIMEOUT_MS = 3500;
 export const DEFAULT_SOL_PRICE_USD = 150;
@@ -806,9 +811,15 @@ interface MayanQuotePayload {
   type?: string;
   quoteId?: string;
   expectedAmountOut?: string | number;
+  expectedAmountOutBaseUnits?: string | number;
   expectedAmountOutUsd?: string | number;
   minAmountOut?: string | number;
+  minAmountOutBaseUnits?: string | number;
+  minMiddleAmount?: string | number;
+  effectiveAmountIn?: string | number;
+  effectiveAmountIn64?: string;
   toTokenPrice?: number;
+  toPrice?: number;
   price?: number;
   etaSeconds?: number;
   eta?: number;
@@ -816,6 +827,21 @@ interface MayanQuotePayload {
   bridgeFeeUsd?: number | string;
   swapRelayerFee?: number | string;
   relayerFeeUsd?: number | string;
+  clientRelayerFeeSuccess?: number | string | null;
+  cancelRelayerFee64?: string | null;
+  refundRelayerFee64?: string | null;
+  deadline64?: string | null;
+  referrerBps?: number;
+  slippageBps?: number;
+  gasDrop?: number;
+  swiftVersion?: string;
+  swiftMayanContract?: string;
+  swiftInputContract?: string;
+  swiftInputDecimals?: number;
+  swiftAuctionMode?: number;
+  swiftWrapAndLock?: boolean;
+  fromToken?: { contract?: string; decimals?: number };
+  toToken?: { contract?: string; decimals?: number; mint?: string };
   gasCostUsd?: number | string;
   estimatedGasUsd?: number | string;
   forwarderAddress?: string;
@@ -850,6 +876,190 @@ interface MayanQuotePayload {
     gasLimit?: string | number;
     chainId?: number;
   };
+}
+
+// Verified keccak256 selectors from @mayanfinance/swap-sdk MayanSwiftV2 & MayanForwarder artifacts
+const MAYAN_SWIFT_V2_CREATE_ORDER_WITH_TOKEN_SEL = 'a3a30834';
+const MAYAN_FORWARDER_FORWARD_ERC20_SEL = 'e4269fc4';
+const MAYAN_FORWARDER_SWAP_AND_FORWARD_ERC20_SEL = '30dedc57';
+const MAYAN_FORWARDER_SWAP_AND_FORWARD_ETH_SEL = 'fa74fd43';
+
+function abiPadUint(v: bigint | number): string {
+  const n = typeof v === 'bigint' ? v : BigInt(Math.max(0, Math.trunc(v)));
+  return (n < 0n ? 0n : n).toString(16).padStart(64, '0');
+}
+
+function abiPadAddr(addr: string): string {
+  return addr.replace(/^0x/i, '').toLowerCase().padStart(64, '0');
+}
+
+function abiPadBytes32(hex32: string): string {
+  return hex32.replace(/^0x/i, '').toLowerCase().padStart(64, '0').slice(-64);
+}
+
+function abiEncodeBytesBody(hexData: string): string {
+  const clean = hexData.replace(/^0x/i, '').toLowerCase();
+  const byteLen = Math.floor(clean.length / 2);
+  const paddedLen = Math.ceil(byteLen / 32) * 64;
+  return abiPadUint(byteLen) + clean.slice(0, byteLen * 2).padEnd(paddedLen, '0');
+}
+
+function solanaPubkeyToHex32(base58OrZero: string): string {
+  const trimmed = base58OrZero.trim();
+  if (
+    !trimmed ||
+    trimmed === ZERO_ADDRESS ||
+    trimmed === SOLANA_NATIVE_MINT
+  ) {
+    return '00'.repeat(32);
+  }
+  const pk = new PublicKey(trimmed);
+  return Buffer.from(pk.toBytes()).toString('hex').padStart(64, '0');
+}
+
+function deriveMayanSwiftRandomHex32(quoteId?: string): string {
+  if (quoteId) {
+    const clean = quoteId.replace(/^0x/i, '').toLowerCase();
+    if (/^[0-9a-f]+$/.test(clean) && clean.length > 0 && clean.length <= 64) {
+      return clean.padStart(32, '0').slice(-32) + '00'.repeat(16);
+    }
+  }
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function encodeMayanSwiftV2CreateOrderWithToken(params: {
+  tokenIn: string;
+  amountIn: bigint;
+  traderAddress: string;
+  solanaDestination: string;
+  outputAsset: 'USDC' | 'SOL';
+  minAmountOut: bigint;
+  cancelFee: bigint;
+  refundFee: bigint;
+  deadline: bigint;
+  referrerBps: number;
+  auctionMode: number;
+  quoteId?: string;
+}): string {
+  // createOrderWithToken(address tokenIn, uint256 amountIn, OrderParams params, bytes customPayload)
+  // OrderParams has 14 static fields (14 * 32 = 448 bytes), so head is:
+  //   word 0: tokenIn (address)
+  //   word 1: amountIn (uint256)
+  //   words 2..15: OrderParams inline tuple (14 static words)
+  //   word 16: offset to customPayload bytes = 17 * 32 = 544 (0x220)
+  //   word 17: customPayload length = 0
+  const destAddrHex = solanaPubkeyToHex32(params.solanaDestination);
+  const tokenOutHex =
+    params.outputAsset === 'SOL'
+      ? '00'.repeat(32)
+      : solanaPubkeyToHex32(SOLANA_USDC_MINT);
+  const randomHex = deriveMayanSwiftRandomHex32(params.quoteId);
+
+  const headAndTuple = [
+    abiPadAddr(params.tokenIn),
+    abiPadUint(params.amountIn),
+    // OrderParams (14 fields in exact MayanSwiftV2 ABI order):
+    abiPadUint(1), // payloadType = 1 (DEFAULT)
+    abiPadAddr(params.traderAddress), // trader (bytes32 left-padded EVM address)
+    abiPadBytes32(destAddrHex), // destAddr (bytes32 Solana pubkey)
+    abiPadUint(1), // destChainId = 1 (Solana Wormhole chain ID)
+    '00'.repeat(32), // referrerAddr
+    abiPadBytes32(tokenOutHex), // tokenOut (bytes32)
+    abiPadUint(params.minAmountOut), // minAmountOut (uint64)
+    abiPadUint(0n), // gasDrop (uint64)
+    abiPadUint(params.cancelFee), // cancelFee (uint64)
+    abiPadUint(params.refundFee), // refundFee (uint64)
+    abiPadUint(params.deadline), // deadline (uint64)
+    abiPadUint(params.referrerBps), // referrerBps (uint8)
+    abiPadUint(params.auctionMode), // auctionMode (uint8)
+    abiPadBytes32(randomHex), // random (bytes32)
+    abiPadUint(17 * 32), // offset to customPayload (bytes)
+    abiPadUint(0), // customPayload length = 0
+  ];
+  return `0x${MAYAN_SWIFT_V2_CREATE_ORDER_WITH_TOKEN_SEL}${headAndTuple.join('')}`;
+}
+
+function encodeMayanForwardErc20(params: {
+  tokenIn: string;
+  amountIn: bigint;
+  mayanProtocol: string;
+  protocolData: string;
+}): string {
+  // forwardERC20(address tokenIn, uint256 amountIn, PermitParams(5 static words), address mayanProtocol, bytes protocolData)
+  // Head = 1 + 1 + 5 + 1 + 1 = 9 words (288 bytes)
+  const head = [
+    abiPadAddr(params.tokenIn),
+    abiPadUint(params.amountIn),
+    abiPadUint(0), // permit.value
+    abiPadUint(0), // permit.deadline
+    abiPadUint(0), // permit.v
+    '00'.repeat(32), // permit.r
+    '00'.repeat(32), // permit.s
+    abiPadAddr(params.mayanProtocol),
+    abiPadUint(9 * 32),
+  ];
+  return `0x${MAYAN_FORWARDER_FORWARD_ERC20_SEL}${head.join('')}${abiEncodeBytesBody(params.protocolData)}`;
+}
+
+function encodeMayanSwapAndForwardErc20(params: {
+  tokenIn: string;
+  amountIn: bigint;
+  swapProtocol: string;
+  swapData: string;
+  middleToken: string;
+  minMiddleAmount: bigint;
+  mayanProtocol: string;
+  mayanData: string;
+}): string {
+  // swapAndForwardERC20(address, uint256, PermitParams(5), address, bytes, address, uint256, address, bytes)
+  // Head = 1 + 1 + 5 + 1 + 1(off swapData) + 1 + 1 + 1 + 1(off mayanData) = 13 words (416 bytes)
+  const swapBody = abiEncodeBytesBody(params.swapData);
+  const mayanBody = abiEncodeBytesBody(params.mayanData);
+  const swapOffset = 13 * 32;
+  const mayanOffset = swapOffset + swapBody.length / 2;
+  const head = [
+    abiPadAddr(params.tokenIn),
+    abiPadUint(params.amountIn),
+    abiPadUint(0), // permit.value
+    abiPadUint(0), // permit.deadline
+    abiPadUint(0), // permit.v
+    '00'.repeat(32), // permit.r
+    '00'.repeat(32), // permit.s
+    abiPadAddr(params.swapProtocol),
+    abiPadUint(swapOffset),
+    abiPadAddr(params.middleToken),
+    abiPadUint(params.minMiddleAmount),
+    abiPadAddr(params.mayanProtocol),
+    abiPadUint(mayanOffset),
+  ];
+  return `0x${MAYAN_FORWARDER_SWAP_AND_FORWARD_ERC20_SEL}${head.join('')}${swapBody}${mayanBody}`;
+}
+
+function encodeMayanSwapAndForwardEth(params: {
+  amountIn: bigint;
+  swapProtocol: string;
+  swapData: string;
+  middleToken: string;
+  minMiddleAmount: bigint;
+  mayanProtocol: string;
+  mayanData: string;
+}): string {
+  // swapAndForwardEth(uint256, address, bytes, address, uint256, address, bytes)
+  // Head = 7 words (224 bytes)
+  const swapBody = abiEncodeBytesBody(params.swapData);
+  const mayanBody = abiEncodeBytesBody(params.mayanData);
+  const swapOffset = 7 * 32;
+  const mayanOffset = swapOffset + swapBody.length / 2;
+  const head = [
+    abiPadUint(params.amountIn),
+    abiPadAddr(params.swapProtocol),
+    abiPadUint(swapOffset),
+    abiPadAddr(params.middleToken),
+    abiPadUint(params.minMiddleAmount),
+    abiPadAddr(params.mayanProtocol),
+    abiPadUint(mayanOffset),
+  ];
+  return `0x${MAYAN_FORWARDER_SWAP_AND_FORWARD_ETH_SEL}${head.join('')}${swapBody}${mayanBody}`;
 }
 
 export async function fetchMayanSwiftQuote(params: {
@@ -895,7 +1105,7 @@ export async function fetchMayanSwiftQuote(params: {
     }).slippageBps;
 
   const fromToken = asset.address === 'native' ? ZERO_ADDRESS : asset.address;
-  const toToken = outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
+  const toToken = outputAsset === 'SOL' ? ZERO_ADDRESS : SOLANA_USDC_MINT;
   const amountInUi = Number(bridgeRaw) / 10 ** asset.decimals;
 
   const url = new URL('https://price-api.mayan.finance/v3/quote');
@@ -907,8 +1117,16 @@ export async function fetchMayanSwiftQuote(params: {
   url.searchParams.set('toChain', 'solana');
   url.searchParams.set('slippageBps', String(slippageBps));
   url.searchParams.set('swift', 'true');
+  url.searchParams.set('mctp', 'true');
+  url.searchParams.set('fastMctp', 'true');
+  url.searchParams.set('gasless', 'false');
+  url.searchParams.set('solanaProgram', MAYAN_SOLANA_PROGRAM_ID);
+  url.searchParams.set('forwarderAddress', MAYAN_FORWARDER_CONTRACT);
+  url.searchParams.set('sdkVersion', MAYAN_SDK_VERSION);
   url.searchParams.set('fromAddress', userAddress);
   url.searchParams.set('destAddress', solanaDestination);
+  url.searchParams.set('destinationAddress', solanaDestination);
+  url.searchParams.set('swapperAddress', userAddress);
   url.searchParams.set('gasDrop', '0');
 
   const res = await fetchWithStrictTimeout(
@@ -948,12 +1166,154 @@ export async function fetchMayanSwiftQuote(params: {
   });
 
   const best = sorted[0];
-  const txObj = best.tx ?? best.transactionRequest ?? best.evmTx ?? {
+  let txObj: {
+    from?: string;
+    to?: string;
+    data?: string;
+    value?: string | number;
+    gasLimit?: string | number;
+    gas?: string | number;
+    chainId?: number;
+  } = best.tx ?? best.transactionRequest ?? best.evmTx ?? {
     to: best.to ?? best.forwarderAddress,
     data: best.data ?? best.calldata,
     value: best.value,
     gasLimit: best.gasLimit,
   };
+
+  // Live Mayan v3/quote returns Swift V2 order parameters without pre-encoded EVM calldata;
+  // encode canonical MayanForwarder -> MayanSwiftV2.createOrderWithToken calldata locally!
+  if (
+    (!txObj?.data || !/^0x[0-9a-fA-F]{8,}$/.test(txObj.data)) &&
+    String(best.type ?? '').toUpperCase() === 'SWIFT' &&
+    best.swiftMayanContract &&
+    /^0x[0-9a-fA-F]{40}$/.test(best.swiftMayanContract) &&
+    best.swiftInputContract &&
+    /^0x[0-9a-fA-F]{40}$/.test(best.swiftInputContract) &&
+    best.deadline64 &&
+    best.cancelRelayerFee64 &&
+    best.refundRelayerFee64 &&
+    best.swiftAuctionMode
+  ) {
+    const swiftInputContract = best.swiftInputContract;
+    const swiftContractAddress = best.swiftMayanContract;
+    const orderAmountIn = BigInt(best.effectiveAmountIn64 || bridgeRaw.toString());
+    const toDecimals = best.toToken?.decimals ?? (outputAsset === 'SOL' ? 9 : 6);
+    const normDecimals = Math.min(toDecimals, 8);
+    let minAmountOutNorm: bigint;
+    if (best.minAmountOutBaseUnits && /^\d+$/.test(String(best.minAmountOutBaseUnits))) {
+      const rawMin = BigInt(best.minAmountOutBaseUnits);
+      minAmountOutNorm =
+        toDecimals > normDecimals
+          ? rawMin / 10n ** BigInt(toDecimals - normDecimals)
+          : rawMin;
+    } else {
+      const minUi = Number(best.minAmountOut ?? best.expectedAmountOut ?? 0);
+      minAmountOutNorm = BigInt(Math.max(1, Math.floor(minUi * 10 ** normDecimals)));
+    }
+
+    const swiftCallData = encodeMayanSwiftV2CreateOrderWithToken({
+      tokenIn: best.swiftWrapAndLock ? ZERO_ADDRESS : swiftInputContract,
+      amountIn: orderAmountIn,
+      traderAddress: userAddress,
+      solanaDestination,
+      outputAsset,
+      minAmountOut: minAmountOutNorm,
+      cancelFee: BigInt(best.cancelRelayerFee64),
+      refundFee: BigInt(best.refundRelayerFee64),
+      deadline: BigInt(best.deadline64),
+      referrerBps: best.referrerBps ?? 0,
+      auctionMode: best.swiftAuctionMode,
+      quoteId: best.quoteId,
+    });
+
+    const quoteFromContract = (best.fromToken?.contract ?? fromToken).toLowerCase();
+    if (quoteFromContract === swiftInputContract.toLowerCase() && quoteFromContract !== ZERO_ADDRESS) {
+      txObj = {
+        from: userAddress,
+        to: MAYAN_FORWARDER_CONTRACT,
+        data: encodeMayanForwardErc20({
+          tokenIn: swiftInputContract,
+          amountIn: orderAmountIn,
+          mayanProtocol: swiftContractAddress,
+          protocolData: swiftCallData,
+        }),
+        value: '0x0',
+        chainId: cfg.chainId,
+      };
+    } else if (best.minMiddleAmount !== undefined) {
+      // Non-direct token (e.g. ETH / WETH / alt ERC-20) -> fetch Mayan EVM pre-swap calldata
+      const swapUrl = new URL('https://price-api.mayan.finance/v3/get-swap/evm');
+      swapUrl.searchParams.set('forwarderAddress', MAYAN_FORWARDER_CONTRACT);
+      swapUrl.searchParams.set('slippageBps', String(best.slippageBps ?? slippageBps));
+      swapUrl.searchParams.set('fromToken', fromToken);
+      swapUrl.searchParams.set('middleToken', swiftInputContract);
+      swapUrl.searchParams.set('chainName', mayanFromChain);
+      swapUrl.searchParams.set('amountIn64', orderAmountIn.toString());
+      swapUrl.searchParams.set('userWallet', userAddress);
+      swapUrl.searchParams.set('destinationWallet', solanaDestination);
+      swapUrl.searchParams.set('sdkVersion', MAYAN_SDK_VERSION);
+
+      const swapRes = await fetchWithStrictTimeout(
+        swapUrl.toString(),
+        { method: 'GET', headers: { Accept: 'application/json' } },
+        Math.min(timeoutMs, 2500),
+        fetcher,
+        signal
+      ).catch(() => null);
+      if (!swapRes || !swapRes.ok) return null;
+      const swapJson = (await swapRes.json().catch(() => null)) as {
+        swapRouterAddress?: string;
+        swapRouterCalldata?: string;
+      } | null;
+      if (
+        !swapJson?.swapRouterAddress ||
+        !/^0x[0-9a-fA-F]{40}$/.test(swapJson.swapRouterAddress) ||
+        !swapJson.swapRouterCalldata ||
+        !/^0x[0-9a-fA-F]{8,}$/.test(swapJson.swapRouterCalldata)
+      ) {
+        return null;
+      }
+      const midDecimals = best.swiftInputDecimals ?? 6;
+      const minMiddleRaw = BigInt(
+        Math.max(1, Math.floor(Number(best.minMiddleAmount) * 10 ** midDecimals))
+      );
+      if (fromToken.toLowerCase() === ZERO_ADDRESS) {
+        txObj = {
+          from: userAddress,
+          to: MAYAN_FORWARDER_CONTRACT,
+          data: encodeMayanSwapAndForwardEth({
+            amountIn: orderAmountIn,
+            swapProtocol: swapJson.swapRouterAddress,
+            swapData: swapJson.swapRouterCalldata,
+            middleToken: swiftInputContract,
+            minMiddleAmount: minMiddleRaw,
+            mayanProtocol: swiftContractAddress,
+            mayanData: swiftCallData,
+          }),
+          value: toHexWei(orderAmountIn),
+          chainId: cfg.chainId,
+        };
+      } else {
+        txObj = {
+          from: userAddress,
+          to: MAYAN_FORWARDER_CONTRACT,
+          data: encodeMayanSwapAndForwardErc20({
+            tokenIn: fromToken,
+            amountIn: orderAmountIn,
+            swapProtocol: swapJson.swapRouterAddress,
+            swapData: swapJson.swapRouterCalldata,
+            middleToken: swiftInputContract,
+            minMiddleAmount: minMiddleRaw,
+            mayanProtocol: swiftContractAddress,
+            mayanData: swiftCallData,
+          }),
+          value: '0x0',
+          chainId: cfg.chainId,
+        };
+      }
+    }
+  }
 
   const tokenAddresses = [asset.address !== 'native' ? asset.address : undefined, cfg.usdcAddress];
   const targetCheck = validateRouterCallTarget({

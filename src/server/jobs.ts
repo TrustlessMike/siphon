@@ -118,6 +118,7 @@ export interface BackgroundJobStoreOptions {
   statusChecker?: typeof checkLiveExecutionStatus;
   attestationFetcher?: typeof fetchCctpAttestationForTx;
   stateStore?: TurgaliumStateStore;
+  enableBackgroundPollers?: boolean;
   resumePollersOnLoad?: boolean;
 }
 
@@ -190,6 +191,7 @@ export class BackgroundJobStore {
   private readonly statusChecker: typeof checkLiveExecutionStatus;
   private readonly attestationFetcher: typeof fetchCctpAttestationForTx;
   private readonly stateStore?: TurgaliumStateStore;
+  private readonly enableBackgroundPollers: boolean;
 
   constructor(opts: BackgroundJobStoreOptions = {}) {
     this.maxJobs = Math.max(1, Math.floor(opts.maxJobs ?? DEFAULT_MAX_JOBS));
@@ -199,9 +201,18 @@ export class BackgroundJobStore {
     this.statusChecker = opts.statusChecker ?? checkLiveExecutionStatus;
     this.attestationFetcher = opts.attestationFetcher ?? fetchCctpAttestationForTx;
     this.stateStore = opts.stateStore;
+    this.enableBackgroundPollers = opts.enableBackgroundPollers ?? true;
     if (this.stateStore) {
-      this.hydrateFromStore(Boolean(opts.resumePollersOnLoad));
+      this.hydrateFromStore(this.enableBackgroundPollers && Boolean(opts.resumePollersOnLoad));
     }
+  }
+
+  get backgroundPollersEnabled(): boolean {
+    return this.enableBackgroundPollers;
+  }
+
+  get activePollerCount(): number {
+    return this.pollTimers.size;
   }
 
   private hydrateFromStore(resumePollers: boolean): void {
@@ -239,6 +250,7 @@ export class BackgroundJobStore {
    * Resumes background settlement pollers for any persisted in-flight EVM legs after restart.
    */
   resumeActivePollers(): number {
+    if (!this.enableBackgroundPollers) return 0;
     const now = this.nowMs();
     let resumed = 0;
     for (const [jobId, entry] of this.jobs.entries()) {
@@ -486,6 +498,7 @@ export class BackgroundJobStore {
 
     // Start autonomous server-side background settlement watcher once an EVM tx or Relay intent exists
     if (
+      this.enableBackgroundPollers &&
       isEvmChainId(leg.chain) &&
       (leg.status === 'confirming' || leg.status === 'relaying') &&
       (leg.evmTxHash || leg.requestId)
@@ -539,6 +552,7 @@ export class BackgroundJobStore {
   }
 
   private ensureBackgroundPoller(jobId: string, legId: string, chain: EvmChainId): void {
+    if (!this.enableBackgroundPollers) return;
     const key = `${jobId}:${legId}`;
     if (this.pollTimers.has(key)) return;
 

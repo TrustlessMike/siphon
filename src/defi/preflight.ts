@@ -1,4 +1,4 @@
-import { EVM_CHAINS } from '../scanner/chains.js';
+import { EVM_CHAINS, resolveUnderlyingDecimals } from '../scanner/chains.js';
 import { checkAaveV3AccountSafety, type AaveAccountSafety } from '../scanner/discovery.js';
 import { evmJsonRpcCall } from '../scanner/rpc.js';
 import type {
@@ -139,6 +139,24 @@ export function translateDefiRevertToPlainEnglish(params: {
 }
 
 /**
+ * Translates Compound v2 / Venus / Benqi / Moonwell non-reverting uint256 error codes returned by
+ * `cToken.redeem(uint256)` or `cToken.redeemUnderlying(uint256)` into plain English.
+ */
+function translateCompoundV2ErrorCode(code: bigint, protocolName: string, symbol: string): string {
+  const n = Number(code);
+  if (n === 3) {
+    return `${protocolName} Comptroller rejected redeeming ${symbol} (error code 3 — active borrow or collateral shortfall).`;
+  }
+  if (n === 4 || n === 14) {
+    return `${protocolName} market currently has insufficient cash liquidity to redeem ${symbol} (error code ${n}).`;
+  }
+  if (n === 9) {
+    return `${protocolName} rejected redeeming ${symbol} (error code 9 — insufficient cToken balance or math underflow). Refresh your scan.`;
+  }
+  return `${protocolName} cToken.redeem() returned non-zero error code ${code.toString()} for ${symbol} — withdrawal blocked for safety.`;
+}
+
+/**
  * Runs a single `eth_call` dry-run simulation for one DeFi extraction transaction.
  */
 async function simulateSingleCallOnchain(params: {
@@ -177,6 +195,36 @@ async function simulateSingleCallOnchain(params: {
           symbol: params.symbol,
         }),
       };
+    }
+
+    // Compound v2 / Venus / Benqi / Moonwell `redeem(uint256)` (0xdb006a75) & `redeemUnderlying(uint256)` (0x852a12e3)
+    // signal failure by returning a non-zero uint256 error code WITHOUT reverting!
+    const dataLower = (params.tx.data ?? '').toLowerCase();
+    const isCompoundV2Redeem =
+      params.tx.stepId === 'compound_v2_redeem' ||
+      dataLower.startsWith('0xdb006a75') ||
+      dataLower.startsWith('0x852a12e3');
+    if (isCompoundV2Redeem) {
+      const cleanReturn = (res.result ?? '').replace(/^0x/i, '');
+      if (cleanReturn.length < 64) {
+        return {
+          stepId: params.tx.stepId,
+          label: params.tx.label,
+          to: params.tx.to,
+          status: 'reverted',
+          plainEnglishMessage: `${params.protocolName} cToken.redeem() returned empty data for ${params.symbol} — blocking withdrawal for safety.`,
+        };
+      }
+      const errCode = BigInt('0x' + cleanReturn.slice(0, 64));
+      if (errCode !== 0n) {
+        return {
+          stepId: params.tx.stepId,
+          label: params.tx.label,
+          to: params.tx.to,
+          status: 'reverted',
+          plainEnglishMessage: translateCompoundV2ErrorCode(errCode, params.protocolName, params.symbol),
+        };
+      }
     }
 
     return {
@@ -293,10 +341,12 @@ export async function preflightDefiAsset(params: {
                 address: asset.protocolAddress || asset.address,
                 rawBalance: rawBal,
                 decimals: asset.decimals,
-                underlyingDecimals:
-                  asset.underlyingAddress?.toLowerCase() === cfg.usdcAddress.toLowerCase()
-                    ? 6
-                    : asset.decimals,
+                underlyingDecimals: resolveUnderlyingDecimals({
+                  chain,
+                  underlyingAddress: asset.underlyingAddress,
+                  explicitDecimals: asset.defiExitPlan?.underlyingDecimals,
+                  fallbackDecimals: asset.decimals,
+                }),
               },
             ],
           })

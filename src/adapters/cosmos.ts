@@ -158,7 +158,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     symbol: 'NTRN',
     decimals: 6,
     logo: '/logos/cosmos.svg',
-    lcdUrls: ['https://rest.cosmos.directory/neutron', 'https://neutron-rest.publicnode.com'],
+    lcdUrls: ['https://rest.cosmos.directory/neutron', 'https://neutron-api.polkachu.com'],
     explorerUrl: 'https://www.mintscan.io/neutron',
     coingeckoKey: 'coingecko:neutron-3',
     cctpDomain: null,
@@ -372,10 +372,11 @@ export async function prepareCosmosDirectBatch(
   const chainIdKey = (params.chain in COSMOS_CHAINS ? params.chain : 'cosmoshub') as CosmosChainId;
   const cfg = COSMOS_CHAINS[chainIdKey];
   const outputAsset = params.outputAsset ?? 'USDC';
-  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
   const feeRecipient = getNonEvmFeeRecipient('cosmos');
   const solanaUsdcAtaBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
   const sweepable = filterChainSweepableAssets(cfg.id, params.assets);
+  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
 
   // Resolve the exact signer address for THIS Cosmos chain (never send cosmos1... to Osmosis/Injective!)
   const resolvedUserAddress =
@@ -772,8 +773,8 @@ export async function prepareCosmosDirectBatch(
     notes.push('Injective uses coinType 60 (ethsecp256k1); connect Keplr/Leap with Osmosis/Noble enabled to assemble multi-hop Skip Go messages.');
   }
 
-  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-  const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+  const estimatedFeeUsd =
+    feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
 
   return {
     family: 'cosmos',
@@ -859,13 +860,15 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       const chains = subReports.flatMap((r) => r.chains);
       const assets = subReports.flatMap((r) => r.assets);
       const warnings = subReports.flatMap((r) => r.warnings);
-      const feeBps = subReports[0]?.totals.protocolFeeBps ?? getProtocolFeeConfig().feeBps;
       const solPriceUsd = subReports[0]?.totals.solPriceUsd ?? 70;
       const grossUsd = Number(assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+      const multiFeeCfg = getProtocolFeeConfig({ grossUsd });
+      const feeBps = multiFeeCfg.feeBps;
       const defiGrossUsd = Number(
         assets.filter((a) => a.kind === 'defi_position').reduce((s, a) => s + a.grossUsd, 0).toFixed(2)
       );
-      const protocolFeeUsd = Number(((grossUsd * feeBps) / 10_000).toFixed(2));
+      const protocolFeeUsd =
+        multiFeeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeBps) / 10_000).toFixed(2));
       const singleTxGasUsd = Number(assets.reduce((s, a) => s + a.estimatedGasUsd, 0).toFixed(2));
       const batchedGasUsd = Number(assets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(2));
       const estimatedSlippageUsd = Number(
@@ -914,7 +917,6 @@ export const cosmosAdapter: ChainFamilyAdapter = {
 
     const cleanAddr = rawParts[0] ?? address.trim();
     const cfg = detectCosmosChainFromAddress(cleanAddr);
-    const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
     const hasStakingModule = cfg.id !== 'noble' && cfg.id !== 'neutron';
 
@@ -1150,8 +1152,10 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     const defiGrossUsd = Number(
       assets.filter((a) => a.kind === 'defi_position').reduce((s, a) => s + a.grossUsd, 0).toFixed(2)
     );
+    const feeCfg = getProtocolFeeConfig({ grossUsd });
     const liquidGrossUsd = Number((grossUsd - defiGrossUsd).toFixed(2));
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const singleTxGasUsd = Number(assets.reduce((s, a) => s + a.estimatedGasUsd, 0).toFixed(2));
     const batchedGasUsd = Number(assets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(2));
     const slippageTotal = Number(assets.reduce((s, a) => s + a.estimatedSlippageUsd, 0).toFixed(2));
@@ -1229,7 +1233,9 @@ export const cosmosAdapter: ChainFamilyAdapter = {
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {
     const chainIdKey = (params.chain in COSMOS_CHAINS ? params.chain : 'cosmoshub') as CosmosChainId;
     const cfg = COSMOS_CHAINS[chainIdKey];
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const chainAssets = filterChainSweepableAssets(cfg.id, params.assets);
+    const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     // Canonical SPL USDC ATA PDA (fixes CRIT-03 for Noble CCTP Domain 4 -> Solana Domain 5!)
     const mintRecipientBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
     const feeGranter =
@@ -1237,9 +1243,8 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     const feeRecipientCosmos =
       getNonEvmFeeRecipient('cosmos') || `${cfg.prefix}1turgaliumtreasuryvault00000000000`;
 
-    const chainAssets = filterChainSweepableAssets(cfg.id, params.assets);
-    const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const sponsoredGasEstUsd = Number(Math.max(cfg.gasEstUsd, chainAssets.length * 0.02).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - protocolFeeUsd - sponsoredGasEstUsd).toFixed(2));
     const minNetUsdcOut = BigInt(Math.round(estimatedNetUsd * 0.985 * 1_000_000)).toString();
@@ -1399,7 +1404,6 @@ export const cosmosAdapter: ChainFamilyAdapter = {
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
     const chainIdKey = (params.chain in COSMOS_CHAINS ? params.chain : 'cosmoshub') as CosmosChainId;
     const cfg = COSMOS_CHAINS[chainIdKey];
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const cleanAddr = params.userAddress.trim();
     const userAddressValid = cosmosAdapter.matchesAddress(cleanAddr);
     const hrpMatches = cleanAddr.toLowerCase().startsWith(`${cfg.prefix}1`);
@@ -1413,6 +1417,8 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     }
 
     const sweepable = filterChainSweepableAssets(cfg.id, params.assets);
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     const outputAsset = params.outputAsset ?? 'USDC';
 
     const [blockRes, balRes, solSnap, priceMap] = await Promise.all([
@@ -1448,8 +1454,8 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     const estimatedGasUsd = Number((cfg.gasEstUsd * Math.max(1, sweepable.length * 0.5)).toFixed(2));
     const hasEnoughNativeGas = nativeBalanceUsd >= Math.max(0.05, estimatedGasUsd * 1.5);
 
-    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const feeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
 
@@ -1724,21 +1730,13 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       proof?: UniversalExecutionProof;
     } = {};
 
-    if (params.signature && params.intentId) {
-      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
-        throw new Error('Signed Cosmos gasless TxBody expired. Re-sign a fresh intent.');
-      }
-      const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.TURGALIUM_COSMOS_RELAYER_KEY?.trim());
+    if (params.signature || params.intentId) {
       out.submitted = {
-        accepted: true,
-        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        accepted: false,
+        mode: 'unsupported_non_evm_relayer',
         broadcasted: false,
-        settlementStatus: configured ? 'queued_for_relayer' : 'awaiting_relayer',
-        signatureFingerprint: fp,
-        nextStep: configured
-          ? `Cosmos x/feegrant relayer queued atomic TxBody ${params.intentId} (${fp}) on ${cfg.name}.`
-          : `Cosmos 1-Sig TxBody verified (${fp}). Use Direct Mode (Skip Go) to broadcast directly from Keplr/Leap today, or configure TURGALIUM_COSMOS_RELAYER_KEY.`,
+        settlementStatus: 'rejected_unverified',
+        nextStep: `Sponsored relayer submission is not enabled for ${cfg.name} (requires server-issued intent verification and Cosmos Amino/Direct cryptographic signature validation). Use Direct Mode (Skip Go) to sign and broadcast directly from Keplr/Leap.`,
       };
     }
 

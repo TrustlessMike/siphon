@@ -228,10 +228,11 @@ export async function prepareAptosDirectBatch(
   }
 ): Promise<PreparedNonEvmBatch> {
   const outputAsset = params.outputAsset ?? 'USDC';
-  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
   const feeRecipient = getNonEvmFeeRecipient('aptos');
   const solanaUsdcAtaBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
   const sweepable = filterChainSweepableAssets('aptos', params.assets);
+  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
 
   const calls: PreparedNonEvmCall[] = [];
   const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
@@ -441,8 +442,8 @@ export async function prepareAptosDirectBatch(
     );
   }
 
-  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-  const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+  const estimatedFeeUsd =
+    feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
 
   return {
     family: 'aptos',
@@ -491,7 +492,6 @@ export const aptosAdapter: ChainFamilyAdapter = {
   async scanWallet(address: string, label?: string): Promise<ScanReport> {
     const start = Date.now();
     const cleanAddr = address.trim();
-    const feeCfg = getProtocolFeeConfig();
     const warnings: string[] = [];
     const safeAddr = cleanAddr.replace(/[^0-9a-fA-Fx]/g, '');
 
@@ -637,10 +637,12 @@ export const aptosAdapter: ChainFamilyAdapter = {
     }
 
     const grossUsd = Number(assets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ grossUsd });
     const defiGrossUsd = Number(
       assets.filter((a) => a.kind === 'defi_position').reduce((s, a) => s + a.grossUsd, 0).toFixed(2)
     );
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const batchedGasUsd = Number(assets.reduce((s, a) => s + a.batchedGasUsd, 0).toFixed(3));
     const singleTxGasUsd = Number(assets.reduce((s, a) => s + a.estimatedGasUsd, 0).toFixed(3));
     const slippageTotal = Number(assets.reduce((s, a) => s + a.estimatedSlippageUsd, 0).toFixed(2));
@@ -714,15 +716,16 @@ export const aptosAdapter: ChainFamilyAdapter = {
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+    const chainAssets = filterChainSweepableAssets('aptos', params.assets);
+    const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     // Canonical SPL USDC ATA PDA (fixes CRIT-03 for Aptos CCTP Domain 9 -> Solana Domain 5!)
     const mintRecipientBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
     const feePayerAddress =
       getNonEvmFeeRecipient('aptos') ||
       '0x00000000000000000000000000000000000000000000000000000000000051f0';
-    const chainAssets = filterChainSweepableAssets('aptos', params.assets);
-    const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const protocolFeeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const sponsoredGasEstUsd = 0.01;
     const estimatedNetUsd = Number(Math.max(0, grossUsd - protocolFeeUsd - sponsoredGasEstUsd).toFixed(2));
     const minNetUsdcOut = BigInt(Math.round(estimatedNetUsd * 0.985 * 1_000_000)).toString();
@@ -800,7 +803,6 @@ export const aptosAdapter: ChainFamilyAdapter = {
   },
 
   async simulatePreSignProof(params): Promise<UniversalPreSignProof> {
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const cleanAddr = params.userAddress.trim();
     const userAddressValid = aptosAdapter.matchesAddress(cleanAddr);
     let expectedBytes32 = '0x' + '00'.repeat(32);
@@ -813,6 +815,8 @@ export const aptosAdapter: ChainFamilyAdapter = {
     }
 
     const sweepable = filterChainSweepableAssets('aptos', params.assets);
+    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps, grossUsd });
     const outputAsset = params.outputAsset ?? 'USDC';
 
     const [ledger, aptFaRes, aptCoinRes, usdcFaRes, solSnap, priceMap] = await Promise.all([
@@ -853,8 +857,8 @@ export const aptosAdapter: ChainFamilyAdapter = {
     const nativeBalanceUsd = Number((nativeBalanceUi * nativePriceUsd).toFixed(2));
     const estimatedGasUsd = 0.01;
     const hasEnoughNativeGas = nativeBalanceUi >= 0.05;
-    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const feeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+    const feeUsd =
+      feeCfg.preservationFee?.feeUsd ?? Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
     const estimatedNetUsd = Number(Math.max(0, grossUsd - feeUsd - estimatedGasUsd).toFixed(2));
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.985).toFixed(2));
     const rpcReachable = blockNumber > 0;
@@ -1134,21 +1138,14 @@ export const aptosAdapter: ChainFamilyAdapter = {
       proof?: UniversalExecutionProof;
     } = {};
 
-    if (params.signature && params.intentId) {
-      if (params.deadline && Math.floor(Date.now() / 1000) > params.deadline) {
-        throw new Error('Signed Aptos FeePayer intent expired. Re-sign a fresh intent.');
-      }
-      const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.TURGALIUM_APTOS_FEE_PAYER_KEY?.trim());
+    if (params.signature || params.intentId) {
       out.submitted = {
-        accepted: true,
-        mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
+        accepted: false,
+        mode: 'unsupported_non_evm_relayer',
         broadcasted: false,
-        settlementStatus: configured ? 'queued_for_fee_payer' : 'awaiting_relayer',
-        signatureFingerprint: fp,
-        nextStep: configured
-          ? `Aptos Fee Payer queued ${params.intentId} (${fp}).`
-          : `Aptos 1-Sig Move intent verified (${fp}). Use Direct Mode (Petra/Phantom) for immediate CCTP Domain 9 execution, or configure TURGALIUM_APTOS_FEE_PAYER_KEY.`,
+        settlementStatus: 'rejected_unverified',
+        nextStep:
+          'Sponsored relayer submission is not enabled for Aptos (requires server-issued intent verification and Aptos Ed25519 BCS signature validation). Use Direct Mode (Petra/Phantom) for immediate CCTP Domain 9 wallet broadcast.',
       };
     }
 

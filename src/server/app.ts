@@ -124,6 +124,8 @@ const MAX_JOB_LEGS = 50;
 export interface TurgaliumServerOptions {
   allowedOrigins?: string[];
   allowedHosts?: string[];
+  allowLoopbackOrigins?: boolean;
+  allowLoopbackHosts?: boolean;
   publicBaseUrl?: string;
   requirePluginAuth?: boolean;
   adminSessionToken?: string;
@@ -166,8 +168,13 @@ function isLoopbackHostname(hostname: string): boolean {
   return lower === '127.0.0.1' || lower === 'localhost' || lower === '[::1]' || lower === '::1';
 }
 
-function parseConfiguredAllowedHosts(explicit?: string[], extraOrigins?: Set<string>, publicBaseUrl?: string): Set<string> {
-  const set = new Set<string>(['127.0.0.1', 'localhost', '[::1]', '::1']);
+function parseConfiguredAllowedHosts(
+  explicit?: string[],
+  extraOrigins?: Set<string>,
+  publicBaseUrl?: string,
+  allowLoopbackHosts = true
+): Set<string> {
+  const set = new Set<string>(allowLoopbackHosts ? ['127.0.0.1', 'localhost', '[::1]', '::1'] : []);
   const envHosts = process.env.TURGALIUM_ALLOWED_HOSTS
     ? process.env.TURGALIUM_ALLOWED_HOSTS.split(',')
     : [];
@@ -200,9 +207,13 @@ function parseConfiguredAllowedHosts(explicit?: string[], extraOrigins?: Set<str
  */
 function validateHostHeader(
   rawHost: string | undefined,
-  allowedHostnames: Set<string>
+  allowedHostnames: Set<string>,
+  allowLoopbackHosts = true
 ): { ok: true; host: string; hostname: string } | { ok: false; status: 400 | 403; error: string } {
   if (!rawHost || typeof rawHost !== 'string') {
+    if (!allowLoopbackHosts) {
+      return { ok: false, status: 400, error: 'Missing Host header.' };
+    }
     return { ok: true, host: '127.0.0.1', hostname: '127.0.0.1' };
   }
   const trimmed = rawHost.trim();
@@ -219,7 +230,7 @@ function validateHostHeader(
     return { ok: false, status: 400, error: 'Malformed Host header.' };
   }
   const hostname = parsed.hostname.toLowerCase();
-  if (!isLoopbackHostname(hostname) && !allowedHostnames.has(hostname)) {
+  if (!(allowLoopbackHosts && isLoopbackHostname(hostname)) && !allowedHostnames.has(hostname)) {
     return {
       ok: false,
       status: 403,
@@ -337,9 +348,25 @@ function parseConfiguredAllowedOrigins(explicit?: string[]): Set<string> {
   return set;
 }
 
+function isPublicOpenCorsPath(pathname: string): boolean {
+  return (
+    pathname === '/api/health' ||
+    pathname === '/api/config' ||
+    pathname === '/api/chains' ||
+    pathname === '/api/families' ||
+    pathname === '/api/contract' ||
+    pathname === '/openapi.json' ||
+    pathname === '/.well-known/ai-plugin.json' ||
+    pathname.startsWith('/api/degen/') ||
+    pathname.startsWith('/api/solana/') ||
+    pathname.startsWith('/api/approvals/')
+  );
+}
+
 function isRestrictedCorsRoute(pathname: string, method: string): boolean {
   if (
     pathname === '/mcp' ||
+    pathname === '/api/metrics' ||
     pathname.startsWith('/api/agents/') ||
     pathname === '/api/agents' ||
     pathname.startsWith('/api/plugin/') ||
@@ -349,7 +376,10 @@ function isRestrictedCorsRoute(pathname: string, method: string): boolean {
   ) {
     return true;
   }
-  return method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
+  if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+    return true;
+  }
+  return !isPublicOpenCorsPath(pathname);
 }
 
 function isAdminMutationRoute(pathname: string, method: string): boolean {
@@ -472,6 +502,8 @@ function sendJson(
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
     ...corsHeaders,
   };
   if (status === 413) {
@@ -504,6 +536,7 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
+    'Cross-Origin-Resource-Policy': 'same-origin',
   };
 
   if (reqPath === '/vendor/wallet-sdks.js') {
@@ -562,6 +595,9 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
     ...baseSecurityHeaders,
     'Content-Type': MIME_TYPES[ext],
   };
+  if (safePath.startsWith('/logos/')) {
+    headers['Cross-Origin-Resource-Policy'] = 'cross-origin';
+  }
   if (ext === '.html' || ext === '.js' || ext === '.mjs' || ext === '.css') {
     headers['Cache-Control'] = 'no-store, no-cache, must-revalidate';
     headers['Pragma'] = 'no-cache';
@@ -588,13 +624,33 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
   const normalizedPublicBaseUrl = configuredPublicBaseUrl
     ? normalizeOrigin(configuredPublicBaseUrl)
     : null;
+  const isVercelRuntime = process.env.VERCEL === '1';
+  const envDisableLoopback = process.env.TURGALIUM_ALLOW_LOOPBACK?.trim().toLowerCase() === 'false';
+  const hasExplicitNonLoopbackOrigins =
+    Array.isArray(opts.allowedOrigins) &&
+    opts.allowedOrigins.length > 0 &&
+    !opts.allowedOrigins.some((o) => {
+      const norm = normalizeOrigin(o);
+      return Boolean(norm && isLoopbackOrigin(norm));
+    });
+  const hasExplicitNonLoopbackHosts =
+    Array.isArray(opts.allowedHosts) &&
+    opts.allowedHosts.length > 0 &&
+    !opts.allowedHosts.some((h) => isLoopbackHostname(h.trim().replace(/:\d+$/, '')));
+  const allowLoopbackOrigins =
+    opts.allowLoopbackOrigins ??
+    !(isVercelRuntime || envDisableLoopback || (hasExplicitNonLoopbackOrigins && hasExplicitNonLoopbackHosts));
+  const allowLoopbackHosts =
+    opts.allowLoopbackHosts ??
+    !(isVercelRuntime || envDisableLoopback || hasExplicitNonLoopbackHosts);
   const allowedHostnames = parseConfiguredAllowedHosts(
     opts.allowedHosts,
     configuredAllowedOrigins,
-    normalizedPublicBaseUrl ?? undefined
+    normalizedPublicBaseUrl ?? undefined,
+    allowLoopbackHosts
   );
   const isAllowedOrigin = (origin: string): boolean =>
-    isLoopbackOrigin(origin) || configuredAllowedOrigins.has(origin);
+    (allowLoopbackOrigins && isLoopbackOrigin(origin)) || configuredAllowedOrigins.has(origin);
 
   const envRequirePluginAuthRaw = process.env.TURGALIUM_REQUIRE_PLUGIN_AUTH?.trim().toLowerCase();
   const forcePluginAuth =
@@ -640,12 +696,14 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
     ttlMs: opts.scanCacheTtlMs ?? DEFAULT_SCAN_CACHE_TTL_MS,
     nowMs: opts.nowMs,
   });
+  const jobPollersEnabled = opts.enableBackgroundPollers ?? !isVercelRuntime;
   const jobStore = new BackgroundJobStore({
     maxJobs: opts.jobStoreMaxJobs,
     ttlMs: opts.jobStoreTtlMs,
     nowMs: opts.nowMs,
     stateStore,
-    resumePollersOnLoad: stateStore.persistent,
+    enableBackgroundPollers: jobPollersEnabled,
+    resumePollersOnLoad: jobPollersEnabled && stateStore.persistent,
   });
   const agentEngine = new TurgaliumAgentEngine({ nowMs: opts.nowMs, stateStore });
   const degenClient = opts.degenClient ?? new JupiterMarketsClient({ nowMs: opts.nowMs });
@@ -742,7 +800,8 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
       // Validate Host header syntax & enforce DNS-rebinding allowlist (HIGH-5 & CRIT-3)
       const hostCheck = validateHostHeader(
         typeof req.headers.host === 'string' ? req.headers.host : undefined,
-        allowedHostnames
+        allowedHostnames,
+        allowLoopbackHosts
       );
       if (!hostCheck.ok) {
         return sendJson(res, hostCheck.status, { error: hostCheck.error });
@@ -774,12 +833,15 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         restricted: restrictedCors,
         isAllowedOrigin,
       });
-      const reply = (status: number, payload: unknown) => sendJson(res, status, payload, corsHeaders);
+      let rateLimitHeaders: Record<string, string> = {};
+      const reply = (status: number, payload: unknown) =>
+        sendJson(res, status, payload, { ...corsHeaders, ...rateLimitHeaders });
 
       const normalizedOrigin = originHeader ? normalizeOrigin(originHeader) : null;
       const originAllowed = !originHeader || (normalizedOrigin !== null && isAllowedOrigin(normalizedOrigin));
 
       const isSameOriginLocalhostUi = (): boolean => {
+        if (!allowLoopbackOrigins) return false;
         if (!normalizedOrigin) return false;
         if (normalizedOrigin !== url.origin) return false;
         if (!isLoopbackOrigin(normalizedOrigin)) return false;
@@ -860,7 +922,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           ? agentEngine.verifyPluginToken(authHeaderForRateLimit)
           : null;
         const rl = rateLimiter.consumeRequest(req, verifiedRateLimitToken?.tokenId ?? null);
-        const rlHeaders = buildRateLimitHeaders(rl);
+        rateLimitHeaders = buildRateLimitHeaders(rl);
         if (!rl.allowed) {
           return sendJson(
             res,
@@ -869,7 +931,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
               error: 'Rate limit exceeded. Please retry later.',
               retryAfterSec: rl.retryAfterSec,
             },
-            { ...corsHeaders, ...rlHeaders }
+            { ...corsHeaders, ...rateLimitHeaders }
           );
         }
       }
@@ -908,6 +970,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           protocolFeeBps: protocolFee.feeBps,
           protocolFee,
           l2IndexerProvider: getL2IndexerProvider(),
+          persistence: stateStore.persistent ? 'file' : 'ephemeral-memory',
         });
       }
 
@@ -947,12 +1010,15 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
       }
 
       if (method === 'GET' && pathname === '/api/config') {
+        const vercelEphemeralRelayerBlocked =
+          process.env.VERCEL === '1' && !stateStore.persistent;
         return reply(200, {
           coinbaseSmartWalletEnabled: fs.existsSync(path.join(DIST_VENDOR_DIR, 'wallet-sdks.js')),
           walletConnectProjectId: process.env.WALLETCONNECT_PROJECT_ID?.trim() || null,
           l2IndexerProvider: getL2IndexerProvider(),
           protocolFee: getProtocolFeeConfig(),
-          gaslessRelayerConfigured: isSponsorRelayerConfigured(),
+          gaslessRelayerConfigured:
+            isSponsorRelayerConfigured() && !vercelEphemeralRelayerBlocked,
           requirePluginAuth,
           adminSessionRequired: Boolean(adminSessionToken),
         });
@@ -964,7 +1030,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           burnSink: DEAD_BURN_ADDRESS,
           protocolFeeBps: PROTOCOL_FEE_BPS,
           protocolFee: getProtocolFeeConfig(),
-          chains: CHAIN_LIST,
+          chains: CHAIN_LIST.map(({ rpcUrl: _rpcUrl, rpcUrls: _rpcUrls, ...publicChain }) => publicChain),
           families: listAllFamilyMetas(),
           presets: WALLET_PRESETS,
         });
@@ -1282,7 +1348,14 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         res.writeHead(405, {
           Allow: 'POST, OPTIONS',
           'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          'X-Frame-Options': 'DENY',
+          'Referrer-Policy': 'no-referrer',
+          'Cross-Origin-Resource-Policy': 'same-origin',
+          'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
           ...corsHeaders,
+          ...rateLimitHeaders,
         });
         res.end(JSON.stringify({ error: 'Method Not Allowed: use POST /mcp with JSON-RPC 2.0.' }));
         return;
@@ -1336,7 +1409,12 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           res.writeHead(202, {
             'Cache-Control': 'no-store',
             'X-Content-Type-Options': 'nosniff',
+            'X-Frame-Options': 'DENY',
+            'Referrer-Policy': 'no-referrer',
+            'Cross-Origin-Resource-Policy': 'same-origin',
+            'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
             ...corsHeaders,
+            ...rateLimitHeaders,
           });
           res.end();
           return;
@@ -2027,6 +2105,21 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
 
         try {
           if (isEvmChain(body.chain)) {
+            if (
+              process.env.VERCEL === '1' &&
+              !stateStore.persistent &&
+              (isSponsorRelayerConfigured(body.chain) ||
+                isSponsorRelayerConfigured() ||
+                Boolean(typeof body.txCalldata === 'string' && body.txCalldata.trim()))
+            ) {
+              return reply(503, {
+                accepted: false,
+                broadcasted: false,
+                settlementStatus: 'blocked_ephemeral_persistence',
+                error:
+                  'Live sponsored relayer broadcast is disabled on Vercel serverless without durable shared persistence. Configure shared durable storage before enabling live relayer broadcast.',
+              });
+            }
             const receipt = await submitAndBroadcastSignedGaslessIntent({
               intentId: intentIdClean,
               chain: body.chain,
@@ -2048,7 +2141,19 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
             solanaDestination:
               typeof body.solanaDestination === 'string' ? body.solanaDestination.trim() : '',
           });
-          return reply(200, result.submitted);
+          const submitted = result.submitted ?? {
+            accepted: false,
+            mode: 'unsupported_non_evm_relayer',
+            broadcasted: false,
+            settlementStatus: 'rejected_unverified',
+            nextStep: `Non-EVM sponsored relayer submission on ${body.chain} requires server-issued intent verification and chain-specific cryptographic signature validation. Use Direct Mode wallet broadcast instead.`,
+          };
+          return reply(501, {
+            ...submitted,
+            accepted: false,
+            broadcasted: false,
+            error: submitted.nextStep,
+          });
         } catch (err) {
           return reply(400, {
             error: err instanceof Error ? err.message : 'Could not submit signed gasless intent',

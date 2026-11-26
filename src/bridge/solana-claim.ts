@@ -46,8 +46,8 @@ const RECEIVE_MESSAGE_DISCRIMINATOR = crypto
 
 const SOLANA_RPC_URLS = [
   process.env.SOLANA_RPC_URL?.trim(),
-  'https://solana-rpc.publicnode.com',
   'https://api.mainnet-beta.solana.com',
+  'https://solana.publicnode.com',
 ].filter((u): u is string => Boolean(u));
 
 export interface DecodedCctpBurnMessage {
