@@ -1,7 +1,8 @@
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey, VersionedTransaction } from '@solana/web3.js';
 
 export { createCoinbaseWalletSDK } from '@coinbase/wallet-sdk';
 export { EthereumProvider } from '@walletconnect/ethereum-provider';
+export { VersionedTransaction };
 
 const SOLANA_USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 const SPL_TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');

@@ -6,14 +6,20 @@ import {
   buildSidePricingQuote,
   computeDegenSidePocket,
   computeProjectedPayout,
+  DEFAULT_PRESERVED_YIELD_APY_PCT,
   JUPITER_GAME_MODES,
   JupiterMarketsClient,
+  MIN_JUPITER_ORDER_USD,
   normalizeJupiterCategoryAndFilter,
   normalizeJupiterEvent,
+  normalizeJupiterPosition,
   parseMicroUsd,
   sanitizeDegenText,
   sanitizeHttpsUrl,
   sanitizeJupiterSlug,
+  sanitizePositionId,
+  SOLANA_USDC_MINT,
+  summarizeDegenPositions,
 } from '../src/degen/jupiter-markets.js';
 import { createSiphonServer } from '../src/server/app.js';
 
@@ -465,7 +471,24 @@ test('HTTP endpoints GET /api/degen/markets, GET /api/degen/search, and POST /ap
     assert.ok(liveTxJson.liveOrder.transactionBase64.length > 10);
     assert.equal(orderPostBodies.length, 1);
     assert.equal(orderPostBodies[0]?.ownerPubkey, VALID_SOLANA_WALLET);
+    assert.equal(orderPostBodies[0]?.depositMint, SOLANA_USDC_MINT);
     assert.equal(orderPostBodies[0]?.depositAmount, '10000000');
+
+    // Minimum order size (< $5.00) MUST fail closed with 400
+    const belowMinResp = await fetch(`${base}/api/degen/order-preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        marketId: 'POLY-7176619',
+        side: 'yes',
+        stakeUsd: 4.99,
+        availableUsdc: 250,
+        riskPct: 10,
+      }),
+    });
+    assert.equal(belowMinResp.status, 400);
+    const belowMinJson = (await belowMinResp.json()) as { error: string };
+    assert.ok(belowMinJson.error.includes('$5.00'));
 
     // Invalid Solana wallet on live tx request fails closed (400)
     const badWalletResp = await fetch(`${base}/api/degen/order-preview`, {
@@ -491,4 +514,387 @@ test('HTTP endpoints GET /api/degen/markets, GET /api/degen/search, and POST /ap
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test('yield-funded side-pocket keeps 100% principal untouched, caps Degen to 30d yield, and 90/10 computes 7% APY annual yield', () => {
+  // 90% Yield Safe / 10% Degen on $10,000 -> $9,000 preserved earning 7% APY = $630/yr
+  const split9010 = computeDegenSidePocket({ availableUsdc: 10_000, riskPct: 10 });
+  assert.equal(split9010.mode, 'percent');
+  assert.equal(split9010.preservedPct, 90);
+  assert.equal(split9010.preservedUsdc, 9_000);
+  assert.equal(split9010.maxDegenBudgetUsd, 1_000);
+  assert.equal(split9010.yieldApyPct, DEFAULT_PRESERVED_YIELD_APY_PCT);
+  assert.equal(split9010.projectedAnnualYieldUsd, 630);
+
+  // 100% Principal Safe · Yield-Funded Degen on $10,000 @ 7% APY (30d):
+  // 10000 * 0.07 * (30 / 365) = 57.5342... -> floored to $57.53
+  const yieldFunded = computeDegenSidePocket({
+    availableUsdc: 10_000,
+    mode: 'yield_funded',
+  });
+  assert.equal(yieldFunded.mode, 'yield_funded');
+  assert.equal(yieldFunded.preservedPct, 100);
+  assert.equal(yieldFunded.preservedUsdc, 10_000);
+  assert.equal(yieldFunded.projectedAnnualYieldUsd, 700);
+  assert.equal(yieldFunded.projected30dYieldUsd, 57.53);
+  assert.equal(yieldFunded.maxDegenBudgetUsd, 57.53);
+  assert.equal(yieldFunded.wasClamped, false);
+  assert.equal(yieldFunded.highRiskWarning, null);
+
+  // Small balance ($250) yield-funded cap: 250 * 0.07 * 30/365 = $1.43 (strictly < $5 min order)
+  const smallYieldFunded = computeDegenSidePocket({
+    availableUsdc: 250,
+    mode: 'yield_funded',
+  });
+  assert.equal(smallYieldFunded.preservedUsdc, 250);
+  assert.equal(smallYieldFunded.maxDegenBudgetUsd, 1.43);
+});
+
+test('order builder enforces $5.00 min, yield-funded cap, depositMint, and graceful geo-block surfacing', async () => {
+  const capturedPayloads: Array<Record<string, unknown>> = [];
+  let mode: 'ok' | 'geoblock' | 'unauth' = 'ok';
+
+  const client = new JupiterMarketsClient({
+    apiKey: 'jup-test-key',
+    fetchImpl: async (_input, init) => {
+      capturedPayloads.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
+      if (mode === 'geoblock') {
+        return new Response(
+          JSON.stringify({ message: 'Prediction markets are restricted in your region' }),
+          { status: 451, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (mode === 'unauth') {
+        return new Response(
+          JSON.stringify({ error: 'Invalid API key' }),
+          { status: 401, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          orderId: 'ord_usdc_1',
+          transaction: 'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAA==',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    },
+  });
+
+  // Fail closed below $5.00 minimum order
+  await assert.rejects(
+    () =>
+      client.buildOrderPreview({
+        marketId: 'POLY-7176619',
+        side: 'yes',
+        stakeUsd: MIN_JUPITER_ORDER_USD - 0.01,
+        availableUsdc: 1000,
+        riskPct: 10,
+        priceUsd: 0.4,
+      }),
+    /\$5\.00 minimum/i
+  );
+
+  // Yield-funded cap rejects stakes above 30d projected yield ($57.53 on $10k)
+  await assert.rejects(
+    () =>
+      client.buildOrderPreview({
+        marketId: 'POLY-7176619',
+        side: 'yes',
+        stakeUsd: 58,
+        availableUsdc: 10_000,
+        sidePocketMode: 'yield_funded',
+        priceUsd: 0.5,
+      }),
+    /Yield-Funded Degen cap/i
+  );
+
+  // Valid yield-funded order includes depositMint (Solana USDC)
+  const okRes = await client.buildOrderPreview({
+    marketId: 'POLY-7176619',
+    side: 'yes',
+    stakeUsd: 50,
+    availableUsdc: 10_000,
+    sidePocketMode: 'yield_funded',
+    priceUsd: 0.5,
+    walletAddress: VALID_SOLANA_WALLET,
+    requestLiveTx: true,
+  });
+  assert.equal(okRes.sidePocket.preservedUsdc, 10_000);
+  assert.equal(okRes.liveOrder.available, true);
+  assert.equal(okRes.liveOrder.depositMint, SOLANA_USDC_MINT);
+  assert.equal(capturedPayloads[0]?.depositMint, SOLANA_USDC_MINT);
+  assert.equal(capturedPayloads[0]?.depositAmount, '50000000');
+
+  // Geo-block (HTTP 451) surfaces cleanly without throwing
+  mode = 'geoblock';
+  const geoRes = await client.buildOrderPreview({
+    marketId: 'POLY-7176619',
+    side: 'yes',
+    stakeUsd: 10,
+    availableUsdc: 250,
+    riskPct: 10,
+    priceUsd: 0.5,
+    walletAddress: VALID_SOLANA_WALLET,
+    requestLiveTx: true,
+  });
+  assert.equal(geoRes.ok, true);
+  assert.equal(geoRes.liveOrder.attempted, true);
+  assert.equal(geoRes.liveOrder.available, false);
+  assert.equal(geoRes.liveOrder.geoBlocked, true);
+  assert.equal(geoRes.liveOrder.statusCode, 451);
+  assert.ok(geoRes.liveOrder.reason?.toLowerCase().includes('geo-restricted'));
+
+  // API key auth error (HTTP 401) surfaces cleanly without throwing
+  mode = 'unauth';
+  const unauthRes = await client.buildOrderPreview({
+    marketId: 'POLY-7176619',
+    side: 'yes',
+    stakeUsd: 10,
+    availableUsdc: 250,
+    riskPct: 10,
+    priceUsd: 0.5,
+    walletAddress: VALID_SOLANA_WALLET,
+    requestLiveTx: true,
+  });
+  assert.equal(unauthRes.ok, true);
+  assert.equal(unauthRes.liveOrder.available, false);
+  assert.equal(unauthRes.liveOrder.apiKeyRequired, true);
+  assert.equal(unauthRes.liveOrder.statusCode, 401);
+});
+
+test('positions normalization, P&L calculation, XSS sanitization, and /positions, /claim, /close HTTP routes work end-to-end', async () => {
+  // Position ID sanitizer rejects XSS / traversal
+  assert.equal(sanitizePositionId('pos_btc_12345'), 'pos_btc_12345');
+  assert.equal(sanitizePositionId('<script>alert(1)</script>'), null);
+  assert.equal(sanitizePositionId('../../etc/passwd'), null);
+  assert.equal(sanitizePositionId('pos with spaces'), null);
+
+  // Unit normalization + P&L + XSS sanitization
+  const openPos = normalizeJupiterPosition(
+    {
+      positionPubkey: 'pos_open_yes_1',
+      ownerPubkey: VALID_SOLANA_WALLET,
+      marketId: 'POLY-7176619',
+      eventId: 'POLY-1425701',
+      eventSlug: 'bitcoin-price-on-november-26-2026',
+      eventTitle: 'Bitcoin <img src=x onerror=alert(1)> > $120k?',
+      marketTitle: 'BTC > $120k <script>evil()</script>',
+      isYes: true,
+      status: 'open',
+      contracts: 100,
+      avgPriceUsd: 400000, // 40¢ -> $40 cost
+      markPriceUsd: 620000, // 62¢ -> $62 value -> +$22 (+55%)
+    },
+    VALID_SOLANA_WALLET
+  );
+  assert.ok(openPos);
+  assert.equal(openPos.eventTitle.includes('<img'), false);
+  assert.equal(openPos.marketTitle.includes('<script'), false);
+  assert.equal(openPos.avgEntryPriceUsd, 0.4);
+  assert.equal(openPos.markPriceUsd, 0.62);
+  assert.equal(openPos.costBasisUsd, 40);
+  assert.equal(openPos.currentValueUsd, 62);
+  assert.equal(openPos.unrealizedPnlUsd, 22);
+  assert.equal(openPos.unrealizedPnlPct, 55);
+  assert.equal(openPos.canCloseEarly, true);
+  assert.equal(openPos.claimable, false);
+
+  const claimablePos = normalizeJupiterPosition(
+    {
+      positionPubkey: 'pos_win_claim_2',
+      ownerPubkey: VALID_SOLANA_WALLET,
+      marketId: 'POLY-NBA-1',
+      eventSlug: 'javascript:alert(1)',
+      eventTitle: 'Lakers vs Celtics',
+      marketTitle: 'Lakers Moneyline',
+      isYes: false,
+      claimable: true,
+      contracts: 50,
+      avgPriceUsd: 500000, // $25 cost, $50 claimable payout (+$25 / +100%)
+    },
+    VALID_SOLANA_WALLET
+  );
+  assert.ok(claimablePos);
+  assert.equal(claimablePos.side, 'no');
+  assert.equal(claimablePos.status, 'claimable');
+  assert.equal(claimablePos.claimable, true);
+  assert.equal(claimablePos.claimablePayoutUsd, 50);
+  assert.equal(claimablePos.unrealizedPnlUsd, 25);
+  assert.equal(claimablePos.jupiterUrl, 'https://jup.ag/prediction');
+  assert.equal(claimablePos.canCloseEarly, false);
+
+  const summary = summarizeDegenPositions([openPos, claimablePos]);
+  assert.equal(summary.openCount, 1);
+  assert.equal(summary.claimableCount, 1);
+  assert.equal(summary.totalCostBasisUsd, 65);
+  assert.equal(summary.totalCurrentValueUsd, 112);
+  assert.equal(summary.totalUnrealizedPnlUsd, 47);
+  assert.equal(summary.totalClaimablePayoutUsd, 50);
+
+  // HTTP Integration tests for /api/degen/positions, /claim, and /close
+  const upstreamCalls: Array<{ method: string; url: string; body?: string }> = [];
+  const degenClient = new JupiterMarketsClient({
+    apiKey: 'jup-live-key',
+    fetchImpl: async (input, init) => {
+      const urlStr = String(input);
+      const method = init?.method ?? 'GET';
+      upstreamCalls.push({ method, url: urlStr, body: init?.body ? String(init.body) : undefined });
+
+      if (method === 'GET' && urlStr.includes('/positions?ownerPubkey=')) {
+        return new Response(
+          JSON.stringify({
+            data: [
+              {
+                positionPubkey: 'pos_open_yes_1',
+                ownerPubkey: VALID_SOLANA_WALLET,
+                marketId: 'POLY-7176619',
+                eventSlug: 'bitcoin-price-on-november-26-2026',
+                eventTitle: 'Bitcoin <svg onload=alert(1)> Price',
+                marketTitle: 'BTC > $120k',
+                isYes: true,
+                status: 'open',
+                contracts: 100,
+                avgPriceUsd: 400000,
+                markPriceUsd: 620000,
+              },
+              {
+                positionPubkey: 'pos_win_claim_2',
+                ownerPubkey: VALID_SOLANA_WALLET,
+                marketId: 'POLY-NBA-1',
+                eventTitle: 'Lakers vs Celtics',
+                marketTitle: 'Lakers ML',
+                isYes: false,
+                claimable: true,
+                contracts: 50,
+                avgPriceUsd: 500000,
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (method === 'POST' && urlStr.endsWith('/positions/pos_win_claim_2/claim')) {
+        return new Response(
+          JSON.stringify({
+            transaction: 'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAA==',
+            orderId: 'claim_tx_01',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (method === 'DELETE' && urlStr.endsWith('/positions/pos_open_yes_1')) {
+        return new Response(
+          JSON.stringify({
+            transaction: 'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAA==',
+            orderId: 'close_tx_01',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(JSON.stringify({ data: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    },
+  });
+
+  const { server } = createSiphonServer({ degenClient });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const base = `http://127.0.0.1:${port}`;
+
+  try {
+    // 1. GET /api/degen/positions?owner=<valid>
+    const posResp = await fetch(`${base}/api/degen/positions?owner=${encodeURIComponent(VALID_SOLANA_WALLET)}`);
+    assert.equal(posResp.status, 200);
+    const posJson = (await posResp.json()) as {
+      ok: boolean;
+      positions: Array<{ positionId: string; eventTitle: string; claimable: boolean; unrealizedPnlUsd: number }>;
+      summary: { openCount: number; claimableCount: number; totalUnrealizedPnlUsd: number; totalClaimablePayoutUsd: number };
+    };
+    assert.equal(posJson.ok, true);
+    assert.equal(posJson.positions.length, 2);
+    // Claimable winning position sorted first
+    assert.equal(posJson.positions[0].positionId, 'pos_win_claim_2');
+    assert.equal(posJson.positions[0].claimable, true);
+    assert.equal(posJson.positions[1].eventTitle.includes('<svg'), false);
+    assert.equal(posJson.summary.openCount, 1);
+    assert.equal(posJson.summary.claimableCount, 1);
+    assert.equal(posJson.summary.totalUnrealizedPnlUsd, 47);
+    assert.equal(posJson.summary.totalClaimablePayoutUsd, 50);
+
+    // Invalid owner fails closed with 400
+    const badOwnerResp = await fetch(`${base}/api/degen/positions?owner=not-a-valid-pubkey!!!`);
+    assert.equal(badOwnerResp.status, 400);
+
+    // Missing owner fails closed with 400
+    const missingOwnerResp = await fetch(`${base}/api/degen/positions`);
+    assert.equal(missingOwnerResp.status, 400);
+
+    // 2. POST /api/degen/positions/:id/claim
+    const claimResp = await fetch(`${base}/api/degen/positions/pos_win_claim_2/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ownerPubkey: VALID_SOLANA_WALLET }),
+    });
+    assert.equal(claimResp.status, 200);
+    const claimJson = (await claimResp.json()) as {
+      ok: boolean;
+      action: string;
+      available: boolean;
+      transactionBase64: string;
+      orderId: string;
+    };
+    assert.equal(claimJson.ok, true);
+    assert.equal(claimJson.action, 'claim');
+    assert.equal(claimJson.available, true);
+    assert.equal(claimJson.orderId, 'claim_tx_01');
+    assert.ok(claimJson.transactionBase64.length > 10);
+
+    // 3. POST /api/degen/positions/:id/close -> proxies upstream DELETE /positions/{id}
+    const closeResp = await fetch(`${base}/api/degen/positions/pos_open_yes_1/close`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ownerPubkey: VALID_SOLANA_WALLET }),
+    });
+    assert.equal(closeResp.status, 200);
+    const closeJson = (await closeResp.json()) as {
+      ok: boolean;
+      action: string;
+      available: boolean;
+      transactionBase64: string;
+      orderId: string;
+    };
+    assert.equal(closeJson.ok, true);
+    assert.equal(closeJson.action, 'close');
+    assert.equal(closeJson.available, true);
+    assert.equal(closeJson.orderId, 'close_tx_01');
+    assert.ok(
+      upstreamCalls.some((c) => c.method === 'DELETE' && c.url.endsWith('/positions/pos_open_yes_1'))
+    );
+
+    // 4. XSS / traversal / invalid position IDs fail closed with 400
+    const xssClaimResp = await fetch(
+      `${base}/api/degen/positions/${encodeURIComponent('<script>alert(1)</script>')}/claim`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }
+    );
+    assert.equal(xssClaimResp.status, 400);
+
+    const traversalCloseResp = await fetch(
+      `${base}/api/degen/positions/${encodeURIComponent('..%2Fevil')}/close`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }
+    );
+    assert.equal(traversalCloseResp.status, 400);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  // 5. Keyless claim/close returns clean Jupiter URL fallback without crashing
+  const keylessClient = new JupiterMarketsClient({ apiKey: null });
+  const keylessClaim = await keylessClient.claimPosition('pos_win_claim_2', VALID_SOLANA_WALLET);
+  assert.equal(keylessClaim.ok, true);
+  assert.equal(keylessClaim.available, false);
+  assert.equal(keylessClaim.apiKeyConfigured, false);
+  assert.equal(keylessClaim.transactionBase64, null);
+  assert.equal(keylessClaim.jupiterUrl, 'https://jup.ag/prediction/portfolio');
 });

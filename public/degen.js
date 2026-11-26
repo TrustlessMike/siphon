@@ -1,7 +1,15 @@
 // =====================================================================
-// SIPHON DEGEN TAB — LIVE JUPITER PREDICTION MARKETS & SIDE-POCKET UI
+// SIPHON DEGEN TAB — LIVE JUPITER PREDICTION MARKETS, INLINE SIGNING,
+// LIVE POSITIONS / CLAIMS & PRESERVATION-FIRST YIELD SPLIT UI
 // Modular, XSS-safe, zero-overflow controller bound to #view-degen.
 // =====================================================================
+
+import {
+  getConnectedSolanaAddress,
+  getConnectedSolanaWalletName,
+  isValidSolanaBase58,
+  listAvailableSolanaWallets,
+} from './wallets.js?v=7';
 
 const DEFAULT_FALLBACK_GAME_MODES = [
   {
@@ -69,6 +77,12 @@ const CATEGORY_TABS = [
 const RISK_PILLS = [5, 10, 20];
 const MAX_RISK_PCT = 50;
 const HIGH_RISK_WARN_PCT = 25;
+const MIN_JUPITER_ORDER_USD = 5;
+const DEFAULT_YIELD_APY_PCT = 7;
+const YIELD_HORIZON_DAYS = 30;
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+let walletSdksPromise = null;
 
 const state = {
   initialized: false,
@@ -79,7 +93,10 @@ const state = {
   availableUsdc: 250,
   balanceSource: 'Model balance',
   userEditedBalance: false,
+  siphonBalanceDetail: null, // populated by clean `siphon:balance-updated` CustomEvent
+  sidePocketMode: 'percent', // 'percent' | 'yield_funded'
   riskPct: 10,
+  yieldApyPct: DEFAULT_YIELD_APY_PCT,
   events: [],
   gameModes: DEFAULT_FALLBACK_GAME_MODES,
   feedMeta: {
@@ -88,6 +105,7 @@ const state = {
     cached: false,
     fetchedAt: null,
     apiKeyConfigured: false,
+    geoBlocked: false,
     error: null,
   },
   selected: null, // { eventId, eventTitle, eventSlug, jupiterUrl, marketId, marketTitle, side, yes, no }
@@ -95,7 +113,19 @@ const state = {
   orderPreview: null,
   orderPreviewError: null,
   orderPreviewLoading: false,
+  signingOrder: false,
   liveTxStatus: null,
+  liveTxError: null,
+  lastOrderTx: null, // { signature, solscanUrl, walletName, orderId }
+  positions: [],
+  positionsSummary: null,
+  positionsOwner: '',
+  positionsLoading: false,
+  positionsError: null,
+  positionsGeoBlocked: false,
+  positionsSeq: 0,
+  positionBusyId: null,
+  positionActionFeedback: null, // { positionId, type: 'success'|'info'|'error', message, solscanUrl?, jupiterUrl? }
   previewSeq: 0,
   fetchSeq: 0,
   searchTimer: null,
@@ -133,10 +163,18 @@ function safeImageUrl(raw) {
 function fmtUsd(amount, decimals = 2) {
   const n = Number(amount);
   if (!Number.isFinite(n)) return '$0.00';
-  return `$${n.toLocaleString('en-US', {
+  const sign = n < 0 ? '-' : '';
+  return `${sign}$${Math.abs(n).toLocaleString('en-US', {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   })}`;
+}
+
+function fmtSignedUsd(amount, decimals = 2) {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return '$0.00';
+  if (n > 0) return `+${fmtUsd(n, decimals)}`;
+  return fmtUsd(n, decimals);
 }
 
 function fmtCompactUsd(amount) {
@@ -154,14 +192,108 @@ function fmtCloseDate(iso) {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
-function computeLocalSidePocket(availableUsdc, requestedRiskPct) {
+function shortSig(sig) {
+  const s = String(sig || '').trim();
+  if (s.length <= 16) return s;
+  return `${s.slice(0, 6)}…${s.slice(-6)}`;
+}
+
+function base64ToUint8Array(b64) {
+  if (typeof b64 !== 'string' || !b64.trim()) return null;
+  try {
+    const binary = atob(b64.trim());
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+function bytesToBase58(bytes) {
+  if (!bytes || !bytes.length) return '';
+  const digits = [0];
+  for (let i = 0; i < bytes.length; i += 1) {
+    let carry = bytes[i];
+    for (let j = 0; j < digits.length; j += 1) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+  let out = '';
+  for (let k = 0; k < bytes.length && bytes[k] === 0; k += 1) out += '1';
+  for (let q = digits.length - 1; q >= 0; q -= 1) out += BASE58_ALPHABET[digits[q]];
+  return out;
+}
+
+function extractSignatureString(res) {
+  if (!res) return null;
+  if (Array.isArray(res) && res.length > 0) {
+    return extractSignatureString(res[0]);
+  }
+  if (typeof res === 'string') return res.trim() || null;
+  const raw = res.signature ?? res.txid ?? res.hash ?? null;
+  if (typeof raw === 'string') return raw.trim() || null;
+  if (raw instanceof Uint8Array) return bytesToBase58(raw);
+  if (Array.isArray(raw)) return bytesToBase58(Uint8Array.from(raw));
+  return null;
+}
+
+async function loadWalletSdks() {
+  if (!walletSdksPromise) {
+    walletSdksPromise = import('/vendor/wallet-sdks.js').catch(() => null);
+  }
+  return walletSdksPromise;
+}
+
+function computeLocalSidePocket(
+  availableUsdc,
+  requestedRiskPct,
+  mode = state.sidePocketMode,
+  yieldApyPct = state.yieldApyPct
+) {
   const bal = Number.isFinite(availableUsdc) && availableUsdc >= 0 ? Math.round(availableUsdc * 100) / 100 : 0;
+  const apy = Number.isFinite(yieldApyPct) && yieldApyPct >= 0 ? Math.min(100, yieldApyPct) : DEFAULT_YIELD_APY_PCT;
+
+  if (mode === 'yield_funded') {
+    const preservedUsdc = bal;
+    const projectedAnnualYieldUsd = Math.round(preservedUsdc * (apy / 100) * 100) / 100;
+    const projected30dYieldUsd =
+      Math.floor(preservedUsdc * (apy / 100) * (YIELD_HORIZON_DAYS / 365) * 100 + 1e-9) / 100;
+    const maxDegenBudgetUsd = projected30dYieldUsd;
+    const effectiveRiskPct = bal > 0 ? Math.round((maxDegenBudgetUsd / bal) * 10000) / 100 : 0;
+    return {
+      mode: 'yield_funded',
+      availableUsdc: bal,
+      requestedRiskPct: 0,
+      effectiveRiskPct,
+      wasClamped: false,
+      preservedPct: 100,
+      preservedUsdc,
+      maxDegenBudgetUsd,
+      yieldApyPct: apy,
+      projectedAnnualYieldUsd,
+      projected30dYieldUsd,
+      highRiskWarning: null,
+    };
+  }
+
   const reqPct = Number.isFinite(requestedRiskPct) && requestedRiskPct >= 0 ? requestedRiskPct : 10;
   const wasClamped = reqPct > MAX_RISK_PCT;
   const effectiveRiskPct = Math.round(Math.min(MAX_RISK_PCT, Math.max(0, reqPct)) * 100) / 100;
   const maxDegenBudgetUsd = Math.floor(bal * (effectiveRiskPct / 100) * 100 + 1e-9) / 100;
   const preservedUsdc = Math.round(Math.max(0, bal - maxDegenBudgetUsd) * 100) / 100;
   const preservedPct = Math.round((100 - effectiveRiskPct) * 100) / 100;
+  const projectedAnnualYieldUsd = Math.round(preservedUsdc * (apy / 100) * 100) / 100;
+  const projected30dYieldUsd =
+    Math.round(preservedUsdc * (apy / 100) * (YIELD_HORIZON_DAYS / 365) * 100) / 100;
 
   let highRiskWarning = null;
   if (wasClamped) {
@@ -175,6 +307,7 @@ function computeLocalSidePocket(availableUsdc, requestedRiskPct) {
   }
 
   return {
+    mode: 'percent',
     availableUsdc: bal,
     requestedRiskPct: reqPct,
     effectiveRiskPct,
@@ -182,17 +315,35 @@ function computeLocalSidePocket(availableUsdc, requestedRiskPct) {
     preservedPct,
     preservedUsdc,
     maxDegenBudgetUsd,
+    yieldApyPct: apy,
+    projectedAnnualYieldUsd,
+    projected30dYieldUsd,
     highRiskWarning,
   };
 }
 
 function detectSiphonBalance() {
-  // 1. Check live Solana USDC balance badge if connected
+  // 1. Prefer clean structured balance detail emitted by `siphon:balance-updated`
+  const detail = state.siphonBalanceDetail;
+  if (detail && typeof detail === 'object') {
+    const liveSolUsdc = Number(detail.solanaUsdc) || 0;
+    const sweptUsdc = Number(detail.projectedSweepUsdc) || 0;
+    if (Number.isFinite(liveSolUsdc) && liveSolUsdc > 0 && Number.isFinite(sweptUsdc) && sweptUsdc > 0) {
+      return { amount: Math.round((liveSolUsdc + sweptUsdc) * 100) / 100, source: 'Solana + Sweep USDC' };
+    }
+    if (Number.isFinite(liveSolUsdc) && liveSolUsdc > 0) {
+      return { amount: Math.round(liveSolUsdc * 100) / 100, source: 'Live Solana USDC' };
+    }
+    if (Number.isFinite(sweptUsdc) && sweptUsdc > 0) {
+      return { amount: Math.round(sweptUsdc * 100) / 100, source: 'Projected Sweep USDC' };
+    }
+  }
+
+  // 2. Graceful fallback to existing input/balance readers if event has not fired yet
   const solBadgeText = document.getElementById('solanaLiveBalanceBadge')?.textContent || '';
   const solMatch = solBadgeText.match(/([\d,]+(?:\.\d+)?)\s*USDC/i);
   const liveSolUsdc = solMatch ? Number(solMatch[1].replaceAll(',', '')) : 0;
 
-  // 2. Check projected net swept USDC on Sweep tab
   const kpiNetText = document.getElementById('kpiNetUsdc')?.textContent || '';
   const sweepMatch = kpiNetText.match(/\$([\d,]+(?:\.\d+)?)/);
   const sweptUsdc = sweepMatch ? Number(sweepMatch[1].replaceAll(',', '')) : 0;
@@ -215,15 +366,191 @@ function syncBalanceFromSiphon(force = false) {
   if (detected && detected.amount > 0) {
     state.availableUsdc = detected.amount;
     state.balanceSource = detected.source;
-    const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct);
+    const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
     state.stakeUsd = pocket.maxDegenBudgetUsd;
     if (force) state.userEditedBalance = false;
   }
 }
 
 function getSelectedSolanaWallet() {
+  const connected = getConnectedSolanaAddress();
+  if (connected && isValidSolanaBase58(connected)) return connected;
+  const fromEvent = state.siphonBalanceDetail?.solanaWallet;
+  if (fromEvent && isValidSolanaBase58(fromEvent)) return fromEvent;
   const raw = document.getElementById('solanaDestInput')?.value?.trim() || '';
-  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(raw) ? raw : '';
+  return isValidSolanaBase58(raw) ? raw : '';
+}
+
+function resolveActiveSolanaSigner() {
+  const connectedAddress = getConnectedSolanaAddress();
+  const connectedName = (getConnectedSolanaWalletName() || '').toLowerCase();
+
+  // 1. Check Wallet Standard providers first (Phantom, Solflare, Backpack, etc.)
+  const available = listAvailableSolanaWallets();
+  const stdCandidates = available.filter(
+    (w) =>
+      w.kind === 'standard' &&
+      typeof w.wallet?.features?.['solana:signAndSendTransaction']?.signAndSendTransaction === 'function'
+  );
+  if (stdCandidates.length > 0) {
+    const chosen =
+      (connectedName
+        ? stdCandidates.find((w) => w.name.toLowerCase() === connectedName)
+        : null) ||
+      stdCandidates.find((w) =>
+        Array.isArray(w.wallet?.accounts) &&
+        w.wallet.accounts.some((a) => !connectedAddress || a?.address === connectedAddress)
+      ) ||
+      stdCandidates[0];
+    if (chosen) {
+      const account =
+        (chosen.wallet.accounts || []).find((a) => !connectedAddress || a?.address === connectedAddress) ||
+        (chosen.wallet.accounts || [])[0] ||
+        null;
+      if (account) {
+        return {
+          kind: 'standard',
+          name: chosen.name || 'Solana Wallet',
+          wallet: chosen.wallet,
+          account,
+        };
+      }
+    }
+  }
+
+  // 2. Check injected legacy Solana wallets (Phantom, Solflare, Backpack, generic window.solana)
+  if (typeof window !== 'undefined') {
+    const injectedCandidates = [
+      { name: 'Phantom', provider: window.phantom?.solana },
+      { name: 'Solflare', provider: window.solflare },
+      { name: 'Backpack', provider: window.backpack?.solana || window.backpack },
+      { name: window.solana?.isPhantom ? 'Phantom' : 'Solana Wallet', provider: window.solana },
+    ];
+    const preferred =
+      (connectedName
+        ? injectedCandidates.find(
+            (c) =>
+              c.name.toLowerCase() === connectedName &&
+              c.provider &&
+              (typeof c.provider.signAndSendTransaction === 'function' ||
+                typeof c.provider.request === 'function')
+          )
+        : null) ||
+      injectedCandidates.find(
+        (c) =>
+          c.provider &&
+          (typeof c.provider.signAndSendTransaction === 'function' ||
+            typeof c.provider.request === 'function')
+      );
+    if (preferred) {
+      return {
+        kind: 'legacy',
+        name: preferred.name,
+        provider: preferred.provider,
+      };
+    }
+  }
+
+  return null;
+}
+
+function hasConnectedSolanaSigner() {
+  const wallet = getSelectedSolanaWallet();
+  if (!wallet) return false;
+  return Boolean(resolveActiveSolanaSigner());
+}
+
+/**
+ * Decodes a base64 Solana VersionedTransaction via `/vendor/wallet-sdks.js` and prompts
+ * the active Phantom / Solflare / Backpack / Wallet Standard signer via `signAndSendTransaction`.
+ */
+async function signAndSendJupiterTx(transactionBase64) {
+  const txBytes = base64ToUint8Array(transactionBase64);
+  if (!txBytes || txBytes.length < 16) {
+    throw new Error('Invalid or empty Jupiter transaction payload.');
+  }
+
+  const signer = resolveActiveSolanaSigner();
+  if (!signer) {
+    throw new Error('No connected Solana wallet signer found (Phantom, Solflare, or Backpack).');
+  }
+
+  // Decode VersionedTransaction via /vendor/wallet-sdks.js
+  let versionedTx = null;
+  const sdks = await loadWalletSdks();
+  if (sdks?.VersionedTransaction?.deserialize) {
+    try {
+      versionedTx = sdks.VersionedTransaction.deserialize(txBytes);
+    } catch {
+      versionedTx = null;
+    }
+  }
+
+  if (signer.kind === 'standard') {
+    const feature = signer.wallet.features['solana:signAndSendTransaction'];
+    const serialized = versionedTx ? versionedTx.serialize() : txBytes;
+    const res = await feature.signAndSendTransaction({
+      transaction: serialized,
+      account: signer.account,
+      chain: 'solana:mainnet',
+    });
+    const signature = extractSignatureString(res);
+    if (!signature) {
+      throw new Error(`${signer.name} did not return a transaction signature.`);
+    }
+    return {
+      signature,
+      walletName: signer.name,
+      solscanUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
+    };
+  }
+
+  const provider = signer.provider;
+  if (typeof provider.connect === 'function' && !provider.isConnected && !provider.publicKey) {
+    await provider.connect();
+  }
+
+  const txArg =
+    versionedTx || {
+      version: 0,
+      serialize: () => txBytes,
+      serializedTransactionBase64: transactionBase64,
+    };
+
+  if (typeof provider.signAndSendTransaction === 'function') {
+    const res = await provider.signAndSendTransaction(txArg, {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    const signature = extractSignatureString(res);
+    if (!signature) {
+      throw new Error(`${signer.name} did not return a transaction signature.`);
+    }
+    return {
+      signature,
+      walletName: signer.name,
+      solscanUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
+    };
+  }
+
+  if (typeof provider.request === 'function') {
+    const serialized = versionedTx ? versionedTx.serialize() : txBytes;
+    const res = await provider.request({
+      method: 'signAndSendTransaction',
+      params: { message: bytesToBase58(serialized) },
+    });
+    const signature = extractSignatureString(res);
+    if (!signature) {
+      throw new Error(`${signer.name} did not return a transaction signature.`);
+    }
+    return {
+      signature,
+      walletName: signer.name,
+      solscanUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
+    };
+  }
+
+  throw new Error(`${signer.name} does not expose signAndSendTransaction.`);
 }
 
 function pickInitialSelection(events) {
@@ -276,7 +603,10 @@ function computeLocalPayout(stakeUsd, priceUsd) {
 function updateTabBadge() {
   const badge = document.getElementById('tabDegenCount');
   if (!badge) return;
-  if (state.feedMeta.live && state.events.length > 0) {
+  const claimable = state.positionsSummary?.claimableCount || 0;
+  if (claimable > 0) {
+    badge.textContent = `${claimable} WIN`;
+  } else if (state.feedMeta.live && state.events.length > 0) {
     badge.textContent = String(state.events.length);
   } else {
     badge.textContent = 'JUP';
@@ -313,6 +643,7 @@ async function fetchMarkets({ forceSearch = false } = {}) {
         cached: false,
         fetchedAt: new Date().toISOString(),
         apiKeyConfigured: false,
+        geoBlocked: false,
         error: data?.error || `HTTP ${resp.status} fetching Jupiter markets.`,
       };
     } else {
@@ -326,16 +657,16 @@ async function fetchMarkets({ forceSearch = false } = {}) {
         cached: Boolean(data.cached),
         fetchedAt: data.fetchedAt || null,
         apiKeyConfigured: Boolean(data.apiKeyConfigured),
+        geoBlocked: Boolean(data.geoBlocked),
         error: data.error || null,
       };
     }
 
-    // Keep current selection if still valid, else pick first priced outcome
     if (!state.selected || forceSearch) {
       const initial = pickInitialSelection(state.events);
       if (initial) {
         state.selected = initial;
-        const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct);
+        const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
         if (!Number.isFinite(state.stakeUsd) || state.stakeUsd <= 0 || state.stakeUsd > pocket.maxDegenBudgetUsd) {
           state.stakeUsd = pocket.maxDegenBudgetUsd;
         }
@@ -358,10 +689,144 @@ async function fetchMarkets({ forceSearch = false } = {}) {
       cached: false,
       fetchedAt: new Date().toISOString(),
       apiKeyConfigured: false,
+      geoBlocked: false,
       error: err instanceof Error ? err.message : 'Network error contacting Siphon Degen API.',
     };
     updateTabBadge();
     renderAll();
+  }
+}
+
+async function fetchPositions({ silent = false } = {}) {
+  const owner = getSelectedSolanaWallet();
+  if (!owner) {
+    state.positionsOwner = '';
+    state.positions = [];
+    state.positionsSummary = null;
+    state.positionsError = null;
+    state.positionsGeoBlocked = false;
+    state.positionsLoading = false;
+    updateTabBadge();
+    renderPositionsStrip();
+    return;
+  }
+
+  const seq = ++state.positionsSeq;
+  state.positionsOwner = owner;
+  if (!silent) {
+    state.positionsLoading = true;
+    renderPositionsStrip();
+  }
+
+  try {
+    const resp = await fetch(`/api/degen/positions?owner=${encodeURIComponent(owner)}`, {
+      headers: { Accept: 'application/json' },
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (seq !== state.positionsSeq) return;
+    state.positionsLoading = false;
+
+    if (!resp.ok) {
+      state.positions = [];
+      state.positionsSummary = null;
+      state.positionsGeoBlocked = false;
+      state.positionsError = data?.error || `Failed to load positions (HTTP ${resp.status}).`;
+    } else if (!data.ok) {
+      state.positions = [];
+      state.positionsSummary = data.summary || null;
+      state.positionsGeoBlocked = Boolean(data.geoBlocked);
+      state.positionsError = data.error || 'Live Jupiter positions currently unavailable.';
+    } else {
+      state.positions = Array.isArray(data.positions) ? data.positions : [];
+      state.positionsSummary = data.summary || null;
+      state.positionsGeoBlocked = false;
+      state.positionsError = null;
+    }
+
+    updateTabBadge();
+    renderPositionsStrip();
+  } catch (err) {
+    if (seq !== state.positionsSeq) return;
+    state.positionsLoading = false;
+    state.positionsError = err instanceof Error ? err.message : 'Unable to fetch Jupiter positions.';
+    renderPositionsStrip();
+  }
+}
+
+async function handlePositionAction(positionId, action) {
+  if (!positionId || state.positionBusyId) return;
+  const owner = getSelectedSolanaWallet();
+  state.positionBusyId = positionId;
+  state.positionActionFeedback = {
+    positionId,
+    type: 'info',
+    message: action === 'claim' ? 'Building $1.00 payout claim transaction…' : 'Building early exit transaction…',
+  };
+  renderPositionsStrip();
+
+  try {
+    const endpoint = `/api/degen/positions/${encodeURIComponent(positionId)}/${action}`;
+    const resp = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(owner ? { ownerPubkey: owner } : {}),
+    });
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      state.positionActionFeedback = {
+        positionId,
+        type: 'error',
+        message: data?.error || `Failed to build ${action} transaction (HTTP ${resp.status}).`,
+        jupiterUrl: 'https://jup.ag/prediction/portfolio',
+      };
+      return;
+    }
+
+    if (data?.available && data?.transactionBase64 && hasConnectedSolanaSigner()) {
+      state.positionActionFeedback = {
+        positionId,
+        type: 'info',
+        message: action === 'claim' ? 'Approve $1.00 payout claim in your Solana wallet…' : 'Approve early exit in your Solana wallet…',
+      };
+      renderPositionsStrip();
+
+      const signed = await signAndSendJupiterTx(data.transactionBase64);
+      state.positionActionFeedback = {
+        positionId,
+        type: 'success',
+        message:
+          action === 'claim'
+            ? `Claim submitted via ${signed.walletName} (${shortSig(signed.signature)})`
+            : `Early exit submitted via ${signed.walletName} (${shortSig(signed.signature)})`,
+        solscanUrl: signed.solscanUrl,
+      };
+      renderPositionsStrip();
+      // Refresh live positions after tx dispatch
+      fetchPositions({ silent: true });
+      return;
+    }
+
+    state.positionActionFeedback = {
+      positionId,
+      type: 'info',
+      message:
+        data?.reason ||
+        (action === 'claim'
+          ? 'Open Jupiter Portfolio to claim your $1.00 winning payout.'
+          : 'Open Jupiter Portfolio to close this position early.'),
+      jupiterUrl: safeHttpsUrl(data?.jupiterUrl, 'https://jup.ag/prediction/portfolio'),
+    };
+  } catch (err) {
+    state.positionActionFeedback = {
+      positionId,
+      type: 'error',
+      message: err instanceof Error ? err.message : `Wallet rejected or failed ${action} transaction.`,
+      jupiterUrl: 'https://jup.ag/prediction/portfolio',
+    };
+  } finally {
+    state.positionBusyId = null;
+    renderPositionsStrip();
   }
 }
 
@@ -372,28 +837,40 @@ async function requestOrderPreview(requestLiveTx = false) {
     state.orderPreview = null;
     state.orderPreviewError = null;
     renderSlip();
-    return;
+    return null;
   }
 
-  const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct);
+  const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
   const stake = Number(state.stakeUsd);
   if (!Number.isFinite(stake) || stake <= 0) {
     state.orderPreview = null;
     state.orderPreviewError = 'Enter a stake greater than $0.00.';
     renderSlip();
-    return;
+    return null;
+  }
+  if (stake < MIN_JUPITER_ORDER_USD - 1e-9) {
+    state.orderPreview = null;
+    state.orderPreviewError = `Jupiter Prediction minimum order size is $${MIN_JUPITER_ORDER_USD.toFixed(2)} USDC.`;
+    renderSlip();
+    return null;
   }
   if (stake > pocket.maxDegenBudgetUsd + 1e-9) {
     state.orderPreview = null;
-    state.orderPreviewError = `Stake ${fmtUsd(stake)} exceeds your capped side-pocket of ${fmtUsd(pocket.maxDegenBudgetUsd)} (${pocket.effectiveRiskPct}% cap).`;
+    state.orderPreviewError =
+      pocket.mode === 'yield_funded'
+        ? `Stake ${fmtUsd(stake)} exceeds your 30d Yield-Funded budget of ${fmtUsd(pocket.maxDegenBudgetUsd)} (100% principal untouched).`
+        : `Stake ${fmtUsd(stake)} exceeds your capped side-pocket of ${fmtUsd(pocket.maxDegenBudgetUsd)} (${pocket.effectiveRiskPct}% cap).`;
     renderSlip();
-    return;
+    return null;
   }
 
   const seq = ++state.previewSeq;
   state.orderPreviewLoading = true;
   state.orderPreviewError = null;
-  if (requestLiveTx) state.liveTxStatus = 'Requesting signable Jupiter transaction…';
+  if (requestLiveTx) {
+    state.liveTxError = null;
+    state.liveTxStatus = 'Building signable Jupiter VersionedTransaction…';
+  }
   renderSlip();
 
   try {
@@ -406,6 +883,8 @@ async function requestOrderPreview(requestLiveTx = false) {
         stakeUsd: stake,
         availableUsdc: pocket.availableUsdc,
         riskPct: state.riskPct,
+        sidePocketMode: state.sidePocketMode,
+        yieldApyPct: state.yieldApyPct,
         priceUsd: quote.priceUsd,
         eventSlug: sel.eventSlug,
         eventTitle: sel.eventTitle,
@@ -415,30 +894,95 @@ async function requestOrderPreview(requestLiveTx = false) {
       }),
     });
     const data = await resp.json().catch(() => ({}));
-    if (seq !== state.previewSeq) return;
+    if (seq !== state.previewSeq) return null;
     state.orderPreviewLoading = false;
 
     if (!resp.ok) {
       state.orderPreview = null;
       state.orderPreviewError = data?.error || `Order preview rejected (HTTP ${resp.status}).`;
       if (requestLiveTx) state.liveTxStatus = null;
-    } else {
-      state.orderPreview = data;
-      state.orderPreviewError = null;
-      if (requestLiveTx) {
-        if (data?.liveOrder?.available) {
-          state.liveTxStatus = `Inline Jupiter tx built (Order ${data.liveOrder.orderId || 'ready'}).`;
-        } else {
-          state.liveTxStatus = data?.liveOrder?.reason || 'Use the direct Jupiter launch button to trade.';
-        }
+      renderSlip();
+      return null;
+    }
+
+    state.orderPreview = data;
+    state.orderPreviewError = null;
+    if (requestLiveTx) {
+      if (data?.liveOrder?.available) {
+        state.liveTxStatus = `Jupiter order transaction ready (${data.liveOrder.orderId || 'USDC'}).`;
+      } else {
+        state.liveTxStatus = data?.liveOrder?.reason || 'Use "Open on Jupiter ↗" to trade.';
       }
     }
     renderSlip();
+    return data;
   } catch (err) {
-    if (seq !== state.previewSeq) return;
+    if (seq !== state.previewSeq) return null;
     state.orderPreviewLoading = false;
     state.orderPreviewError = err instanceof Error ? err.message : 'Preview request failed.';
     if (requestLiveTx) state.liveTxStatus = null;
+    renderSlip();
+    return null;
+  }
+}
+
+async function handleSignAndPlaceOrder() {
+  if (state.signingOrder) return;
+  const wallet = getSelectedSolanaWallet();
+  if (!wallet) {
+    document.getElementById('connectSolBtn')?.click();
+    return;
+  }
+  if (!hasConnectedSolanaSigner()) {
+    state.liveTxError = 'Connect Phantom, Solflare, or Backpack to sign inline, or click "Open on Jupiter ↗".';
+    renderSlip();
+    return;
+  }
+
+  state.signingOrder = true;
+  state.liveTxError = null;
+  state.lastOrderTx = null;
+  renderSlip();
+
+  try {
+    let txBase64 = state.orderPreview?.liveOrder?.transactionBase64 || null;
+    let orderId = state.orderPreview?.liveOrder?.orderId || null;
+
+    if (!txBase64) {
+      const built = await requestOrderPreview(true);
+      txBase64 = built?.liveOrder?.transactionBase64 || null;
+      orderId = built?.liveOrder?.orderId || null;
+      if (!txBase64) {
+        return;
+      }
+    }
+
+    state.liveTxStatus = 'Confirm order signature in your Solana wallet…';
+    renderSlip();
+
+    const signed = await signAndSendJupiterTx(txBase64);
+    state.lastOrderTx = {
+      signature: signed.signature,
+      solscanUrl: signed.solscanUrl,
+      walletName: signed.walletName,
+      orderId,
+    };
+    state.liveTxStatus = `Order placed via ${signed.walletName}!`;
+    state.liveTxError = null;
+    // Clear used transaction so subsequent click requests fresh blockhash
+    if (state.orderPreview?.liveOrder) {
+      state.orderPreview = {
+        ...state.orderPreview,
+        liveOrder: { ...state.orderPreview.liveOrder, transactionBase64: null },
+      };
+    }
+    renderSlip();
+    fetchPositions({ silent: true });
+  } catch (err) {
+    state.liveTxError = err instanceof Error ? err.message : 'Solana wallet signing cancelled or failed.';
+    state.liveTxStatus = null;
+  } finally {
+    state.signingOrder = false;
     renderSlip();
   }
 }
@@ -461,11 +1005,14 @@ function renderPocketBar() {
   const host = document.getElementById('degenPocketHost');
   if (!host) return;
 
-  const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct);
+  const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
   const detected = detectSiphonBalance();
 
+  const is9010Active = pocket.mode === 'percent' && Math.abs(pocket.effectiveRiskPct - 10) < 0.01 && !pocket.wasClamped;
+  const isYieldFundedActive = pocket.mode === 'yield_funded';
+
   const riskPillsHtml = RISK_PILLS.map((pct) => {
-    const active = Math.abs(pocket.effectiveRiskPct - pct) < 0.01 && !pocket.wasClamped;
+    const active = pocket.mode === 'percent' && Math.abs(pocket.effectiveRiskPct - pct) < 0.01 && !pocket.wasClamped;
     return `<button type="button" class="degen-pct-pill mono ${active ? 'active' : ''}" data-degen-risk="${pct}">${pct}%</button>`;
   }).join('');
 
@@ -473,11 +1020,24 @@ function renderPocketBar() {
     ? `<div class="degen-risk-warning ${pocket.wasClamped ? 'is-clamped' : ''}" role="alert">${esc(pocket.highRiskWarning)}</div>`
     : '';
 
-  const liveBadgeHtml = state.feedMeta.live
-    ? `<span class="degen-pill-live mono"><span class="degen-live-dot"></span>Jupiter Prediction v1 · Live</span>`
-    : state.loading
-      ? `<span class="degen-pill-live mono">Connecting Jupiter v1…</span>`
-      : `<span class="degen-pill-offline mono">Jupiter v1 Offline</span>`;
+  const liveBadgeHtml = state.feedMeta.geoBlocked
+    ? `<span class="degen-pill-offline mono">Jupiter v1 · Region Restricted</span>`
+    : state.feedMeta.live
+      ? `<span class="degen-pill-live mono"><span class="degen-live-dot"></span>Jupiter Prediction v1 · Live</span>`
+      : state.loading
+        ? `<span class="degen-pill-live mono">Connecting Jupiter v1…</span>`
+        : `<span class="degen-pill-offline mono">Jupiter v1 Offline</span>`;
+
+  const headlineHtml = isYieldFundedActive
+    ? `100% Principal Safe: <span class="degen-safe-num mono">${esc(fmtUsd(pocket.preservedUsdc))} Untouched</span> · Yield-Funded Degen: <span class="degen-cap-num mono">${esc(fmtUsd(pocket.maxDegenBudgetUsd))} (30d @ ${esc(pocket.yieldApyPct)}% APY)</span>`
+    : `Preserved Safe: <span class="degen-safe-num mono">${esc(pocket.preservedPct)}% (${esc(fmtUsd(pocket.preservedUsdc))})</span> · Degen Side-Pocket: <span class="degen-cap-num mono">${esc(pocket.effectiveRiskPct)}% (${esc(fmtUsd(pocket.maxDegenBudgetUsd))})</span>`;
+
+  const yieldSubline = isYieldFundedActive
+    ? `Zero principal at risk: ${fmtUsd(pocket.preservedUsdc)} earns est. +${fmtUsd(pocket.projectedAnnualYieldUsd)}/yr (~${pocket.yieldApyPct}% APY); Degen cap strictly limited to 30-day yield (${fmtUsd(pocket.projected30dYieldUsd)}).`
+    : `90%+ preservation target: ${fmtUsd(pocket.preservedUsdc)} safe principal earns est. +${fmtUsd(pocket.projectedAnnualYieldUsd)}/yr (~${pocket.yieldApyPct}% APY on Jupiter Lend / Kamino).`;
+
+  const splitSafePct = isYieldFundedActive ? 100 : Math.max(0, Math.min(100, pocket.preservedPct));
+  const splitCapPct = isYieldFundedActive ? 0 : Math.max(0, Math.min(100, pocket.effectiveRiskPct));
 
   host.innerHTML = `
     <div class="degen-pocket-card">
@@ -488,10 +1048,8 @@ function renderPocketBar() {
             <span class="degen-pill-safe mono">${esc(pocket.preservedPct)}% Principal Guarded</span>
             ${liveBadgeHtml}
           </div>
-          <p class="degen-split-summary" id="degenSplitHeadline">
-            Preserved Safe: <span class="degen-safe-num mono">${esc(pocket.preservedPct)}% (${esc(fmtUsd(pocket.preservedUsdc))})</span>
-            · Degen Side-Pocket: <span class="degen-cap-num mono">${esc(pocket.effectiveRiskPct)}% (${esc(fmtUsd(pocket.maxDegenBudgetUsd))})</span>
-          </p>
+          <p class="degen-split-summary" id="degenSplitHeadline">${headlineHtml}</p>
+          <div class="degen-yield-meta mono" id="degenYieldProjectionLine">${esc(yieldSubline)}</div>
         </div>
 
         <div class="degen-pocket-controls">
@@ -527,7 +1085,7 @@ function renderPocketBar() {
                   min="0"
                   max="100"
                   step="1"
-                  value="${esc(pocket.effectiveRiskPct)}"
+                  value="${esc(pocket.mode === 'yield_funded' ? 0 : pocket.effectiveRiskPct)}"
                   aria-label="Custom side-pocket risk percentage"
                 />
                 <span class="mono muted-xs">%</span>
@@ -537,16 +1095,37 @@ function renderPocketBar() {
         </div>
       </div>
 
+      <div class="degen-split-presets" role="group" aria-label="Preservation-first split presets">
+        <button
+          type="button"
+          class="degen-split-preset-btn ${is9010Active ? 'active' : ''}"
+          id="degenPreset9010Btn"
+          data-split-preset="yield_90_10"
+        >
+          <span class="degen-preset-title">90% Yield Safe / 10% Degen</span>
+          <span class="degen-preset-sub mono">Est. +${esc(fmtUsd(computeLocalSidePocket(pocket.availableUsdc, 10, 'percent', pocket.yieldApyPct).projectedAnnualYieldUsd))}/yr @ ~${esc(pocket.yieldApyPct)}% APY</span>
+        </button>
+        <button
+          type="button"
+          class="degen-split-preset-btn is-yield-safe ${isYieldFundedActive ? 'active' : ''}"
+          id="degenPresetYieldFundedBtn"
+          data-split-preset="yield_funded"
+        >
+          <span class="degen-preset-title">100% Principal Safe · Yield-Funded Degen</span>
+          <span class="degen-preset-sub mono">Principal untouched · ${esc(fmtUsd(computeLocalSidePocket(pocket.availableUsdc, 0, 'yield_funded', pocket.yieldApyPct).maxDegenBudgetUsd))} 30d yield budget</span>
+        </button>
+      </div>
+
       <div class="degen-split-bar" aria-hidden="true">
-        <div class="degen-split-bar-safe" style="width: ${Math.max(0, Math.min(100, pocket.preservedPct))}%"></div>
-        <div class="degen-split-bar-cap" style="width: ${Math.max(0, Math.min(100, pocket.effectiveRiskPct))}%"></div>
+        <div class="degen-split-bar-safe" style="width: ${splitSafePct}%"></div>
+        <div class="degen-split-bar-cap" style="width: ${splitCapPct}%"></div>
       </div>
 
       ${warningHtml}
 
       <div class="degen-pocket-foot">
         <span>Non-custodial guard: Siphon caps optional Degen sizing so your migrated Solana principal stays untouched. Binary contracts can settle to $0.</span>
-        ${detected ? `<button type="button" class="degen-sync-btn" id="degenSyncBalanceBtn">Sync ${esc(fmtUsd(detected.amount))} (${esc(detected.source)})</button>` : `<span class="mono">Hard ceiling: 50% max</span>`}
+        ${detected ? `<button type="button" class="degen-sync-btn" id="degenSyncBalanceBtn">Sync ${esc(fmtUsd(detected.amount))} (${esc(detected.source)})</button>` : `<span class="mono">Min order $5 · Hard ceiling 50%</span>`}
       </div>
     </div>
   `;
@@ -559,7 +1138,7 @@ function renderPocketBar() {
         state.availableUsdc = Math.round(val * 100) / 100;
         state.balanceSource = 'Custom balance';
         state.userEditedBalance = true;
-        const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct);
+        const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
         if (state.stakeUsd > nextPocket.maxDegenBudgetUsd || state.stakeUsd <= 0) {
           state.stakeUsd = nextPocket.maxDegenBudgetUsd;
         }
@@ -571,12 +1150,32 @@ function renderPocketBar() {
     });
   }
 
+  host.querySelectorAll('[data-split-preset]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const preset = btn.dataset.splitPreset;
+      if (preset === 'yield_funded') {
+        state.sidePocketMode = 'yield_funded';
+        state.riskPct = 0;
+      } else {
+        state.sidePocketMode = 'percent';
+        state.riskPct = 10;
+      }
+      const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
+      state.stakeUsd = nextPocket.maxDegenBudgetUsd;
+      renderPocketBar();
+      renderMarketsSection();
+      renderSlip();
+      requestOrderPreview(false);
+    });
+  });
+
   host.querySelectorAll('[data-degen-risk]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const nextPct = Number(btn.dataset.degenRisk);
       if (!Number.isFinite(nextPct)) return;
+      state.sidePocketMode = 'percent';
       state.riskPct = nextPct;
-      const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct);
+      const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
       state.stakeUsd = nextPocket.maxDegenBudgetUsd;
       renderPocketBar();
       renderMarketsSection();
@@ -590,8 +1189,9 @@ function renderPocketBar() {
     customPctInput.addEventListener('change', () => {
       const val = Number(customPctInput.value);
       if (!Number.isFinite(val) || val < 0) return;
+      state.sidePocketMode = 'percent';
       state.riskPct = val;
-      const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct);
+      const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
       state.stakeUsd = nextPocket.maxDegenBudgetUsd;
       renderPocketBar();
       renderMarketsSection();
@@ -606,6 +1206,174 @@ function renderPocketBar() {
     renderMarketsSection();
     renderSlip();
     requestOrderPreview(false);
+  });
+}
+
+function renderPositionsStrip() {
+  const host = document.getElementById('degenPositionsHost');
+  if (!host) return;
+
+  const owner = getSelectedSolanaWallet();
+  const summary = state.positionsSummary;
+  const feedback = state.positionActionFeedback;
+
+  if (!owner) {
+    host.innerHTML = `
+      <div class="degen-positions-card">
+        <div class="degen-positions-head">
+          <div class="degen-positions-title-wrap">
+            <h2 class="degen-section-title">My Positions &amp; Claims</h2>
+            <span class="mono muted-xs">Track active YES/NO bets, unrealized P&amp;L, early exit &amp; $1.00 winning claims</span>
+          </div>
+          <button type="button" class="degen-pos-connect-btn mono" id="degenPositionsConnectBtn">
+            Connect Solana Wallet
+          </button>
+        </div>
+      </div>
+    `;
+    document.getElementById('degenPositionsConnectBtn')?.addEventListener('click', () => {
+      document.getElementById('connectSolBtn')?.click();
+    });
+    return;
+  }
+
+  const pnlVal = summary ? summary.totalUnrealizedPnlUsd : 0;
+  const pnlClass = pnlVal > 0 ? 'is-pos' : pnlVal < 0 ? 'is-neg' : '';
+  const summaryPills = summary
+    ? `
+      <div class="degen-pos-summary-pills mono">
+        <span class="degen-pos-pill">${esc(summary.openCount)} Open</span>
+        ${summary.claimableCount > 0 ? `<span class="degen-pos-pill is-claimable">${esc(summary.claimableCount)} Claimable (${esc(fmtUsd(summary.totalClaimablePayoutUsd))})</span>` : ''}
+        <span class="degen-pos-pill ${pnlClass}">Live P&amp;L ${esc(fmtSignedUsd(pnlVal))}</span>
+      </div>
+    `
+    : '';
+
+  let bodyHtml = '';
+  if (state.positionsLoading && state.positions.length === 0) {
+    bodyHtml = `<div class="degen-pos-empty mono">Loading live Jupiter positions for ${esc(shortSig(owner))}…</div>`;
+  } else if (state.positionsError) {
+    bodyHtml = `
+      <div class="degen-pos-banner ${state.positionsGeoBlocked ? 'is-warn' : ''}">
+        <span>${esc(state.positionsError)}</span>
+        <a href="https://jup.ag/prediction/portfolio" target="_blank" rel="noopener noreferrer" class="degen-jup-link">Open Portfolio on Jupiter ↗</a>
+      </div>
+    `;
+  } else if (state.positions.length === 0) {
+    bodyHtml = `
+      <div class="degen-pos-empty">
+        <span>No active or claimable Jupiter Prediction positions for <strong class="mono">${esc(shortSig(owner))}</strong> yet.</span>
+        <a href="https://jup.ag/prediction/portfolio" target="_blank" rel="noopener noreferrer" class="degen-jup-link">Jupiter Portfolio ↗</a>
+      </div>
+    `;
+  } else {
+    bodyHtml = `<div class="degen-positions-list">${state.positions
+      .map((pos) => {
+        const pnlCls = pos.unrealizedPnlUsd > 0 ? 'is-pos' : pos.unrealizedPnlUsd < 0 ? 'is-neg' : '';
+        const busy = state.positionBusyId === pos.positionId;
+        const posUrl = safeHttpsUrl(pos.jupiterUrl, 'https://jup.ag/prediction/portfolio');
+        const entryCents = `${(pos.avgEntryPriceUsd * 100).toFixed(1)}¢`;
+        const markCents = `${(pos.markPriceUsd * 100).toFixed(1)}¢`;
+        const pnlPctText = `${pos.unrealizedPnlPct >= 0 ? '+' : ''}${pos.unrealizedPnlPct.toFixed(1)}%`;
+
+        let actionBtnHtml = `<a href="${esc(posUrl)}" target="_blank" rel="noopener noreferrer" class="degen-pos-link-btn">View on Jupiter ↗</a>`;
+        if (pos.claimable) {
+          actionBtnHtml = `
+            <button
+              type="button"
+              class="degen-claim-btn mono"
+              data-claim-position="${esc(pos.positionId)}"
+              ${busy ? 'disabled' : ''}
+            >
+              ${busy ? 'Claiming…' : `Claim ${esc(fmtUsd(pos.claimablePayoutUsd))} ($1.00/sh)`}
+            </button>
+          `;
+        } else if (pos.canCloseEarly) {
+          actionBtnHtml = `
+            <button
+              type="button"
+              class="degen-exit-btn mono"
+              data-close-position="${esc(pos.positionId)}"
+              ${busy ? 'disabled' : ''}
+            >
+              ${busy ? 'Exiting…' : 'Early Exit'}
+            </button>
+          `;
+        }
+
+        const statusBadge = pos.claimable
+          ? `<span class="degen-pos-status is-claimable mono">WIN · CLAIM $1.00</span>`
+          : pos.status === 'settled'
+            ? `<span class="degen-pos-status mono">SETTLED ${esc(fmtUsd(pos.settledPayoutUsd))}</span>`
+            : `<span class="degen-pos-status mono">${esc(pos.status.toUpperCase())}</span>`;
+
+        return `
+          <div class="degen-position-row ${pos.claimable ? 'is-claimable' : ''}">
+            <div class="degen-pos-main">
+              <div class="degen-pos-badges">
+                <span class="degen-pos-side mono ${pos.side === 'yes' ? 'is-yes' : 'is-no'}">${esc(pos.side.toUpperCase())}</span>
+                ${statusBadge}
+                <span class="mono muted-xs">${esc(pos.shares.toFixed(2))} sh · Entry ${esc(entryCents)} → Mark ${esc(markCents)}</span>
+              </div>
+              <div class="degen-pos-title">${esc(pos.eventTitle)}</div>
+              <div class="degen-pos-market">${esc(pos.marketTitle)}</div>
+            </div>
+            <div class="degen-pos-right">
+              <div class="degen-pos-pnl mono">
+                <strong class="${pnlCls}">${esc(fmtSignedUsd(pos.unrealizedPnlUsd))}</strong>
+                <span class="muted-xs">${esc(pnlPctText)} · Val ${esc(fmtUsd(pos.currentValueUsd))}</span>
+              </div>
+              <div class="degen-pos-actions">
+                ${actionBtnHtml}
+              </div>
+            </div>
+          </div>
+        `;
+      })
+      .join('')}</div>`;
+  }
+
+  const feedbackHtml = feedback
+    ? `
+      <div class="degen-pos-feedback is-${esc(feedback.type)} mono">
+        <span>${esc(feedback.message)}</span>
+        ${feedback.solscanUrl ? `<a href="${esc(safeHttpsUrl(feedback.solscanUrl, 'https://solscan.io'))}" target="_blank" rel="noopener noreferrer" class="degen-solscan-link">View on Solscan ↗</a>` : ''}
+        ${feedback.jupiterUrl ? `<a href="${esc(safeHttpsUrl(feedback.jupiterUrl, 'https://jup.ag/prediction/portfolio'))}" target="_blank" rel="noopener noreferrer" class="degen-jup-link">Open on Jupiter ↗</a>` : ''}
+      </div>
+    `
+    : '';
+
+  host.innerHTML = `
+    <div class="degen-positions-card">
+      <div class="degen-positions-head">
+        <div class="degen-positions-title-wrap">
+          <h2 class="degen-section-title">My Positions &amp; Claims</h2>
+          <span class="mono muted-xs">${esc(shortSig(owner))}</span>
+          ${summaryPills}
+        </div>
+        <button type="button" class="degen-refresh-btn" id="degenRefreshPositionsBtn">Refresh</button>
+      </div>
+      ${feedbackHtml}
+      ${bodyHtml}
+    </div>
+  `;
+
+  document.getElementById('degenRefreshPositionsBtn')?.addEventListener('click', () => {
+    fetchPositions({ silent: false });
+  });
+
+  host.querySelectorAll('[data-claim-position]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.claimPosition;
+      if (id) handlePositionAction(id, 'claim');
+    });
+  });
+
+  host.querySelectorAll('[data-close-position]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.closePosition;
+      if (id) handlePositionAction(id, 'close');
+    });
   });
 }
 
@@ -649,7 +1417,7 @@ function renderMarketsSection() {
   const host = document.getElementById('degenFeedHost');
   if (!host) return;
 
-  const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct);
+  const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
   const previewStake = pocket.maxDegenBudgetUsd > 0 ? pocket.maxDegenBudgetUsd : 0;
 
   const catPillsHtml = CATEGORY_TABS.map((cat) => {
@@ -679,7 +1447,7 @@ function renderMarketsSection() {
   } else if (!state.feedMeta.live && state.events.length === 0) {
     cardsHtml = `
       <div class="degen-empty-state">
-        <strong>Live Jupiter markets temporarily unreachable</strong>
+        <strong>${state.feedMeta.geoBlocked ? 'Jupiter Prediction API geo-restricted in this region' : 'Live Jupiter markets temporarily unreachable'}</strong>
         <span>${esc(state.feedMeta.error || 'Unable to fetch live events from Jupiter Prediction API.')}</span>
         <span class="muted-xs">Siphon never fabricates placeholder markets when live odds are unavailable.</span>
         <button type="button" class="btn-outline-sm" id="degenRetryFeedBtn">Retry Live Feed</button>
@@ -856,7 +1624,9 @@ function renderMarketsSection() {
         no: market.no,
       };
       state.liveTxStatus = null;
-      const curPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct);
+      state.liveTxError = null;
+      state.lastOrderTx = null;
+      const curPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
       if (!Number.isFinite(state.stakeUsd) || state.stakeUsd <= 0 || state.stakeUsd > curPocket.maxDegenBudgetUsd) {
         state.stakeUsd = curPocket.maxDegenBudgetUsd;
       }
@@ -871,7 +1641,7 @@ function renderSlip() {
   const host = document.getElementById('degenSlipHost');
   if (!host) return;
 
-  const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct);
+  const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
   const sel = state.selected;
   const quote = getActiveQuote(sel);
 
@@ -883,7 +1653,7 @@ function renderSlip() {
           <span class="degen-cap-badge mono">Cap ${esc(fmtUsd(pocket.maxDegenBudgetUsd))}</span>
         </div>
         <div class="muted-xs" style="padding:14px 0;">
-          Click any <strong>YES ¢</strong> or <strong>NO ¢</strong> odds pill on a live Jupiter market to model capped payout math and launch directly on Jupiter.
+          Click any <strong>YES ¢</strong> or <strong>NO ¢</strong> odds pill on a live Jupiter market to model capped payout math and sign inline or launch on Jupiter.
         </div>
       </div>
     `;
@@ -894,13 +1664,67 @@ function renderSlip() {
   const localPayout = computeLocalPayout(stake, quote.priceUsd);
   const serverPayout = state.orderPreview?.payout || null;
   const displayPayout = serverPayout || localPayout;
+  const underMin = stake > 0 && stake < MIN_JUPITER_ORDER_USD - 1e-9;
   const overCap = stake > pocket.maxDegenBudgetUsd + 1e-9;
   const tradeUrl = safeHttpsUrl(state.orderPreview?.jupiterUrl || sel.jupiterUrl, 'https://jup.ag/prediction');
-  const canLaunch = !overCap && stake > 0 && !state.orderPreviewError;
-  const walletConnected = Boolean(getSelectedSolanaWallet());
+  const canLaunch = !overCap && !underMin && stake >= MIN_JUPITER_ORDER_USD - 1e-9 && !state.orderPreviewError;
+
+  const signerReady = hasConnectedSolanaSigner();
+  const hasReadyTx = Boolean(state.orderPreview?.liveOrder?.available && state.orderPreview?.liveOrder?.transactionBase64);
+  const canInlineSign = canLaunch && signerReady && (hasReadyTx || state.feedMeta.apiKeyConfigured);
+  const geoBlocked = Boolean(state.orderPreview?.liveOrder?.geoBlocked || state.feedMeta.geoBlocked);
 
   const yesLabel = sel.yes ? `YES ${sel.yes.cents.toFixed(1)}¢ (${sel.yes.payoutMultiplier.toFixed(2)}x)` : 'YES —';
   const noLabel = sel.no ? `NO ${sel.no.cents.toFixed(1)}¢ (${sel.no.payoutMultiplier.toFixed(2)}x)` : 'NO —';
+
+  let primaryCtaHtml = '';
+  if (canInlineSign && !geoBlocked) {
+    primaryCtaHtml = `
+      <button
+        type="button"
+        class="degen-trade-cta is-inline-sign"
+        id="degenSignOrderBtn"
+        ${state.signingOrder || state.orderPreviewLoading ? 'disabled' : ''}
+      >
+        ${state.signingOrder ? 'Signing in Wallet…' : 'Sign & Place Order in Wallet'}
+      </button>
+      <a
+        href="${esc(tradeUrl)}"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="degen-live-tx-btn degen-fallback-link ${canLaunch ? '' : 'is-disabled'}"
+        id="degenTradeJupiterLink"
+      >
+        Open on Jupiter ↗
+      </a>
+    `;
+  } else {
+    primaryCtaHtml = `
+      <a
+        href="${esc(tradeUrl)}"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="degen-trade-cta ${canLaunch ? '' : 'is-disabled'}"
+        id="degenTradeJupiterLink"
+      >
+        Open on Jupiter ↗
+      </a>
+      ${
+        state.feedMeta.apiKeyConfigured && !geoBlocked
+          ? `<button type="button" class="degen-live-tx-btn mono" id="degenBuildLiveTxBtn">${signerReady ? 'Sign & Place Order in Wallet' : 'Connect Solana for 1-Click Inline Signing'}</button>`
+          : ''
+      }
+    `;
+  }
+
+  const orderTxBannerHtml = state.lastOrderTx
+    ? `
+      <div class="degen-tx-success mono" role="status">
+        <span>Placed via ${esc(state.lastOrderTx.walletName)} · ${esc(shortSig(state.lastOrderTx.signature))}</span>
+        <a href="${esc(safeHttpsUrl(state.lastOrderTx.solscanUrl, 'https://solscan.io'))}" target="_blank" rel="noopener noreferrer" class="degen-solscan-link">Solscan ↗</a>
+      </div>
+    `
+    : '';
 
   host.innerHTML = `
     <div class="degen-slip-card">
@@ -921,7 +1745,7 @@ function renderSlip() {
       <div class="degen-stake-block">
         <div class="degen-stake-head">
           <label for="degenStakeInput">Side-Pocket Wager (USDC)</label>
-          <span class="mono">Max ${esc(fmtUsd(pocket.maxDegenBudgetUsd))}</span>
+          <span class="mono">Min $5 · Max ${esc(fmtUsd(pocket.maxDegenBudgetUsd))}</span>
         </div>
         <div class="degen-stake-input-row">
           <span class="mono muted-xs">$</span>
@@ -929,7 +1753,7 @@ function renderSlip() {
             type="number"
             id="degenStakeInput"
             class="degen-stake-input mono"
-            min="0"
+            min="5"
             max="${esc(pocket.maxDegenBudgetUsd)}"
             step="1"
             value="${esc(stake)}"
@@ -945,6 +1769,7 @@ function renderSlip() {
       </div>
 
       ${state.orderPreviewError ? `<div class="degen-slip-error" role="alert">${esc(state.orderPreviewError)}</div>` : ''}
+      ${state.liveTxError ? `<div class="degen-slip-error" role="alert">${esc(state.liveTxError)}</div>` : ''}
 
       <div class="degen-payout-hero">
         <span class="degen-eyebrow mono">PROJECTED PAYOUT IF ${esc(sel.side.toUpperCase())} WINS</span>
@@ -977,25 +1802,12 @@ function renderSlip() {
         </div>
       </div>
 
-      <a
-        href="${esc(tradeUrl)}"
-        target="_blank"
-        rel="noopener noreferrer"
-        class="degen-trade-cta ${canLaunch ? '' : 'is-disabled'}"
-        id="degenTradeJupiterLink"
-      >
-        Trade on Jupiter →
-      </a>
-
-      ${
-        state.feedMeta.apiKeyConfigured
-          ? `<button type="button" class="degen-live-tx-btn mono" id="degenBuildLiveTxBtn">${walletConnected ? 'Build Signable Jupiter Tx' : 'Connect Solana for Inline Tx'}</button>`
-          : ''
-      }
+      ${primaryCtaHtml}
+      ${orderTxBannerHtml}
       ${state.liveTxStatus ? `<div class="degen-slip-note mono">${esc(state.liveTxStatus)}</div>` : ''}
 
       <div class="degen-slip-note">
-        ${state.orderPreviewLoading ? 'Verifying side-pocket cap…' : 'Non-custodial payout calculator verified against Siphon side-pocket cap. Execution settles directly on Jupiter / Solana.'}
+        ${state.orderPreviewLoading ? 'Verifying side-pocket cap & $5 min order…' : 'Non-custodial payout calculator verified against Siphon side-pocket cap. Settlement uses Solana USDC directly on Jupiter.'}
       </div>
     </div>
   `;
@@ -1003,6 +1815,8 @@ function renderSlip() {
   document.getElementById('degenSlipYesBtn')?.addEventListener('click', () => {
     if (!sel.yes) return;
     state.selected = { ...sel, side: 'yes' };
+    state.lastOrderTx = null;
+    state.liveTxError = null;
     renderMarketsSection();
     renderSlip();
     requestOrderPreview(false);
@@ -1011,6 +1825,8 @@ function renderSlip() {
   document.getElementById('degenSlipNoBtn')?.addEventListener('click', () => {
     if (!sel.no) return;
     state.selected = { ...sel, side: 'no' };
+    state.lastOrderTx = null;
+    state.liveTxError = null;
     renderMarketsSection();
     renderSlip();
     requestOrderPreview(false);
@@ -1021,6 +1837,7 @@ function renderSlip() {
     stakeInput.addEventListener('change', () => {
       const val = Number(stakeInput.value);
       state.stakeUsd = Number.isFinite(val) ? Math.round(val * 100) / 100 : 0;
+      state.lastOrderTx = null;
       renderSlip();
       requestOrderPreview(false);
     });
@@ -1031,9 +1848,14 @@ function renderSlip() {
       const frac = Number(btn.dataset.stakeFrac);
       if (!Number.isFinite(frac)) return;
       state.stakeUsd = Math.floor(pocket.maxDegenBudgetUsd * frac * 100) / 100;
+      state.lastOrderTx = null;
       renderSlip();
       requestOrderPreview(false);
     });
+  });
+
+  document.getElementById('degenSignOrderBtn')?.addEventListener('click', () => {
+    handleSignAndPlaceOrder();
   });
 
   document.getElementById('degenBuildLiveTxBtn')?.addEventListener('click', () => {
@@ -1041,12 +1863,13 @@ function renderSlip() {
       document.getElementById('connectSolBtn')?.click();
       return;
     }
-    requestOrderPreview(true);
+    handleSignAndPlaceOrder();
   });
 }
 
 function renderAll() {
   renderPocketBar();
+  renderPositionsStrip();
   renderGamesStrip();
   renderMarketsSection();
   renderSlip();
@@ -1059,6 +1882,7 @@ function mountShell() {
 
   root.innerHTML = `
     <div id="degenPocketHost"></div>
+    <div id="degenPositionsHost"></div>
     <div id="degenGamesHost"></div>
     <div class="degen-workspace">
       <div class="degen-feed-col" id="degenFeedHost"></div>
@@ -1074,8 +1898,14 @@ function onDegenTabActivated() {
   mountShell();
   syncBalanceFromSiphon(false);
   renderPocketBar();
+  renderPositionsStrip();
+  renderSlip();
   if (!state.hasLoadedOnce && !state.loading) {
     fetchMarkets({ forceSearch: false });
+  }
+  const owner = getSelectedSolanaWallet();
+  if (owner && owner !== state.positionsOwner && !state.positionsLoading) {
+    fetchPositions({ silent: false });
   }
 }
 
@@ -1099,23 +1929,43 @@ function initDegenModule() {
     });
   });
 
-  // Auto-sync balance if Solana live balance or Sweep payout hero updates
-  const watchEl = (id) => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    const obs = new MutationObserver(() => {
-      if (!state.userEditedBalance) {
-        syncBalanceFromSiphon(false);
-        if (pane.classList.contains('active')) {
-          renderPocketBar();
-          renderSlip();
-        }
+  // Clean event-driven balance & Solana wallet sync dispatched by app.js
+  window.addEventListener('siphon:balance-updated', (event) => {
+    const detail = event?.detail && typeof event.detail === 'object' ? event.detail : null;
+    if (!detail) return;
+    state.siphonBalanceDetail = detail;
+
+    if (!state.userEditedBalance) {
+      syncBalanceFromSiphon(false);
+    }
+
+    const nextWallet = getSelectedSolanaWallet();
+    const walletChanged = nextWallet !== state.positionsOwner;
+
+    if (pane.classList.contains('active')) {
+      renderPocketBar();
+      renderSlip();
+      if (walletChanged) {
+        fetchPositions({ silent: false });
+      } else {
+        renderPositionsStrip();
       }
-    });
-    obs.observe(el, { childList: true, characterData: true, subtree: true });
-  };
-  watchEl('solanaLiveBalanceBadge');
-  watchEl('kpiNetUsdc');
+    } else if (!nextWallet && state.positionsOwner) {
+      // Clear stale positions immediately when wallet disconnects
+      state.positionsOwner = '';
+      state.positions = [];
+      state.positionsSummary = null;
+      updateTabBadge();
+    }
+  });
+
+  // Graceful fallback if #solanaDestInput is edited directly by the user
+  document.getElementById('solanaDestInput')?.addEventListener('change', () => {
+    if (pane.classList.contains('active')) {
+      renderSlip();
+      fetchPositions({ silent: false });
+    }
+  });
 
   if (pane.classList.contains('active')) {
     onDegenTabActivated();
