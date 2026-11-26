@@ -3,6 +3,7 @@ import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { resolveProtocolFeeBps } from '../scanner/chains.js';
 import { sanitizeFreeText } from '../scanner/sanitize.js';
 import type { AnyChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
+import type { SiphonStateStore } from '../storage/state-store.js';
 
 export type AgentActionType =
   | 'dust_convert'
@@ -77,6 +78,7 @@ export interface SiphonAgentEngineOptions {
   maxTokens?: number;
   approvalTtlMs?: number;
   tokenTtlMs?: number;
+  stateStore?: SiphonStateStore;
 }
 
 const DAY_MS = 86_400_000;
@@ -165,6 +167,7 @@ export class SiphonAgentEngine {
   private readonly maxTokens: number;
   private readonly approvalTtlMs: number;
   private readonly tokenTtlMs: number;
+  private readonly stateStore?: SiphonStateStore;
 
   constructor(opts: SiphonAgentEngineOptions = {}) {
     this.nowMs = opts.nowMs ?? (() => Date.now());
@@ -173,19 +176,86 @@ export class SiphonAgentEngine {
     this.maxTokens = Math.max(10, Math.floor(opts.maxTokens ?? DEFAULT_MAX_TOKENS));
     this.approvalTtlMs = Math.max(60_000, Math.floor(opts.approvalTtlMs ?? DEFAULT_APPROVAL_TTL_MS));
     this.tokenTtlMs = Math.max(60_000, Math.floor(opts.tokenTtlMs ?? DEFAULT_TOKEN_TTL_MS));
+    this.stateStore = opts.stateStore;
+    if (this.stateStore) {
+      this.hydrateFromStore();
+    }
+  }
+
+  private hydrateFromStore(): void {
+    if (!this.stateStore) return;
+    const savedMandates = this.stateStore.load<AgentMandateRecord[]>('mandates', []);
+    if (Array.isArray(savedMandates)) {
+      for (const m of savedMandates) {
+        if (m && typeof m === 'object' && typeof m.mandateId === 'string') {
+          this.mandates.set(m.mandateId, m);
+        }
+      }
+    }
+
+    const savedApprovals = this.stateStore.load<PermissionRequestRecord[]>('approvals', []);
+    if (Array.isArray(savedApprovals)) {
+      for (const a of savedApprovals) {
+        if (a && typeof a === 'object' && typeof a.approvalId === 'string') {
+          this.approvals.set(a.approvalId, a);
+        }
+      }
+    }
+
+    const savedTokens = this.stateStore.load<
+      Array<{ record: PluginApiTokenRecord; secretHashHex: string }>
+    >('plugin_tokens', []);
+    if (Array.isArray(savedTokens)) {
+      for (const t of savedTokens) {
+        if (
+          t &&
+          typeof t === 'object' &&
+          t.record &&
+          typeof t.record.tokenId === 'string' &&
+          typeof t.secretHashHex === 'string' &&
+          /^[0-9a-fA-F]{64}$/.test(t.secretHashHex)
+        ) {
+          this.tokens.set(t.record.tokenId, {
+            record: t.record,
+            secretHash: Buffer.from(t.secretHashHex, 'hex'),
+          });
+        }
+      }
+    }
+  }
+
+  private persistMandates(): void {
+    if (!this.stateStore) return;
+    this.stateStore.save('mandates', Array.from(this.mandates.values()));
+  }
+
+  private persistApprovals(): void {
+    if (!this.stateStore) return;
+    this.stateStore.save('approvals', Array.from(this.approvals.values()));
+  }
+
+  private persistTokens(): void {
+    if (!this.stateStore) return;
+    const serialized = Array.from(this.tokens.values()).map((entry) => ({
+      record: entry.record,
+      secretHashHex: entry.secretHash.toString('hex'),
+    }));
+    this.stateStore.save('plugin_tokens', serialized);
   }
 
   /**
    * Matches `SiphonAgentVault.sol` rolling 24h window semantics:
    * `if (block.timestamp >= dayWindowStart + 1 days) { dayWindowStart = block.timestamp; spentTodayUsd6 = 0; }`
    */
-  private refreshRollingDayWindow(mandate: AgentMandateRecord, nowMs = this.nowMs()): void {
+  private refreshRollingDayWindow(mandate: AgentMandateRecord, nowMs = this.nowMs()): boolean {
     const startMs = Date.parse(mandate.dayWindowStart || mandate.createdAt);
     if (Number.isFinite(startMs) && nowMs >= startMs + DAY_MS) {
       mandate.dayWindowStart = new Date(nowMs).toISOString();
       mandate.spentTodayUsd = 0;
       mandate.remainingDailyUsd = round2(mandate.dailyCapUsd);
+      return true;
     }
+    return false;
   }
 
   createMandate(input: {
@@ -306,22 +376,27 @@ export class SiphonAgentEngine {
       if (!oldestKey) break;
       this.mandates.delete(oldestKey);
     }
+    this.persistMandates();
     return record;
   }
 
   listMandates(): AgentMandateRecord[] {
     const nowMs = this.nowMs();
     const items = Array.from(this.mandates.values());
+    let rolled = false;
     for (const m of items) {
-      this.refreshRollingDayWindow(m, nowMs);
+      if (this.refreshRollingDayWindow(m, nowMs)) rolled = true;
     }
+    if (rolled) this.persistMandates();
     return items.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   getMandate(mandateId: string): AgentMandateRecord | null {
     const m = this.mandates.get(mandateId);
     if (!m) return null;
-    this.refreshRollingDayWindow(m);
+    if (this.refreshRollingDayWindow(m)) {
+      this.persistMandates();
+    }
     return m;
   }
 
@@ -330,14 +405,18 @@ export class SiphonAgentEngine {
     if (!m) return null;
     m.active = false;
     const nowIso = new Date(this.nowMs()).toISOString();
+    let approvalChanged = false;
     // Cascade-reject pending approvals tied to the revoked mandate (MED-2)
     for (const apr of this.approvals.values()) {
       if (apr.mandateId === mandateId && apr.status === 'pending_approval') {
         apr.status = 'rejected';
         apr.decisionReason = `Auto-rejected because mandate ${mandateId} was revoked.`;
         apr.decidedAt = nowIso;
+        approvalChanged = true;
       }
     }
+    this.persistMandates();
+    if (approvalChanged) this.persistApprovals();
     return m;
   }
 
@@ -522,9 +601,12 @@ export class SiphonAgentEngine {
 
     let canAutoApprove = false;
     let hardMandateViolation: string | undefined;
+    let mandateMutated = false;
 
     if (mandate) {
-      this.refreshRollingDayWindow(mandate, nowMs);
+      if (this.refreshRollingDayWindow(mandate, nowMs)) {
+        mandateMutated = true;
+      }
 
       const notExpired = mandate.active && Date.parse(mandate.expiresAt) > nowMs;
       const destMatches = mandate.lockedSolanaRecipient === solDest;
@@ -610,6 +692,7 @@ export class SiphonAgentEngine {
         mandate.remainingDailyUsd = round2(Math.max(0, mandate.dailyCapUsd - mandate.spentTodayUsd));
         mandate.executionsCount += 1;
         mandate.lastRunAt = new Date(nowMs).toISOString();
+        mandateMutated = true;
       }
     } else {
       policyChecks.push({
@@ -662,6 +745,8 @@ export class SiphonAgentEngine {
       if (!oldestKey) break;
       this.approvals.delete(oldestKey);
     }
+    this.persistApprovals();
+    if (mandateMutated) this.persistMandates();
     return record;
   }
 
@@ -692,8 +777,11 @@ export class SiphonAgentEngine {
       req.status = 'rejected';
       req.decisionReason = 'Approval request expired before owner decision.';
       req.decidedAt = nowIso;
+      this.persistApprovals();
       throw new Error('Permission request has expired and can no longer be approved.');
     }
+
+    let mandateMutated = false;
 
     // Re-enforce ALL mandate invariants before allowing human approval to debit mandate quota (HIGH-3)
     if (params.decision === 'approve' && req.mandateId) {
@@ -702,9 +790,12 @@ export class SiphonAgentEngine {
         req.status = 'rejected';
         req.decisionReason = 'Mandate is missing, revoked, or expired.';
         req.decidedAt = nowIso;
+        this.persistApprovals();
         throw new Error('Cannot approve: associated mandate is inactive or expired.');
       }
-      this.refreshRollingDayWindow(m, nowMs);
+      if (this.refreshRollingDayWindow(m, nowMs)) {
+        mandateMutated = true;
+      }
 
       if (!Number.isFinite(req.grossUsd) || req.grossUsd <= 0 || !Number.isFinite(req.estimatedNetUsdc) || req.estimatedNetUsdc <= 0) {
         throw new Error('Cannot approve: non-finite or non-positive request amount.');
@@ -734,6 +825,7 @@ export class SiphonAgentEngine {
       m.remainingDailyUsd = round2(Math.max(0, m.dailyCapUsd - m.spentTodayUsd));
       m.executionsCount += 1;
       m.lastRunAt = nowIso;
+      mandateMutated = true;
     }
 
     req.status = params.decision === 'approve' ? 'approved' : 'rejected';
@@ -743,6 +835,8 @@ export class SiphonAgentEngine {
         ? 'Explicitly approved by wallet owner.'
         : 'Rejected by wallet owner.');
     req.decidedAt = nowIso;
+    this.persistApprovals();
+    if (mandateMutated) this.persistMandates();
     return req;
   }
 
@@ -784,6 +878,7 @@ export class SiphonAgentEngine {
       if (!oldestKey) break;
       this.tokens.delete(oldestKey);
     }
+    this.persistTokens();
     return { token: rawSecret, record };
   }
 
@@ -795,6 +890,7 @@ export class SiphonAgentEngine {
     const entry = this.tokens.get(tokenId);
     if (!entry) return null;
     entry.record.revoked = true;
+    this.persistTokens();
     return entry.record;
   }
 
