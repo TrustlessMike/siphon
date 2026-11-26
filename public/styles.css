@@ -1,44 +1,43 @@
 /* =====================================================================
-   TURGALIUM — JUPITER DARK OBSIDIAN DESIGN SYSTEM
-   Obsidian surfaces (#0B0E13 / #131820 / #1A212B / #212A36),
-   crisp white-slate ink (#F3F6FA / #CBD5E1 / #8B97A8 / #64748B),
-   Jupiter lime primary CTA (#C7F284), Solana mint (#14F195),
-   and calm teal interactive accents (#24C1D9).
+   TURGALIUM — DAYLIGHT PROTOCOL DESIGN SYSTEM
+   Paper white (#FCFCFC), pure white surfaces (#FFFFFF), soft wells
+   (#F4F5F7), stark black ink & CTAs (#0A0A0A), 1px hairlines (#E4E6EB),
+   and Kamino ice-cyan (#C6F4FF) active highlights.
    ===================================================================== */
 
 :root {
-  --bg-canvas: #0b0e13;
-  --bg-paper: #0b0e13;
-  --bg-surface: #131820;
-  --bg-well: #1a212b;
-  --bg-hover: #212a36;
-  --border: rgba(255, 255, 255, 0.07);
-  --border-strong: rgba(255, 255, 255, 0.14);
+  --bg-canvas: #fcfcfc;
+  --bg-paper: #fcfcfc;
+  --bg-surface: #ffffff;
+  --bg-well: #f4f5f7;
+  --bg-hover: #f8f9fb;
+  --border: #e4e6eb;
+  --border-strong: #d1d5db;
 
-  --ink-0: #f3f6fa;
-  --ink-1: #cbd5e1;
-  --ink-2: #8b97a8;
-  --ink-3: #64748b;
+  --ink-0: #0a0a0a;
+  --ink-1: #27272a;
+  --ink-2: #52525b;
+  --ink-3: #71717a;
 
-  --accent-lime: #c7f284;
-  --accent-lime-hover: #d7f89e;
-  --accent-mint: #14f195;
-  --accent-teal: #24c1d9;
+  --accent-lime: #0a0a0a;
+  --accent-lime-hover: #27272a;
+  --accent-mint: #059669;
+  --accent-teal: #0369a1;
 
-  --ice: #24c1d9;
-  --ice-soft: rgba(36, 193, 217, 0.12);
-  --ice-row: rgba(36, 193, 217, 0.1);
-  --ice-border: rgba(36, 193, 217, 0.34);
+  --ice: #c6f4ff;
+  --ice-soft: #e8faff;
+  --ice-row: #dcf7ff;
+  --ice-border: #7dd3fc;
 
-  --allow: #14f195;
-  --allow-bg: rgba(20, 241, 149, 0.1);
-  --allow-border: rgba(20, 241, 149, 0.28);
-  --hold: #f59e0b;
-  --hold-bg: rgba(245, 158, 11, 0.12);
-  --hold-border: rgba(245, 158, 11, 0.3);
-  --block: #f87171;
-  --block-bg: rgba(248, 113, 113, 0.1);
-  --block-border: rgba(248, 113, 113, 0.3);
+  --allow: #059669;
+  --allow-bg: #ecfdf5;
+  --allow-border: #a7f3d0;
+  --hold: #b45309;
+  --hold-bg: #fffbeb;
+  --hold-border: #fde68a;
+  --block: #dc2626;
+  --block-bg: #fef2f2;
+  --block-border: #fecaca;
 
   --font-display: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -61,7 +60,7 @@ body {
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 a {
@@ -77,8 +76,8 @@ select {
 }
 
 select option {
-  background: #131820;
-  color: #f3f6fa;
+  background: #ffffff;
+  color: #0a0a0a;
 }
 
 .hidden {
@@ -161,7 +160,7 @@ select option {
   justify-content: center;
   gap: 8px;
   background: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
   border: 1px solid var(--accent-lime);
   border-radius: 14px;
   padding: 10px 20px;
@@ -213,7 +212,7 @@ select option {
 
 .btn-outline-sm:hover:not(:disabled) {
   background: var(--bg-hover);
-  border-color: rgba(255, 255, 255, 0.24);
+  border-color: #9ca3af;
   color: var(--ink-0);
 }
 
@@ -290,7 +289,7 @@ select option {
 
 .btn-outline-dark:hover:not(:disabled) {
   background: var(--bg-hover);
-  border-color: rgba(255, 255, 255, 0.26);
+  border-color: #9ca3af;
 }
 
 .link-btn {
@@ -354,8 +353,7 @@ select option {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  background: radial-gradient(circle at 75% 15%, rgba(20, 241, 149, 0.06), transparent 46%),
-    radial-gradient(circle at 20% 80%, rgba(36, 193, 217, 0.05), transparent 45%),
+  background: radial-gradient(circle at 78% 14%, rgba(198, 244, 255, 0.42), transparent 44%),
     var(--bg-canvas);
 }
 
@@ -363,7 +361,7 @@ select option {
   position: sticky;
   top: 0;
   z-index: 40;
-  background: rgba(11, 14, 19, 0.88);
+  background: rgba(252, 252, 252, 0.9);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--border);
 }
@@ -489,7 +487,7 @@ select option {
 
 .hero-inspect-btn {
   background: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
   border: none;
   border-radius: 10px;
   padding: 9px 16px;
@@ -635,7 +633,7 @@ select option {
   position: sticky;
   top: 0;
   z-index: 40;
-  background: rgba(19, 24, 32, 0.92);
+  background: rgba(255, 255, 255, 0.92);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--border);
 }
@@ -721,8 +719,8 @@ select option {
   font-size: 11px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-  background: rgba(199, 242, 132, 0.16);
-  color: var(--accent-lime);
+  background: var(--ice-soft);
+  color: #0369a1;
   border-radius: 999px;
   padding: 1px 7px;
 }
@@ -964,7 +962,7 @@ select option {
 
 .tag-direct {
   background: var(--ice-soft);
-  color: #7dd3fc;
+  color: #0369a1;
 }
 
 .tag-burn {
@@ -1006,7 +1004,7 @@ select option {
 .micro-pill.is-warn {
   background: var(--hold-bg);
   border-color: var(--hold-border);
-  color: #fbbf24;
+  color: #92400e;
 }
 
 .micro-pill.is-danger {
@@ -1108,8 +1106,8 @@ select option {
 }
 
 .family-pill.active {
-  background: var(--bg-hover);
-  border-color: var(--accent-teal);
+  background: var(--ice-soft);
+  border-color: var(--ice-border);
   color: var(--ink-0);
 }
 
@@ -1227,9 +1225,13 @@ select option {
 }
 
 .chain-chip.active {
-  background: var(--bg-hover);
-  border-color: var(--accent-lime);
-  color: var(--ink-0);
+  background: var(--ink-0);
+  border-color: var(--ink-0);
+  color: #ffffff;
+}
+
+.chain-chip.active .chain-chip-val {
+  color: rgba(255, 255, 255, 0.8);
 }
 
 .chain-chip-val {
@@ -1258,7 +1260,7 @@ select option {
   max-height: 500px;
   overflow-y: auto;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+  scrollbar-color: #d1d5db transparent;
 }
 
 .asset-row {
@@ -1281,7 +1283,7 @@ select option {
 }
 
 .asset-row.is-checked {
-  background: rgba(36, 193, 217, 0.08);
+  background: var(--ice-soft);
 }
 
 .asset-row.is-blocked {
@@ -1322,7 +1324,7 @@ select option {
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  background: #131820;
+  background: #ffffff;
   border: 1px solid var(--border-strong);
   padding: 1px;
   object-fit: contain;
@@ -1551,13 +1553,13 @@ select option {
 }
 
 .logo-dark-backing {
-  background: #0b0e13;
+  background: #0a0a0a;
   border-radius: 50%;
   padding: 2px;
 }
 
 .logo-light-backing {
-  background: #f3f6fa;
+  background: #ffffff;
   border-radius: 50%;
   padding: 2px;
 }
@@ -1811,7 +1813,7 @@ select option {
   border-radius: 999px;
   background: var(--hold-bg);
   border: 1px solid var(--hold-border);
-  color: #fbbf24;
+  color: #92400e;
 }
 
 .sweep-cta-btn {
@@ -1821,7 +1823,7 @@ select option {
   border-radius: 14px;
   border: none;
   background: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
   font-family: var(--font-display);
   font-size: 15px;
   font-weight: 800;
@@ -1859,7 +1861,7 @@ select option {
   max-height: 210px;
   overflow-y: auto;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+  scrollbar-color: #d1d5db transparent;
 }
 
 .chain-queue-item {
@@ -1890,7 +1892,7 @@ select option {
 .chain-queue-run:hover:not(:disabled) {
   background: var(--accent-lime);
   border-color: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .chain-queue-run:disabled {
@@ -1918,7 +1920,7 @@ select option {
   height: 8px;
   border-radius: 50%;
   background: var(--accent-mint);
-  box-shadow: 0 0 0 3px rgba(20, 241, 149, 0.2);
+  box-shadow: 0 0 0 3px rgba(5, 150, 105, 0.18);
   flex-shrink: 0;
 }
 
@@ -1981,7 +1983,7 @@ select option {
   color: var(--ink-0);
   font-size: 12.5px;
   font-weight: 600;
-  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 14px 32px rgba(10, 10, 10, 0.14);
   cursor: pointer;
 }
 
@@ -2136,7 +2138,7 @@ select option {
   width: 34px;
   height: 34px;
   border-radius: 9px;
-  background: #f3f6fa;
+  background: #ffffff;
   border: 1px solid var(--border);
   display: inline-flex;
   align-items: center;
@@ -2146,7 +2148,7 @@ select option {
 }
 
 .wallet-logo-tile.is-dark {
-  background: #131820;
+  background: #0a0a0a;
   border-color: var(--border-strong);
 }
 
@@ -2288,7 +2290,7 @@ select option {
   height: 28px;
   border-radius: 7px;
   background: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 700;
@@ -2396,9 +2398,9 @@ select option {
 }
 
 .toast-msg {
-  background: #1d2532;
-  color: var(--ink-0);
-  border: 1px solid var(--border-strong);
+  background: #0a0a0a;
+  color: #ffffff;
+  border: 1px solid #27272a;
   border-radius: 14px;
   padding: 10px 16px;
   font-size: 13px;
@@ -2406,7 +2408,7 @@ select option {
   line-height: 1.4;
   max-width: min(460px, calc(100vw - 28px));
   overflow-wrap: anywhere;
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 12px 30px rgba(10, 10, 10, 0.14);
   pointer-events: auto;
 }
 
@@ -2432,7 +2434,7 @@ select option {
 
 .roi-low {
   background: var(--hold-bg);
-  color: #fbbf24;
+  color: #92400e;
   border-color: var(--hold-border);
 }
 
@@ -2537,7 +2539,7 @@ select option {
   height: 22px;
   border-radius: 999px;
   background: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
   font-size: 11px;
   font-weight: 700;
   display: inline-flex;
@@ -2995,19 +2997,19 @@ select option {
 .defi-step.is-active .defi-step-dot {
   background: var(--accent-teal);
   border-color: var(--accent-teal);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .defi-step.is-done .defi-step-dot {
   background: var(--accent-mint);
   border-color: var(--accent-mint);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .defi-step.is-failed .defi-step-dot {
   background: var(--block);
   border-color: var(--block);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .defi-step-title {
@@ -3032,10 +3034,10 @@ select option {
   flex-direction: column;
   gap: 10px;
   padding: 12px 14px 14px;
-  max-height: 360px;
+  max-height: 420px;
   overflow-y: auto;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.14) transparent;
+  scrollbar-color: #d1d5db transparent;
 }
 
 .defi-unavailable-details {
@@ -3161,11 +3163,11 @@ select option {
 }
 
 .defi-pos-row.is-checked {
-  background: rgba(36, 193, 217, 0.08);
+  background: var(--ice-soft);
 }
 
 .defi-pos-row.is-restricted {
-  background: rgba(19, 24, 32, 0.65);
+  background: #f8f9fb;
 }
 
 .defi-pos-main {
@@ -3232,15 +3234,15 @@ select option {
 }
 
 .defi-badge-swap {
-  background: rgba(167, 139, 250, 0.14);
-  border-color: rgba(167, 139, 250, 0.34);
-  color: #c4b5fd;
+  background: #f5f3ff;
+  border-color: #ddd6fe;
+  color: #6d28d9;
 }
 
 .defi-badge-guard {
   background: var(--hold-bg);
   border-color: var(--hold-border);
-  color: #fbbf24;
+  color: #92400e;
 }
 
 .defi-badge-cooldown {
@@ -3264,7 +3266,7 @@ select option {
 .defi-status-warn {
   background: var(--hold-bg);
   border-color: var(--hold-border);
-  color: #fbbf24;
+  color: #92400e;
 }
 
 .defi-status-blocked {
@@ -3280,7 +3282,7 @@ select option {
   border-radius: 8px;
   border: 1px solid var(--hold-border);
   background: var(--hold-bg);
-  color: #fbbf24;
+  color: #92400e;
   overflow-wrap: break-word;
 }
 
@@ -3417,13 +3419,14 @@ html[data-ui-mode="pro"] .lite-only {
 }
 
 .ui-mode-btn.active[data-ui-mode="lite"] {
-  background: var(--bg-hover);
+  background: var(--bg-surface);
   color: var(--ink-0);
+  box-shadow: 0 1px 2px rgba(10, 10, 10, 0.08);
 }
 
 .ui-mode-btn.active[data-ui-mode="pro"] {
   background: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .dust-strategy-banner {
@@ -3509,7 +3512,7 @@ html[data-ui-mode="pro"] .lite-only {
   font-weight: 600;
   background: var(--hold-bg);
   border: 1px solid var(--hold-border);
-  color: #fbbf24;
+  color: #92400e;
 }
 
 .agents-unlock-form {

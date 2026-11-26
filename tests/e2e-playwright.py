@@ -439,8 +439,8 @@ def main():
             ]), f"Pro-only controls leaked in Lite mode: {lite_check}"
             assert not lite_check["hasEipInLiteCard"], f"Technical EIP/route copy leaked in Lite card: {lite_check}"
             assert lite_check["overflowLite"] <= 0, lite_check
-            assert lite_check["bodyBg"] == "rgb(11, 14, 19)", f"Expected Jupiter obsidian #0B0E13 body bg, got {lite_check['bodyBg']}"
-            assert lite_check["ctaBg"] == "rgb(199, 242, 132)", f"Expected Jupiter lime #C7F284 CTA bg, got {lite_check['ctaBg']}"
+            assert lite_check["bodyBg"] == "rgb(252, 252, 252)", f"Expected Turgalium daylight porcelain #FCFCFC body bg, got {lite_check['bodyBg']}"
+            assert lite_check["ctaBg"] == "rgb(10, 10, 10)", f"Expected Turgalium stark black #0A0A0A CTA bg, got {lite_check['ctaBg']}"
             assert lite_check["ctaTopLite"] <= 760, f"Desktop Lite CTA pushed below fold: y={lite_check['ctaTopLite']}"
             assert not lite_check["hasRawEmoji"], f"Raw emoji or Unicode status symbol found in Lite UI!"
             assert len(lite_check["brandLogos"]) == 2 and all("/logos/turgalium.svg" in s for s in lite_check["brandLogos"]), lite_check
@@ -680,7 +680,7 @@ def main():
             results["desktop_1440"] = {
                 "ok": True,
                 "liteAndProVerified": True,
-                "jupiterDarkObsidianVerified": True,
+                "turgaliumDaylightVerified": True,
                 "zeroRawEmojis": True,
                 "ctaTopLitePx": lite_check["ctaTopLite"],
                 "ctaTopProPx": pro_check["ctaTopPro"],

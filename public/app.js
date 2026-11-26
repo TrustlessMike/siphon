@@ -1,5 +1,5 @@
-import { mountTurgaliumFunnelScene } from './turgalium-3d.js?v=2';
-import { renderConvergenceSvg } from './turgalium-svg.js?v=2';
+import { mountTurgaliumFunnelScene } from './turgalium-3d.js?v=3';
+import { renderConvergenceSvg } from './turgalium-svg.js?v=3';
 import {
   claimCctpOnSolana,
   connectCoinbaseSmartWallet,
@@ -1428,7 +1428,19 @@ function renderAll() {
     flowMeta.textContent = `${currentPlan.legs.length} active chain(s) · ${t.selectedAssets} selected · ~$${t.totalGasUsd.toFixed(2)} est. gas`;
   }
   const svgHost = document.getElementById('convergenceSvgHost');
-  if (svgHost) svgHost.innerHTML = renderConvergenceSvg(currentPlan, currentScan);
+  if (svgHost) {
+    const svgPlan = {
+      ...currentPlan,
+      effectiveFeeLabel: fin.useTiered ? fin.tieredInfo.feePercentLabel : `${feePct}%`,
+      totals: {
+        ...t,
+        effectiveProtocolFeeUsd: fin.useTiered ? fin.tieredInfo.feeUsd : safeNum(t.protocolFeeUsd),
+        effectiveNetSolanaUsdc: fin.netUsdc,
+        effectiveNetSolanaSol: fin.netSol,
+      },
+    };
+    svgHost.innerHTML = renderConvergenceSvg(svgPlan, currentScan);
+  }
 
   renderDefiUnwindPanel();
   renderChainFilterBar();

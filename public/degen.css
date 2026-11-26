@@ -1,7 +1,6 @@
 /* =====================================================================
    TURGALIUM DEGEN TAB — JUPITER PREDICTION MARKETS & SIDE-POCKET
-   Jupiter Dark Obsidian Token System (#0B0E13 / #131820 / #1A212B)
-   with #C7F284 lime CTAs, #14F195 mint, and #24C1D9 teal highlights.
+   Turgalium Daylight Porcelain Palette (#FCFCFC / #FFFFFF / #F4F5F7 / #0A0A0A / #C6F4FF).
    ===================================================================== */
 
 .degen-root {
@@ -99,7 +98,7 @@
   padding: 2px 9px;
   border-radius: 999px;
   background: var(--hold-bg);
-  color: #fbbf24;
+  color: #92400e;
   border: 1px solid var(--hold-border);
 }
 
@@ -240,7 +239,7 @@
 .degen-pct-pill.active {
   background: var(--accent-lime);
   border-color: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .degen-custom-pct-wrap {
@@ -271,7 +270,7 @@
   border-radius: 12px;
   background: var(--hold-bg);
   border: 1px solid var(--hold-border);
-  color: #fbbf24;
+  color: #92400e;
   font-size: 12.5px;
   line-height: 1.45;
 }
@@ -342,7 +341,7 @@
 }
 
 .degen-split-preset-btn:hover {
-  border-color: rgba(255, 255, 255, 0.24);
+  border-color: #9ca3af;
   background: var(--bg-hover);
 }
 
@@ -442,7 +441,7 @@
   border-radius: 10px;
   border: none;
   background: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
@@ -450,7 +449,7 @@
 }
 
 .degen-pos-connect-btn:hover {
-  background: var(--accent-lime-hover, #d7f89e);
+  background: var(--accent-lime-hover, #27272a);
 }
 
 .degen-positions-list {
@@ -502,11 +501,12 @@
 
 .degen-pos-side.is-yes {
   background: var(--accent-mint);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .degen-pos-side.is-no {
-  background: rgba(255, 255, 255, 0.14);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
   color: var(--ink-0);
 }
 
@@ -523,7 +523,7 @@
 .degen-pos-status.is-claimable {
   background: var(--accent-mint);
   border-color: var(--accent-mint);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .degen-pos-title {
@@ -577,7 +577,7 @@
   border-radius: 9px;
   border: none;
   background: var(--accent-mint);
-  color: #0b0e13;
+  color: #ffffff;
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
@@ -608,7 +608,7 @@
 }
 
 .degen-exit-btn:hover:not(:disabled) {
-  border-color: rgba(255, 255, 255, 0.25);
+  border-color: #9ca3af;
   background: var(--bg-hover);
 }
 
@@ -637,7 +637,7 @@
 .degen-pos-banner.is-warn {
   background: var(--hold-bg);
   border-color: var(--hold-border);
-  color: #fbbf24;
+  color: #92400e;
 }
 
 .degen-pos-feedback,
@@ -844,7 +844,7 @@
 .degen-cat-pill.active {
   background: var(--accent-lime);
   border-color: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .degen-search-form {
@@ -892,7 +892,7 @@
 }
 
 .degen-refresh-btn:hover {
-  border-color: rgba(255, 255, 255, 0.25);
+  border-color: #9ca3af;
   color: var(--ink-0);
   background: var(--bg-hover);
 }
@@ -1088,7 +1088,7 @@
 .degen-quote-btn.is-yes.active {
   background: var(--accent-mint);
   border-color: var(--accent-mint);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .degen-quote-btn.is-no {
@@ -1101,7 +1101,7 @@
 .degen-quote-btn.is-no.active {
   background: var(--ink-0);
   border-color: var(--ink-0);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .degen-quote-btn:disabled {
@@ -1242,13 +1242,13 @@
 .degen-side-opt.active-yes {
   background: var(--accent-mint);
   border-color: var(--accent-mint);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .degen-side-opt.active-no {
   background: var(--ink-0);
   border-color: var(--ink-0);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .degen-stake-block {
@@ -1386,7 +1386,7 @@
   height: 44px;
   border-radius: 14px;
   background: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
   border: none;
   font-size: 13.5px;
   font-weight: 700;
@@ -1396,7 +1396,7 @@
 }
 
 .degen-trade-cta:hover:not(:disabled) {
-  background: var(--accent-lime-hover, #d7f89e);
+  background: var(--accent-lime-hover, #27272a);
 }
 
 .degen-trade-cta.is-disabled {
@@ -1435,11 +1435,11 @@
 
 .degen-trade-cta.is-inline-sign {
   background: var(--accent-lime);
-  color: #0b0e13;
+  color: #ffffff;
 }
 
 .degen-trade-cta.is-inline-sign:hover:not(:disabled) {
-  background: var(--accent-lime-hover, #d7f89e);
+  background: var(--accent-lime-hover, #27272a);
 }
 
 .degen-trade-cta:disabled {
