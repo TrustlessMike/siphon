@@ -360,6 +360,11 @@ function getChainLogoPath(chain) {
       'mantle',
       'blast',
       'worldchain',
+      'hyperevm',
+      'berachain',
+      'zksync',
+      'ink',
+      'gnosis',
       'osmosis',
       'sui',
       'aptos',
@@ -3766,7 +3771,7 @@ function renderWalletModalContent() {
 
   titleEl.textContent = isEvm ? `Connect ${famShort} Wallet` : 'Connect Solana Wallet';
   subEl.textContent = isSourceEvm
-    ? 'Sign exits, swaps, burns, and bridges across 14 EVM chains.'
+    ? 'Sign exits, swaps, burns, and bridges across 19 EVM chains.'
     : isEvm
     ? meta?.signingMechanism || `Connect your ${famShort} wallet to sign 1-sig gasless sweeps.`
     : 'Receive native USDC or SOL on Solana.';

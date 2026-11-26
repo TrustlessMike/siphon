@@ -415,6 +415,90 @@ const CHAIN_SPECIFIC_SPENDERS: Partial<Record<EvmChainId, readonly KnownApproval
       riskLevel: 'medium',
     },
   ],
+  hyperevm: [
+    {
+      address: '0x00A89d7a5A02160f20150EbEA7a2b5E4879A1A8b',
+      label: 'HyperLend V3 Pool (HyperEVM)',
+      protocol: 'HyperLend',
+      category: 'defi_lending',
+      riskLevel: 'low',
+    },
+  ],
+  berachain: [
+    {
+      address: '0x4Be03f781C497A489E3cB0287833452cA9B9E80B',
+      label: 'BEX Vault (Berachain)',
+      protocol: 'BEX',
+      category: 'dex_router',
+      riskLevel: 'medium',
+    },
+    {
+      address: '0xd91dd58387Ccd9B66B390ae2d7c66dBD46BC6022',
+      label: 'Kodiak V2 Router (Berachain)',
+      protocol: 'Kodiak',
+      category: 'dex_router',
+      riskLevel: 'medium',
+    },
+    {
+      address: '0xe301E48F77963D3F7DbD2a4796962Bd7f3867Fb4',
+      label: 'Kodiak V3 SwapRouter (Berachain)',
+      protocol: 'Kodiak',
+      category: 'dex_router',
+      riskLevel: 'medium',
+    },
+  ],
+  zksync: [
+    {
+      address: '0x2da10A1e27bF85cEdD8FFb1AbBe97e53391C0295',
+      label: 'SyncSwap Classic Router (zkSync Era)',
+      protocol: 'SyncSwap',
+      category: 'dex_router',
+      riskLevel: 'medium',
+    },
+    {
+      address: '0x8B791913eB07C32779a16750e3868aA8495F5964',
+      label: 'Mute.io Switch Router (zkSync Era)',
+      protocol: 'Mute.io',
+      category: 'legacy_high_risk',
+      riskLevel: 'high',
+      deprecated: true,
+      note: 'Legacy zkSync Era AMM router — revoke unused unlimited allowances.',
+    },
+  ],
+  ink: [
+    {
+      address: '0x3a63171DD9Bebf4D07BC782FECC7eb0b890C2A45',
+      label: 'Velodrome Slipstream Router (Ink)',
+      protocol: 'Velodrome',
+      category: 'dex_router',
+      riskLevel: 'medium',
+    },
+  ],
+  gnosis: [
+    {
+      address: '0x1C232F01118CB8B424793ae03F870aa7D0ac7f77',
+      label: 'Honeyswap V2 Router (Gnosis)',
+      protocol: 'Honeyswap',
+      category: 'dex_router',
+      riskLevel: 'medium',
+    },
+    {
+      address: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506',
+      label: 'SushiSwap V2 Router (Gnosis)',
+      protocol: 'SushiSwap',
+      category: 'legacy_high_risk',
+      riskLevel: 'high',
+      deprecated: true,
+      note: 'Legacy SushiSwap v2 router on Gnosis — revoke lingering approvals.',
+    },
+    {
+      address: '0xC92E8bdf79f0507f65a392b0ab4667716BFE0110',
+      label: 'CoW Protocol GPv2VaultRelayer (Gnosis)',
+      protocol: 'CoW Swap',
+      category: 'dex_router',
+      riskLevel: 'medium',
+    },
+  ],
 };
 
 /**

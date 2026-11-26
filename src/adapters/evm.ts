@@ -20,7 +20,7 @@ import type {
 
 export const EVM_FAMILY_META: ChainFamilyMeta = {
   family: 'evm',
-  label: 'EVM (14 Chains)',
+  label: 'EVM (19 Chains)',
   shortLabel: 'EVM',
   chains: CHAIN_LIST.map((c) => ({
     id: c.id,

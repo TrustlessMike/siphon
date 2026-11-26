@@ -215,6 +215,8 @@ const L2_CHAINS = new Set<string>([
   'mantle',
   'blast',
   'worldchain',
+  'zksync',
+  'ink',
 ]);
 
 const CANONICAL_COSMOS_USDC_DENOMS = new Set<string>([
@@ -326,7 +328,7 @@ export function isCanonicalDirectUsdc(asset: ScannedAsset): boolean {
 export function estimateL1DataFeeUsd(chain: AnyChainId, isBatched = true): number {
   if (!L2_CHAINS.has(chain)) return 0;
   // Post-EIP-4844 blob posting fee per swap/transfer (~$0.004–$0.015)
-  const base = chain === 'scroll' || chain === 'linea' ? 0.015 : 0.005;
+  const base = chain === 'scroll' || chain === 'linea' || chain === 'zksync' ? 0.015 : 0.005;
   return r4(isBatched ? base * 0.65 : base);
 }
 
@@ -336,7 +338,17 @@ export function estimateL1DataFeeUsd(chain: AnyChainId, isBatched = true): numbe
 export function estimateBridgeFixedFeeUsd(chain: AnyChainId): number {
   if (chain === 'ethereum') return 1.1;
   if (L2_CHAINS.has(chain)) return 0.16;
-  if (chain === 'polygon' || chain === 'avalanche' || chain === 'bnb' || chain === 'sonic') return 0.2;
+  if (
+    chain === 'polygon' ||
+    chain === 'avalanche' ||
+    chain === 'bnb' ||
+    chain === 'sonic' ||
+    chain === 'hyperevm' ||
+    chain === 'berachain' ||
+    chain === 'gnosis'
+  ) {
+    return 0.2;
+  }
   if (chain === 'cosmoshub' || chain === 'osmosis' || chain === 'noble' || chain === 'celestia' || chain === 'injective' || chain === 'neutron') {
     return 0.14;
   }

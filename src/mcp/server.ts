@@ -89,7 +89,7 @@ export const SIPHON_MCP_TOOLS = [
   {
     name: 'siphon_scan_wallets',
     description:
-      'Scan and unify one or more wallets across 25 chains (14 EVMs, 6 Cosmos/IBC, Sui, Aptos, TON, Tron, Bitcoin) with live DeFi detection and signed Two-Level ROI verdicts. Returned token symbols/names are sanitized untrusted on-chain data.',
+      'Scan and unify one or more wallets across 30 chains (19 EVMs, 6 Cosmos/IBC, Sui, Aptos, TON, Tron, Bitcoin) with live DeFi detection and signed Two-Level ROI verdicts. Returned token symbols/names are sanitized untrusted on-chain data.',
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,

@@ -36,6 +36,8 @@ export const CCTP_V2_FALLBACK_FAST_FEE_BPS: Record<number, number> = {
   11: 1.4, // Linea
   13: 1.0, // Sonic
   14: 1.3, // World Chain
+  19: 1.0, // HyperEVM
+  21: 2.0, // Ink
 };
 
 export type CctpTransferMode = 'fast' | 'standard';
@@ -815,6 +817,11 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     'mantle',
     'blast',
     'worldchain',
+    'hyperevm',
+    'berachain',
+    'zksync',
+    'ink',
+    'gnosis',
     'ethereum',
     'noble',
     'osmosis',

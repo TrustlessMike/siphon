@@ -23,7 +23,12 @@ export type EvmChainId =
   | 'scroll'
   | 'mantle'
   | 'blast'
-  | 'worldchain';
+  | 'worldchain'
+  | 'hyperevm'
+  | 'berachain'
+  | 'zksync'
+  | 'ink'
+  | 'gnosis';
 
 export type CosmosChainId =
   | 'cosmoshub'

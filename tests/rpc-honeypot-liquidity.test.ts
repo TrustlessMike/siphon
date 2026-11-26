@@ -409,6 +409,10 @@ test('HIGH-05: ALCHEMY_NETWORK_SUBDOMAINS covers all supported chains including 
   assert.equal(ALCHEMY_NETWORK_SUBDOMAINS.blast, 'blast-mainnet');
   assert.equal(ALCHEMY_NETWORK_SUBDOMAINS.unichain, 'unichain-mainnet');
   assert.equal(ALCHEMY_NETWORK_SUBDOMAINS.worldchain, 'worldchain-mainnet');
+  assert.equal(ALCHEMY_NETWORK_SUBDOMAINS.berachain, 'berachain-mainnet');
+  assert.equal(ALCHEMY_NETWORK_SUBDOMAINS.zksync, 'zksync-mainnet');
+  assert.equal(ALCHEMY_NETWORK_SUBDOMAINS.ink, 'ink-mainnet');
+  assert.equal(ALCHEMY_NETWORK_SUBDOMAINS.gnosis, 'gnosis-mainnet');
 });
 
 test('HIGH-05: decodeAbiStringOrBytes32 decodes standard ABI strings and MKR-style bytes32', () => {

@@ -348,6 +348,25 @@ export const V2_DEX_ROUTERS: Partial<Record<EvmChainId, V2DexRouterConfig[]>> = 
       factory: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73',
     },
   ],
+  berachain: [
+    {
+      name: 'Kodiak v2',
+      router: '0xd91dd58387Ccd9B66B390ae2d7c66dBD46BC6022',
+      factory: '0x5e705e184d233ff2a7cb1553793464a9d0c3028f',
+    },
+  ],
+  gnosis: [
+    {
+      name: 'Honeyswap v2',
+      router: '0x1C232F01118CB8B424793ae03F870aa7D0ac7f77',
+      factory: '0xa818b4f111ccac7aa31d0bcc0806d64f2e0737d7',
+    },
+    {
+      name: 'SushiSwap v2',
+      router: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506',
+      factory: '0xc35DADB65012eC5796536bD9864eD8773aBc74C4',
+    },
+  ],
 };
 
 export interface NftPositionManagerConfig {
@@ -377,6 +396,9 @@ export const UNISWAP_V3_NFT_MANAGERS: Partial<Record<EvmChainId, NftPositionMana
   ],
   bnb: [
     { protocol: 'Uniswap v3', address: '0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613' },
+  ],
+  berachain: [
+    { protocol: 'Kodiak v3', address: '0xFE5E8C83FFE4d9627A75EaA7Fee864768dB989bD' },
   ],
 };
 
