@@ -1,8 +1,9 @@
 /**
  * Turgalium Capital-Preservation & Post-Arrival Solana Tools Module:
  *  1. 1-Click Reclaim Free SOL (Empty-ATA Rent Vacuum) -> POST /api/solana/rent-scan
- *  2. 1-Click Post-Arrival Solana Yield Park (90% Safe Compound) -> GET /api/solana/yield-strategies + POST /api/solana/yield-park
- *  3. 1-Click Stale ERC-20 Approval Revoker -> POST /api/approvals/scan + EIP-5792 / sequential revoke
+ *  2. 1-Click Sweep Solana SPL Dust (Swap to USDC/SOL + Atomic CloseAccount Rent Reclaim) -> POST /api/solana/dust-scan + /api/solana/dust-sweep
+ *  3. 1-Click Post-Arrival Solana Yield Park (90% Safe Compound) -> GET /api/solana/yield-strategies + POST /api/solana/yield-park
+ *  4. 1-Click Stale ERC-20 Approval Revoker -> POST /api/approvals/scan + EIP-5792 / sequential revoke
  *
  * Security: Zero `innerHTML` with untrusted API strings — all dynamic values rendered strictly via `textContent`.
  */
@@ -95,6 +96,17 @@ const state = {
   revokedKeys: new Set(),
   approvalLastResult: null, // { mode, count, txHashes, batchId }
   approvalSeq: 0,
+
+  // Solana SPL Dust Sweeper
+  dustTargetAsset: 'usdc', // 'usdc' | 'sol'
+  dustMaxUsd: 50,
+  dustScan: null,
+  dustLoading: false,
+  dustError: null,
+  dustSweepingKey: null, // 'all' | tokenAccount
+  sweptDustAccounts: new Set(),
+  dustLastResult: null, // { count, targetSymbol, outputUi, reclaimedSol, signatures, explorerUrl }
+  dustSeq: 0,
 
   // Shared context from app.js events
   latestScanReport: null,
@@ -266,6 +278,25 @@ function updateSectionSummaryBadges() {
     } else {
       apprBadge.textContent = 'Approval Hygiene';
       apprBadge.classList.remove('is-warn', 'is-active');
+    }
+  }
+
+  const dustBadge = document.getElementById('toolsSummaryDustBadge');
+  if (dustBadge) {
+    if (state.dustScan) {
+      const remaining = (state.dustScan.dustAccounts || []).filter(
+        (a) => !state.sweptDustAccounts.has(a.tokenAccount)
+      );
+      if (remaining.length > 0) {
+        dustBadge.textContent = `${remaining.length} SPL Dust · +${fmtSol(remaining.reduce((s, a) => s + (Number(a.rentSol) || 0.00203928), 0))} SOL`;
+        dustBadge.classList.add('is-active');
+      } else {
+        dustBadge.textContent = '0 SPL Dust';
+        dustBadge.classList.add('is-active');
+      }
+    } else {
+      dustBadge.textContent = 'SPL Dust Sweep';
+      dustBadge.classList.remove('is-active');
     }
   }
 }
@@ -1223,6 +1254,550 @@ function renderApprovalRevokerCard() {
 }
 
 // =========================================================================
+// 4. SOLANA SPL DUST SWEEPER (1-CLICK SWEEP TO USDC/SOL + ATOMIC ATA RENT)
+// =========================================================================
+
+function createLucideSvgNode(iconName, size = 16) {
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('width', String(size));
+  svg.setAttribute('height', String(size));
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  svg.setAttribute('aria-hidden', 'true');
+
+  if (iconName === 'sparkles') {
+    const p1 = document.createElementNS(SVG_NS, 'path');
+    p1.setAttribute(
+      'd',
+      'M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z'
+    );
+    const p2 = document.createElementNS(SVG_NS, 'path');
+    p2.setAttribute('d', 'M20 3v4');
+    const p3 = document.createElementNS(SVG_NS, 'path');
+    p3.setAttribute('d', 'M22 5h-4');
+    svg.append(p1, p2, p3);
+  } else if (iconName === 'check') {
+    const poly = document.createElementNS(SVG_NS, 'polyline');
+    poly.setAttribute('points', '20 6 9 17 4 12');
+    svg.appendChild(poly);
+  } else {
+    const p = document.createElementNS(SVG_NS, 'path');
+    p.setAttribute('d', 'M12 2L2 7l10 5 10-5-10-5z');
+    svg.appendChild(p);
+  }
+  return svg;
+}
+
+function ensureSplDustCard() {
+  const grid = document.getElementById('preservationToolsGrid');
+  if (!grid || document.getElementById('splDustCard')) return;
+
+  // Add summary chip inside .ptools-summary-chips if not present
+  const chipsRow = document.querySelector('#preservationToolsSection .ptools-summary-chips');
+  if (chipsRow && !document.getElementById('toolsSummaryDustBadge')) {
+    const chip = el('span', 'ptools-chip', 'SPL Dust Sweep');
+    chip.id = 'toolsSummaryDustBadge';
+    chipsRow.appendChild(chip);
+  }
+
+  const card = el('article', 'ptool-card');
+  card.id = 'splDustCard';
+
+  const head = el('div', 'ptool-card-head');
+  const titleWrap = document.createElement('div');
+  const titleRow = el('div', 'ptool-card-title-row');
+  const iconWrap = el('span', 'ptool-card-icon');
+  iconWrap.appendChild(createLucideSvgNode('sparkles', 16));
+  titleRow.appendChild(iconWrap);
+  titleRow.appendChild(el('h3', '', 'Sweep Solana SPL Dust'));
+  titleWrap.appendChild(titleRow);
+  titleWrap.appendChild(
+    el('p', 'ptool-card-sub', 'Convert small SPL tokens into USDC or SOL & reclaim ATA rent')
+  );
+  head.appendChild(titleWrap);
+
+  const badge = el('span', 'ptool-badge mono', 'Max $50 / token');
+  badge.id = 'splDustCountBadge';
+  head.appendChild(badge);
+  card.appendChild(head);
+
+  const controls = el('div', 'ptool-dust-controls');
+
+  const targetField = el('label', 'ptool-field');
+  targetField.appendChild(el('span', 'ptool-label', 'Convert into'));
+  const targetSelect = el('select', 'ptool-select');
+  targetSelect.id = 'splDustTargetSelect';
+  targetSelect.setAttribute('aria-label', 'Target asset for Solana SPL dust sweep');
+  const optUsdc = document.createElement('option');
+  optUsdc.value = 'usdc';
+  optUsdc.textContent = 'USDC (SPL)';
+  optUsdc.selected = state.dustTargetAsset === 'usdc';
+  const optSol = document.createElement('option');
+  optSol.value = 'sol';
+  optSol.textContent = 'SOL (Native)';
+  optSol.selected = state.dustTargetAsset === 'sol';
+  targetSelect.append(optUsdc, optSol);
+  targetField.appendChild(targetSelect);
+  controls.appendChild(targetField);
+
+  const maxField = el('label', 'ptool-field');
+  maxField.appendChild(el('span', 'ptool-label', 'Max USD'));
+  const maxInput = el('input', 'ptool-input mono');
+  maxInput.id = 'splDustMaxUsdInput';
+  maxInput.type = 'number';
+  maxInput.min = '1';
+  maxInput.max = '5000';
+  maxInput.step = '5';
+  maxInput.value = String(state.dustMaxUsd);
+  maxInput.setAttribute('aria-label', 'Maximum USD value per Solana SPL dust token');
+  maxField.appendChild(maxInput);
+  controls.appendChild(maxField);
+
+  const scanBtn = el('button', 'btn-outline-sm ptool-inline-btn', 'Scan Dust');
+  scanBtn.type = 'button';
+  scanBtn.id = 'scanSplDustBtn';
+  controls.appendChild(scanBtn);
+
+  card.appendChild(controls);
+
+  const body = el('div', 'ptool-card-body');
+  body.id = 'splDustBody';
+  body.setAttribute('aria-live', 'polite');
+  card.appendChild(body);
+
+  const rentCard = document.getElementById('rentVacuumCard');
+  if (rentCard && rentCard.parentElement === grid) {
+    rentCard.insertAdjacentElement('afterend', card);
+  } else {
+    grid.appendChild(card);
+  }
+
+  targetSelect.addEventListener('change', (ev) => {
+    const val = String(ev.target?.value || 'usdc');
+    state.dustTargetAsset = val === 'sol' ? 'sol' : 'usdc';
+    state.dustError = null;
+    renderSplDustCard();
+  });
+
+  maxInput.addEventListener('change', (ev) => {
+    const val = Number(ev.target?.value);
+    if (Number.isFinite(val) && val >= 0.01 && val <= 5000) {
+      state.dustMaxUsd = Number(val.toFixed(2));
+      state.dustScan = null;
+      state.sweptDustAccounts.clear();
+      state.dustError = null;
+      renderSplDustCard();
+      updateSectionSummaryBadges();
+    }
+  });
+
+  scanBtn.addEventListener('click', () => {
+    runSolanaSplDustScan({ silent: false });
+  });
+}
+
+async function runSolanaSplDustScan({ silent = false, forceOwnerAddress = null } = {}) {
+  const ownerAddress = forceOwnerAddress || resolveSolanaAddress();
+  if (!ownerAddress) {
+    if (!silent) {
+      state.dustError =
+        'Connect a Solana wallet or enter a Solana address to scan sweepable SPL dust.';
+      renderSplDustCard();
+      document.getElementById('rentOwnerInput')?.focus();
+    }
+    return null;
+  }
+
+  const maxInput = document.getElementById('splDustMaxUsdInput');
+  const parsedMax = Number(maxInput?.value ?? state.dustMaxUsd);
+  const maxDustUsd =
+    Number.isFinite(parsedMax) && parsedMax >= 0.01 && parsedMax <= 5000
+      ? Number(parsedMax.toFixed(2))
+      : 50;
+  state.dustMaxUsd = maxDustUsd;
+
+  const seq = ++state.dustSeq;
+  state.dustLoading = true;
+  state.dustError = null;
+  state.dustLastResult = null;
+  renderSplDustCard();
+
+  try {
+    const data = await apiJson('/api/solana/dust-scan', {
+      method: 'POST',
+      body: JSON.stringify({
+        ownerAddress,
+        maxDustUsd,
+      }),
+    });
+    if (seq !== state.dustSeq) return null;
+    state.dustScan = data;
+    state.sweptDustAccounts.clear();
+    return data;
+  } catch (err) {
+    if (seq !== state.dustSeq) return null;
+    if (!silent) {
+      state.dustError = err instanceof Error ? err.message : 'Failed to scan Solana SPL dust.';
+    }
+    return null;
+  } finally {
+    if (seq === state.dustSeq) {
+      state.dustLoading = false;
+      renderSplDustCard();
+      updateSectionSummaryBadges();
+    }
+  }
+}
+
+async function handleSweepSplDust(accountsToSweep, keyLabel) {
+  const connectedSol = getConnectedSolanaAddress();
+  if (!connectedSol) {
+    showToast('Connect your Solana wallet (Phantom, Backpack, or Solflare) to sweep SPL dust.');
+    document.getElementById('connectSolBtn')?.click();
+    return;
+  }
+
+  let scan = state.dustScan;
+  if (!scan || scan.ownerAddress !== connectedSol) {
+    scan = await runSolanaSplDustScan({ silent: false, forceOwnerAddress: connectedSol });
+    if (!scan) return;
+    accountsToSweep = scan.dustAccounts || [];
+  }
+
+  const activeAccounts = (accountsToSweep || []).filter(
+    (a) => a && a.tokenAccount && !state.sweptDustAccounts.has(a.tokenAccount)
+  );
+  if (!activeAccounts.length) {
+    showToast('No remaining SPL dust accounts to sweep.');
+    return;
+  }
+
+  const seq = ++state.dustSeq;
+  state.dustSweepingKey = keyLabel;
+  state.dustError = null;
+  renderSplDustCard();
+
+  let sweptCount = 0;
+  let totalOutputUi = 0;
+  let totalReclaimedSol = 0;
+  const signatures = [];
+  let firstExplorerUrl = null;
+  let targetSymbol = state.dustTargetAsset === 'sol' ? 'SOL' : 'USDC';
+
+  try {
+    const plan = await apiJson('/api/solana/dust-sweep', {
+      method: 'POST',
+      body: JSON.stringify({
+        ownerAddress: connectedSol,
+        targetAsset: state.dustTargetAsset,
+        maxDustUsd: state.dustMaxUsd,
+        closeAccounts: true,
+        buildTransactions: true,
+        tokens: activeAccounts.slice(0, 10).map((a) => ({
+          tokenAccount: a.tokenAccount,
+          mint: a.mint,
+          amount: a.amount,
+          decimals: a.decimals,
+          uiAmount: a.uiAmount,
+          symbol: a.symbol,
+          usdValue: a.usdValue,
+          rentLamports: a.rentLamports,
+        })),
+      }),
+    });
+    if (seq !== state.dustSeq) return;
+    targetSymbol = plan?.targetSymbol || targetSymbol;
+
+    const items = Array.isArray(plan?.items) ? plan.items : [];
+    if (items.length === 0) {
+      const skipReason = plan?.skipped?.[0]?.reason;
+      state.dustError =
+        skipReason || 'No routable SPL dust swaps available within safe 5% price impact cap.';
+      return;
+    }
+
+    for (const item of items) {
+      if (getConnectedSolanaAddress() !== connectedSol) {
+        throw new Error('Connected Solana wallet changed during sweep. Please retry.');
+      }
+      const txB64 = item?.transaction?.swapTransactionBase64;
+      if (!txB64) continue;
+      const res = await signAndSendSolanaVersionedTx(txB64, {
+        expectedFeePayer: connectedSol,
+        flow: 'jupiter_yield',
+        autoConnect: false,
+      });
+      if (seq !== state.dustSeq) return;
+      state.sweptDustAccounts.add(item.tokenAccount);
+      sweptCount += 1;
+      totalOutputUi += Number(item?.quote?.estimatedOutputUi || 0);
+      if (item?.rentReclaim?.atomicCloseAppended) {
+        totalReclaimedSol += Number(item?.rentReclaim?.rentSol || 0.00203928);
+      }
+      if (res?.signature) signatures.push(res.signature);
+      if (!firstExplorerUrl && res?.explorerUrl) firstExplorerUrl = res.explorerUrl;
+    }
+
+    if (sweptCount > 0) {
+      state.dustLastResult = {
+        count: sweptCount,
+        targetSymbol,
+        outputUi: Number(totalOutputUi.toFixed(targetSymbol === 'SOL' ? 5 : 2)),
+        reclaimedSol: Number(totalReclaimedSol.toFixed(8)),
+        signatures,
+        explorerUrl: firstExplorerUrl,
+      };
+      showToast(
+        `Swept ${sweptCount} SPL dust token(s) into ${targetSymbol}${totalReclaimedSol > 0 ? ` + reclaimed ${fmtSol(totalReclaimedSol)} SOL rent` : ''}!`
+      );
+    }
+  } catch (err) {
+    if (seq !== state.dustSeq) return;
+    if (sweptCount > 0) {
+      state.dustLastResult = {
+        count: sweptCount,
+        targetSymbol,
+        outputUi: Number(totalOutputUi.toFixed(targetSymbol === 'SOL' ? 5 : 2)),
+        reclaimedSol: Number(totalReclaimedSol.toFixed(8)),
+        signatures,
+        explorerUrl: firstExplorerUrl,
+      };
+    }
+    state.dustError = isUserRejectedError(err)
+      ? sweptCount > 0
+        ? `Swept ${sweptCount} token(s) before signature was rejected in Solana wallet.`
+        : 'Signature rejected in Solana wallet. No SPL dust was swept.'
+      : err instanceof Error
+      ? err.message
+      : 'Failed to sweep Solana SPL dust.';
+  } finally {
+    if (seq === state.dustSeq) {
+      state.dustSweepingKey = null;
+      renderSplDustCard();
+      updateSectionSummaryBadges();
+    }
+  }
+}
+
+function renderSplDustCard() {
+  const host = document.getElementById('splDustBody');
+  const badge = document.getElementById('splDustCountBadge');
+  const scanBtn = document.getElementById('scanSplDustBtn');
+  const targetSelect = document.getElementById('splDustTargetSelect');
+  if (!host) return;
+
+  if (targetSelect && targetSelect.value !== state.dustTargetAsset) {
+    targetSelect.value = state.dustTargetAsset;
+  }
+  if (scanBtn) {
+    scanBtn.disabled = state.dustLoading || Boolean(state.dustSweepingKey);
+    scanBtn.textContent = state.dustLoading ? 'Scanning…' : 'Scan Dust';
+  }
+
+  const connectedSol = getConnectedSolanaAddress();
+  const activeSol = resolveSolanaAddress();
+  const scan = state.dustScan;
+  const allDust = Array.isArray(scan?.dustAccounts) ? scan.dustAccounts : [];
+  const activeDust = allDust.filter((a) => !state.sweptDustAccounts.has(a.tokenAccount));
+  const targetLabel = state.dustTargetAsset === 'sol' ? 'SOL' : 'USDC';
+
+  if (badge) {
+    if (!scan) {
+      badge.textContent = `Max $${state.dustMaxUsd} / token`;
+      badge.className = 'ptool-badge mono';
+    } else if (activeDust.length === 0) {
+      badge.textContent = '0 dust left';
+      badge.className = 'ptool-badge is-emerald mono';
+    } else {
+      badge.textContent = `${activeDust.length} dust · +${fmtSol(
+        activeDust.reduce((s, a) => s + (Number(a.rentSol) || 0.00203928), 0)
+      )} SOL`;
+      badge.className = 'ptool-badge is-emerald mono';
+    }
+  }
+
+  const frag = document.createDocumentFragment();
+
+  if (state.dustError) {
+    frag.appendChild(el('div', 'ptool-alert is-error', state.dustError));
+  }
+
+  if (state.dustLastResult) {
+    const r = state.dustLastResult;
+    const okBox = el('div', 'ptool-alert is-success');
+    const rentSuffix =
+      r.reclaimedSol > 0 ? ` + ${fmtSol(r.reclaimedSol)} SOL rent reclaimed` : '';
+    okBox.appendChild(
+      el(
+        'span',
+        '',
+        `Swept ${r.count} SPL token(s) → ~${r.outputUi} ${r.targetSymbol}${rentSuffix} · `
+      )
+    );
+    const linkHref = safeHttpsUrl(r.explorerUrl, SOLSCAN_ALLOWED_HOSTS);
+    if (linkHref && r.signatures?.length) {
+      const a = el('a', 'ptool-link mono', `${shortAddr(r.signatures[0])} ↗`);
+      a.href = linkHref;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      okBox.appendChild(a);
+    }
+    frag.appendChild(okBox);
+  }
+
+  if (!scan) {
+    frag.appendChild(
+      el(
+        'p',
+        'ptool-empty',
+        activeSol
+          ? `Ready to scan ${shortAddr(activeSol)} for SPL dust under $${state.dustMaxUsd}. Automatically protects SOL, USDC, JupSOL, jlUSDC, frozen accounts, and large positions.`
+          : 'Connect Solana or enter a Solana address to convert small SPL dust into USDC or SOL and reclaim 0.00203928 SOL ATA rent per token.'
+      )
+    );
+    host.replaceChildren(frag);
+    return;
+  }
+
+  const remainingDustUsd = activeDust.reduce((s, a) => s + (Number(a.usdValue) || 0), 0);
+  const remainingRentSol = activeDust.reduce(
+    (s, a) => s + (Number(a.rentSol) || 0.00203928),
+    0
+  );
+
+  const metrics = el('div', 'ptool-kpi-grid');
+  const k1 = el('div', 'ptool-kpi');
+  k1.appendChild(el('span', 'ptool-kpi-label', 'Dust Tokens'));
+  k1.appendChild(el('strong', 'ptool-kpi-val mono', String(activeDust.length)));
+  metrics.appendChild(k1);
+
+  const k2 = el('div', 'ptool-kpi');
+  k2.appendChild(el('span', 'ptool-kpi-label', 'Est. Dust Value'));
+  k2.appendChild(el('strong', 'ptool-kpi-val mono', fmtUsd(remainingDustUsd)));
+  metrics.appendChild(k2);
+
+  const k3 = el('div', 'ptool-kpi');
+  k3.appendChild(el('span', 'ptool-kpi-label', 'ATA Rent Reclaim'));
+  k3.appendChild(
+    el('strong', 'ptool-kpi-val mono is-emerald', `+${fmtSol(remainingRentSol)} SOL`)
+  );
+  metrics.appendChild(k3);
+  frag.appendChild(metrics);
+
+  frag.appendChild(
+    el(
+      'div',
+      'ptool-meta-line mono',
+      `Scanned ${Number(scan.totalTokenAccountsScanned || 0)} SPL accounts · skips SOL/USDC/JupSOL/jlUSDC & >$${Number(scan.maxDustUsd || state.dustMaxUsd)}`
+    )
+  );
+
+  if (allDust.length === 0) {
+    frag.appendChild(
+      el(
+        'div',
+        'ptool-alert is-success',
+        `Clean wallet — 0 sweepable SPL dust tokens under $${Number(scan.maxDustUsd || state.dustMaxUsd)}.`
+      )
+    );
+    host.replaceChildren(frag);
+    return;
+  }
+
+  if (!connectedSol && activeDust.length > 0) {
+    frag.appendChild(
+      el(
+        'div',
+        'ptool-alert is-info',
+        'Read-only scan — connect Phantom, Backpack, or Solflare to sign Jupiter dust swaps & atomic CloseAccount.'
+      )
+    );
+  }
+
+  const list = el('div', 'ptool-list');
+  const visible = allDust.slice(0, 5);
+  for (const acc of visible) {
+    const isSwept = state.sweptDustAccounts.has(acc.tokenAccount);
+    const isBusy =
+      state.dustSweepingKey === acc.tokenAccount || state.dustSweepingKey === 'all';
+    const row = el('div', `ptool-list-row${isSwept ? ' is-revoked' : ''}`);
+    const main = el('div', 'ptool-list-main');
+    const titleLine = el('div', 'ptool-finding-title-row');
+    titleLine.appendChild(
+      el('strong', 'ptool-list-primary mono', String(acc.symbol || shortAddr(acc.mint)))
+    );
+    titleLine.appendChild(
+      el(
+        'span',
+        'ptool-pill is-emerald mono',
+        `+${Number(acc.rentSol || 0.00203928).toFixed(5)} SOL`
+      )
+    );
+    main.appendChild(titleLine);
+
+    const valLabel =
+      acc.usdValue !== null && acc.usdValue !== undefined
+        ? fmtUsd(acc.usdValue)
+        : 'Unpriced (quoted on sweep)';
+    main.appendChild(
+      el(
+        'span',
+        'ptool-list-sub mono',
+        `${Number(acc.uiAmount || 0).toLocaleString(undefined, { maximumFractionDigits: 4 })} · ${valLabel}`
+      )
+    );
+    row.appendChild(main);
+
+    const rowBtn = el('button', `btn-row-exec ptool-row-btn${isSwept ? ' is-done' : ''}`);
+    rowBtn.type = 'button';
+    if (isSwept) {
+      rowBtn.appendChild(createLucideSvgNode('check', 12));
+      rowBtn.appendChild(el('span', '', 'Swept'));
+    } else {
+      rowBtn.textContent = isBusy ? 'Signing…' : 'Sweep';
+    }
+    rowBtn.disabled = isSwept || Boolean(state.dustSweepingKey) || state.dustLoading;
+    rowBtn.addEventListener('click', () => handleSweepSplDust([acc], acc.tokenAccount));
+    row.appendChild(rowBtn);
+    list.appendChild(row);
+  }
+  if (allDust.length > visible.length) {
+    list.appendChild(
+      el(
+        'div',
+        'ptool-meta-line mono',
+        `+${allDust.length - visible.length} more SPL dust token(s) ready to sweep`
+      )
+    );
+  }
+  frag.appendChild(list);
+
+  if (activeDust.length > 0) {
+    const sweepAllBtn = el(
+      'button',
+      'btn-pill-dark btn-sm ptool-primary-btn',
+      state.dustSweepingKey === 'all'
+        ? 'Confirm in Solana Wallet…'
+        : connectedSol
+        ? `1-Click Sweep ${activeDust.length} Dust → ${targetLabel}`
+        : `Connect Solana to Sweep Dust → ${targetLabel}`
+    );
+    sweepAllBtn.type = 'button';
+    sweepAllBtn.id = 'sweepAllSplDustBtn';
+    sweepAllBtn.disabled = Boolean(state.dustSweepingKey) || state.dustLoading;
+    sweepAllBtn.addEventListener('click', () => handleSweepSplDust(activeDust, 'all'));
+    frag.appendChild(sweepAllBtn);
+  }
+
+  host.replaceChildren(frag);
+}
+
+// =========================================================================
 // LIFECYCLE & EVENT SYNC
 // =========================================================================
 
@@ -1327,6 +1902,7 @@ function bindEvents() {
     } else if (detail.family === 'solana') {
       state.rentSeq += 1;
       state.yieldSeq += 1;
+      state.dustSeq += 1;
       state.rentScan = null;
       state.rentLastTx = null;
       state.rentError = null;
@@ -1335,6 +1911,12 @@ function bindEvents() {
       state.yieldLastTx = null;
       state.yieldError = null;
       state.yieldLoading = false;
+      state.dustScan = null;
+      state.dustLastResult = null;
+      state.dustError = null;
+      state.dustLoading = false;
+      state.dustSweepingKey = null;
+      state.sweptDustAccounts.clear();
       if (detail.action === 'disconnect' || !detail.address) {
         state.yieldAmountUsdc = 100;
         state.userEditedYieldAmount = false;
@@ -1347,6 +1929,7 @@ function bindEvents() {
         if (rentIn) rentIn.value = detail.address;
       }
       renderRentVacuumCard();
+      renderSplDustCard();
       renderYieldParkCard();
       updateSectionSummaryBadges();
     }
@@ -1372,6 +1955,7 @@ function bindEvents() {
       }
     }
     renderRentVacuumCard();
+    renderSplDustCard();
     renderYieldParkCard();
     renderApprovalRevokerCard();
     updateSectionSummaryBadges();
@@ -1389,7 +1973,9 @@ function bindEvents() {
     updateSectionSummaryBadges();
   });
 
+  ensureSplDustCard();
   renderRentVacuumCard();
+  renderSplDustCard();
   renderYieldParkCard();
   renderApprovalRevokerCard();
   updateSectionSummaryBadges();
@@ -1405,12 +1991,14 @@ if (document.readyState === 'loading') {
 window.__turgaliumPreservationTools = {
   getState: () => ({
     rentScan: state.rentScan,
+    dustScan: state.dustScan,
     yieldPlan: state.yieldPlan,
     approvalScan: state.approvalScan,
     strategies: state.strategies,
     selectedApprovalChain: state.selectedApprovalChain,
   }),
   runSolanaRentScan,
+  runSolanaSplDustScan,
   runYieldParkRequest,
   runApprovalScan,
 };
