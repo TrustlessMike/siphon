@@ -4,7 +4,7 @@ import {
   type ReadLiveUnlockQueuesOptions,
 } from '../defi/unlock-readers.js';
 import { validateCosmosAddress, validateEvmHexAddress } from '../scanner/address.js';
-import { EVM_CHAINS, getProtocolFeeConfig } from '../scanner/chains.js';
+import { computePreservationFee, EVM_CHAINS, getProtocolFeeConfig } from '../scanner/chains.js';
 import {
   estimateBridgeFixedFeeUsd,
   estimateL1DataFeeUsd,
@@ -340,6 +340,7 @@ function buildChainRouteCandidates(params: {
   assets: ScannedAsset[];
   outputAsset: 'USDC' | 'SOL';
   protocolFeeBps: number;
+  useTieredFee?: boolean;
   gasGwei: number;
   nativePriceUsd: number;
   ataRentUsd: number;
@@ -349,7 +350,7 @@ function buildChainRouteCandidates(params: {
   naiveBridgeBaseline: RouteCandidateQuote;
   rationale: string;
 } {
-  const { chain, assets, outputAsset, protocolFeeBps, gasGwei, nativePriceUsd, ataRentUsd } =
+  const { chain, assets, outputAsset, protocolFeeBps, useTieredFee = false, gasGwei, nativePriceUsd, ataRentUsd } =
     params;
   const evmCfg = isEvmChainId(chain) ? EVM_CHAINS[chain] : undefined;
   const feeRate = protocolFeeBps / 10_000;
@@ -420,7 +421,10 @@ function buildChainRouteCandidates(params: {
     const slippageUsd = r2(Math.max(0, spec.slippageUsd));
     const bridgeFeeUsd = r2(Math.max(0, spec.bridgeFeeUsd));
     const ataRent = r2(Math.max(0, spec.ataRentUsd));
-    const protocolFeeUsd = r2(Math.max(0, grossUsd - slippageUsd) * feeRate);
+    const feeBaseUsd = Math.max(0, grossUsd - slippageUsd);
+    const protocolFeeUsd = useTieredFee
+      ? computePreservationFee(feeBaseUsd).feeUsd
+      : r2(feeBaseUsd * feeRate);
     const totalCostUsd = r2(gasUsd + l1Fee + slippageUsd + bridgeFeeUsd + protocolFeeUsd + ataRent);
     const netUsdPreserved = r2(grossUsd - totalCostUsd);
     const preservationRatePct =
@@ -883,10 +887,13 @@ export async function evaluatePreservationPlan(
 ): Promise<PreservationPlanReport> {
   const nowMs = clampDateMs(options.nowMs ?? Date.now(), Date.now());
   const outputAsset: 'USDC' | 'SOL' = options.outputAsset === 'SOL' ? 'SOL' : 'USDC';
-  const protocolFeeBps =
+  const useTieredFee =
+    options.protocolFeeBps === undefined && !process.env.TURGALIUM_FEE_BPS?.trim();
+  const explicitProtocolFeeBps =
     options.protocolFeeBps !== undefined
       ? Math.max(0, Math.min(1000, Math.round(Number(options.protocolFeeBps) || 0)))
-      : getProtocolFeeConfig().feeBps;
+      : undefined;
+  const protocolFeeBps = explicitProtocolFeeBps ?? getProtocolFeeConfig().feeBps;
   const maxBaseFeeGwei =
     typeof options.maxBaseFeeGwei === 'number' &&
     Number.isFinite(options.maxBaseFeeGwei) &&
@@ -974,7 +981,11 @@ export async function evaluatePreservationPlan(
     const prunedNegativeRoi: ScannedAsset[] = [];
 
     for (const a of chainAssets) {
-      const roi = evaluateAssetRoi(a, { protocolFeeBps, isBatched: true });
+      const roi = evaluateAssetRoi(a, {
+        protocolFeeBps: useTieredFee ? undefined : protocolFeeBps,
+        feeSchedule: useTieredFee ? 'tiered' : 'flat',
+        isBatched: true,
+      });
       const explicitlySelected = selectedSet ? selectedSet.has(a.id) : a.selectedByDefault;
       const isNegativeRoi =
         a.action === 'SKIP_GAS_NEGATIVE' ||
@@ -1020,6 +1031,7 @@ export async function evaluatePreservationPlan(
       assets: sweepable,
       outputAsset,
       protocolFeeBps,
+      useTieredFee,
       gasGwei: gwei,
       nativePriceUsd,
       ataRentUsd: ataForChain,
@@ -1287,11 +1299,22 @@ export async function evaluatePreservationPlan(
     mergedLiveUnlockItems
   );
 
+  const totalOptimizedFeeUsd = r2(
+    chainAudits.reduce(
+      (s, a) => s + (a.candidates.find((c) => c.route === a.bestRoute)?.protocolFeeUsd ?? 0),
+      0
+    )
+  );
+  const reportedProtocolFeeBps =
+    useTieredFee && totalGrossSweepableUsd > 0
+      ? Math.max(0, Math.round((totalOptimizedFeeUsd / totalGrossSweepableUsd) * 10_000))
+      : protocolFeeBps;
+
   return {
     generatedAt: new Date(nowMs).toISOString(),
     walletAddress: scanReport.walletAddress,
     outputAsset,
-    protocolFeeBps,
+    protocolFeeBps: reportedProtocolFeeBps,
     recommendedBridgePreference,
     recommendedRouteLabel,
     totals: {

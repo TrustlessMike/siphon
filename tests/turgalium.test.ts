@@ -1216,6 +1216,16 @@ test('Smart-contract DeFi withdrawals (Aave non-USDC, Compound cWETHv3, ERC-4626
     }),
     userAddress: user,
     solanaDestination: SAMPLE_SOLANA_WALLET,
+    compoundSafetyCheckFn: async () => ({
+      checked: true,
+      protocolId: 'compound_v3',
+      hasActiveBorrow: false,
+      borrowBalanceRaw: 0n,
+      suppliedBalanceRaw: 10n ** 18n,
+      isCollateralized: true,
+      safeForWithdraw: true,
+      reason: 'Verified onchain supplied balance.',
+    }),
   });
   assert.equal(compWeth.provider, 'compound_v3');
   assert.equal(compWeth.transactions[0].to.toLowerCase(), C_WETH_V3.toLowerCase());
