@@ -6,9 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,8 +28,31 @@ jobs:
       - run: npm run build
       - run: npm test
 
+  playwright-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci && npm run build
+      - name: Install Playwright Chromium
+        run: |
+          python3 -m pip install --upgrade playwright
+          python3 -m playwright install --with-deps chromium
+      - name: Run Playwright 8-suite E2E regression & safety suite
+        env:
+          TURGALIUM_E2E_PORT: "4440"
+        run: python3 tests/e2e-playwright.py
+
   foundry-contracts:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install Foundry
