@@ -14,9 +14,9 @@ function createRenderer(canvas, width, height) {
     });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(width, height, false);
-    renderer.setClearColor(0x0b0e13, 0);
+    renderer.setClearColor(0x000000, 0);
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.12;
+    renderer.toneMappingExposure = 1.1;
     return renderer;
   } catch {
     return null;
@@ -24,13 +24,13 @@ function createRenderer(canvas, width, height) {
 }
 
 /**
- * Procedural dark-obsidian studio environment so brushed dark titanium ribs
- * and the emerald-mint prism core catch crisp architectural highlights on #0B0E13.
+ * Procedural studio softbox environment so brushed silver-titanium ribs and
+ * frosted Kamino ice-cyan glass have crisp architectural reflections on #FCFCFC.
  */
 function buildStudioEnvironment(renderer) {
   const pmrem = new THREE.PMREMGenerator(renderer);
   const envScene = new THREE.Scene();
-  envScene.background = new THREE.Color(0x0b0e13);
+  envScene.background = new THREE.Color(0xf8fafc);
 
   const plane = new THREE.PlaneGeometry(1, 1);
   const envMats = [];
@@ -47,15 +47,14 @@ function buildStudioEnvironment(renderer) {
     envScene.add(m);
   };
 
-  // Architectural soft overhead key + cool slate fill + subtle Jupiter lime/mint rim panels
-  addPanel(0xf3f6fa, 1.9, [0, 7.5, 2], [11, 9, 1], [Math.PI / 2, 0, 0]);
-  addPanel(0xc7f284, 1.15, [-7.5, 4.2, 4.5], [7, 7, 1], [0, Math.PI / 3, 0]);
-  addPanel(0x14f195, 1.25, [8, 2.2, 3], [7, 8, 1], [0, -Math.PI / 2.2, 0]);
-  addPanel(0x1a212b, 1.0, [-6, -2.5, -5], [9, 3, 1], [0, Math.PI / 4, 0]);
-  addPanel(0x131820, 1.0, [5, -3.5, -4], [10, 2.6, 1], [0, -Math.PI / 4, 0]);
-  addPanel(0x0b0e13, 1.0, [0, -6.5, 0], [14, 14, 1], [-Math.PI / 2, 0, 0]);
+  addPanel(0xffffff, 2.3, [0, 7, 1], [12, 10, 1], [Math.PI / 2, 0, 0]);
+  addPanel(0xffffff, 2.5, [-7, 4, 5], [8, 8, 1], [0, Math.PI / 3, 0]);
+  addPanel(0xc6f4ff, 2.0, [8, 2, 3], [8, 9, 1], [0, -Math.PI / 2.2, 0]);
+  addPanel(0x18181b, 1.0, [-6, -2.5, -5], [9, 3, 1], [0, Math.PI / 4, 0]);
+  addPanel(0x27272a, 1.0, [5, -3.5, -4], [10, 2.6, 1], [0, -Math.PI / 4, 0]);
+  addPanel(0x0f172a, 1.0, [0, -6.5, 0], [14, 14, 1], [-Math.PI / 2, 0, 0]);
 
-  const rt = pmrem.fromScene(envScene, 0.04);
+  const rt = pmrem.fromScene(envScene, 0.035);
   pmrem.dispose();
   plane.dispose();
   for (const m of envMats) m.dispose();
@@ -69,10 +68,10 @@ function createSoftShadowTexture() {
   c.height = size;
   const ctx = c.getContext('2d');
   if (ctx) {
-    const grad = ctx.createRadialGradient(size / 2, size / 2, 8, size / 2, size / 2, size / 2);
-    grad.addColorStop(0, 'rgba(20, 241, 149, 0.14)');
-    grad.addColorStop(0.45, 'rgba(11, 14, 19, 0.42)');
-    grad.addColorStop(1, 'rgba(11, 14, 19, 0)');
+    const grad = ctx.createRadialGradient(size / 2, size / 2, 10, size / 2, size / 2, size / 2);
+    grad.addColorStop(0, 'rgba(15, 23, 42, 0.13)');
+    grad.addColorStop(0.5, 'rgba(15, 23, 42, 0.04)');
+    grad.addColorStop(1, 'rgba(15, 23, 42, 0)');
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, size, size);
   }
@@ -82,9 +81,9 @@ function createSoftShadowTexture() {
 }
 
 /**
- * Turgalium Dark-Obsidian 3D Convergence Sculpture:
- * Satin dark anodized-titanium flared funnel, 6 brushed gunmetal-titanium conduit ribs,
- * and a central frosted emerald-mint (#14F195 / #C7F284) glass triangular prism core.
+ * Turgalium Daylight 3D Convergence Sculpture:
+ * Matte porcelain-ceramic flared funnel, 6 brushed silver-titanium vertical conduit ribs
+ * (6 EVM chains), and a central frosted Kamino ice-cyan (#C6F4FF) glass triangular prism core.
  */
 export function mountTurgaliumFunnelScene(canvas) {
   if (!canvas) return { setActive() {}, setPaused() {}, isRunning() { return false; }, destroy() {} };
@@ -110,33 +109,28 @@ export function mountTurgaliumFunnelScene(canvas) {
   };
   fitCamera(w, h);
 
-  scene.add(new THREE.HemisphereLight(0xdbeafe, 0x0b0e13, 0.8));
-
-  const key = new THREE.DirectionalLight(0xf3f6fa, 1.45);
-  key.position.set(-4.5, 8.5, 6.5);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0xe2e8f0, 0.95));
+  const key = new THREE.DirectionalLight(0xffffff, 1.5);
+  key.position.set(-5, 8, 6);
   scene.add(key);
 
-  const limeRim = new THREE.DirectionalLight(0xc7f284, 0.95);
-  limeRim.position.set(-6.5, 3.2, -3.5);
-  scene.add(limeRim);
-
-  const mintRim = new THREE.DirectionalLight(0x14f195, 1.1);
-  mintRim.position.set(6.5, 2.8, -4);
-  scene.add(mintRim);
+  const rim = new THREE.DirectionalLight(0xc6f4ff, 1.2);
+  rim.position.set(6, 3, -4);
+  scene.add(rim);
 
   const root = new THREE.Group();
   root.position.y = 0.05;
   scene.add(root);
 
-  // Subtle dark obsidian contact glow shadow
+  // Soft grounded studio shadow
   const shadow = new THREE.Mesh(
-    new THREE.PlaneGeometry(3.3, 1.1),
+    new THREE.PlaneGeometry(3.2, 1.05),
     new THREE.MeshBasicMaterial({ map: createSoftShadowTexture(), transparent: true, depthWrite: false })
   );
   shadow.position.set(0, -1.78, -0.2);
   scene.add(shadow);
 
-  // 1. Satin Dark Anodized-Titanium Sculpted Funnel Dish (LatheGeometry)
+  // 1. Matte Porcelain-Ceramic Sculpted Funnel Dish (LatheGeometry)
   const funnelPoints = [
     new THREE.Vector2(0.46, -1.22),
     new THREE.Vector2(0.56, -0.82),
@@ -153,31 +147,31 @@ export function mountTurgaliumFunnelScene(canvas) {
     new THREE.Vector2(0.46, -1.22),
   ];
 
-  const obsidianHullMat = new THREE.MeshPhysicalMaterial({
-    color: 0x1a212b,
-    roughness: 0.34,
-    metalness: 0.62,
-    clearcoat: 0.42,
-    clearcoatRoughness: 0.26,
-    envMapIntensity: 1.25,
+  const ceramicMat = new THREE.MeshPhysicalMaterial({
+    color: 0xf5f6f8,
+    roughness: 0.3,
+    metalness: 0.03,
+    clearcoat: 0.35,
+    clearcoatRoughness: 0.25,
+    envMapIntensity: 0.75,
   });
 
-  const funnelMesh = new THREE.Mesh(new THREE.LatheGeometry(funnelPoints, 96), obsidianHullMat);
+  const funnelMesh = new THREE.Mesh(new THREE.LatheGeometry(funnelPoints, 96), ceramicMat);
   root.add(funnelMesh);
 
-  // 2. Brushed Dark-Titanium Precision Collar Rings + Conduit Ribs
+  // 2. Brushed Silver-Titanium Precision Collar Ring + Inner Basin
   const titaniumMat = new THREE.MeshStandardMaterial({
-    color: 0x6b778a,
-    metalness: 0.92,
-    roughness: 0.22,
-    envMapIntensity: 1.45,
+    color: 0xd0d5de,
+    metalness: 0.94,
+    roughness: 0.18,
+    envMapIntensity: 1.35,
   });
 
   const titaniumDarkMat = new THREE.MeshStandardMaterial({
-    color: 0x334155,
-    metalness: 0.94,
-    roughness: 0.24,
-    envMapIntensity: 1.35,
+    color: 0x8a92a1,
+    metalness: 0.95,
+    roughness: 0.22,
+    envMapIntensity: 1.3,
   });
 
   const innerRing = new THREE.Mesh(new THREE.TorusGeometry(1.16, 0.048, 28, 108), titaniumMat);
@@ -190,7 +184,7 @@ export function mountTurgaliumFunnelScene(canvas) {
   lowerCollar.position.y = -0.18;
   root.add(lowerCollar);
 
-  // 6 Brushed-Titanium Sweeping Conduit Ribs
+  // 6 Brushed-Titanium Sweeping Conduit Ribs (representing Ethereum, Base, Arbitrum, Optimism, Polygon, Avalanche)
   const ribsGroup = new THREE.Group();
   root.add(ribsGroup);
   for (let i = 0; i < 6; i++) {
@@ -205,21 +199,21 @@ export function mountTurgaliumFunnelScene(canvas) {
     ribsGroup.add(tube);
   }
 
-  // 3. Central Luminous Emerald-Mint Frosted Glass Triangular Prism Core (Solana Core)
+  // 3. Central Luminous Frosted Kamino Ice-Cyan Glass Triangular Prism Core (Solana Core)
   const prismMat = new THREE.MeshPhysicalMaterial({
-    color: 0x14f195,
-    emissive: 0x0ea66b,
-    emissiveIntensity: 0.2,
-    roughness: 0.16,
-    metalness: 0.08,
-    transmission: 0.48,
-    thickness: 1.15,
-    ior: 1.45,
+    color: 0xa5efff,
+    emissive: 0x38bdf8,
+    emissiveIntensity: 0.1,
+    roughness: 0.14,
+    metalness: 0.03,
+    transmission: 0.52,
+    thickness: 1.2,
+    ior: 1.44,
     clearcoat: 1.0,
-    clearcoatRoughness: 0.08,
+    clearcoatRoughness: 0.07,
     transparent: true,
-    opacity: 0.9,
-    envMapIntensity: 1.4,
+    opacity: 0.92,
+    envMapIntensity: 1.45,
   });
 
   const prismGeo = new THREE.CylinderGeometry(0.36, 0.24, 2.28, 3, 1);
@@ -227,20 +221,20 @@ export function mountTurgaliumFunnelScene(canvas) {
   prism.position.y = -0.18;
   root.add(prism);
 
-  // Crisp subtle lime-mint architectural prism edges
+  // Subtle architectural prism edges
   const prismEdges = new THREE.LineSegments(
     new THREE.EdgesGeometry(prismGeo),
-    new THREE.LineBasicMaterial({ color: 0xc7f284, transparent: true, opacity: 0.58 })
+    new THREE.LineBasicMaterial({ color: 0xe0f8ff, transparent: true, opacity: 0.85 })
   );
   prism.add(prismEdges);
 
   // 6 Converging Dust Motes gliding down the funnel ribs into the Solana prism
-  const moteGeo = new THREE.SphereGeometry(0.046, 16, 16);
+  const moteGeo = new THREE.SphereGeometry(0.048, 16, 16);
   const moteMat = new THREE.MeshPhysicalMaterial({
-    color: 0xc7f284,
-    emissive: 0x14f195,
-    emissiveIntensity: 0.35,
-    roughness: 0.18,
+    color: 0xc6f4ff,
+    emissive: 0x0ea5e9,
+    emissiveIntensity: 0.18,
+    roughness: 0.15,
     clearcoat: 1.0,
   });
   const motes = Array.from({ length: 6 }, (_, i) => {
@@ -387,7 +381,7 @@ export function mountTurgaliumFunnelScene(canvas) {
   }
   syncLoopState();
 
-  const controller = {
+  return {
     setActive(isActive) {
       activeBoost = Boolean(isActive);
     },
@@ -422,21 +416,4 @@ export function mountTurgaliumFunnelScene(canvas) {
       renderer.dispose();
     },
   };
-
-  if (typeof window !== 'undefined') {
-    window.TurgaliumHero3D = Object.assign(window.TurgaliumHero3D || {}, {
-      mountTurgaliumFunnelScene,
-      instance: controller,
-      setActive: controller.setActive,
-      setPaused: controller.setPaused,
-      isRunning: controller.isRunning,
-      destroy: controller.destroy,
-    });
-  }
-
-  return controller;
-}
-
-if (typeof window !== 'undefined' && !window.TurgaliumHero3D) {
-  window.TurgaliumHero3D = { mountTurgaliumFunnelScene };
 }
