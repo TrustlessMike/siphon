@@ -314,6 +314,8 @@ let cachedBatchCapabilities = {
 let walletSdkConfig = {
   coinbaseSmartWalletEnabled: true,
   walletConnectProjectId: null,
+  paymasterUrl: null,
+  paymasterUrls: null,
   protocolFee: {
     feeBps: 700,
     feePercent: 7,
@@ -425,11 +427,112 @@ export async function loadWalletConnectorConfig() {
   } catch {
     // keep defaults
   }
+  if (!walletSdkConfig.paymasterUrl && !walletSdkConfig.paymasterUrls) {
+    try {
+      const healthRes = await fetch('/api/health');
+      if (healthRes.ok) {
+        const healthData = await healthRes.json();
+        if (healthData && typeof healthData === 'object') {
+          if (typeof healthData.paymasterUrl === 'string' && healthData.paymasterUrl.trim()) {
+            walletSdkConfig = { ...walletSdkConfig, paymasterUrl: healthData.paymasterUrl.trim() };
+          }
+          if (healthData.paymasterUrls && typeof healthData.paymasterUrls === 'object') {
+            walletSdkConfig = { ...walletSdkConfig, paymasterUrls: healthData.paymasterUrls };
+          }
+        }
+      }
+    } catch {
+      // optional paymaster metadata on /api/health
+    }
+  }
   return walletSdkConfig;
 }
 
 export function getWalletConnectorConfig() {
   return walletSdkConfig;
+}
+
+export function setWalletPaymasterConfig({ paymasterUrl = null, paymasterUrls = null } = {}) {
+  walletSdkConfig = {
+    ...walletSdkConfig,
+    paymasterUrl: normalizePaymasterUrl(paymasterUrl),
+    paymasterUrls: paymasterUrls && typeof paymasterUrls === 'object' ? { ...paymasterUrls } : null,
+  };
+  return walletSdkConfig;
+}
+
+export function normalizePaymasterUrl(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+    const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
+    if (parsed.protocol === 'https:' || (parsed.protocol === 'http:' && isLoopback)) {
+      return parsed.toString();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolvePaymasterUrl(chainId, explicitUrl = null) {
+  const explicit = normalizePaymasterUrl(explicitUrl);
+  if (explicit) return explicit;
+
+  const numId = Number(chainId);
+  const decKey = Number.isInteger(numId) && numId > 0 ? String(numId) : null;
+  const hexKey = Number.isInteger(numId) && numId > 0 ? '0x' + numId.toString(16) : null;
+
+  const lookupMap = (mapObj) => {
+    if (!mapObj || typeof mapObj !== 'object') return null;
+    const raw =
+      (decKey && mapObj[decKey]) ||
+      (hexKey && (mapObj[hexKey] || mapObj[hexKey.toLowerCase()])) ||
+      mapObj['*'] ||
+      mapObj.default ||
+      null;
+    return normalizePaymasterUrl(raw);
+  };
+
+  if (typeof window !== 'undefined') {
+    const winPerChain = lookupMap(window.__SIPHON_PAYMASTER_URLS);
+    if (winPerChain) return winPerChain;
+    const winGlobal = normalizePaymasterUrl(window.__SIPHON_PAYMASTER_URL);
+    if (winGlobal) return winGlobal;
+  }
+
+  const cfgPerChain = lookupMap(walletSdkConfig.paymasterUrls);
+  if (cfgPerChain) return cfgPerChain;
+  return normalizePaymasterUrl(walletSdkConfig.paymasterUrl);
+}
+
+/**
+ * Builds ERC-7677 `capabilities` object for EIP-5792 `wallet_sendCalls` ONLY when:
+ *   1. The connected wallet advertises `paymasterService.supported === true` on `chainId`, AND
+ *   2. A valid paymaster URL is configured (explicitly, via `window.__SIPHON_PAYMASTER_URL`, or server config).
+ * Returns `undefined` when unavailable so callers cleanly fall back to self-funded batches.
+ */
+export function buildEip5792Capabilities({
+  chainId,
+  paymasterUrl = null,
+  paymasterContext = null,
+  batchCapabilities = cachedBatchCapabilities,
+} = {}) {
+  const numId = Number(chainId);
+  const chainCap = batchCapabilities?.details?.[numId];
+  if (!chainCap?.paymaster) return undefined;
+
+  const resolvedUrl = resolvePaymasterUrl(numId, paymasterUrl);
+  if (!resolvedUrl) return undefined;
+
+  const paymasterService = { url: resolvedUrl };
+  if (paymasterContext && typeof paymasterContext === 'object' && !Array.isArray(paymasterContext)) {
+    paymasterService.context = paymasterContext;
+  }
+  return { paymasterService };
 }
 
 function registerStandardWallet(wallet) {
@@ -736,6 +839,7 @@ export function refreshInstalledWallets() {
 function inferInjectedEvmName(prov) {
   if (prov?.isRabby) return 'Rabby Wallet';
   if (prov?.isPhantom) return 'Phantom EVM';
+  if (prov?.isBackpack) return 'Backpack EVM';
   if (prov?.isCoinbaseWallet) return 'Coinbase Wallet';
   if (prov?.isBraveWallet) return 'Brave Wallet';
   if (prov?.isOkxWallet || prov?.isOKExWallet) return 'OKX Wallet';
@@ -743,6 +847,8 @@ function inferInjectedEvmName(prov) {
   if (prov?.isMetaMask) return 'MetaMask';
   return 'Browser EVM Wallet';
 }
+
+export const DUAL_VM_WALLET_FAMILIES = new Set(['phantom', 'okx', 'coinbase', 'backpack']);
 
 function canonicalWalletFamily(name, rdns = '') {
   const s = `${name || ''} ${rdns || ''}`.toLowerCase();
@@ -791,6 +897,7 @@ export function listAvailableEvmWallets() {
       injectedCandidates.push({ prov: window.ethereum, fallbackName: null });
     }
     if (window.phantom?.ethereum) injectedCandidates.push({ prov: window.phantom.ethereum, fallbackName: 'Phantom EVM' });
+    if (window.backpack?.ethereum) injectedCandidates.push({ prov: window.backpack.ethereum, fallbackName: 'Backpack EVM' });
     if (window.coinbaseWalletExtension) {
       injectedCandidates.push({ prov: window.coinbaseWalletExtension, fallbackName: 'Coinbase Wallet' });
     }
@@ -850,6 +957,99 @@ export async function connectEvmWallet(optionsOrCallback) {
   attachEvmListeners(provider, opts);
 
   return { address: connectedEvmAddress, walletName: chosen.name, capabilities };
+}
+
+/**
+ * Finds the matching Solana provider for a dual-VM EVM wallet (Phantom, OKX, Coinbase, Backpack).
+ */
+export function findMatchingSolanaWalletForEvm(evmWalletOrName) {
+  if (!evmWalletOrName) return null;
+  const name = typeof evmWalletOrName === 'string' ? evmWalletOrName : evmWalletOrName.name;
+  const rdns = typeof evmWalletOrName === 'object' ? evmWalletOrName.rdns || '' : '';
+  const family = canonicalWalletFamily(name, rdns);
+  if (!DUAL_VM_WALLET_FAMILIES.has(family)) return null;
+  const solWallets = listAvailableSolanaWallets();
+  return solWallets.find((sw) => canonicalWalletFamily(sw.name) === family) || null;
+}
+
+/**
+ * Lists all detected dual-VM wallets exposing both EVM and Solana providers in this browser.
+ */
+export function listDualVmWallets() {
+  const evmWallets = listAvailableEvmWallets();
+  const pairs = [];
+  for (const evmWallet of evmWallets) {
+    const solanaWallet = findMatchingSolanaWalletForEvm(evmWallet);
+    if (!solanaWallet) continue;
+    pairs.push({
+      family: canonicalWalletFamily(evmWallet.name, evmWallet.rdns),
+      name: evmWallet.name,
+      evmWallet,
+      solanaWallet,
+      dualVm: true,
+    });
+  }
+  return pairs;
+}
+
+/**
+ * 1-Click Unified Dual-VM Connect: connects the selected EVM wallet and, when a matching
+ * dual-VM Solana provider (Phantom, OKX, Coinbase, Backpack) is available, automatically
+ * connects the Solana destination in the same flow without requiring a second modal pass.
+ * Never breaks the EVM connection if the secondary Solana prompt is cancelled or fails.
+ */
+export async function connectDualVmWallet(options = {}) {
+  const evmWallets = listAvailableEvmWallets();
+  const preChosenEvm = options.walletId
+    ? evmWallets.find((w) => w.id === options.walletId) || null
+    : evmWallets[0] || null;
+
+  const evmRes = await connectEvmWallet({
+    walletId: options.walletId,
+    onAccountsChanged: options.onAccountsChanged,
+    onChainChanged: options.onChainChanged,
+    onDisconnect: options.onDisconnect,
+  });
+
+  const matchedSolana =
+    (options.solanaWalletId
+      ? listAvailableSolanaWallets().find((w) => w.id === options.solanaWalletId) || null
+      : null) ||
+    findMatchingSolanaWalletForEvm(preChosenEvm || { name: evmRes.walletName });
+
+  const shouldConnectSolana =
+    options.autoConnectSolana !== false &&
+    Boolean(matchedSolana) &&
+    !(options.skipSolanaIfConnected && getConnectedSolanaAddress());
+
+  if (!shouldConnectSolana) {
+    return {
+      ...evmRes,
+      dualVm: Boolean(matchedSolana),
+      solana: null,
+      solanaError: null,
+    };
+  }
+
+  try {
+    const solRes = await connectSolanaWallet({
+      walletId: matchedSolana.id,
+      onAccountChanged: options.onSolanaAccountChanged,
+    });
+    return {
+      ...evmRes,
+      dualVm: true,
+      solana: solRes,
+      solanaError: null,
+    };
+  } catch (err) {
+    return {
+      ...evmRes,
+      dualVm: true,
+      solana: null,
+      solanaError: err?.message || 'Solana wallet connection skipped.',
+    };
+  }
 }
 
 /**
@@ -1066,6 +1266,8 @@ export async function sendEip5792Batch({
   atomicRequired,
   expectedFrom,
   expectedSolanaDestination,
+  paymasterUrl,
+  paymasterContext,
 }) {
   if (!activeEvmProvider || !connectedEvmAddress) {
     throw new Error('Connect your EVM wallet before signing live batches.');
@@ -1095,6 +1297,13 @@ export async function sendEip5792Batch({
     value: c.value || '0x0',
   }));
 
+  const capabilities = buildEip5792Capabilities({
+    chainId,
+    paymasterUrl,
+    paymasterContext,
+    batchCapabilities: cachedBatchCapabilities,
+  });
+
   const isUnsupportedErr = (err) => {
     const code = err?.code ?? err?.cause?.code;
     const msg = String(err?.message || '').toLowerCase();
@@ -1108,24 +1317,73 @@ export async function sendEip5792Batch({
     );
   };
 
+  const isPaymasterCapabilityErr = (err) => {
+    const code = err?.code ?? err?.cause?.code;
+    const msg = String(err?.message || '').toLowerCase();
+    return (
+      code === 5740 ||
+      code === 5750 ||
+      code === 5760 ||
+      msg.includes('paymaster') ||
+      msg.includes('sponsor') ||
+      msg.includes('capability') ||
+      msg.includes('capabilities')
+    );
+  };
+
   try {
+    const v2Params = {
+      version: '2.0.0',
+      chainId: hexChainId,
+      from: connectedEvmAddress,
+      atomicRequired: mustBeAtomic,
+      calls: formattedCalls,
+      ...(capabilities ? { capabilities } : {}),
+    };
     const res = await activeEvmProvider.request({
       method: 'wallet_sendCalls',
-      params: [
-        {
-          version: '2.0.0',
-          chainId: hexChainId,
-          from: connectedEvmAddress,
-          atomicRequired: mustBeAtomic,
-          calls: formattedCalls,
-        },
-      ],
+      params: [v2Params],
     });
     const batchId = typeof res === 'string' ? res : res?.id;
     if (!batchId) throw new Error('Wallet returned empty EIP-5792 batch ID.');
-    return { mode: 'eip5792', batchId, version: '2.0.0', atomicRequired: mustBeAtomic };
+    return {
+      mode: 'eip5792',
+      batchId,
+      version: '2.0.0',
+      atomicRequired: mustBeAtomic,
+      paymasterSponsored: Boolean(capabilities),
+      paymasterUrl: capabilities?.paymasterService?.url || null,
+    };
   } catch (err) {
     if (isUserRejectedError(err)) throw err;
+
+    // Graceful fallback when paymaster endpoint rejects/errors: retry self-funded v2 batch without capabilities
+    if (capabilities && isPaymasterCapabilityErr(err)) {
+      const resNoPm = await activeEvmProvider.request({
+        method: 'wallet_sendCalls',
+        params: [
+          {
+            version: '2.0.0',
+            chainId: hexChainId,
+            from: connectedEvmAddress,
+            atomicRequired: mustBeAtomic,
+            calls: formattedCalls,
+          },
+        ],
+      });
+      const batchId = typeof resNoPm === 'string' ? resNoPm : resNoPm?.id;
+      if (!batchId) throw new Error('Wallet returned empty EIP-5792 batch ID.');
+      return {
+        mode: 'eip5792',
+        batchId,
+        version: '2.0.0',
+        atomicRequired: mustBeAtomic,
+        paymasterSponsored: false,
+        paymasterUrl: null,
+        paymasterFallbackReason: err?.message || 'Paymaster unavailable',
+      };
+    }
+
     if (isUnsupportedErr(err)) {
       const wrapped = new Error('Connected wallet does not support EIP-5792 wallet_sendCalls.');
       wrapped.unsupportedEip5792 = true;
@@ -1139,20 +1397,27 @@ export async function sendEip5792Batch({
 
     // Retry once with EIP-5792 v1 schema (`version: '1.0'`, no `atomicRequired`)
     try {
+      const v1Params = {
+        version: '1.0',
+        chainId: hexChainId,
+        from: connectedEvmAddress,
+        calls: formattedCalls,
+        ...(capabilities ? { capabilities } : {}),
+      };
       const resV1 = await activeEvmProvider.request({
         method: 'wallet_sendCalls',
-        params: [
-          {
-            version: '1.0',
-            chainId: hexChainId,
-            from: connectedEvmAddress,
-            calls: formattedCalls,
-          },
-        ],
+        params: [v1Params],
       });
       const batchId = typeof resV1 === 'string' ? resV1 : resV1?.id;
       if (!batchId) throw new Error('Wallet returned empty EIP-5792 batch ID.');
-      return { mode: 'eip5792', batchId, version: '1.0', atomicRequired: false };
+      return {
+        mode: 'eip5792',
+        batchId,
+        version: '1.0',
+        atomicRequired: false,
+        paymasterSponsored: Boolean(capabilities),
+        paymasterUrl: capabilities?.paymasterService?.url || null,
+      };
     } catch (errV1) {
       if (isUserRejectedError(errV1)) throw errV1;
       if (isUnsupportedErr(errV1)) {
@@ -1314,12 +1579,208 @@ function removeProviderEventListener(provider, eventName, handler) {
   }
 }
 
+export function isMobileBrowser(userAgent) {
+  const ua =
+    typeof userAgent === 'string'
+      ? userAgent
+      : typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string'
+      ? navigator.userAgent
+      : '';
+  return /android|iphone|ipad|ipod|mobile|iemobile|opera mini|blackberry|webos/i.test(ua);
+}
+
+function resolveDeepLinkTarget(targetUrl, refUrl) {
+  const fallbackHref =
+    typeof window !== 'undefined' && window.location?.href ? window.location.href : 'https://siphon.app/';
+  const candidate = typeof targetUrl === 'string' && targetUrl.trim() ? targetUrl.trim() : fallbackHref;
+  let parsedTarget;
+  try {
+    parsedTarget = new URL(candidate);
+    if (parsedTarget.protocol !== 'http:' && parsedTarget.protocol !== 'https:') {
+      parsedTarget = new URL('https://siphon.app/');
+    }
+  } catch {
+    parsedTarget = new URL('https://siphon.app/');
+  }
+
+  let cleanRef = parsedTarget.origin;
+  if (typeof refUrl === 'string' && refUrl.trim()) {
+    try {
+      const parsedRef = new URL(refUrl.trim());
+      if (parsedRef.protocol === 'http:' || parsedRef.protocol === 'https:') {
+        cleanRef = parsedRef.origin;
+      }
+    } catch {
+      // keep target origin
+    }
+  }
+  return { cleanTarget: parsedTarget.toString(), cleanRef };
+}
+
+/**
+ * Builds official mobile universal deep-links for Phantom and Solflare in-app browsers
+ * so mobile Safari/Chrome users without injected providers can connect in 1 tap.
+ */
+export function buildMobileWalletDeepLink(walletKey, targetUrl, refUrl) {
+  const key = String(walletKey || '').trim().toLowerCase();
+  const { cleanTarget, cleanRef } = resolveDeepLinkTarget(targetUrl, refUrl);
+  const encodedUrl = encodeURIComponent(cleanTarget);
+  const encodedRef = encodeURIComponent(cleanRef);
+  if (key === 'phantom') {
+    return `https://phantom.app/ul/browse/${encodedUrl}?ref=${encodedRef}`;
+  }
+  if (key === 'solflare') {
+    return `https://solflare.com/ul/v1/browse/${encodedUrl}?ref=${encodedRef}`;
+  }
+  return null;
+}
+
+export function getMobileSolanaDeepLinks(targetUrl, refUrl) {
+  return [
+    {
+      id: 'mobile-phantom',
+      walletKey: 'phantom',
+      name: 'Open in Phantom',
+      subtitle: 'Mobile Universal Link · EVM + Solana',
+      logo: '/logos/phantom.svg',
+      deepLinkUrl: buildMobileWalletDeepLink('phantom', targetUrl, refUrl),
+    },
+    {
+      id: 'mobile-solflare',
+      walletKey: 'solflare',
+      name: 'Open in Solflare',
+      subtitle: 'Mobile Universal Link · Solana',
+      logo: '/logos/solflare.svg',
+      deepLinkUrl: buildMobileWalletDeepLink('solflare', targetUrl, refUrl),
+    },
+  ];
+}
+
+export const MAX_PARALLEL_PREQUOTE_CONCURRENCY = 3;
+
+/**
+ * Bounded-concurrency parallel chain batch pre-quoter (concurrency strictly <= 3).
+ * Starts preparing remaining chains in the background immediately so multi-chain queues
+ * never stall sequentially between wallet signatures, with TTL staleness protection.
+ */
+export function createChainBatchPrequoter(
+  chains,
+  prepareChainFn,
+  { maxConcurrency = MAX_PARALLEL_PREQUOTE_CONCURRENCY, maxQuoteAgeMs = 45_000, nowMs = () => Date.now() } = {}
+) {
+  const orderedChains = Array.from(new Set(Array.isArray(chains) ? chains.filter(Boolean) : []));
+  const concurrency = Math.max(
+    1,
+    Math.min(MAX_PARALLEL_PREQUOTE_CONCURRENCY, Math.trunc(Number(maxConcurrency) || MAX_PARALLEL_PREQUOTE_CONCURRENCY))
+  );
+
+  let nextIdx = 0;
+  let active = 0;
+  let peakActive = 0;
+  let completed = 0;
+  let failed = 0;
+  let cancelled = false;
+
+  const entries = new Map();
+  for (const chain of orderedChains) {
+    let resolveFn;
+    const promise = new Promise((resolve) => {
+      resolveFn = resolve;
+    });
+    entries.set(chain, {
+      promise,
+      resolve: resolveFn,
+      settled: false,
+      result: null,
+      error: null,
+      quotedAtMs: 0,
+    });
+  }
+
+  const pump = () => {
+    while (!cancelled && active < concurrency && nextIdx < orderedChains.length) {
+      const chain = orderedChains[nextIdx++];
+      const entry = entries.get(chain);
+      if (!entry || entry.settled) continue;
+      active += 1;
+      if (active > peakActive) peakActive = active;
+
+      Promise.resolve()
+        .then(() => prepareChainFn(chain))
+        .then((res) => {
+          entry.result = res ?? null;
+          entry.quotedAtMs = nowMs();
+          entry.settled = true;
+          completed += 1;
+          entry.resolve(entry);
+        })
+        .catch((err) => {
+          entry.error = err;
+          entry.result = null;
+          entry.settled = true;
+          failed += 1;
+          entry.resolve(entry);
+        })
+        .finally(() => {
+          active -= 1;
+          pump();
+        });
+    }
+  };
+
+  pump();
+
+  return {
+    async getBatch(chain) {
+      const entry = entries.get(chain);
+      if (!entry) return null;
+      const done = await entry.promise;
+      if (!done || done.error || !done.result) return null;
+      if (maxQuoteAgeMs > 0 && nowMs() - done.quotedAtMs > maxQuoteAgeMs) {
+        return null;
+      }
+      return done.result;
+    },
+    cancel() {
+      cancelled = true;
+      for (const entry of entries.values()) {
+        if (!entry.settled) {
+          entry.settled = true;
+          entry.result = null;
+          entry.resolve(entry);
+        }
+      }
+    },
+    getStats() {
+      return {
+        total: orderedChains.length,
+        completed,
+        failed,
+        active,
+        peakActive,
+        maxConcurrency: concurrency,
+        cancelled,
+      };
+    },
+  };
+}
+
 export async function connectSolanaWallet(options = {}) {
   if (typeof window === 'undefined') {
     throw new Error('Solana browser wallet is unavailable in this environment.');
   }
   const wallets = listAvailableSolanaWallets();
   if (!wallets.length) {
+    if (isMobileBrowser(options.userAgent)) {
+      const deepLinks = getMobileSolanaDeepLinks(options.targetUrl, options.refUrl);
+      const mobileErr = new Error(
+        'Open Siphon inside Phantom or Solflare mobile browser to connect your Solana wallet, or paste any Solana address manually.'
+      );
+      mobileErr.code = 'MOBILE_DEEP_LINK_REQUIRED';
+      mobileErr.isMobile = true;
+      mobileErr.deepLinks = deepLinks;
+      throw mobileErr;
+    }
     throw new Error(
       'No Solana wallet extension found (Phantom, Backpack, or Solflare). You can still paste any Solana address manually.'
     );
