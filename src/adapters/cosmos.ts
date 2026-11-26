@@ -2,12 +2,16 @@ import crypto from 'node:crypto';
 import {
   checkQuoteHaircutPass,
   decodeBech32,
+  DEFAULT_NON_EVM_AUCTION_TIMEOUT_MS,
   deriveNonEvmCctpRecipientBytes32,
   evaluateNonEvmGaslessBreakEven,
   filterChainSweepableAssets,
   getNonEvmFeeRecipient,
+  type NonEvmRouteAuctionCandidate,
+  type NonEvmRouteAuctionMetadata,
   quoteSkipGoCosmos,
 } from '../execution/non-evm-converter.js';
+import type { RouteAuctionFetcher } from '../execution/route-auction.js';
 import { getProtocolFeeConfig, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
@@ -46,6 +50,7 @@ export interface CosmosChainConfig {
   liquidStakeProvider?: string;
   supportsTxFees?: boolean;
   nobleIbcChannel?: string;
+  gasPrice: number;
   gasEstUsd: number;
 }
 
@@ -66,6 +71,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     supportsLiquidStakeExit: true,
     liquidStakeProvider: 'Stride stATOM / Skip Go IBC PFM',
     nobleIbcChannel: 'channel-536',
+    gasPrice: 0.025,
     gasEstUsd: 0.04,
   },
   osmosis: {
@@ -85,6 +91,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     liquidStakeProvider: 'Stride stOSMO / Osmosis Pool Swap',
     supportsTxFees: true,
     nobleIbcChannel: 'channel-750',
+    gasPrice: 0.025,
     gasEstUsd: 0.02,
   },
   noble: {
@@ -101,6 +108,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     coingeckoKey: 'coingecko:usd-coin',
     cctpDomain: 4,
     supportsLiquidStakeExit: false,
+    gasPrice: 0.1,
     gasEstUsd: 0.01,
   },
   celestia: {
@@ -119,6 +127,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     supportsLiquidStakeExit: true,
     liquidStakeProvider: 'MilkyWay milkTIA / Skip Go IBC PFM',
     nobleIbcChannel: 'channel-2',
+    gasPrice: 0.02,
     gasEstUsd: 0.03,
   },
   injective: {
@@ -137,6 +146,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     supportsLiquidStakeExit: true,
     liquidStakeProvider: 'Hydro hINJ / Skip Go IBC PFM',
     nobleIbcChannel: 'channel-148',
+    gasPrice: 500_000_000,
     gasEstUsd: 0.03,
   },
   neutron: {
@@ -154,6 +164,7 @@ export const COSMOS_CHAINS: Record<CosmosChainId, CosmosChainConfig> = {
     cctpDomain: null,
     supportsLiquidStakeExit: false,
     nobleIbcChannel: 'channel-30',
+    gasPrice: 0.01,
     gasEstUsd: 0.02,
   },
 };
@@ -243,12 +254,17 @@ function detectCosmosChainFromAddress(address: string): CosmosChainConfig {
   return COSMOS_CHAINS.cosmoshub;
 }
 
-async function cosmosLcdGet<T>(lcdUrls: string[], endpoint: string, timeoutMs = 4200): Promise<T | null> {
+async function cosmosLcdGet<T>(
+  lcdUrls: string[],
+  endpoint: string,
+  timeoutMs = 4200,
+  fetcher: RouteAuctionFetcher = globalThis.fetch.bind(globalThis)
+): Promise<T | null> {
   for (const base of lcdUrls) {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
-      const res = await fetch(`${base.replace(/\/$/, '')}${endpoint}`, {
+      const res = await fetcher(`${base.replace(/\/$/, '')}${endpoint}`, {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
       });
@@ -259,6 +275,543 @@ async function cosmosLcdGet<T>(lcdUrls: string[], endpoint: string, timeoutMs = 
     }
   }
   return null;
+}
+
+export interface CosmosLiveAccountInfo {
+  accountNumber: string;
+  sequence: string;
+  accountType?: string;
+}
+
+/**
+ * Extracts `account_number` and `sequence` from `/cosmos/auth/v1beta1/accounts/{address}`,
+ * cleanly unwrapping standard `BaseAccount`, Injective `EthAccount` (`base_account`),
+ * and `ContinuousVestingAccount` / `DelayedVestingAccount` / `PeriodicVestingAccount`
+ * (`base_vesting_account.base_account`) wrappers.
+ */
+export function extractCosmosAccountNumbers(raw: unknown): CosmosLiveAccountInfo | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const root = raw as Record<string, unknown>;
+  const account = (root.account && typeof root.account === 'object' ? root.account : root) as Record<string, unknown>;
+  const accountType = typeof account['@type'] === 'string' ? account['@type'] : undefined;
+
+  const candidates: Array<Record<string, unknown>> = [account];
+  if (account.base_account && typeof account.base_account === 'object') {
+    candidates.push(account.base_account as Record<string, unknown>);
+  }
+  if (account.base_vesting_account && typeof account.base_vesting_account === 'object') {
+    const bva = account.base_vesting_account as Record<string, unknown>;
+    candidates.push(bva);
+    if (bva.base_account && typeof bva.base_account === 'object') {
+      candidates.push(bva.base_account as Record<string, unknown>);
+    }
+  }
+
+  for (const c of candidates) {
+    const accNum = c.account_number;
+    const seq = c.sequence;
+    if (accNum !== undefined && accNum !== null && seq !== undefined && seq !== null) {
+      const accStr = String(accNum).trim();
+      const seqStr = String(seq).trim();
+      if (/^\d+$/.test(accStr) && /^\d+$/.test(seqStr)) {
+        return { accountNumber: accStr, sequence: seqStr, accountType };
+      }
+    }
+  }
+  return null;
+}
+
+export async function fetchCosmosAccountInfo(
+  lcdUrls: string[],
+  address: string,
+  timeoutMs = 3500,
+  fetcher?: RouteAuctionFetcher
+): Promise<CosmosLiveAccountInfo | null> {
+  const cleanAddr = address.trim();
+  if (!cleanAddr) return null;
+  const res = await cosmosLcdGet<Record<string, unknown>>(
+    lcdUrls,
+    `/cosmos/auth/v1beta1/accounts/${encodeURIComponent(cleanAddr)}`,
+    timeoutMs,
+    fetcher
+  );
+  return extractCosmosAccountNumbers(res);
+}
+
+/**
+ * Builds a real Noble Circle CCTP Domain 4 -> Solana Domain 5 `MsgDepositForBurn` message
+ * with base64-encoded 32-byte canonical Solana USDC ATA PDA `mint_recipient`.
+ */
+export function buildNobleCctpBurnMsg(params: {
+  userAddress: string;
+  amountRaw: string;
+  solanaUsdcAtaBytes32: string;
+}): { msg_type_url: string; msg: string } {
+  const cleanHex = params.solanaUsdcAtaBytes32.replace(/^0x/i, '');
+  const mintRecipientBase64 = Buffer.from(cleanHex, 'hex').toString('base64');
+  return {
+    msg_type_url: '/circle.cctp.v1.MsgDepositForBurn',
+    msg: JSON.stringify({
+      from: params.userAddress,
+      amount: params.amountRaw,
+      destination_domain: SOLANA_CCTP_DOMAIN,
+      mint_recipient: mintRecipientBase64,
+      burn_token: 'uusdc',
+    }),
+  };
+}
+
+const NOBLE_CCTP_SOLANA_CLAIM_COST_USD = 0.25;
+
+export async function prepareCosmosDirectBatch(
+  params: Parameters<NonNullable<ChainFamilyAdapter['prepareDirectBatch']>>[0] & {
+    fetcher?: RouteAuctionFetcher;
+    auctionTimeoutMs?: number;
+  }
+): Promise<PreparedNonEvmBatch> {
+  const chainIdKey = (params.chain in COSMOS_CHAINS ? params.chain : 'cosmoshub') as CosmosChainId;
+  const cfg = COSMOS_CHAINS[chainIdKey];
+  const outputAsset = params.outputAsset ?? 'USDC';
+  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+  const feeRecipient = getNonEvmFeeRecipient('cosmos');
+  const solanaUsdcAtaBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+  const sweepable = filterChainSweepableAssets(cfg.id, params.assets);
+
+  // Resolve the exact signer address for THIS Cosmos chain (never send cosmos1... to Osmosis/Injective!)
+  const resolvedUserAddress =
+    params.addressesByChain?.[cfg.id] ||
+    params.addressesByChain?.[cfg.chainId] ||
+    sweepable.find((a) => a.sourceWallet?.startsWith(`${cfg.prefix}1`))?.sourceWallet ||
+    params.userAddress;
+
+  // Fetch live account_number & sequence upfront (graceful fallback metadata if LCD unreachable; wallets.js re-fetches fail-closed before sign!)
+  const accountInfo = await fetchCosmosAccountInfo(
+    cfg.lcdUrls,
+    resolvedUserAddress,
+    3500,
+    params.fetcher
+  );
+  const accountPayloadMeta = {
+    chainId: cfg.chainId,
+    signerAddress: resolvedUserAddress,
+    lcdUrl: cfg.lcdUrls[0],
+    lcdUrls: cfg.lcdUrls,
+    feeDenom: cfg.baseDenom,
+    gasPrice: cfg.gasPrice,
+    accountNumber: accountInfo?.accountNumber ?? null,
+    sequence: accountInfo?.sequence ?? null,
+    accountInfoLive: Boolean(accountInfo),
+    ...(accountInfo?.accountType ? { accountType: accountInfo.accountType } : {}),
+  };
+
+  const calls: PreparedNonEvmCall[] = [];
+  const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
+  const skippedAssets: PreparedNonEvmBatch['skippedAssets'] = [];
+  const notes: string[] = [];
+  let maxSeconds = 45;
+  let liveExecutable = false;
+  let routeAuction: NonEvmRouteAuctionMetadata | undefined;
+
+  if (!accountInfo) {
+    notes.push(
+      `${cfg.name} LCD account_number/sequence lookup deferred to wallet execution (will be fetched live before signing; fails closed if unreachable).`
+    );
+  }
+
+  // 1. Prepend real distribution reward claims in the same atomic Cosmos TxBody
+  for (const asset of sweepable.filter((a) => a.address.startsWith('rewards:'))) {
+    const validators = (asset.protocolAddress || '').split(',').filter(Boolean);
+    if (validators.length > 0) {
+      calls.push({
+        stepId: 'cosmos_claim_rewards',
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        action: asset.action,
+        provider: 'cosmos_distribution',
+        label: `Claim ${asset.uiBalance} ${cfg.symbol} staking rewards (${validators.length} validator${validators.length === 1 ? '' : 's'})`,
+        description: 'Batches MsgWithdrawDelegatorReward before Skip Go IBC/CCTP conversion',
+        nativePayload: {
+          ...accountPayloadMeta,
+          msgs: validators.map((valAddr) => ({
+            msg_type_url: '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward',
+            msg: JSON.stringify({
+              delegator_address: resolvedUserAddress,
+              validator_address: valAddr,
+            }),
+          })),
+        },
+      });
+    }
+  }
+
+  // 2. Liquid bank/IBC assets — with Noble Native USDC CCTP (0 bps) vs Skip Go Smart Relay parallel auction!
+  const liquidAssets = sweepable.filter(
+    (a) => !a.address.startsWith('rewards:') && !a.address.startsWith('staking:')
+  );
+  for (const asset of liquidAssets) {
+    const isNobleNativeUsdc = cfg.id === 'noble' && asset.address === 'uusdc' && outputAsset === 'USDC';
+
+    if (isNobleNativeUsdc) {
+      const auctionStart = Date.now();
+      const timeoutMs = params.auctionTimeoutMs ?? DEFAULT_NON_EVM_AUCTION_TIMEOUT_MS;
+
+      // Build Noble Direct Circle CCTP candidate (0 bps bridge fee, Domain 4 -> 5)
+      const usdcUi = rawToUi(asset.rawBalance, 6);
+      const cctpQuotedOutUsd = Number(usdcUi.toFixed(2));
+      const cctpGasUsd = cfg.gasEstUsd;
+      const cctpNetUsd = Number(
+        Math.max(0, cctpQuotedOutUsd - cctpGasUsd - NOBLE_CCTP_SOLANA_CLAIM_COST_USD).toFixed(2)
+      );
+      const cctpHaircut = checkQuoteHaircutPass({
+        grossUsd: asset.grossUsd,
+        quotedOutUsd: cctpQuotedOutUsd,
+        estimatedGasUsd: cctpGasUsd + NOBLE_CCTP_SOLANA_CLAIM_COST_USD,
+        allowHighCost: params.allowHighCost,
+      });
+
+      const cctpMsg = buildNobleCctpBurnMsg({
+        userAddress: resolvedUserAddress,
+        amountRaw: asset.rawBalance,
+        solanaUsdcAtaBytes32,
+      });
+
+      const cctpCandidate: NonEvmRouteAuctionCandidate = {
+        provider: 'noble_cctp',
+        label: 'Noble Direct Circle CCTP (0 bps, Domain 4 → 5)',
+        status: cctpHaircut.passed ? 'ok' : 'rejected_haircut',
+        quotedOutUsd: cctpQuotedOutUsd,
+        gasUsd: cctpGasUsd,
+        bridgeFeeUsd: 0,
+        netUsd: cctpNetUsd,
+        etaSeconds: 20,
+        latencyMs: 0,
+        liveExecutable: true,
+        reason: cctpHaircut.passed
+          ? '0 bps protocol bridge fee; requires Solana CCTP claim (~$0.25 est. Solana claim overhead)'
+          : cctpHaircut.reason,
+      };
+
+      // Query Skip Go Smart Relay in parallel (unless bridgePreference explicitly locks cctp)
+      const skipStart = Date.now();
+      let skipQuote: Awaited<ReturnType<typeof quoteSkipGoCosmos>> = null;
+      let skipTimedOut = false;
+      if (params.bridgePreference !== 'cctp') {
+        const timeoutPromise = new Promise<'timeout'>((resolve) =>
+          setTimeout(() => resolve('timeout'), timeoutMs)
+        );
+        const raced = await Promise.race([
+          quoteSkipGoCosmos({
+            sourceChainId: cfg.chainId,
+            sourceDenom: asset.address,
+            amountInRaw: asset.rawBalance,
+            userAddress: resolvedUserAddress,
+            solanaDestination: params.solanaDestination,
+            outputAsset,
+            addressesByChain: params.addressesByChain,
+            tradeUsd: asset.grossUsd,
+            liquidityUsd: asset.liquidityUsd,
+            symbol: asset.symbol,
+            fetcher: params.fetcher,
+          }).catch(() => null),
+          timeoutPromise,
+        ]);
+        if (raced === 'timeout') {
+          skipTimedOut = true;
+        } else {
+          skipQuote = raced;
+        }
+      }
+      const skipLatencyMs = Date.now() - skipStart;
+
+      let skipCandidate: NonEvmRouteAuctionCandidate;
+      if (params.bridgePreference === 'cctp') {
+        skipCandidate = {
+          provider: 'skip_go',
+          label: 'Skip Go Smart Relay (1-Click)',
+          status: 'ineligible',
+          quotedOutUsd: 0,
+          gasUsd: cfg.gasEstUsd,
+          bridgeFeeUsd: 0,
+          netUsd: 0,
+          etaSeconds: 0,
+          latencyMs: 0,
+          liveExecutable: false,
+          reason: 'Skipped because bridgePreference="cctp" was explicitly requested.',
+        };
+      } else if (skipTimedOut) {
+        skipCandidate = {
+          provider: 'skip_go',
+          label: 'Skip Go Smart Relay (1-Click)',
+          status: 'timeout',
+          quotedOutUsd: 0,
+          gasUsd: cfg.gasEstUsd,
+          bridgeFeeUsd: 0,
+          netUsd: 0,
+          etaSeconds: 0,
+          latencyMs: skipLatencyMs,
+          liveExecutable: false,
+          reason: `Skip Go timed out after ${timeoutMs}ms`,
+        };
+      } else if (!skipQuote) {
+        skipCandidate = {
+          provider: 'skip_go',
+          label: 'Skip Go Smart Relay (1-Click)',
+          status: 'error',
+          quotedOutUsd: 0,
+          gasUsd: cfg.gasEstUsd,
+          bridgeFeeUsd: 0,
+          netUsd: 0,
+          etaSeconds: 0,
+          latencyMs: skipLatencyMs,
+          liveExecutable: false,
+          reason: 'Skip Go returned no live Noble USDC → Solana quote.',
+        };
+      } else {
+        const skipHaircut = checkQuoteHaircutPass({
+          grossUsd: asset.grossUsd,
+          quotedOutUsd: skipQuote.quotedOutUsd,
+          estimatedGasUsd: cfg.gasEstUsd,
+          allowHighCost: params.allowHighCost,
+        });
+        const skipNetUsd = Number(Math.max(0, skipQuote.quotedOutUsd - cfg.gasEstUsd).toFixed(2));
+        const skipBridgeFeeUsd = Number(
+          Math.max(0, cctpQuotedOutUsd - skipQuote.quotedOutUsd).toFixed(2)
+        );
+        skipCandidate = {
+          provider: 'skip_go',
+          label: 'Skip Go Smart Relay (1-Click)',
+          status: skipHaircut.passed ? 'ok' : 'rejected_haircut',
+          quotedOutUsd: skipQuote.quotedOutUsd,
+          gasUsd: cfg.gasEstUsd,
+          bridgeFeeUsd: skipBridgeFeeUsd,
+          netUsd: skipNetUsd,
+          etaSeconds: skipQuote.estimatedSeconds,
+          latencyMs: skipLatencyMs,
+          liveExecutable: skipQuote.liveExecutable,
+          requestId: skipQuote.requestId,
+          reason: skipHaircut.passed ? '1-click Smart Relay arrival on Solana' : skipHaircut.reason,
+        };
+      }
+
+      const candidates = [cctpCandidate, skipCandidate].sort((a, b) => b.netUsd - a.netUsd);
+      const passing = candidates.filter((c) => c.status === 'ok');
+      const executablePassing = passing.filter((c) => c.liveExecutable);
+      const winnerPool = executablePassing.length > 0 ? executablePassing : passing;
+      const winner =
+        params.bridgePreference === 'cctp' && cctpCandidate.status === 'ok'
+          ? cctpCandidate
+          : winnerPool[0];
+      const runnerUp = winner ? passing.find((c) => c.provider !== winner.provider) : undefined;
+      const savingsOverRunnerUpUsd =
+        winner && runnerUp
+          ? Number(Math.max(0, winner.netUsd - runnerUp.netUsd).toFixed(2))
+          : 0;
+      const bpsSavedOverRunnerUp =
+        winner && runnerUp && asset.grossUsd > 0
+          ? Math.round((savingsOverRunnerUpUsd / asset.grossUsd) * 10_000)
+          : 0;
+
+      if (winner) {
+        routeAuction = {
+          winner: winner.provider,
+          winnerNetUsd: winner.netUsd,
+          ...(runnerUp ? { runnerUp: runnerUp.provider, runnerUpNetUsd: runnerUp.netUsd } : {}),
+          savingsOverRunnerUpUsd,
+          bpsSavedOverRunnerUp,
+          totalAuctionDurationMs: Date.now() - auctionStart,
+          providersQueried: ['noble_cctp', 'skip_go'],
+          providersSucceeded: passing.length,
+          candidates,
+        };
+
+        if (winner.provider === 'noble_cctp') {
+          liveExecutable = true;
+          maxSeconds = Math.max(maxSeconds, 20);
+          calls.push({
+            stepId: 'cosmos_noble_cctp_burn',
+            assetId: asset.id,
+            assetSymbol: asset.symbol,
+            action: asset.action,
+            provider: 'noble_cctp',
+            label: `Noble Direct Circle CCTP (0 bps) → ${usdcUi.toFixed(2)} USDC on Solana`,
+            description: `Direct /circle.cctp.v1.MsgDepositForBurn (Domain 4 → Solana USDC ATA PDA ${solanaUsdcAtaBytes32.slice(0, 14)}…)`,
+            nativePayload: {
+              ...accountPayloadMeta,
+              sourceDomain: 4,
+              destinationDomain: SOLANA_CCTP_DOMAIN,
+              mintRecipientBytes32: solanaUsdcAtaBytes32,
+              cosmosTx: {
+                chain_id: cfg.chainId,
+                msgs: [cctpMsg],
+                signer_address: resolvedUserAddress,
+              },
+              msgs: [cctpMsg],
+            },
+          });
+          bridgeTrackers.push({
+            assetId: asset.id,
+            assetSymbol: asset.symbol,
+            provider: 'noble_cctp',
+            estimatedOutput: `${usdcUi.toFixed(2)} USDC`,
+            estimatedSeconds: 20,
+            requiresSolanaClaim: true,
+          });
+          notes.push(
+            runnerUp
+              ? `Noble USDC Auction: Direct Circle CCTP (0 bps) won at $${winner.netUsd.toFixed(2)} net, saving $${savingsOverRunnerUpUsd.toFixed(2)} (+${bpsSavedOverRunnerUp} bps) vs Skip Go Smart Relay ($${runnerUp.netUsd.toFixed(2)}).`
+              : `Noble USDC Auction: Direct Circle CCTP (0 bps, Domain 4 → 5) selected at $${winner.netUsd.toFixed(2)} net.`
+          );
+          continue;
+        }
+
+        if (winner.provider === 'skip_go' && skipQuote) {
+          if (skipQuote.liveExecutable) liveExecutable = true;
+          maxSeconds = Math.max(maxSeconds, skipQuote.estimatedSeconds);
+          calls.push({
+            stepId: 'cosmos_skip_go_convert',
+            assetId: asset.id,
+            assetSymbol: asset.symbol,
+            action: asset.action,
+            provider: 'skip_go',
+            label: `Convert ${asset.uiBalance} ${asset.symbol} → ${skipQuote.estimatedOutputUi} (Skip Go Smart Relay)`,
+            description: `1-Click Skip Go Smart Relay (${skipQuote.chainIds.join(' → ')})`,
+            nativePayload: {
+              ...accountPayloadMeta,
+              cosmosTx: skipQuote.cosmosTx,
+              routePath: skipQuote.chainIds,
+              requiredChainAddresses: skipQuote.requiredChainAddresses,
+            },
+          });
+          bridgeTrackers.push({
+            assetId: asset.id,
+            assetSymbol: asset.symbol,
+            provider: 'skip_go',
+            requestId: skipQuote.requestId,
+            estimatedOutput: skipQuote.estimatedOutputUi,
+            estimatedSeconds: skipQuote.estimatedSeconds,
+          });
+          if (runnerUp) {
+            notes.push(
+              `Noble USDC Auction: Skip Go Smart Relay (1-Click) won at $${winner.netUsd.toFixed(2)} net, saving $${savingsOverRunnerUpUsd.toFixed(2)} vs Noble Direct CCTP ($${runnerUp.netUsd.toFixed(2)} after est. Solana claim overhead).`
+            );
+          }
+          continue;
+        }
+      }
+
+      skippedAssets.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        reason: cctpHaircut.reason || 'Noble USDC route auction produced no profitable executable route.',
+      });
+      continue;
+    }
+
+    const skipQuote = await quoteSkipGoCosmos({
+      sourceChainId: cfg.chainId,
+      sourceDenom: asset.address,
+      amountInRaw: asset.rawBalance,
+      userAddress: resolvedUserAddress,
+      solanaDestination: params.solanaDestination,
+      outputAsset,
+      addressesByChain: params.addressesByChain,
+      tradeUsd: asset.grossUsd,
+      liquidityUsd: asset.liquidityUsd,
+      symbol: asset.symbol,
+      fetcher: params.fetcher,
+    });
+
+    if (!skipQuote) {
+      skippedAssets.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        reason: `Skip Go returned no live ${cfg.name} → Solana route for ${asset.symbol}.`,
+      });
+      continue;
+    }
+
+    const haircut = checkQuoteHaircutPass({
+      grossUsd: asset.grossUsd,
+      quotedOutUsd: skipQuote.quotedOutUsd,
+      estimatedGasUsd: cfg.gasEstUsd,
+      allowHighCost: params.allowHighCost,
+    });
+    if (!haircut.passed) {
+      skippedAssets.push({ assetId: asset.id, assetSymbol: asset.symbol, reason: haircut.reason });
+      continue;
+    }
+
+    if (skipQuote.liveExecutable) liveExecutable = true;
+    maxSeconds = Math.max(maxSeconds, skipQuote.estimatedSeconds);
+    calls.push({
+      stepId: 'cosmos_skip_go_convert',
+      assetId: asset.id,
+      assetSymbol: asset.symbol,
+      action: asset.action,
+      provider: 'skip_go',
+      label: `Convert ${asset.uiBalance} ${asset.symbol} → ${skipQuote.estimatedOutputUi} (Skip Go)`,
+      description: `1-Tx IBC/CCTP route (${skipQuote.chainIds.join(' → ')})`,
+      nativePayload: {
+        ...accountPayloadMeta,
+        cosmosTx: skipQuote.cosmosTx,
+        routePath: skipQuote.chainIds,
+        requiredChainAddresses: skipQuote.requiredChainAddresses,
+      },
+    });
+    bridgeTrackers.push({
+      assetId: asset.id,
+      assetSymbol: asset.symbol,
+      provider: 'skip_go',
+      requestId: skipQuote.requestId,
+      estimatedOutput: skipQuote.estimatedOutputUi,
+      estimatedSeconds: skipQuote.estimatedSeconds,
+    });
+  }
+
+  if (cfg.id === 'injective' && !liveExecutable) {
+    notes.push('Injective uses coinType 60 (ethsecp256k1); connect Keplr/Leap with Osmosis/Noble enabled to assemble multi-hop Skip Go messages.');
+  }
+
+  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+  const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+
+  return {
+    family: 'cosmos',
+    chain: cfg.id,
+    chainId: cfg.chainId,
+    chainName: cfg.name,
+    explorerUrl: cfg.explorerUrl,
+    userAddress: resolvedUserAddress,
+    solanaDestination: params.solanaDestination,
+    solanaUsdcAtaBytes32,
+    outputAsset,
+    executionKind: 'cosmos_skip_tx',
+    signingStandard: 'Keplr / Leap OfflineSigner (Amino/Direct TxBody)',
+    liveExecutable,
+    calls,
+    bridgeTrackers,
+    skippedAssets,
+    savings: {
+      totalCalls: calls.length,
+      walletPopupsBatched: calls.length ? 1 : 0,
+      walletPopupsLegacy: calls.length,
+      popupsSaved: Math.max(0, calls.length - 1),
+    },
+    feeBreakdown: {
+      feeBps: feeCfg.feeBps,
+      feePercent: feeCfg.feePercent,
+      feeRecipient,
+      collectionMethod: feeRecipient ? 'cosmos_bank_msgsend' : 'skip_go_quote_only',
+      estimatedFeeUsd,
+    },
+    estimatedSeconds: maxSeconds,
+    gaslessAvailable: Boolean(process.env.SIPHON_COSMOS_RELAYER_KEY?.trim() || cfg.supportsTxFees),
+    gaslessMechanism: cfg.supportsTxFees
+      ? 'Osmosis x/txfees (pay gas in any IBC token) or x/feegrant'
+      : 'Cosmos x/feegrant BasicAllowance',
+    notes,
+    ...(routeAuction ? { routeAuction } : {}),
+  };
 }
 
 function rawToUi(raw: string, decimals: number): number {
@@ -670,163 +1223,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
   },
 
   async prepareDirectBatch(params): Promise<PreparedNonEvmBatch> {
-    const chainIdKey = (params.chain in COSMOS_CHAINS ? params.chain : 'cosmoshub') as CosmosChainId;
-    const cfg = COSMOS_CHAINS[chainIdKey];
-    const outputAsset = params.outputAsset ?? 'USDC';
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
-    const feeRecipient = getNonEvmFeeRecipient('cosmos');
-    const solanaUsdcAtaBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
-    const sweepable = filterChainSweepableAssets(cfg.id, params.assets);
-
-    // Resolve the exact signer address for THIS Cosmos chain (never send cosmos1... to Osmosis/Injective!)
-    const resolvedUserAddress =
-      params.addressesByChain?.[cfg.id] ||
-      params.addressesByChain?.[cfg.chainId] ||
-      sweepable.find((a) => a.sourceWallet?.startsWith(`${cfg.prefix}1`))?.sourceWallet ||
-      params.userAddress;
-
-    const calls: PreparedNonEvmCall[] = [];
-    const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
-    const skippedAssets: PreparedNonEvmBatch['skippedAssets'] = [];
-    const notes: string[] = [];
-    let maxSeconds = 45;
-    let liveExecutable = false;
-
-    // 1. Prepend real distribution reward claims in the same atomic Cosmos TxBody
-    for (const asset of sweepable.filter((a) => a.address.startsWith('rewards:'))) {
-      const validators = (asset.protocolAddress || '').split(',').filter(Boolean);
-      if (validators.length > 0) {
-        calls.push({
-          stepId: 'cosmos_claim_rewards',
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          action: asset.action,
-          provider: 'cosmos_distribution',
-          label: `Claim ${asset.uiBalance} ${cfg.symbol} staking rewards (${validators.length} validator${validators.length === 1 ? '' : 's'})`,
-          description: 'Batches MsgWithdrawDelegatorReward before Skip Go IBC/CCTP conversion',
-          nativePayload: {
-            chainId: cfg.chainId,
-            signerAddress: resolvedUserAddress,
-            msgs: validators.map((valAddr) => ({
-              msg_type_url: '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward',
-              msg: JSON.stringify({
-                delegator_address: resolvedUserAddress,
-                validator_address: valAddr,
-              }),
-            })),
-          },
-        });
-      }
-    }
-
-    // 2. Live Skip Go route + executable Cosmos messages for every liquid bank/IBC asset
-    const liquidAssets = sweepable.filter(
-      (a) => !a.address.startsWith('rewards:') && !a.address.startsWith('staking:')
-    );
-    for (const asset of liquidAssets) {
-      const skipQuote = await quoteSkipGoCosmos({
-        sourceChainId: cfg.chainId,
-        sourceDenom: asset.address,
-        amountInRaw: asset.rawBalance,
-        userAddress: resolvedUserAddress,
-        solanaDestination: params.solanaDestination,
-        outputAsset,
-        addressesByChain: params.addressesByChain,
-      });
-
-      if (!skipQuote) {
-        skippedAssets.push({
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          reason: `Skip Go returned no live ${cfg.name} → Solana route for ${asset.symbol}.`,
-        });
-        continue;
-      }
-
-      const haircut = checkQuoteHaircutPass({
-        grossUsd: asset.grossUsd,
-        quotedOutUsd: skipQuote.quotedOutUsd,
-        estimatedGasUsd: cfg.gasEstUsd,
-        allowHighCost: params.allowHighCost,
-      });
-      if (!haircut.passed) {
-        skippedAssets.push({ assetId: asset.id, assetSymbol: asset.symbol, reason: haircut.reason });
-        continue;
-      }
-
-      if (skipQuote.liveExecutable) liveExecutable = true;
-      maxSeconds = Math.max(maxSeconds, skipQuote.estimatedSeconds);
-      calls.push({
-        stepId: 'cosmos_skip_go_convert',
-        assetId: asset.id,
-        assetSymbol: asset.symbol,
-        action: asset.action,
-        provider: 'skip_go',
-        label: `Convert ${asset.uiBalance} ${asset.symbol} → ${skipQuote.estimatedOutputUi} (Skip Go)`,
-        description: `1-Tx IBC/CCTP route (${skipQuote.chainIds.join(' → ')})`,
-        nativePayload: {
-          chainId: cfg.chainId,
-          signerAddress: resolvedUserAddress,
-          lcdUrl: cfg.lcdUrls[0],
-          feeDenom: cfg.baseDenom,
-          cosmosTx: skipQuote.cosmosTx,
-          routePath: skipQuote.chainIds,
-          requiredChainAddresses: skipQuote.requiredChainAddresses,
-        },
-      });
-      bridgeTrackers.push({
-        assetId: asset.id,
-        assetSymbol: asset.symbol,
-        provider: 'skip_go',
-        requestId: skipQuote.requestId,
-        estimatedOutput: skipQuote.estimatedOutputUi,
-        estimatedSeconds: skipQuote.estimatedSeconds,
-      });
-    }
-
-    if (cfg.id === 'injective' && !liveExecutable) {
-      notes.push('Injective uses coinType 60 (ethsecp256k1); connect Keplr/Leap with Osmosis/Noble enabled to assemble multi-hop Skip Go messages.');
-    }
-
-    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
-
-    return {
-      family: 'cosmos',
-      chain: cfg.id,
-      chainId: cfg.chainId,
-      chainName: cfg.name,
-      explorerUrl: cfg.explorerUrl,
-      userAddress: resolvedUserAddress,
-      solanaDestination: params.solanaDestination,
-      solanaUsdcAtaBytes32,
-      outputAsset,
-      executionKind: 'cosmos_skip_tx',
-      signingStandard: 'Keplr / Leap OfflineSigner (Amino/Direct TxBody)',
-      liveExecutable,
-      calls,
-      bridgeTrackers,
-      skippedAssets,
-      savings: {
-        totalCalls: calls.length,
-        walletPopupsBatched: calls.length ? 1 : 0,
-        walletPopupsLegacy: calls.length,
-        popupsSaved: Math.max(0, calls.length - 1),
-      },
-      feeBreakdown: {
-        feeBps: feeCfg.feeBps,
-        feePercent: feeCfg.feePercent,
-        feeRecipient,
-        collectionMethod: feeRecipient ? 'cosmos_bank_msgsend' : 'skip_go_quote_only',
-        estimatedFeeUsd,
-      },
-      estimatedSeconds: maxSeconds,
-      gaslessAvailable: Boolean(process.env.SIPHON_COSMOS_RELAYER_KEY?.trim() || cfg.supportsTxFees),
-      gaslessMechanism: cfg.supportsTxFees
-        ? 'Osmosis x/txfees (pay gas in any IBC token) or x/feegrant'
-        : 'Cosmos x/feegrant BasicAllowance',
-      notes,
-    };
+    return prepareCosmosDirectBatch(params);
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {

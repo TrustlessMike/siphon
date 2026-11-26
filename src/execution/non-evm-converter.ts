@@ -29,6 +29,44 @@ export const LIFI_TRON_CHAIN_ID = 728126428;
 export const RELAY_BTC_NATIVE_CURRENCY = 'bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqmql8k8';
 export const RELAY_TON_NATIVE_CURRENCY = 'EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c';
 export const RELAY_TRON_NATIVE_CURRENCY = 'T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb';
+export const APTOS_NATIVE_USDC_FA_ADDRESS =
+  '0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b';
+export const DEFAULT_NON_EVM_AUCTION_TIMEOUT_MS = 3500;
+
+export interface NonEvmRouteAuctionCandidate {
+  provider: string;
+  label: string;
+  status: 'ok' | 'rejected_haircut' | 'timeout' | 'error' | 'ineligible';
+  quotedOutUsd: number;
+  gasUsd: number;
+  bridgeFeeUsd: number;
+  netUsd: number;
+  etaSeconds: number;
+  latencyMs: number;
+  liveExecutable: boolean;
+  requestId?: string;
+  reason?: string;
+}
+
+export interface NonEvmRouteAuctionMetadata {
+  winner: string;
+  winnerNetUsd: number;
+  runnerUp?: string;
+  runnerUpNetUsd?: number;
+  savingsOverRunnerUpUsd: number;
+  bpsSavedOverRunnerUp: number;
+  totalAuctionDurationMs: number;
+  providersQueried: string[];
+  providersSucceeded: number;
+  candidates: NonEvmRouteAuctionCandidate[];
+  perAsset?: Record<string, Omit<NonEvmRouteAuctionMetadata, 'perAsset'>>;
+}
+
+declare module '../adapters/interface.js' {
+  interface PreparedNonEvmBatch {
+    routeAuction?: NonEvmRouteAuctionMetadata;
+  }
+}
 
 // =====================================================================
 // BECH32 / BECH32M CODEC (Zero-Dependency RFC BIP-173 & BIP-350)
@@ -270,6 +308,7 @@ export async function quoteRelayNonEvm(params: {
   outputAsset: 'USDC' | 'SOL';
   feeRecipient?: string | null;
   protocolFeeBps?: number;
+  fetcher?: RouteAuctionFetcher;
 }): Promise<RelayNonEvmQuoteResult | null> {
   const destCurrency = params.outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
   const body: Record<string, unknown> = {
@@ -298,11 +337,16 @@ export async function quoteRelayNonEvm(params: {
     headers['x-api-key'] = process.env.RELAY_API_KEY.trim();
   }
 
-  const res = await fetchWithRetry('https://api.relay.link/quote', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
+  const res = await fetchWithRetry(
+    'https://api.relay.link/quote',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    },
+    5500,
+    params.fetcher
+  );
   if (!res || !res.ok) return null;
 
   const json = (await res.json()) as {
@@ -803,4 +847,380 @@ export function checkQuoteHaircutPass(params: {
 
 export function getCctpSolanaDomain(): number {
   return SOLANA_CCTP_DOMAIN;
+}
+
+// =====================================================================
+// LIVE QUOTE PROVIDER 5: MAYAN SWIFT NON-EVM (Sui -> Solana)
+// =====================================================================
+
+export interface MayanSwiftNonEvmQuoteResult {
+  provider: 'mayan_swift';
+  tool: string;
+  requestId: string;
+  estimatedOutputUi: string;
+  quotedOutUsd: number;
+  estimatedGasUsd: number;
+  bridgeFeeUsd: number;
+  estimatedSeconds: number;
+  liveExecutable: boolean;
+  appliedSlippageBps: number;
+  transactionRequest: Record<string, unknown> | null;
+  rawQuote: Record<string, unknown>;
+}
+
+interface MayanRawQuotePayload {
+  type?: string;
+  quoteId?: string;
+  expectedAmountOut?: string | number;
+  expectedAmountOutBaseUnits?: string | number;
+  minAmountOut?: string | number;
+  toTokenPrice?: number;
+  toToken?: { decimals?: number; symbol?: string };
+  clientRelayerFeeSuccess?: number;
+  swapRelayerFee?: number;
+  redeemRelayerFee?: number;
+  etaSeconds?: number;
+  eta?: number;
+  transactionRequest?: Record<string, unknown>;
+  serializedTransaction?: string;
+  ptbBytes?: string;
+  [key: string]: unknown;
+}
+
+export async function quoteMayanSwiftNonEvm(params: {
+  fromChain: 'sui';
+  fromToken: string;
+  fromAmount: string;
+  fromDecimals: number;
+  fromAddress: string;
+  solanaDestination: string;
+  outputAsset: 'USDC' | 'SOL';
+  tradeUsd?: number;
+  liquidityUsd?: number;
+  symbol?: string;
+  slippageBps?: number;
+  timeoutMs?: number;
+  fetcher?: RouteAuctionFetcher;
+}): Promise<MayanSwiftNonEvmQuoteResult | null> {
+  const toToken = params.outputAsset === 'SOL' ? SOLANA_NATIVE_MINT : SOLANA_USDC_MINT;
+  const slippagePlan = computeTierScaledSlippageBps({
+    tradeUsd: params.tradeUsd,
+    liquidityUsd: params.liquidityUsd,
+    symbol: params.symbol,
+    overrideBps: params.slippageBps,
+  });
+
+  let amountInUi = 0;
+  try {
+    const raw = BigInt(params.fromAmount);
+    const div = 10n ** BigInt(params.fromDecimals);
+    amountInUi = Number(raw / div) + Number(raw % div) / Number(div);
+  } catch {
+    amountInUi = Number(params.fromAmount) / 10 ** params.fromDecimals;
+  }
+  if (!Number.isFinite(amountInUi) || amountInUi <= 0) return null;
+
+  const url = new URL('https://price-api.mayan.finance/v3/quote');
+  url.searchParams.set('amountIn64', params.fromAmount);
+  url.searchParams.set('amountIn', String(amountInUi));
+  url.searchParams.set('fromToken', params.fromToken);
+  url.searchParams.set('fromChain', params.fromChain);
+  url.searchParams.set('toToken', toToken);
+  url.searchParams.set('toChain', 'solana');
+  url.searchParams.set('slippageBps', String(slippagePlan.slippageBps));
+  url.searchParams.set('swift', 'true');
+  url.searchParams.set('fromAddress', params.fromAddress);
+  url.searchParams.set('destAddress', params.solanaDestination);
+  url.searchParams.set('gasDrop', '0');
+
+  const timeoutMs = params.timeoutMs ?? DEFAULT_NON_EVM_AUCTION_TIMEOUT_MS;
+  const fetcher = params.fetcher ?? globalThis.fetch.bind(globalThis);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response | null = null;
+  try {
+    res = await fetcher(url.toString(), {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+  } catch {
+    res = null;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res || !res.ok) return null;
+
+  const rawJson = (await res.json().catch(() => null)) as
+    | MayanRawQuotePayload
+    | MayanRawQuotePayload[]
+    | { quotes?: MayanRawQuotePayload[] }
+    | null;
+  if (!rawJson) return null;
+
+  const list: MayanRawQuotePayload[] = Array.isArray(rawJson)
+    ? rawJson
+    : Array.isArray((rawJson as { quotes?: MayanRawQuotePayload[] }).quotes)
+    ? ((rawJson as { quotes: MayanRawQuotePayload[] }).quotes)
+    : [rawJson as MayanRawQuotePayload];
+
+  const valid = list.filter((q) => {
+    const out = Number(q.expectedAmountOut ?? 0);
+    const outBase = Number(q.expectedAmountOutBaseUnits ?? 0);
+    return (Number.isFinite(out) && out > 0) || (Number.isFinite(outBase) && outBase > 0);
+  });
+  if (!valid.length) return null;
+
+  const swiftQuotes = valid.filter((q) => String(q.type || '').toUpperCase() === 'SWIFT');
+  const pool = swiftQuotes.length ? swiftQuotes : valid;
+  const best = pool.reduce((a, b) =>
+    Number(b.expectedAmountOut ?? 0) > Number(a.expectedAmountOut ?? 0) ? b : a
+  );
+
+  const outDec = params.outputAsset === 'SOL' ? 9 : 6;
+  const outUi =
+    Number(best.expectedAmountOut ?? 0) > 0
+      ? Number(best.expectedAmountOut)
+      : Number(best.expectedAmountOutBaseUnits ?? 0) / 10 ** outDec;
+  if (!Number.isFinite(outUi) || outUi <= 0) return null;
+
+  const outPrice =
+    params.outputAsset === 'USDC'
+      ? 1.0
+      : Number(best.toTokenPrice ?? 0) > 0
+      ? Number(best.toTokenPrice)
+      : 150;
+  const quotedOutUsd = Number((outUi * outPrice).toFixed(2));
+  const bridgeFeeUsd = Number(
+    Math.max(0, Number(best.clientRelayerFeeSuccess ?? best.swapRelayerFee ?? 0)).toFixed(4)
+  );
+  const estimatedGasUsd = 0.01;
+  const etaSeconds = Math.max(8, Number(best.etaSeconds ?? best.eta ?? 18));
+
+  const txReq: Record<string, unknown> | null =
+    best.transactionRequest && Object.keys(best.transactionRequest).length > 0
+      ? best.transactionRequest
+      : typeof best.serializedTransaction === 'string' && best.serializedTransaction.length > 0
+      ? { data: best.serializedTransaction }
+      : typeof best.ptbBytes === 'string' && best.ptbBytes.length > 0
+      ? { data: best.ptbBytes }
+      : null;
+
+  const hasExecutableBytes = Boolean(
+    txReq &&
+      ((typeof txReq.data === 'string' && txReq.data.trim().length > 0) ||
+        (typeof txReq.transactionBlock === 'string' && txReq.transactionBlock.trim().length > 0))
+  );
+
+  return {
+    provider: 'mayan_swift',
+    tool: String(best.type || 'SWIFT').toUpperCase() === 'SWIFT' ? 'Mayan Swift' : `Mayan ${best.type}`,
+    requestId: best.quoteId || `mayan_${crypto.randomBytes(6).toString('hex')}`,
+    estimatedOutputUi: `${outUi.toFixed(params.outputAsset === 'SOL' ? 4 : 2)} ${params.outputAsset}`,
+    quotedOutUsd,
+    estimatedGasUsd,
+    bridgeFeeUsd,
+    estimatedSeconds: etaSeconds,
+    liveExecutable: hasExecutableBytes,
+    appliedSlippageBps: slippagePlan.slippageBps,
+    transactionRequest: txReq,
+    rawQuote: best as Record<string, unknown>,
+  };
+}
+
+// =====================================================================
+// LIVE QUOTE PROVIDER 6: PANORA SWAP API (Aptos Pre-Swap -> Native USDC FA)
+// =====================================================================
+
+const MOVE_ENTRY_FN_RE = /^0x[0-9a-fA-F]+::[A-Za-z0-9_]+::[A-Za-z0-9_]+$/;
+
+export interface PanoraAptosSwapQuoteResult {
+  ok: true;
+  provider: 'panora';
+  requestId: string;
+  fromTokenAddress: string;
+  toTokenAddress: string;
+  expectedOutUsdcUi: number;
+  minOutUsdcUi: number;
+  minOutUsdcRaw: string;
+  quotedOutUsd: number;
+  estimatedGasUsd: number;
+  appliedSlippageBps: number;
+  txData: {
+    function: string;
+    type_arguments: string[];
+    arguments: unknown[];
+  };
+}
+
+export interface PanoraAptosSwapFailure {
+  ok: false;
+  reason: string;
+  unkeyed?: boolean;
+}
+
+export async function quotePanoraAptosSwap(params: {
+  fromTokenAddress: string;
+  toTokenAddress?: string;
+  fromAmountRaw: string;
+  fromDecimals: number;
+  userAddress: string;
+  tradeUsd?: number;
+  liquidityUsd?: number;
+  symbol?: string;
+  slippageBps?: number;
+  apiKey?: string;
+  timeoutMs?: number;
+  fetcher?: RouteAuctionFetcher;
+}): Promise<PanoraAptosSwapQuoteResult | PanoraAptosSwapFailure> {
+  const apiKey = (params.apiKey ?? process.env.PANORA_API_KEY ?? '').trim();
+  if (!apiKey) {
+    return {
+      ok: false,
+      unkeyed: true,
+      reason:
+        'PANORA_API_KEY is not configured; cannot fetch live Aptos Panora pre-swap Move entry function payload (fail-closed).',
+    };
+  }
+
+  const toTokenAddress = params.toTokenAddress?.trim() || APTOS_NATIVE_USDC_FA_ADDRESS;
+  const rawLower = params.fromTokenAddress.trim().toLowerCase();
+  const normalizedFromToken =
+    rawLower === '0xa' ||
+    rawLower === '0x000000000000000000000000000000000000000000000000000000000000000a' ||
+    rawLower === '0x1::aptos_coin::aptoscoin'
+      ? '0x1::aptos_coin::AptosCoin'
+      : params.fromTokenAddress.trim();
+
+  let amountInUi = 0;
+  try {
+    const raw = BigInt(params.fromAmountRaw);
+    const div = 10n ** BigInt(params.fromDecimals);
+    amountInUi = Number(raw / div) + Number(raw % div) / Number(div);
+  } catch {
+    amountInUi = Number(params.fromAmountRaw) / 10 ** params.fromDecimals;
+  }
+  if (!Number.isFinite(amountInUi) || amountInUi <= 0) {
+    return { ok: false, reason: 'Invalid non-positive Aptos swap input amount.' };
+  }
+
+  const slippagePlan = computeTierScaledSlippageBps({
+    tradeUsd: params.tradeUsd,
+    liquidityUsd: params.liquidityUsd,
+    symbol: params.symbol,
+    overrideBps: params.slippageBps,
+  });
+
+  const url = new URL('https://api.panora.exchange/swap');
+  url.searchParams.set('fromTokenAddress', normalizedFromToken);
+  url.searchParams.set('toTokenAddress', toTokenAddress);
+  url.searchParams.set('fromTokenAmount', String(amountInUi));
+  url.searchParams.set('toWalletAddress', params.userAddress);
+  url.searchParams.set('slippagePercentage', String(slippagePlan.slippagePercent));
+
+  const res = await fetchWithRetry(
+    url.toString(),
+    {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+      },
+    },
+    params.timeoutMs ?? 4500,
+    params.fetcher
+  );
+  if (!res) {
+    return {
+      ok: false,
+      reason: 'Panora Swap API did not respond within timeout; skipping Aptos pre-swap (fail-closed).',
+    };
+  }
+  if (!res.ok) {
+    return {
+      ok: false,
+      reason: `Panora Swap API returned HTTP ${res.status}; skipping Aptos pre-swap (fail-closed).`,
+    };
+  }
+
+  const json = (await res.json().catch(() => null)) as {
+    quotes?: Array<{
+      toTokenAmount?: string | number;
+      minToTokenAmount?: string | number;
+      toTokenAmountUSD?: string | number;
+      txData?: {
+        function?: string;
+        type_arguments?: unknown[];
+        arguments?: unknown[];
+      };
+    }>;
+    txData?: {
+      function?: string;
+      type_arguments?: unknown[];
+      arguments?: unknown[];
+    };
+    toTokenAmount?: string | number;
+    minToTokenAmount?: string | number;
+    toTokenAmountUSD?: string | number;
+  } | null;
+
+  const best = Array.isArray(json?.quotes) && json.quotes.length > 0 ? json.quotes[0] : json;
+  const txData = best?.txData;
+  if (
+    !txData ||
+    typeof txData.function !== 'string' ||
+    !MOVE_ENTRY_FN_RE.test(txData.function.trim()) ||
+    !Array.isArray(txData.type_arguments) ||
+    !Array.isArray(txData.arguments)
+  ) {
+    return {
+      ok: false,
+      reason: 'Panora Swap API returned no valid Move entry_function_payload (function/type_arguments/arguments); fail-closed.',
+    };
+  }
+
+  const expectedOutUsdcUi = Number(best?.toTokenAmount ?? 0);
+  const rawMinOutUi = Number(best?.minToTokenAmount ?? 0);
+  const minOutUsdcUi =
+    Number.isFinite(rawMinOutUi) && rawMinOutUi > 0
+      ? rawMinOutUi
+      : expectedOutUsdcUi * (1 - slippagePlan.slippageFraction);
+  if (!Number.isFinite(expectedOutUsdcUi) || expectedOutUsdcUi <= 0 || !Number.isFinite(minOutUsdcUi) || minOutUsdcUi <= 0) {
+    return {
+      ok: false,
+      reason: 'Panora Swap API returned zero or invalid USDC output amount.',
+    };
+  }
+
+  const minOutUsdcRaw = BigInt(Math.floor(minOutUsdcUi * 1_000_000)).toString();
+  if (BigInt(minOutUsdcRaw) <= 0n) {
+    return {
+      ok: false,
+      reason: 'Panora pre-swap minimum USDC output rounds to 0 base units.',
+    };
+  }
+
+  const quotedOutUsd = Number(
+    (Number(best?.toTokenAmountUSD ?? 0) > 0 ? Number(best?.toTokenAmountUSD) : expectedOutUsdcUi).toFixed(2)
+  );
+
+  return {
+    ok: true,
+    provider: 'panora',
+    requestId: `panora_${crypto.randomBytes(6).toString('hex')}`,
+    fromTokenAddress: normalizedFromToken,
+    toTokenAddress,
+    expectedOutUsdcUi: Number(expectedOutUsdcUi.toFixed(6)),
+    minOutUsdcUi: Number(minOutUsdcUi.toFixed(6)),
+    minOutUsdcRaw,
+    quotedOutUsd,
+    estimatedGasUsd: 0.01,
+    appliedSlippageBps: slippagePlan.slippageBps,
+    txData: {
+      function: txData.function.trim(),
+      type_arguments: txData.type_arguments.map(String),
+      arguments: txData.arguments,
+    },
+  };
 }
