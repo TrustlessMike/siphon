@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# --- Stage 1: Build TypeScript server & browser vendor bundle ---
+# --- Stage 1: Build TypeScript server, SDK, MCP & browser vendor bundles ---
 FROM node:22-slim AS builder
 
 WORKDIR /app
@@ -9,13 +9,14 @@ COPY package.json package-lock.json ./
 RUN npm ci
 
 COPY tsconfig.json ./
+COPY scripts ./scripts
 COPY src ./src
 COPY public ./public
 COPY contracts ./contracts
 
 RUN npm run build && npm prune --omit=dev
 
-# --- Stage 2: Minimal non-root production runtime ---
+# --- Stage 2: Minimal non-root Node 22 Slim production runtime ---
 FROM node:22-slim AS runner
 
 WORKDIR /app

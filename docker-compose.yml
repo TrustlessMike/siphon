@@ -1,0 +1,58 @@
+# Self-host Turgalium + optional gasless relayer in one command:
+#   TURGALIUM_ADMIN_SESSION_TOKEN="$(openssl rand -hex 32)" docker compose up -d --build
+#
+# Or copy .env.example to .env, set TURGALIUM_ADMIN_SESSION_TOKEN (and optional RPC/relayer keys),
+# then run:
+#   docker compose up -d --build
+
+services:
+  turgalium:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: turgalium-migrator:1.0.0
+    container_name: turgalium-migrator
+    restart: unless-stopped
+    ports:
+      - "${TURGALIUM_BIND_IP:-127.0.0.1}:${TURGALIUM_PORT:-4420}:4420"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      HOST: "0.0.0.0"
+      PORT: "4420"
+      TURGALIUM_DATA_DIR: /data
+      TURGALIUM_ADMIN_SESSION_TOKEN: "${TURGALIUM_ADMIN_SESSION_TOKEN:?Set TURGALIUM_ADMIN_SESSION_TOKEN (e.g. openssl rand -hex 32) in .env or shell}"
+      TURGALIUM_ALLOWED_HOSTS: "${TURGALIUM_ALLOWED_HOSTS:-localhost,127.0.0.1}"
+      TURGALIUM_ALLOWED_ORIGIN: "${TURGALIUM_ALLOWED_ORIGIN:-http://localhost:4420,http://127.0.0.1:4420}"
+      TURGALIUM_PUBLIC_BASE_URL: "${TURGALIUM_PUBLIC_BASE_URL:-http://127.0.0.1:4420}"
+      TURGALIUM_TRUST_PROXY: "${TURGALIUM_TRUST_PROXY:-false}"
+      TURGALIUM_REQUIRE_PLUGIN_AUTH: "${TURGALIUM_REQUIRE_PLUGIN_AUTH:-true}"
+      TURGALIUM_RATE_LIMIT_MAX: "${TURGALIUM_RATE_LIMIT_MAX:-240}"
+      TURGALIUM_RATE_LIMIT_WINDOW_MS: "${TURGALIUM_RATE_LIMIT_WINDOW_MS:-60000}"
+      TURGALIUM_RPC_COOLDOWN_MS: "${TURGALIUM_RPC_COOLDOWN_MS:-60000}"
+      # Optional gasless relayer private key (leave empty to disable sponsored relayer)
+      TURGALIUM_RELAYER_PRIVATE_KEY: "${TURGALIUM_RELAYER_PRIVATE_KEY:-}"
+    volumes:
+      - turgalium_data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4420/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  turgalium_data:
+    driver: local
