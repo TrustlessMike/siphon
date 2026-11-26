@@ -19,7 +19,7 @@ export function buildAiPluginManifest(baseUrl: string) {
       url: `${cleanBase}/openapi.json`,
       is_user_authenticated: true,
     },
-    logo_url: `${cleanBase}/logos/solana.svg`,
+    logo_url: `${cleanBase}/logos/turgalium.svg`,
     contact_email: 'security@turgalium.local',
     legal_info_url: `${cleanBase}/`,
   };

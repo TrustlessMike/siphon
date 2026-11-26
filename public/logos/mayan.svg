@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <defs>
+    <linearGradient id="mayanGrad" x1="7" y1="9" x2="25" y2="23" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FDE047"/>
+      <stop offset="100%" stop-color="#F97316"/>
+    </linearGradient>
+  </defs>
+  <rect x="1.5" y="1.5" width="29" height="29" rx="8" fill="#141320" stroke="#362819" stroke-width="1"/>
+  <path d="M7.5 22h17v-2.6h-2.5v-2.6h-2.5v-2.6h-2.2V11h-2.6v3.2h-2.2v2.6H10v2.6H7.5V22Z" fill="url(#mayanGrad)"/>
+  <rect x="14.2" y="18.2" width="3.6" height="3.8" fill="#141320"/>
+</svg>

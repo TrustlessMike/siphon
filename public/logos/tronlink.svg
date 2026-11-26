@@ -1,1 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><rect x="2" y="2" width="20" height="20" rx="6" fill="#2A4494"/><path d="M6.5 7.5l11 2.2-5.4 8.3-5.6-10.5z" fill="#fff"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <defs>
+    <linearGradient id="tronLinkBg" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3152B8"/>
+      <stop offset="100%" stop-color="#1B2E6B"/>
+    </linearGradient>
+  </defs>
+  <rect x="1.5" y="1.5" width="21" height="21" rx="6" fill="url(#tronLinkBg)"/>
+  <path d="M6.2 7.2l11.6 2.3-5.8 8.7L6.2 7.2Z" stroke="#FFFFFF" stroke-width="1.5" stroke-linejoin="round"/>
+  <path d="M6.2 7.2l6.1 4.2 5.5-1.9M12.3 11.4L12 18.2" stroke="#93C5FD" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

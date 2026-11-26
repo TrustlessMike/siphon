@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <defs>
+    <linearGradient id="debridgeGrad" x1="7" y1="8" x2="25" y2="24" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#C7F284"/>
+      <stop offset="100%" stop-color="#A855F7"/>
+    </linearGradient>
+  </defs>
+  <rect x="1.5" y="1.5" width="29" height="29" rx="8" fill="#131820" stroke="#2D3748" stroke-width="1"/>
+  <path d="M8.5 18.5c0-4.2 3.4-7.5 7.5-7.5s7.5 3.3 7.5 7.5" stroke="url(#debridgeGrad)" stroke-width="2.6" stroke-linecap="round"/>
+  <path d="M12.2 18.5a3.8 3.8 0 0 1 7.6 0" stroke="#F3F6FA" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M8.5 21.8h15" stroke="#94A3B8" stroke-width="2" stroke-linecap="round"/>
+</svg>
