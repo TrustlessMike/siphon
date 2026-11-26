@@ -3,6 +3,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
+import {
+  ComputeBudgetProgram,
+  PublicKey,
+  SystemProgram,
+  TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+} from '@solana/web3.js';
 
 interface WalletSession {
   family: string;
@@ -29,10 +37,26 @@ interface WalletsModule {
   isBitcoinMainnetAddress: (addr: string) => boolean;
   listAvailableSolanaWallets: () => Array<{ id: string; name: string; kind: string }>;
   listAvailableFamilyWallets: (family: string) => Array<{ id: string; name: string; kind?: string; standard?: string }>;
+  connectEvmWallet: (opts?: Record<string, unknown>) => Promise<{ address: string; walletName: string }>;
+  disconnectEvmWallet: () => void;
+  getConnectedEvmAddress: () => string | null;
   connectSolanaWallet: (opts?: Record<string, unknown>) => Promise<{ address: string; walletName: string }>;
   disconnectSolanaWallet: () => void;
   getConnectedSolanaAddress: () => string | null;
   getConnectedSolanaWalletName: () => string | null;
+  signAndSendSolanaVersionedTx: (
+    base64Tx: string,
+    opts?: Record<string, unknown>
+  ) => Promise<{ signature: string; walletName: string; mode: string; explorerUrl: string }>;
+  sendEvmRevokeCalls: (params: Record<string, unknown>) => Promise<{
+    mode: string;
+    batchId: string | null;
+    txHashes: string[];
+    revokedCount: number;
+    revokedIndices?: number[];
+  }>;
+  isUserRejectedError: (err: unknown) => boolean;
+  normalizePaymasterUrl: (raw: unknown) => string | null;
   connectFamilyWallet: (family: string, opts?: Record<string, unknown>) => Promise<WalletSession>;
   disconnectFamilyWallet: (family: string) => void;
   getConnectedFamilyWallet: (family: string) => WalletSession | null;
@@ -636,17 +660,42 @@ test('Tron: handles locked "" / false address, waits for async tronWeb.ready rac
   });
   assert.equal(session.address, TRON_MAINNET_A);
 
-  // Post-connect accountsChanged message updates address
+  // Cross-origin or foreign-source postMessage MUST be ignored (M-5)
   mockWindow.dispatchEvent(
     Object.assign(new Event('message'), {
+      source: {},
+      origin: 'https://evil.example',
+      data: { message: { action: 'accountsChanged', data: { address: TRON_MAINNET_B } } },
+    })
+  );
+  mockWindow.dispatchEvent(
+    Object.assign(new Event('message'), {
+      source: mockWindow,
+      origin: 'https://evil.example',
+      data: { message: { action: 'disconnect' } },
+    })
+  );
+  assert.equal(
+    wallets.getConnectedFamilyWallet('tron')?.address,
+    TRON_MAINNET_A,
+    'Cross-origin / foreign-source Tron postMessage must be ignored'
+  );
+
+  // Same-origin window post-connect accountsChanged message updates address
+  mockWindow.dispatchEvent(
+    Object.assign(new Event('message'), {
+      source: mockWindow,
+      origin: mockWindow.location.origin,
       data: { message: { action: 'accountsChanged', data: { address: TRON_MAINNET_B } } },
     })
   );
   assert.equal(wallets.getConnectedFamilyWallet('tron')?.address, TRON_MAINNET_B);
 
-  // Post-connect setNode switching to Nile testnet disconnects fail-closed
+  // Same-origin window post-connect setNode switching to Nile testnet disconnects fail-closed
   mockWindow.dispatchEvent(
     Object.assign(new Event('message'), {
+      source: mockWindow,
+      origin: mockWindow.location.origin,
       data: { message: { action: 'setNode', data: { node: { fullNode: 'https://nile.trongrid.io' } } } },
     })
   );
@@ -1307,4 +1356,321 @@ test('Bitcoin Phantom executeNonEvmDirectBatch: passes non-empty inputsToSign, e
       ),
     /Pre-sign check failed/i
   );
+});
+
+// =========================================================================
+// 6. WAVE 8C: FRONTEND PRE-SIGN VERIFICATION & HARDENING BACKTESTS
+// =========================================================================
+
+const SPL_TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const JUPITER_V6_PROGRAM = new PublicKey('JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4');
+const TEST_SOL_BLOCKHASH = '11111111111111111111111111111111';
+
+function buildSignedReadyV0Base64(payerBase58: string, instructions: TransactionInstruction[]): string {
+  const msg = new TransactionMessage({
+    payerKey: new PublicKey(payerBase58),
+    recentBlockhash: TEST_SOL_BLOCKHASH,
+    instructions,
+  }).compileToV0Message();
+  return Buffer.from(new VersionedTransaction(msg).serialize()).toString('base64');
+}
+
+test('Wave 8C [C-1]: signAndSendSolanaVersionedTx deserializes fail-closed, verifies fee payer, rent_reclaim CloseAccount, jupiter flows, and Wallet Standard account match', async () => {
+  resetMockWalletGlobals();
+  let signCalls = 0;
+
+  mockWindow.phantom = {
+    solana: {
+      isPhantom: true,
+      connect: async () => ({ publicKey: { toBase58: () => SOL_ADDR_A } }),
+      signAndSendTransaction: async (tx: VersionedTransaction) => {
+        signCalls += 1;
+        assert.ok(typeof tx?.serialize === 'function', 'Provider should receive deserialized VersionedTransaction');
+        return { signature: '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d' };
+      },
+    },
+  };
+  await wallets.connectSolanaWallet({ walletId: 'legacy-phantom' });
+
+  // 1. Unparseable / corrupted bytes -> MUST fail closed (never submit raw bytes!)
+  const garbageB64 = Buffer.from('not-a-valid-solana-versioned-transaction-payload-12345').toString('base64');
+  await assert.rejects(
+    () => wallets.signAndSendSolanaVersionedTx(garbageB64, { flow: 'rent_reclaim', autoConnect: false }),
+    /failed to deserialize Solana VersionedTransaction/i
+  );
+  assert.equal(signCalls, 0);
+
+  // 2. Valid VersionedTransaction with WRONG fee payer (SOL_ADDR_B !== connected SOL_ADDR_A) -> rejected!
+  const ownerA = new PublicKey(SOL_ADDR_A);
+  const ownerB = new PublicKey(SOL_ADDR_B);
+  const dummyAta = new PublicKey(SOL_ADDR_MANUAL);
+
+  const wrongFeePayerB64 = buildSignedReadyV0Base64(SOL_ADDR_B, [
+    new TransactionInstruction({
+      programId: SPL_TOKEN_PROGRAM,
+      keys: [
+        { pubkey: dummyAta, isSigner: false, isWritable: true },
+        { pubkey: ownerB, isSigner: false, isWritable: true },
+        { pubkey: ownerB, isSigner: true, isWritable: false },
+      ],
+      data: Buffer.from([9]),
+    }),
+  ]);
+  await assert.rejects(
+    () => wallets.signAndSendSolanaVersionedTx(wrongFeePayerB64, { flow: 'rent_reclaim', autoConnect: false }),
+    /fee payer.*does not match connected Solana wallet/i
+  );
+  assert.equal(signCalls, 0);
+
+  // 3. rent_reclaim with non-CloseAccount Token opcode (3 = Transfer) -> rejected!
+  const tokenTransferB64 = buildSignedReadyV0Base64(SOL_ADDR_A, [
+    new TransactionInstruction({
+      programId: SPL_TOKEN_PROGRAM,
+      keys: [
+        { pubkey: dummyAta, isSigner: false, isWritable: true },
+        { pubkey: ownerA, isSigner: false, isWritable: true },
+        { pubkey: ownerA, isSigner: true, isWritable: false },
+      ],
+      data: Buffer.from([3, 1, 0, 0, 0, 0, 0, 0, 0]),
+    }),
+  ]);
+  await assert.rejects(
+    () => wallets.signAndSendSolanaVersionedTx(tokenTransferB64, { flow: 'rent_reclaim', autoConnect: false }),
+    /CloseAccount opcode \(9\)/i
+  );
+  assert.equal(signCalls, 0);
+
+  // 4. rent_reclaim with CloseAccount redirecting rent destination to foreign wallet SOL_ADDR_B -> rejected!
+  const foreignDestCloseB64 = buildSignedReadyV0Base64(SOL_ADDR_A, [
+    new TransactionInstruction({
+      programId: SPL_TOKEN_PROGRAM,
+      keys: [
+        { pubkey: dummyAta, isSigner: false, isWritable: true },
+        { pubkey: ownerB, isSigner: false, isWritable: true }, // attacker destination!
+        { pubkey: ownerA, isSigner: true, isWritable: false },
+      ],
+      data: Buffer.from([9]),
+    }),
+  ]);
+  await assert.rejects(
+    () => wallets.signAndSendSolanaVersionedTx(foreignDestCloseB64, { flow: 'rent_reclaim', autoConnect: false }),
+    /CloseAccount rent destination.*does not match connected Solana wallet/i
+  );
+  assert.equal(signCalls, 0);
+
+  // 5. rent_reclaim with disallowed SystemProgram.transfer -> rejected!
+  const drainerInRentB64 = buildSignedReadyV0Base64(SOL_ADDR_A, [
+    SystemProgram.transfer({ fromPubkey: ownerA, toPubkey: ownerB, lamports: 1_000_000 }),
+  ]);
+  await assert.rejects(
+    () => wallets.signAndSendSolanaVersionedTx(drainerInRentB64, { flow: 'rent_reclaim', autoConnect: false }),
+    /disallowed program/i
+  );
+  assert.equal(signCalls, 0);
+
+  // 6. jupiter_yield / jupiter_predict blocking raw SystemProgram.transfer drainer without Jupiter program!
+  await assert.rejects(
+    () => wallets.signAndSendSolanaVersionedTx(drainerInRentB64, { flow: 'jupiter_yield', autoConnect: false }),
+    /blocked raw SystemProgram\.transfer/i
+  );
+  await assert.rejects(
+    () => wallets.signAndSendSolanaVersionedTx(drainerInRentB64, { flow: 'jupiter_predict', autoConnect: false }),
+    /blocked raw SystemProgram\.transfer/i
+  );
+  assert.equal(signCalls, 0);
+
+  // 7. Valid rent_reclaim VersionedTransaction (ComputeBudget + CloseAccount to ownerA) -> SUCCEEDS!
+  const validRentB64 = buildSignedReadyV0Base64(SOL_ADDR_A, [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 40_000 }),
+    new TransactionInstruction({
+      programId: SPL_TOKEN_PROGRAM,
+      keys: [
+        { pubkey: dummyAta, isSigner: false, isWritable: true },
+        { pubkey: ownerA, isSigner: false, isWritable: true },
+        { pubkey: ownerA, isSigner: true, isWritable: false },
+      ],
+      data: Buffer.from([9]),
+    }),
+  ]);
+  const rentRes = await wallets.signAndSendSolanaVersionedTx(validRentB64, {
+    expectedFeePayer: SOL_ADDR_A,
+    flow: 'rent_reclaim',
+    autoConnect: false,
+  });
+  assert.equal(rentRes.signature, '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d');
+  assert.equal(signCalls, 1);
+
+  // 8. Valid jupiter_yield VersionedTransaction -> SUCCEEDS!
+  const validJupB64 = buildSignedReadyV0Base64(SOL_ADDR_A, [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+    new TransactionInstruction({
+      programId: JUPITER_V6_PROGRAM,
+      keys: [{ pubkey: ownerA, isSigner: true, isWritable: true }],
+      data: Buffer.from([1, 2, 3, 4]),
+    }),
+  ]);
+  const jupRes = await wallets.signAndSendSolanaVersionedTx(validJupB64, {
+    expectedFeePayer: SOL_ADDR_A,
+    flow: 'jupiter_yield',
+    autoConnect: false,
+  });
+  assert.equal(jupRes.signature, '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d');
+  assert.equal(signCalls, 2);
+
+  // 9. Wallet Standard account mismatch -> MUST fail closed (never fall back to accounts[0]!)
+  wallets.disconnectSolanaWallet();
+  const stdAccounts = [{ address: SOL_ADDR_A, chains: ['solana:mainnet'] }];
+  registerStandardWalletMock({
+    name: 'StrictMatchSolWallet',
+    chains: ['solana:mainnet'],
+    accounts: stdAccounts,
+    features: {
+      'standard:connect': {
+        connect: async () => ({ accounts: [{ address: SOL_ADDR_A, chains: ['solana:mainnet'] }] }),
+      },
+      'solana:signAndSendTransaction': {
+        signAndSendTransaction: async () => [{ signature: new Uint8Array(64).fill(5) }],
+      },
+    },
+  });
+  await wallets.connectSolanaWallet({ walletId: 'std:strictmatchsolwallet' });
+  // Mutate wallet.accounts so connected SOL_ADDR_A is replaced by foreign SOL_ADDR_B
+  stdAccounts[0] = { address: SOL_ADDR_B, chains: ['solana:mainnet'] };
+  await assert.rejects(
+    () => wallets.signAndSendSolanaVersionedTx(validRentB64, { flow: 'rent_reclaim', autoConnect: false }),
+    /does not match any active Wallet Standard account/i
+  );
+  wallets.disconnectSolanaWallet();
+});
+
+test('Wave 8C [L-3, M-4, L-4, H-2]: sendEvmRevokeCalls rejects zero spender & mixed chainId, verifies EIP-5792 status, tracks partial sequential failures, and dispatches siphon:wallet-changed', async () => {
+  resetMockWalletGlobals();
+  wallets.disconnectEvmWallet();
+
+  const EVM_USER = '0x1111111111111111111111111111111111111111';
+  const TOKEN_A = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
+  const TOKEN_B = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
+  const GOOD_SPENDER_HEX = '6b7a87899490ece95443e979ca9485cbe7e71522';
+  const ZERO_SPENDER_HEX = '0'.repeat(40);
+  const validRevokeData = '0x095ea7b3' + '0'.repeat(24) + GOOD_SPENDER_HEX + '0'.repeat(64);
+  const zeroSpenderRevokeData = '0x095ea7b3' + '0'.repeat(24) + ZERO_SPENDER_HEX + '0'.repeat(64);
+
+  const walletEvents: Array<Record<string, unknown>> = [];
+  const onWalletChanged = (ev: Event) => {
+    walletEvents.push(((ev as CustomEvent).detail || {}) as Record<string, unknown>);
+  };
+  mockWindow.addEventListener('siphon:wallet-changed', onWalletChanged);
+
+  let sendTxCount = 0;
+  let rejectSecondSequential = false;
+  mockWindow.ethereum = {
+    isMetaMask: true,
+    on: () => {},
+    removeListener: () => {},
+    request: async ({ method }: { method: string }) => {
+      if (method === 'eth_requestAccounts') return [EVM_USER];
+      if (method === 'eth_chainId') return '0x1';
+      if (method === 'wallet_getCapabilities') return {};
+      if (method === 'wallet_sendCalls') {
+        const e = new Error('Method not supported') as Error & { code?: number };
+        e.code = -32601;
+        throw e;
+      }
+      if (method === 'eth_sendTransaction') {
+        sendTxCount += 1;
+        if (rejectSecondSequential && sendTxCount === 2) {
+          const e = new Error('User cancelled signing') as Error & { code?: number };
+          e.code = 4001;
+          throw e;
+        }
+        return '0x' + String(sendTxCount).padStart(64, 'a');
+      }
+      return null;
+    },
+  };
+
+  try {
+    await wallets.connectEvmWallet();
+    assert.ok(
+      walletEvents.some((d) => d.family === 'evm' && d.action === 'connect' && d.address === EVM_USER),
+      'Expected siphon:wallet-changed connect event for EVM'
+    );
+
+    // 1. Reject zero spender (L-3)
+    await assert.rejects(
+      () =>
+        wallets.sendEvmRevokeCalls({
+          chainId: 1,
+          expectedFrom: EVM_USER,
+          calls: [{ to: TOKEN_A, data: zeroSpenderRevokeData, value: '0x0', chainId: 1 }],
+        }),
+      /spender cannot be the zero address/i
+    );
+
+    // 2. Reject mixed chainId (L-3)
+    await assert.rejects(
+      () =>
+        wallets.sendEvmRevokeCalls({
+          chainId: 1,
+          expectedFrom: EVM_USER,
+          calls: [
+            { to: TOKEN_A, data: validRevokeData, value: '0x0', chainId: 1 },
+            { to: TOKEN_B, data: validRevokeData, value: '0x0', chainId: 8453 },
+          ],
+        }),
+      /mixed chainId/i
+    );
+    assert.equal(sendTxCount, 0);
+
+    // 3. Partial sequential failure attaches already-submitted revokedIndices & txHashes (M-4)
+    rejectSecondSequential = true;
+    await assert.rejects(
+      () =>
+        wallets.sendEvmRevokeCalls({
+          chainId: 1,
+          expectedFrom: EVM_USER,
+          calls: [
+            { to: TOKEN_A, data: validRevokeData, value: '0x0', chainId: 1 },
+            { to: TOKEN_B, data: validRevokeData, value: '0x0', chainId: 1 },
+          ],
+        }),
+      (err: Error & { revokedIndices?: number[]; txHashes?: string[]; code?: number }) => {
+        assert.deepEqual(err.revokedIndices, [0]);
+        assert.equal(err.txHashes?.length, 1);
+        assert.equal(wallets.isUserRejectedError(err), true);
+        return true;
+      }
+    );
+
+    // 4. isUserRejectedError covers user cancel / transaction cancel / rejected by user & plain { code: 4001 }
+    assert.equal(wallets.isUserRejectedError({ code: 4001 }), true);
+    assert.equal(wallets.isUserRejectedError(new Error('Transaction canceled in wallet')), true);
+    assert.equal(wallets.isUserRejectedError(new Error('Rejected by user')), true);
+    assert.equal(wallets.isUserRejectedError(new Error('User cancel')), true);
+
+    // 5. normalizePaymasterUrl rejects credentials and rejects http://127.0.0.1 on non-local browser origin (L-4)
+    assert.equal(wallets.normalizePaymasterUrl('https://user:pass@paymaster.example.com/v1'), null);
+    const prevLocation = mockWindow.location;
+    mockWindow.location = { origin: 'https://siphon.app', hostname: 'siphon.app' } as typeof mockWindow.location;
+    try {
+      assert.equal(wallets.normalizePaymasterUrl('http://127.0.0.1:4337/pm'), null);
+      assert.equal(wallets.normalizePaymasterUrl('http://localhost:4337/pm'), null);
+      assert.equal(
+        wallets.normalizePaymasterUrl('https://paymaster.siphon.app/v1'),
+        'https://paymaster.siphon.app/v1'
+      );
+    } finally {
+      mockWindow.location = prevLocation;
+    }
+
+    wallets.disconnectEvmWallet();
+    assert.ok(
+      walletEvents.some((d) => d.family === 'evm' && d.action === 'disconnect' && d.address === null),
+      'Expected siphon:wallet-changed disconnect event for EVM'
+    );
+  } finally {
+    mockWindow.removeEventListener('siphon:wallet-changed', onWalletChanged);
+    delete mockWindow.ethereum;
+    wallets.disconnectEvmWallet();
+  }
 });

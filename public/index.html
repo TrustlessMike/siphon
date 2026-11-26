@@ -68,6 +68,7 @@
                 type="text"
                 id="heroWalletInput"
                 class="hero-inspect-input mono"
+                maxlength="128"
                 placeholder="Inspect any 0x…, cosmos1…, bc1…, EQ…, T… address"
                 aria-label="Inspect any multi-chain wallet address"
               />
@@ -242,6 +243,7 @@
                   type="text"
                   id="appEvmInput"
                   class="source-input mono"
+                  maxlength="128"
                   placeholder="Scan any 0x… EVM, cosmos1…, bc1…, EQ…, T… address"
                   aria-label="Source wallet address"
                 />
@@ -260,6 +262,7 @@
                 type="text"
                 id="unifiedWalletInput"
                 class="field-input-xs mono"
+                maxlength="128"
                 placeholder="Add another 0x…, cosmos1…, bc1…, EQ…, T… wallet to unify"
                 aria-label="Additional wallet address to unify"
               />
@@ -267,6 +270,7 @@
                 type="text"
                 id="unifiedWalletLabelInput"
                 class="field-input-xs unified-label-input"
+                maxlength="64"
                 placeholder="Label (e.g. Hardware, Keplr)"
                 aria-label="Wallet label"
               />
@@ -380,6 +384,7 @@
                       type="text"
                       id="solanaDestInput"
                       class="field-input mono"
+                      maxlength="64"
                       value=""
                       placeholder="Connect Solana or enter destination"
                       aria-label="Solana destination address"
@@ -450,6 +455,7 @@
                       type="text"
                       id="feeRecipientInput"
                       class="field-input-xs mono"
+                      maxlength="64"
                       placeholder="0x… SiphonFeeVault or Treasury wallet"
                       aria-label="Protocol fee recipient EVM address"
                     />
@@ -549,6 +555,7 @@
                     type="text"
                     id="rentOwnerInput"
                     class="ptool-input mono"
+                    maxlength="64"
                     placeholder="Solana wallet address…"
                     aria-label="Solana wallet address for empty ATA rent scan"
                   />
@@ -584,6 +591,7 @@
                         class="ptool-input mono"
                         value="100"
                         min="1"
+                        max="10000000"
                         step="1"
                         aria-label="Total USDC amount for yield split"
                       />
@@ -763,7 +771,7 @@
                 <form class="mandate-form" id="createMandateForm">
                   <label class="mandate-field">
                     <span class="mandate-label">Rule name</span>
-                    <input type="text" id="mandateNameInput" class="mandate-input" value="Dust &amp; DeFi Auto-Sweep Agent" placeholder="e.g. Daily Dust Sweeper" />
+                    <input type="text" id="mandateNameInput" class="mandate-input" maxlength="80" value="Dust &amp; DeFi Auto-Sweep Agent" placeholder="e.g. Daily Dust Sweeper" />
                   </label>
 
                   <div class="mandate-caps-grid">

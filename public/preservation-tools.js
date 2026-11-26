@@ -26,6 +26,18 @@ const SUPPORTED_APPROVAL_CHAINS = [
   { id: 'bnb', label: 'BNB Chain', explorer: 'https://bscscan.com/tx/' },
 ];
 
+const SOLSCAN_ALLOWED_HOSTS = ['solscan.io'];
+const YIELD_VAULT_ALLOWED_HOSTS = ['jup.ag', 'app.kamino.finance', 'kamino.finance'];
+const EVM_EXPLORER_ALLOWED_HOSTS = [
+  'etherscan.io',
+  'basescan.org',
+  'arbiscan.io',
+  'optimistic.etherscan.io',
+  'polygonscan.com',
+  'snowtrace.io',
+  'bscscan.com',
+];
+
 const state = {
   // Rent Vacuum
   rentScan: null,
@@ -33,6 +45,7 @@ const state = {
   rentError: null,
   rentSigning: false,
   rentLastTx: null, // { signature, explorerUrl, count, reclaimedSol }
+  rentSeq: 0,
 
   // Yield Park
   strategies: [],
@@ -46,6 +59,7 @@ const state = {
   yieldError: null,
   yieldSigning: false,
   yieldLastTx: null, // { signature, explorerUrl, strategyName, yieldUsdc }
+  yieldSeq: 0,
 
   // Stale Approval Revoker
   selectedApprovalChain: 'ethereum',
@@ -55,6 +69,7 @@ const state = {
   revokingKey: null, // 'all' | findingKey
   revokedKeys: new Set(),
   approvalLastResult: null, // { mode, count, txHashes, batchId }
+  approvalSeq: 0,
 
   // Shared context from app.js events
   latestScanReport: null,
@@ -83,13 +98,25 @@ function fmtSol(val) {
   return n.toFixed(n > 0 && n < 0.01 ? 8 : 5);
 }
 
-function safeHttpsUrl(raw) {
+function hostMatchesAllowlist(hostname, allowedHosts) {
+  if (!Array.isArray(allowedHosts) || allowedHosts.length === 0) return true;
+  const host = String(hostname || '').toLowerCase();
+  return allowedHosts.some((rawAllowed) => {
+    const allowed = String(rawAllowed || '').toLowerCase().replace(/^\*\./, '');
+    return Boolean(allowed) && (host === allowed || host.endsWith(`.${allowed}`));
+  });
+}
+
+function safeHttpsUrl(raw, allowedHosts = null) {
   if (typeof raw !== 'string') return null;
   const trimmed = raw.trim();
   if (!trimmed || trimmed.startsWith('//')) return null;
   try {
     const parsed = new URL(trimmed);
     if (parsed.protocol !== 'https:' || !parsed.hostname || parsed.username || parsed.password) {
+      return null;
+    }
+    if (allowedHosts && !hostMatchesAllowlist(parsed.hostname, allowedHosts)) {
       return null;
     }
     return parsed.toString();
@@ -221,6 +248,7 @@ async function runSolanaRentScan({ silent = false } = {}) {
     return;
   }
 
+  const seq = ++state.rentSeq;
   state.rentLoading = true;
   state.rentError = null;
   renderRentVacuumCard();
@@ -233,16 +261,20 @@ async function runSolanaRentScan({ silent = false } = {}) {
         includeUnsignedTx: true,
       }),
     });
+    if (seq !== state.rentSeq) return;
     state.rentScan = data;
     state.rentLastTx = null;
   } catch (err) {
+    if (seq !== state.rentSeq) return;
     if (!silent) {
       state.rentError = err instanceof Error ? err.message : 'Failed to scan Solana rent.';
     }
   } finally {
-    state.rentLoading = false;
-    renderRentVacuumCard();
-    updateSectionSummaryBadges();
+    if (seq === state.rentSeq) {
+      state.rentLoading = false;
+      renderRentVacuumCard();
+      updateSectionSummaryBadges();
+    }
   }
 }
 
@@ -290,10 +322,20 @@ async function handleReclaimSolClick() {
   try {
     const res = await signAndSendSolanaVersionedTx(finalTxBase64, {
       expectedFeePayer: connectedSol,
+      flow: 'rent_reclaim',
       autoConnect: false,
     });
     const closedCount = Number(scan.unsignedCloseTx?.accountCount || scan.reclaimableCount || 0);
     const reclaimedSol = Number(scan.unsignedCloseTx?.reclaimedSol || scan.reclaimableSol || 0);
+    // Clear consumed unsignedCloseTx immediately so duplicate clicks cannot resubmit a spent tx
+    if (state.rentScan) {
+      state.rentScan = {
+        ...state.rentScan,
+        unsignedCloseTx: null,
+        unsignedTxBase64: null,
+        transactions: [],
+      };
+    }
     state.rentLastTx = {
       signature: res.signature,
       explorerUrl: res.explorerUrl,
@@ -354,7 +396,7 @@ function renderRentVacuumCard() {
         `Reclaimed ${fmtSol(state.rentLastTx.reclaimedSol)} SOL (${state.rentLastTx.count} ATAs closed) · `
       )
     );
-    const linkHref = safeHttpsUrl(state.rentLastTx.explorerUrl);
+    const linkHref = safeHttpsUrl(state.rentLastTx.explorerUrl, SOLSCAN_ALLOWED_HOSTS);
     if (linkHref) {
       const a = el('a', 'ptool-link mono', `${shortAddr(state.rentLastTx.signature)} ↗`);
       a.href = linkHref;
@@ -522,8 +564,8 @@ async function runYieldParkRequest({ buildTransaction = false } = {}) {
 
   const amountInput = document.getElementById('yieldAmountInput');
   const parsedAmount = Number(amountInput?.value ?? state.yieldAmountUsdc);
-  if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-    state.yieldError = 'Enter a positive USDC amount to park in yield.';
+  if (!Number.isFinite(parsedAmount) || parsedAmount < 1) {
+    state.yieldError = 'Enter at least $1.00 USDC to park in yield.';
     renderYieldParkCard();
     return null;
   }
@@ -535,6 +577,7 @@ async function runYieldParkRequest({ buildTransaction = false } = {}) {
     return null;
   }
 
+  const seq = ++state.yieldSeq;
   state.yieldLoading = !buildTransaction;
   state.yieldSigning = buildTransaction;
   state.yieldError = null;
@@ -551,15 +594,22 @@ async function runYieldParkRequest({ buildTransaction = false } = {}) {
         buildTransaction,
       }),
     });
+    if (seq !== state.yieldSeq) return null;
     state.yieldPlan = plan;
 
     if (buildTransaction) {
+      if (getConnectedSolanaAddress() !== connectedSol) {
+        state.yieldError = 'Connected Solana wallet changed before signing. Please retry.';
+        return null;
+      }
       const txB64 = plan?.transaction?.swapTransactionBase64;
       if (txB64) {
         const res = await signAndSendSolanaVersionedTx(txB64, {
           expectedFeePayer: connectedSol,
+          flow: 'jupiter_yield',
           autoConnect: false,
         });
+        if (seq !== state.yieldSeq) return null;
         state.yieldLastTx = {
           signature: res.signature,
           explorerUrl: res.explorerUrl,
@@ -571,7 +621,7 @@ async function runYieldParkRequest({ buildTransaction = false } = {}) {
           `Parked ${fmtUsd(plan.split?.yieldUsdc)} into ${plan.strategy?.symbol || 'Solana Yield'}!`
         );
       } else {
-        const vaultUrl = safeHttpsUrl(plan?.strategy?.appUrl);
+        const vaultUrl = safeHttpsUrl(plan?.strategy?.appUrl, YIELD_VAULT_ALLOWED_HOSTS);
         showToast(
           plan?.warnings?.[0] ||
             `${plan?.strategy?.name || 'Strategy'} quote ready — deposit directly on protocol.`
@@ -589,6 +639,7 @@ async function runYieldParkRequest({ buildTransaction = false } = {}) {
     }
     return plan;
   } catch (err) {
+    if (seq !== state.yieldSeq) return null;
     state.yieldError = isUserRejectedError(err)
       ? 'Signature rejected in Solana wallet. Yield park cancelled.'
       : err instanceof Error
@@ -596,10 +647,12 @@ async function runYieldParkRequest({ buildTransaction = false } = {}) {
       : 'Failed to build Solana yield park plan.';
     return null;
   } finally {
-    state.yieldLoading = false;
-    state.yieldSigning = false;
-    renderYieldParkCard();
-    updateSectionSummaryBadges();
+    if (seq === state.yieldSeq) {
+      state.yieldLoading = false;
+      state.yieldSigning = false;
+      renderYieldParkCard();
+      updateSectionSummaryBadges();
+    }
   }
 }
 
@@ -657,11 +710,14 @@ function renderYieldParkCard() {
           `Split ready (${fmtUsd(state.yieldLastTx.yieldUsdc)} → ${state.yieldLastTx.strategyName}) · `
         )
       );
-      const a = el('a', 'ptool-link mono', 'Open Protocol Vault ↗');
-      a.href = state.yieldLastTx.explorerUrl;
-      a.target = '_blank';
-      a.rel = 'noopener noreferrer';
-      okBox.appendChild(a);
+      const vaultHref = safeHttpsUrl(state.yieldLastTx.explorerUrl, YIELD_VAULT_ALLOWED_HOSTS);
+      if (vaultHref) {
+        const a = el('a', 'ptool-link mono', 'Open Protocol Vault ↗');
+        a.href = vaultHref;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        okBox.appendChild(a);
+      }
     } else {
       okBox.appendChild(
         el(
@@ -670,7 +726,7 @@ function renderYieldParkCard() {
           `Parked ${fmtUsd(state.yieldLastTx.yieldUsdc)} in ${state.yieldLastTx.strategyName} · `
         )
       );
-      const href = safeHttpsUrl(state.yieldLastTx.explorerUrl);
+      const href = safeHttpsUrl(state.yieldLastTx.explorerUrl, SOLSCAN_ALLOWED_HOSTS);
       if (href) {
         const a = el('a', 'ptool-link mono', `${shortAddr(state.yieldLastTx.signature)} ↗`);
         a.href = href;
@@ -787,6 +843,7 @@ async function runApprovalScan({ silent = false } = {}) {
     return;
   }
 
+  const seq = ++state.approvalSeq;
   state.approvalLoading = true;
   state.approvalError = null;
   state.approvalLastResult = null;
@@ -800,17 +857,21 @@ async function runApprovalScan({ silent = false } = {}) {
         walletAddress,
       }),
     });
+    if (seq !== state.approvalSeq) return;
     state.approvalScan = data;
     state.revokedKeys.clear();
   } catch (err) {
+    if (seq !== state.approvalSeq) return;
     if (!silent) {
       state.approvalError =
         err instanceof Error ? err.message : 'Failed to scan stale ERC-20 approvals.';
     }
   } finally {
-    state.approvalLoading = false;
-    renderApprovalRevokerCard();
-    updateSectionSummaryBadges();
+    if (seq === state.approvalSeq) {
+      state.approvalLoading = false;
+      renderApprovalRevokerCard();
+      updateSectionSummaryBadges();
+    }
   }
 }
 
@@ -819,6 +880,14 @@ async function handleRevokeFindings(findingsToRevoke, keyLabel) {
   if (!connectedEvm) {
     showToast('Read-only scan — connect your EVM wallet to sign ERC-20 revocations.');
     document.getElementById('connectEvmBtn')?.click();
+    return;
+  }
+
+  const scannedWallet = state.approvalScan?.walletAddress;
+  if (!scannedWallet || scannedWallet.toLowerCase() !== connectedEvm.toLowerCase()) {
+    state.approvalError =
+      'Connected EVM wallet does not match the scanned approval report. Re-scan your connected wallet before revoking.';
+    renderApprovalRevokerCard();
     return;
   }
 
@@ -842,8 +911,11 @@ async function handleRevokeFindings(findingsToRevoke, keyLabel) {
       expectedFrom: connectedEvm,
     });
 
-    for (const f of valid) {
-      state.revokedKeys.add(findingKey(f));
+    const indices = Array.isArray(res.revokedIndices)
+      ? res.revokedIndices
+      : valid.map((_, idx) => idx);
+    for (const idx of indices) {
+      if (valid[idx]) state.revokedKeys.add(findingKey(valid[idx]));
     }
     state.approvalLastResult = {
       mode: res.mode,
@@ -858,8 +930,24 @@ async function handleRevokeFindings(findingsToRevoke, keyLabel) {
         : `Submitted ${res.revokedCount} ERC-20 approval revocation(s).`
     );
   } catch (err) {
+    const partialIndices = Array.isArray(err?.revokedIndices) ? err.revokedIndices : [];
+    const partialHashes = Array.isArray(err?.txHashes) ? err.txHashes : [];
+    if (partialIndices.length > 0) {
+      for (const idx of partialIndices) {
+        if (valid[idx]) state.revokedKeys.add(findingKey(valid[idx]));
+      }
+      state.approvalLastResult = {
+        mode: 'sequential',
+        count: partialIndices.length,
+        txHashes: partialHashes,
+        batchId: null,
+        chain: state.approvalScan?.chain || state.selectedApprovalChain,
+      };
+    }
     state.approvalError = isUserRejectedError(err)
-      ? 'Signature rejected in EVM wallet. No approvals were changed.'
+      ? partialIndices.length > 0
+        ? `Revoked ${partialIndices.length}/${valid.length} approval(s) before signature was rejected in EVM wallet.`
+        : 'Signature rejected in EVM wallet. No approvals were changed.'
       : err instanceof Error
       ? err.message
       : 'Failed to submit ERC-20 revoke transaction.';
@@ -919,7 +1007,10 @@ function renderApprovalRevokerCard() {
         : `Submitted ${r.count} revocation tx(s). `;
     okBox.appendChild(el('span', '', summaryText));
     if (r.txHashes?.length) {
-      const href = safeHttpsUrl(`${getChainExplorerPrefix(r.chain)}${encodeURIComponent(r.txHashes[0])}`);
+      const href = safeHttpsUrl(
+        `${getChainExplorerPrefix(r.chain)}${encodeURIComponent(r.txHashes[0])}`,
+        EVM_EXPLORER_ALLOWED_HOSTS
+      );
       if (href) {
         const a = el('a', 'ptool-link mono', `${shortAddr(r.txHashes[0])} ↗`);
         a.href = href;
@@ -1068,10 +1159,6 @@ function bindEvents() {
     });
   }
 
-  document.getElementById('scanSolanaRentBtn')?.addEventListener('click', () => {
-    runSolanaRentScan({ silent: false });
-  });
-
   document.getElementById('rentScanForm')?.addEventListener('submit', (ev) => {
     ev.preventDefault();
     runSolanaRentScan({ silent: false });
@@ -1122,6 +1209,43 @@ function bindEvents() {
 
   document.getElementById('scanApprovalsBtn')?.addEventListener('click', () => {
     runApprovalScan({ silent: false });
+  });
+
+  // Strict wallet-switch / disconnect state isolation
+  window.addEventListener('siphon:wallet-changed', (ev) => {
+    const detail = ev?.detail;
+    if (!detail) return;
+    if (detail.family === 'evm') {
+      state.approvalSeq += 1;
+      state.approvalScan = null;
+      state.revokedKeys.clear();
+      state.approvalLastResult = null;
+      state.approvalError = null;
+      state.approvalLoading = false;
+      if (detail.action === 'disconnect' || !detail.address) {
+        state.latestScanReport = null;
+      }
+      renderApprovalRevokerCard();
+      updateSectionSummaryBadges();
+    } else if (detail.family === 'solana') {
+      state.rentSeq += 1;
+      state.yieldSeq += 1;
+      state.rentScan = null;
+      state.rentLastTx = null;
+      state.rentError = null;
+      state.rentLoading = false;
+      state.yieldPlan = null;
+      state.yieldLastTx = null;
+      state.yieldError = null;
+      state.yieldLoading = false;
+      if (detail.action === 'disconnect' || !detail.address) {
+        state.yieldAmountUsdc = 100;
+        state.userEditedYieldAmount = false;
+      }
+      renderRentVacuumCard();
+      renderYieldParkCard();
+      updateSectionSummaryBadges();
+    }
   });
 
   // Sync with Siphon app balance / wallet updates
