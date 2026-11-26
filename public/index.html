@@ -205,7 +205,7 @@
             <button type="button" class="family-pill active" data-family="evm" role="tab">
               <img src="/logos/ethereum.svg" alt="" class="chain-logo-xs" />
               <span>EVM</span>
-              <span class="family-count mono pro-only">14</span>
+              <span class="family-count mono pro-only">19</span>
             </button>
             <button type="button" class="family-pill" data-family="cosmos" role="tab">
               <img src="/logos/cosmos.svg" alt="" class="chain-logo-xs" />
@@ -404,7 +404,7 @@
                   </div>
                   <div class="receipt-row lite-only">
                     <span>Est. Fees</span>
-                    <span class="mono" id="summaryLiteCostText">~$0.00</span>
+                    <span class="mono" id="summaryLiteCostText">$0.00</span>
                   </div>
                   <div class="receipt-row pro-only">
                     <span>Bridge Route</span>
@@ -428,7 +428,7 @@
                   <div class="receipt-row pro-only">
                     <span>Protocol Fee</span>
                     <button type="button" class="receipt-fee-btn mono" id="toggleFeeDrawerBtn">
-                      <span id="summaryFeeText">7.0% · $0.00</span>
+                      <span id="summaryFeeText">Tiered · $0.00</span>
                       <span class="muted-xs">▾</span>
                     </button>
                   </div>
@@ -441,12 +441,13 @@
                 <!-- Collapsible Fee, Treasury & Options Drawer (Pro Mode Only) -->
                 <div class="options-drawer hidden pro-only" id="feeOptionsDrawer">
                   <div class="options-drawer-row">
-                    <label class="muted-xs" for="protocolFeeSelect">Fee Tier (5–10%)</label>
-                    <select id="protocolFeeSelect" class="field-select-xs mono" aria-label="Protocol fee percentage">
-                      <option value="500">5.0%</option>
-                      <option value="700" selected>7.0% (Default)</option>
-                      <option value="850">8.5%</option>
-                      <option value="1000">10.0%</option>
+                    <label class="muted-xs" for="protocolFeeSelect">Fee Schedule</label>
+                    <select id="protocolFeeSelect" class="field-select-xs mono" aria-label="Protocol fee schedule">
+                      <option value="tiered" selected>Tiered Preservation (0.10%–5%, $50 cap)</option>
+                      <option value="500">5.0% Flat (Override)</option>
+                      <option value="700">7.0% Flat (Legacy)</option>
+                      <option value="850">8.5% Flat (Override)</option>
+                      <option value="1000">10.0% Flat (Override)</option>
                     </select>
                   </div>
                   <div class="options-drawer-col">
@@ -624,6 +625,18 @@
                     <option value="polygon">Polygon</option>
                     <option value="avalanche">Avalanche</option>
                     <option value="bnb">BNB Chain</option>
+                    <option value="sonic">Sonic</option>
+                    <option value="unichain">Unichain</option>
+                    <option value="linea">Linea</option>
+                    <option value="scroll">Scroll</option>
+                    <option value="mantle">Mantle</option>
+                    <option value="blast">Blast</option>
+                    <option value="worldchain">World Chain</option>
+                    <option value="hyperevm">HyperEVM</option>
+                    <option value="berachain">Berachain</option>
+                    <option value="zksync">zkSync Era</option>
+                    <option value="ink">Ink</option>
+                    <option value="gnosis">Gnosis</option>
                   </select>
                   <button type="button" class="btn-outline-sm ptool-inline-btn" id="scanApprovalsBtn">Scan Approvals</button>
                 </div>
@@ -718,6 +731,29 @@
               <h1>AI Assistants &amp; Spending Rules</h1>
               <p>Connect Claude or ChatGPT to scan wallets and draft sweeps to your Solana address. Funds never move unless a request is under your auto-approve limit or you approve it manually.</p>
             </div>
+          </div>
+
+          <div class="card agents-locked-banner hidden" id="agentsAdminLockedBanner" role="status" aria-live="polite">
+            <div class="agents-locked-copy">
+              <div class="agents-locked-title-row">
+                <span class="agents-locked-badge mono">Admin Session Required</span>
+                <strong>Self-Hosted AI Control Plane Locked</strong>
+              </div>
+              <p class="muted-xs" style="margin:4px 0 0;">
+                Public deployments protect spending mandates, API token minting, and gas-window watchdogs behind an admin session. Run Turgalium locally (<code class="code-inline">npm run dev</code>) or enter your self-hosted <code class="code-inline">X-Turgalium-Admin-Session</code> token to unlock live controls.
+              </p>
+            </div>
+            <form class="agents-unlock-form" id="adminSessionUnlockForm">
+              <input
+                type="password"
+                id="adminSessionTokenInput"
+                class="field-input-xs mono"
+                autocomplete="off"
+                placeholder="Paste admin session token…"
+                aria-label="Admin session token"
+              />
+              <button type="submit" class="btn-pill-dark btn-sm" id="adminSessionUnlockBtn">Unlock</button>
+            </form>
           </div>
 
           <div class="agents-flow-strip" aria-label="How AI assistants work in Turgalium">
@@ -848,6 +884,20 @@
                       <option value="arbitrum">Arbitrum</option>
                       <option value="optimism">Optimism</option>
                       <option value="polygon">Polygon</option>
+                      <option value="avalanche">Avalanche</option>
+                      <option value="bnb">BNB Chain</option>
+                      <option value="sonic">Sonic</option>
+                      <option value="unichain">Unichain</option>
+                      <option value="linea">Linea</option>
+                      <option value="scroll">Scroll</option>
+                      <option value="mantle">Mantle</option>
+                      <option value="blast">Blast</option>
+                      <option value="worldchain">World Chain</option>
+                      <option value="hyperevm">HyperEVM</option>
+                      <option value="berachain">Berachain</option>
+                      <option value="zksync">zkSync Era</option>
+                      <option value="ink">Ink</option>
+                      <option value="gnosis">Gnosis</option>
                     </select>
                   </label>
                   <label class="gas-watch-field">
@@ -899,13 +949,13 @@
                   <span class="mandate-label">Claude Desktop · <code class="code-inline">claude_desktop_config.json</code></span>
                   <span class="token-filled-pill hidden" id="claudeTokenFilledBadge">Token filled</span>
                 </div>
-                <pre class="plugin-code-box mono" id="claudeMcpConfigHost">Loading…</pre>
+                <pre class="plugin-code-box mono" id="claudeMcpConfigHost">Preparing Claude MCP snippet…</pre>
 
                 <div class="snippet-label-row" style="margin-top:12px;">
                   <span class="mandate-label">Claude Code CLI</span>
                   <button type="button" class="btn-ghost-xs" id="copyClaudeCliBtn">Copy command</button>
                 </div>
-                <pre class="plugin-code-box plugin-code-single mono" id="claudeCodeCmdHost">Loading…</pre>
+                <pre class="plugin-code-box plugin-code-single mono" id="claudeCodeCmdHost">Preparing Claude Code CLI command…</pre>
               </div>
 
               <div class="card agents-card">
@@ -916,7 +966,7 @@
                   </div>
                   <button type="button" class="btn-outline-sm" id="copyChatgptUrlBtn">Copy OpenAPI URL</button>
                 </div>
-                <pre class="plugin-code-box mono" id="chatgptPluginHost">Loading…</pre>
+                <pre class="plugin-code-box mono" id="chatgptPluginHost">Preparing ChatGPT Action snippet…</pre>
               </div>
             </div>
           </div>

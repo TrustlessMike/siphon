@@ -75,8 +75,36 @@ let isSweepQueueRunning = false;
 const executingChains = new Set();
 let planSeq = 0;
 let solBalSeq = 0;
+let adminSessionRequired = false;
+let adminSessionLoaded = false;
+let adminSessionToken = (() => {
+  try {
+    return window.sessionStorage?.getItem('turgalium_admin_session') || '';
+  } catch {
+    return '';
+  }
+})();
 
+const ADMIN_SESSION_STORAGE_KEY = 'turgalium_admin_session';
 const FEE_RECIPIENT_STORAGE_KEY = 'turgalium_fee_recipient_evm';
+
+function isAdminLocked() {
+  return Boolean(adminSessionRequired && !adminSessionToken);
+}
+
+function canAccessAdminRoutes() {
+  return adminSessionLoaded && !isAdminLocked();
+}
+
+function getAdminHeaders() {
+  return adminSessionToken ? { 'X-Turgalium-Admin-Session': adminSessionToken } : {};
+}
+
+window.__turgaliumAdminAuth = {
+  isAdminLocked,
+  canAccessAdmin: canAccessAdminRoutes,
+  getHeaders: getAdminHeaders,
+};
 const UI_MODE_STORAGE_KEY = 'turgalium_ui_mode';
 const PRO_ONLY_FILTERS = new Set(['low_efficiency', 'burn', 'skipped']);
 const PRO_ONLY_VIEWS = new Set(['agents', 'contract']);
@@ -291,6 +319,71 @@ function fmtUsd(val) {
   return `$${n.toFixed(2)}`;
 }
 
+function formatCompactBalance(val) {
+  const n = Number(val);
+  if (!Number.isFinite(n) || n === 0) return '0';
+  const abs = Math.abs(n);
+  if (abs >= 1e15) {
+    return n.toExponential(2).replace('+', '');
+  }
+  if (abs >= 1e12) return `${(n / 1e12).toFixed(2)}T`;
+  if (abs >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (abs >= 1e5) return `${(n / 1e3).toFixed(1)}K`;
+  if (abs < 0.0001) return '<0.0001';
+  return n.toLocaleString(undefined, { maximumFractionDigits: 4 });
+}
+
+function computeTieredPreservationFee(grossUsdInput) {
+  const grossUsd = Math.max(0, Number(grossUsdInput) || 0);
+  if (grossUsd <= 0) {
+    return {
+      grossUsd: 0,
+      feeBps: 0,
+      feePercentLabel: '0.00%',
+      feeUsd: 0,
+      capUsd: null,
+      capApplied: false,
+      legacy7PctUsd: 0,
+      savedVs7PctUsd: 0,
+      tierLabel: 'Zero',
+    };
+  }
+  let feeBps = 10;
+  let capUsd = 50;
+  let tierLabel = 'Principal ($5k+)';
+  if (grossUsd < 50) {
+    feeBps = 500;
+    capUsd = null;
+    tierLabel = 'Micro-Dust (<$50)';
+  } else if (grossUsd < 500) {
+    feeBps = 100;
+    capUsd = null;
+    tierLabel = 'Small ($50–$500)';
+  } else if (grossUsd < 5000) {
+    feeBps = 25;
+    capUsd = null;
+    tierLabel = 'Mid ($500–$5k)';
+  }
+  const uncappedFeeUsd = Number(((grossUsd * feeBps) / 10_000).toFixed(2));
+  const capApplied = capUsd !== null && uncappedFeeUsd > capUsd;
+  const feeUsd = capApplied ? capUsd : uncappedFeeUsd;
+  const legacy7PctUsd = Number(((grossUsd * 700) / 10_000).toFixed(2));
+  const savedVs7PctUsd = Number(Math.max(0, legacy7PctUsd - feeUsd).toFixed(2));
+  const feePercentLabel = `${(feeBps / 100).toFixed(2)}%`;
+  return {
+    grossUsd,
+    feeBps,
+    feePercentLabel,
+    feeUsd,
+    capUsd,
+    capApplied,
+    legacy7PctUsd,
+    savedVs7PctUsd,
+    tierLabel,
+  };
+}
+
 function showToast(msg) {
   const host = document.getElementById('toastRegion');
   if (!host) return;
@@ -307,8 +400,12 @@ function showToast(msg) {
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
     ...opts,
+    headers: {
+      'Content-Type': 'application/json',
+      ...getAdminHeaders(),
+      ...(opts.headers || {}),
+    },
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
@@ -413,9 +510,18 @@ function getBridgeProviderLogosHtml(pref) {
   return `<img src="/logos/relay.svg" alt="" class="chain-logo-xs" /><img src="/logos/lifi.svg" alt="" class="chain-logo-xs" />`;
 }
 
+function isTieredFeeMode() {
+  if (!isProMode()) return true;
+  const sel = document.getElementById('protocolFeeSelect');
+  const val = String(sel?.value ?? 'tiered').trim();
+  return !val || val === 'tiered';
+}
+
 function getActiveProtocolFeeBps() {
   const sel = document.getElementById('protocolFeeSelect');
-  const raw = Number(sel?.value || 700);
+  const val = String(sel?.value ?? 'tiered').trim();
+  if (!val || val === 'tiered') return 700;
+  const raw = Number(val);
   if (!Number.isFinite(raw)) return 700;
   return Math.min(1000, Math.max(500, Math.round(raw)));
 }
@@ -479,6 +585,11 @@ function setUiMode(mode, { persist = true, silent = false } = {}) {
     const burnEl = document.getElementById('burnToggle');
     if (burnEl && burnEl.checked) {
       burnEl.checked = false;
+      needPlanRecompute = true;
+    }
+    const feeSel = document.getElementById('protocolFeeSelect');
+    if (feeSel && feeSel.value !== 'tiered') {
+      feeSel.value = 'tiered';
       needPlanRecompute = true;
     }
     if (currentScan?.assets) {
@@ -559,16 +670,50 @@ window.openApp = openApp;
 window.switchView = switchView;
 window.setUiMode = setUiMode;
 
+function getEffectivePlanFinancials() {
+  const t = currentPlan?.totals;
+  if (!t) {
+    return {
+      useTiered: isTieredFeeMode(),
+      tieredInfo: computeTieredPreservationFee(0),
+      effectiveProtocolFeeUsd: 0,
+      effectiveNetUsdc: 0,
+      effectiveNetSol: 0,
+    };
+  }
+  const useTiered = isTieredFeeMode();
+  const grossUsd = safeNum(t.grossUsd);
+  const tieredInfo = computeTieredPreservationFee(grossUsd);
+  const hasLegs = Array.isArray(currentPlan?.legs) && currentPlan.legs.length > 0;
+  const effectiveProtocolFeeUsd = useTiered && hasLegs ? tieredInfo.feeUsd : safeNum(t.protocolFeeUsd);
+  const effectiveNetUsdc =
+    useTiered && hasLegs
+      ? Math.max(0, Number((safeNum(t.netSolanaUsdc) + safeNum(t.protocolFeeUsd) - tieredInfo.feeUsd).toFixed(2)))
+      : safeNum(t.netSolanaUsdc);
+  const solPrice =
+    safeNum(currentScan?.totals?.solPriceUsd) ||
+    (safeNum(t.netSolanaSol) > 0 ? safeNum(t.netSolanaUsdc) / safeNum(t.netSolanaSol) : 70);
+  const effectiveNetSol = solPrice > 0 ? effectiveNetUsdc / solPrice : safeNum(t.netSolanaSol);
+  return {
+    useTiered,
+    tieredInfo,
+    effectiveProtocolFeeUsd,
+    effectiveNetUsdc,
+    effectiveNetSol,
+  };
+}
+
 function dispatchTurgaliumBalanceUpdated() {
   if (typeof window === 'undefined' || typeof CustomEvent !== 'function') return;
   const solDest = document.getElementById('solanaDestInput')?.value.trim() || '';
   const connectedSol = getConnectedSolanaAddress();
+  const fin = getEffectivePlanFinancials();
   window.dispatchEvent(
     new CustomEvent('turgalium:balance-updated', {
       detail: {
         solanaUsdc: safeNum(solanaBalances?.usdcBalance),
         solBalance: safeNum(solanaBalances?.solBalance),
-        projectedSweepUsdc: safeNum(currentPlan?.totals?.netSolanaUsdc),
+        projectedSweepUsdc: fin.effectiveNetUsdc,
         solanaWallet: isValidSolanaBase58(solDest) ? solDest : '',
         connectedSolanaWallet: connectedSol || '',
         walletConnected: Boolean(connectedSol),
@@ -685,10 +830,16 @@ function renderEmptyScanState() {
   if (subEl) subEl.textContent = outputAsset === 'SOL' ? '≈ $0.00 USDC · ~2–15s auto-fill' : '≈ 0.00 SOL · ~2–15s auto-fill';
   const selTextEl = document.getElementById('summarySelectedText');
   if (selTextEl) selTextEl.textContent = '0 assets · 0 chains';
+  const liteCostEl = document.getElementById('summaryLiteCostText');
+  if (liteCostEl) liteCostEl.textContent = '$0.00';
   const gasEl = document.getElementById('summaryGasText');
   if (gasEl) gasEl.textContent = '$0.00 · 1 click / chain';
   const feeEl = document.getElementById('summaryFeeText');
-  if (feeEl) feeEl.textContent = `${(getActiveProtocolFeeBps() / 100).toFixed(1)}% · $0.00`;
+  if (feeEl) {
+    feeEl.textContent = isTieredFeeMode()
+      ? 'Tiered · $0.00'
+      : `${(getActiveProtocolFeeBps() / 100).toFixed(1)}% flat · $0.00`;
+  }
   const burnCount = document.getElementById('burnManifestCount');
   if (burnCount) burnCount.textContent = '0 tokens';
   const burnBody = document.getElementById('burnTableBody');
@@ -700,12 +851,21 @@ function renderEmptyScanState() {
   renderPreSignProofCard(null);
   updateWalletButtons();
   dispatchTurgaliumBalanceUpdated();
+  if (typeof window !== 'undefined' && typeof CustomEvent === 'function') {
+    window.dispatchEvent(new CustomEvent('turgalium:scan-cleared', { detail: { family: activeFamily } }));
+  }
 }
 
 function updateFamilyChrome() {
   const meta = familyMetas[activeFamily];
   document.querySelectorAll('.family-pill[data-family]').forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.family === activeFamily);
+    const fam = btn.dataset.family;
+    btn.classList.toggle('active', fam === activeFamily);
+    const fMeta = fam ? familyMetas[fam] : null;
+    const countEl = btn.querySelector('.family-count');
+    if (countEl && fMeta && Array.isArray(fMeta.chains) && fMeta.chains.length > 0) {
+      countEl.textContent = String(fMeta.chains.length);
+    }
   });
   const appIn = document.getElementById('appEvmInput');
   if (appIn && meta?.addressHint) {
@@ -753,7 +913,7 @@ function selectFamily(family, { autoScanConnected = true } = {}) {
   const scanAddr = getScanAddressForSession(activeFamily, connected);
   if (autoScanConnected && scanAddr) {
     runScan({ address: scanAddr, family: activeFamily, autoOpen: false });
-  } else if (currentScan?.family && currentScan.family !== activeFamily) {
+  } else if (currentScan && (currentScan.family || 'evm') !== activeFamily) {
     currentScan = null;
     currentPlan = null;
     selectedAssetIds.clear();
@@ -1013,12 +1173,13 @@ function renderAll() {
   const payoutLogo = document.getElementById('payoutAssetLogo');
   if (payoutLogo) payoutLogo.src = outputAsset === 'SOL' ? '/logos/solana.svg' : '/logos/usdc.svg';
 
+  const fin = getEffectivePlanFinancials();
   const netEl = document.getElementById('kpiNetUsdc');
   if (netEl) {
     netEl.textContent =
       outputAsset === 'SOL'
-        ? `${t.netSolanaSol.toFixed(2)} SOL`
-        : `$${t.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+        ? `${fin.effectiveNetSol.toFixed(2)} SOL`
+        : `$${fin.effectiveNetUsdc.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   }
   dispatchTurgaliumBalanceUpdated();
   const subEl = document.getElementById('kpiNetSub');
@@ -1030,8 +1191,8 @@ function renderAll() {
       : '~2–15s auto-fill';
     subEl.textContent =
       outputAsset === 'SOL'
-        ? `≈ $${t.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })} USDC · ${eta}`
-        : `≈ ${t.netSolanaSol.toFixed(2)} SOL · ${eta}`;
+        ? `≈ $${fin.effectiveNetUsdc.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDC · ${eta}`
+        : `≈ ${fin.effectiveNetSol.toFixed(2)} SOL · ${eta}`;
   }
 
   // Receipt Summary Rows
@@ -1044,7 +1205,7 @@ function renderAll() {
   }
   const liteCostEl = document.getElementById('summaryLiteCostText');
   if (liteCostEl) {
-    const combinedFees = safeNum(t.totalGasUsd) + safeNum(t.protocolFeeUsd);
+    const combinedFees = safeNum(t.totalGasUsd) + fin.effectiveProtocolFeeUsd;
     liteCostEl.textContent =
       currentPlan.legs.length > 0
         ? `~$${combinedFees.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -1061,7 +1222,16 @@ function renderAll() {
 
   const feeEl = document.getElementById('summaryFeeText');
   if (feeEl) {
-    feeEl.textContent = `${feePct}% · $${t.protocolFeeUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+    if (fin.useTiered) {
+      if (currentPlan.legs.length === 0 || fin.tieredInfo.grossUsd <= 0) {
+        feeEl.textContent = 'Tiered · $0.00';
+      } else {
+        const capPart = fin.tieredInfo.capApplied ? ` cap $${fin.tieredInfo.capUsd}` : '';
+        feeEl.textContent = `${fin.tieredInfo.feePercentLabel}${capPart} · $${fin.tieredInfo.feeUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+      }
+    } else {
+      feeEl.textContent = `${feePct}% flat · $${safeNum(t.protocolFeeUsd).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    }
   }
 
   // Activity view topology SVG
@@ -1157,8 +1327,12 @@ function renderRoiVerdictBadge(a) {
     return `<span class="roi-pill roi-low" title="${tip}">High Cost (${pct ?? '—'}% fees)</span>`;
   }
   if (v === 'negative_roi' || a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_NEGATIVE_ROI') {
-    const signedStr =
-      net !== null ? `${net < 0 ? '-' : ''}$${Math.abs(net).toFixed(2)}` : '-$0.00';
+    if (net !== null && net > 0) {
+      const posStr = `$${net.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+      return `<span class="roi-pill roi-low" title="${tip}">Unroutable (Est. ${posStr})</span>`;
+    }
+    const negAbs = net !== null ? Math.abs(net) : 0;
+    const signedStr = `-$${negAbs.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     return `<span class="roi-pill roi-neg" title="${tip}">Negative ROI (${signedStr})</span>`;
   }
   return compactActionTag(a.action);
@@ -1334,7 +1508,7 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
       : typeof plan?.expectedUnderlyingUi === 'number' && plan.expectedUnderlyingUi > 0
       ? plan.expectedUnderlyingUi
       : Number(asset?.uiBalance || 0);
-  const amountFmt = withdrawableUi.toLocaleString(undefined, { maximumFractionDigits: 4 });
+  const amountFmt = formatCompactBalance(withdrawableUi);
 
   const isNonUsdcContractExit =
     category === 'one_click' &&
@@ -1355,26 +1529,13 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
       : 1;
   const sigLabel = sigCount <= 1 ? '1 signature' : `${sigCount} guided steps`;
 
-  const posType = asset?.defiPositionType || plan?.positionType || '';
-  const customRoute = plan?.routeLine || plan?.routeSummary || plan?.plainRoute;
-  let routeLine;
-  if (customRoute) {
-    routeLine = sanitizePlainDefiText(customRoute);
-  } else if (isExternalApp && hasDebt) {
-    const netPart = netUsd !== null ? ` · Net $${netUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '';
-    const hfPart = healthFactor !== null ? ` · HF ${healthFactor.toFixed(2)}` : '';
-    routeLine = `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken} supplied${netPart}${hfPart}`;
-  } else if (isExternalApp) {
-    routeLine = `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken}${posType ? ` · ${posType}` : ''}`;
-  } else {
-    routeLine = `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken} → Solana ${targetOut} · ${sigLabel}`;
-  }
-
   // Pre-flight status pill & plain-English warning reason
   let preflightLevel = 'verified'; // 'verified' | 'warn' | 'blocked'
   let preflightLabel = '✓ Verified withdrawable';
   let warningReason = '';
 
+  const isZeroValueDefi =
+    Number(asset?.grossUsd || 0) <= 0 || asset?.action === 'BURN_ZERO_LIQUIDITY';
   const explicitlyBlocked = Boolean(
     plan?.blocked ||
       statusRaw === 'blocked' ||
@@ -1443,12 +1604,18 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
       (safePartialReady
         ? `Active borrow of ${debtStr}${hfStr}. Turgalium withdraws only the safe excess collateral.`
         : `Active borrow of ${debtStr}${hfStr}. Repay borrow before full withdrawal to protect your position.`);
+  } else if (isZeroValueDefi) {
+    preflightLevel = 'blocked';
+    preflightLabel = '⊘ Zero Liquidity · Unextractable';
+    warningReason = 'No verified withdrawable liquidity ($0.00). Position cannot be extracted to Solana.';
   } else if (asset?.roiVerdict === 'negative_roi') {
     preflightLevel = 'blocked';
-    preflightLabel = '✕ Fees exceed value';
+    preflightLabel = '⊘ Fees exceed value';
+    const cleanedReason = sanitizePlainDefiText(plan?.preflightMessage || asset?.actionReason);
     warningReason =
-      sanitizePlainDefiText(plan?.preflightMessage || asset?.actionReason) ||
-      'Estimated network and bridge costs exceed the withdrawable value.';
+      cleanedReason && !/opt-in burn|0x\.\.\.dead/i.test(cleanedReason)
+        ? cleanedReason
+        : 'Estimated network and bridge costs exceed the withdrawable value.';
   } else if (asset?.roiVerdict === 'low_efficiency') {
     preflightLevel = 'warn';
     preflightLabel = '⚠ High network cost';
@@ -1460,8 +1627,34 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
     warningReason = planReason || '';
   }
 
+  let finalBadgeText = badgeText;
+  if (preflightLevel === 'blocked' && (category === 'one_click' || category === 'instant_swap')) {
+    category = 'blocked';
+    finalBadgeText = isZeroValueDefi
+      ? '⊘ Zero Liquidity · Unextractable'
+      : asset?.roiVerdict === 'negative_roi'
+      ? '⊘ Unextractable · Fees Exceed Value'
+      : '⊘ Blocked · Cannot Extract';
+  }
+
+  const posType = asset?.defiPositionType || plan?.positionType || '';
+  const customRoute = plan?.routeLine || plan?.routeSummary || plan?.plainRoute;
+  let routeLine;
+  if (customRoute && category !== 'blocked') {
+    routeLine = sanitizePlainDefiText(customRoute);
+  } else if (isExternalApp && hasDebt) {
+    const netPart = netUsd !== null ? ` · Net $${netUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '';
+    const hfPart = healthFactor !== null ? ` · HF ${healthFactor.toFixed(2)}` : '';
+    routeLine = `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken} supplied${netPart}${hfPart}`;
+  } else if (isExternalApp || category === 'blocked') {
+    routeLine = `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken}${posType ? ` · ${posType}` : ''}`;
+  } else {
+    routeLine = `${protocolGroup} (${asset?.chainName || asset?.chain}) · ${amountFmt} ${displayToken} → Solana ${targetOut} · ${sigLabel}`;
+  }
+
   const isReady =
     !isExternalApp &&
+    category !== 'blocked' &&
     (preflightLevel === 'verified' ||
       (preflightLevel === 'warn' && !hasCooldown && (!hasDebt || safePartialReady)));
 
@@ -1477,7 +1670,7 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
     protocolUrl,
     chainLogo,
     category,
-    badgeText,
+    badgeText: finalBadgeText,
     routeLine,
     preflightLevel,
     preflightLabel,
@@ -1671,6 +1864,8 @@ function renderDefiUnwindPanel() {
               ? 'defi-badge-swap'
               : pos.category === 'debt_guard'
               ? 'defi-badge-guard'
+              : pos.category === 'blocked'
+              ? 'defi-badge-blocked'
               : 'defi-badge-cooldown';
           const statusClass =
             pos.preflightLevel === 'verified'
@@ -1711,7 +1906,11 @@ function renderDefiUnwindPanel() {
                   </div>
                   <div class="defi-pos-badges">
                     <span class="defi-exit-badge ${badgeClass}">${escHtml(pos.badgeText)}</span>
-                    <span class="defi-status-pill ${statusClass}">${escHtml(pos.preflightLabel)}</span>
+                    ${
+                      pos.category === 'blocked'
+                        ? ''
+                        : `<span class="defi-status-pill ${statusClass}">${escHtml(pos.preflightLabel)}</span>`
+                    }
                   </div>
                   ${
                     pos.warningReason
@@ -1988,7 +2187,8 @@ function renderAssetList() {
           : a.action === 'SKIP_UNPRICED'
           ? 'Unpriced'
           : `$${a.grossUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
-      const balStr = `${a.uiBalance.toLocaleString(undefined, { maximumFractionDigits: 4 })} ${a.symbol}`;
+      const fullBalStr = `${Number(a.uiBalance || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })} ${a.symbol}`;
+      const balStr = `${formatCompactBalance(a.uiBalance)} ${a.symbol}`;
       const debtBadge =
         defiNorm && defiNorm.category === 'debt_guard'
           ? `<span class="micro-pill" style="background:var(--hold-bg);border-color:#fde68a;color:#92400e;">Debt Guard</span>`
@@ -2026,7 +2226,7 @@ function renderAssetList() {
           </div>
           <div class="asset-row-val-col">
             <div class="asset-row-usd">${escHtml(usdStr)}</div>
-            <div class="asset-row-bal">${escHtml(balStr)}</div>
+            <div class="asset-row-bal" title="${escHtml(fullBalStr)}">${escHtml(balStr)}</div>
           </div>
           <div class="asset-row-tag">${renderRoiVerdictBadge(a)}</div>
         </div>
@@ -2106,7 +2306,7 @@ function renderChainQueueList() {
           <span class="inline-logo-row">
             <img src="${escapeHtml(getChainLogoPath(leg.chain))}" alt="" class="chain-logo-xs${darkCls}" />
             <strong>${escapeHtml(leg.chainName)}</strong>
-            <span class="mono muted-xs">${itemCount} items</span>
+            <span class="mono muted-xs">${itemCount} ${itemCount === 1 ? 'item' : 'items'}</span>
             ${legRoiPill}
             ${noGasBadge}
           </span>
@@ -2554,6 +2754,7 @@ function renderBackgroundAgentUI() {
 }
 
 async function syncBackgroundJobs() {
+  if (!canAccessAdminRoutes()) return;
   try {
     const res = await api('/api/jobs');
     backgroundJobs = Array.isArray(res.jobs) ? res.jobs : [];
@@ -4755,8 +4956,58 @@ function wireEvents() {
     await runUnifiedScan();
   });
 
+  document.getElementById('adminSessionUnlockForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const input = document.getElementById('adminSessionTokenInput');
+    const btn = document.getElementById('adminSessionUnlockBtn');
+    const candidate = input?.value?.trim() || '';
+    if (!candidate) {
+      showToast('Enter your X-Turgalium-Admin-Session token to unlock.');
+      input?.focus();
+      return;
+    }
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Verifying…';
+    }
+    try {
+      const res = await fetch('/api/plugin/setup', {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Turgalium-Admin-Session': candidate,
+        },
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody?.error || 'Invalid admin session token.');
+      }
+      adminSessionToken = candidate;
+      try {
+        window.sessionStorage?.setItem(ADMIN_SESSION_STORAGE_KEY, candidate);
+      } catch {
+        // ignore storage errors
+      }
+      if (input) input.value = '';
+      showToast('Admin session unlocked.');
+      window.dispatchEvent(new CustomEvent('turgalium:admin-unlocked'));
+      await Promise.all([syncBackgroundJobs(), loadAgentsAndPlugins()]);
+    } catch (err) {
+      showToast(err?.message || 'Invalid admin session token.');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Unlock';
+      }
+    }
+  });
+
   document.getElementById('createMandateForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
+    if (isAdminLocked()) {
+      showToast('Admin session required — unlock above or run Turgalium locally to grant spending mandates.');
+      document.getElementById('adminSessionTokenInput')?.focus();
+      return;
+    }
     const solDest = requireVerifiedSolanaDestination('create an agent mandate');
     if (!solDest) return;
     const owner = getActiveSourceWallet()?.address || currentScan?.walletAddress?.split(',')[0] || '0x0000000000000000000000000000000000000001';
@@ -4795,10 +5046,15 @@ function wireEvents() {
 
   document.getElementById('copyClaudeMcpBtn')?.addEventListener('click', async () => {
     const cfg = buildRenderedClaudeDesktopConfig();
-    if (!cfg) return;
+    if (!cfg) {
+      showToast('Claude Desktop MCP config is not available yet.');
+      return;
+    }
     await navigator.clipboard?.writeText(JSON.stringify(cfg, null, 2)).catch(() => {});
     showToast(
-      lastIssuedTokens.claude_mcp
+      isAdminLocked()
+        ? 'Copied self-host Claude Desktop MCP template JSON.'
+        : lastIssuedTokens.claude_mcp
         ? 'Copied Claude Desktop MCP config (with your token).'
         : 'Copied Claude Desktop MCP config JSON.'
     );
@@ -4806,22 +5062,34 @@ function wireEvents() {
 
   document.getElementById('copyClaudeCliBtn')?.addEventListener('click', async () => {
     const cmd = buildRenderedClaudeCliCommand();
-    if (!cmd) return;
+    if (!cmd) {
+      showToast('Claude Code CLI command is not available yet.');
+      return;
+    }
     await navigator.clipboard?.writeText(cmd).catch(() => {});
     showToast(
-      lastIssuedTokens.claude_mcp
+      isAdminLocked()
+        ? 'Copied self-host Claude Code CLI template command.'
+        : lastIssuedTokens.claude_mcp
         ? 'Copied Claude Code CLI command (with your token).'
         : 'Copied Claude Code CLI command.'
     );
   });
 
   document.getElementById('copyChatgptUrlBtn')?.addEventListener('click', async () => {
-    if (!pluginSetupData?.chatgptOpenApiUrl) return;
-    await navigator.clipboard?.writeText(pluginSetupData.chatgptOpenApiUrl).catch(() => {});
+    const openApiUrl =
+      pluginSetupData?.chatgptOpenApiUrl ||
+      `${window.location?.origin || 'http://127.0.0.1:4321'}/openapi.json`;
+    await navigator.clipboard?.writeText(openApiUrl).catch(() => {});
     showToast('Copied ChatGPT OpenAPI 3.1 URL.');
   });
 
   document.getElementById('issueGptTokenBtn')?.addEventListener('click', async () => {
+    if (isAdminLocked()) {
+      showToast('Admin session required — unlock above or run Turgalium locally to mint ChatGPT tokens.');
+      document.getElementById('adminSessionTokenInput')?.focus();
+      return;
+    }
     try {
       const issued = await api('/api/plugin/tokens', {
         method: 'POST',
@@ -4838,6 +5106,11 @@ function wireEvents() {
   });
 
   document.getElementById('issueMcpTokenBtn')?.addEventListener('click', async () => {
+    if (isAdminLocked()) {
+      showToast('Admin session required — unlock above or run Turgalium locally to mint Claude MCP tokens.');
+      document.getElementById('adminSessionTokenInput')?.focus();
+      return;
+    }
     try {
       const issued = await api('/api/plugin/tokens', {
         method: 'POST',
@@ -4921,12 +5194,9 @@ api('/api/families')
   })
   .catch(() => {});
 loadWalletConnectorConfig().then((cfg) => {
-  const feeSel = document.getElementById('protocolFeeSelect');
+  adminSessionRequired = Boolean(cfg?.adminSessionRequired);
+  adminSessionLoaded = true;
   const feeInput = document.getElementById('feeRecipientInput');
-  if (feeSel && cfg?.protocolFee?.feeBps) {
-    const bps = String(cfg.protocolFee.feeBps);
-    if (Array.from(feeSel.options).find((o) => o.value === bps)) feeSel.value = bps;
-  }
   if (feeInput) {
     let saved = null;
     try {
@@ -4938,8 +5208,17 @@ loadWalletConnectorConfig().then((cfg) => {
     if (initial && !feeInput.value) feeInput.value = initial;
   }
   syncDestinationUiState();
-  syncBackgroundJobs();
-  loadAgentsAndPlugins();
+  window.dispatchEvent(
+    new CustomEvent('turgalium:config-loaded', {
+      detail: { adminSessionRequired, canAccessAdmin: canAccessAdminRoutes() },
+    })
+  );
+  if (canAccessAdminRoutes()) {
+    syncBackgroundJobs();
+    loadAgentsAndPlugins();
+  } else {
+    renderAgentsLockedState();
+  }
 });
 heroScene = mountTurgaliumFunnelScene(document.getElementById('turgaliumHeroCanvas'));
 window.__turgaliumHeroScene = heroScene;
@@ -5128,7 +5407,82 @@ async function selectConvertibleDust() {
   }
 }
 
+function buildSelfHostTemplateSetup() {
+  const origin = (typeof window !== 'undefined' && window.location?.origin) || 'http://127.0.0.1:4321';
+  return {
+    claudeDesktopConfig: {
+      mcpServers: {
+        turgalium: {
+          command: 'node',
+          args: ['dist/src/mcp/server.js'],
+          env: {
+            TURGALIUM_API_URL: origin,
+            TURGALIUM_API_TOKEN: '<MINT_TOKEN_ON_SELF_HOSTED_INSTANCE>',
+          },
+        },
+      },
+    },
+    claudeCodeCommand: `claude mcp add --transport http turgalium ${origin}/mcp --header "Authorization: Bearer <MINT_TOKEN_ON_SELF_HOSTED_INSTANCE>"`,
+    chatgptPluginManifestUrl: `${origin}/.well-known/ai-plugin.json`,
+    chatgptOpenApiUrl: `${origin}/openapi.json`,
+    mcpHttpEndpoint: `${origin}/mcp`,
+  };
+}
+
+function renderAgentsLockedState() {
+  const banner = document.getElementById('agentsAdminLockedBanner');
+  banner?.classList.remove('hidden');
+
+  const tabCountEl = document.getElementById('tabApprovalCount');
+  if (tabCountEl) {
+    tabCountEl.textContent = '0';
+    tabCountEl.classList.add('muted');
+  }
+  const metaEl = document.getElementById('approvalsCountMeta');
+  if (metaEl) metaEl.textContent = 'Locked · Self-host or unlock';
+
+  syncDestinationUiState();
+
+  const approvalsHost = document.getElementById('agentApprovalsHost');
+  if (approvalsHost) {
+    approvalsHost.innerHTML = `<div class="agents-empty-state">Admin session required to inspect or approve live agent proposals. Unlock above or run Turgalium locally (<code class="code-inline">npm run dev</code>).</div>`;
+  }
+
+  const mandatesHost = document.getElementById('agentMandatesHost');
+  if (mandatesHost) {
+    mandatesHost.innerHTML = `<div class="agents-empty-state">Spending mandates are locked on public deployments. Unlock with your <code class="code-inline">X-Turgalium-Admin-Session</code> token or self-host locally.</div>`;
+  }
+
+  const tokHost = document.getElementById('pluginTokensHost');
+  if (tokHost) {
+    tokHost.innerHTML = `<div class="agents-empty-state">API token minting is locked on public deployments. Unlock above or run locally to generate scoped Claude MCP &amp; ChatGPT bearer tokens.</div>`;
+  }
+
+  const tpl = buildSelfHostTemplateSetup();
+  const claudeHost = document.getElementById('claudeMcpConfigHost');
+  if (claudeHost) claudeHost.textContent = JSON.stringify(tpl.claudeDesktopConfig, null, 2);
+  const cmdHost = document.getElementById('claudeCodeCmdHost');
+  if (cmdHost) cmdHost.textContent = tpl.claudeCodeCommand;
+  const gptHost = document.getElementById('chatgptPluginHost');
+  if (gptHost) {
+    gptHost.textContent = JSON.stringify(
+      {
+        manifest: tpl.chatgptPluginManifestUrl,
+        openApiSpec: tpl.chatgptOpenApiUrl,
+        mcpHttp: tpl.mcpHttpEndpoint,
+        auth: 'Bearer <mint token on self-hosted instance>',
+      },
+      null,
+      2
+    );
+  }
+}
+
 async function loadAgentsAndPlugins() {
+  if (!canAccessAdminRoutes()) {
+    renderAgentsLockedState();
+    return;
+  }
   try {
     const [mRes, aRes, pRes] = await Promise.all([
       api('/api/agents/mandates'),
@@ -5138,14 +5492,25 @@ async function loadAgentsAndPlugins() {
     agentMandates = mRes.mandates || [];
     agentApprovals = aRes.approvals || [];
     pluginSetupData = pRes;
+    document.getElementById('agentsAdminLockedBanner')?.classList.add('hidden');
     renderAgentsAndPlugins();
   } catch {
-    // non-fatal during initial boot
+    if (adminSessionRequired) {
+      adminSessionToken = '';
+      try {
+        window.sessionStorage?.removeItem(ADMIN_SESSION_STORAGE_KEY);
+      } catch {
+        // ignore
+      }
+      renderAgentsLockedState();
+    }
   }
 }
 
 function buildRenderedClaudeDesktopConfig() {
-  if (!pluginSetupData?.claudeDesktopConfig) return null;
+  if (!pluginSetupData?.claudeDesktopConfig) {
+    return isAdminLocked() ? buildSelfHostTemplateSetup().claudeDesktopConfig : null;
+  }
   const cloned = JSON.parse(JSON.stringify(pluginSetupData.claudeDesktopConfig));
   if (lastIssuedTokens.claude_mcp && cloned?.mcpServers?.turgalium?.env) {
     cloned.mcpServers.turgalium.env.TURGALIUM_API_TOKEN = lastIssuedTokens.claude_mcp;
@@ -5154,7 +5519,9 @@ function buildRenderedClaudeDesktopConfig() {
 }
 
 function buildRenderedClaudeCliCommand() {
-  if (!pluginSetupData?.claudeCodeCommand) return '';
+  if (!pluginSetupData?.claudeCodeCommand) {
+    return isAdminLocked() ? buildSelfHostTemplateSetup().claudeCodeCommand : '';
+  }
   if (lastIssuedTokens.claude_mcp) {
     return pluginSetupData.claudeCodeCommand.replace('<TURGALIUM_API_TOKEN>', lastIssuedTokens.claude_mcp);
   }
