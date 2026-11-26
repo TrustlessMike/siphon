@@ -41,6 +41,37 @@ import type {
   EvmChainId,
   ScannedAsset,
 } from '../scanner/types.js';
+import {
+  type AuctionBridgeProvider,
+  type AuctionProviderFn,
+  type AuctionProviderQuote,
+  computeDynamicGasReserveSummary,
+  DEFAULT_AUCTION_TIMEOUT_MS,
+  type RouteAuctionCandidateSummary,
+  type RouteAuctionFetcher,
+  type RouteAuctionMetadata,
+  runLiveParallelRouteAuction,
+  validateQuoteTransactions,
+} from './route-auction.js';
+
+export type {
+  AuctionBridgeProvider,
+  AuctionProviderFn,
+  AuctionProviderQuote,
+  RouteAuctionCandidateSummary,
+  RouteAuctionFetcher,
+  RouteAuctionMetadata,
+};
+
+export interface RouteAuctionExecutionOptions {
+  timeoutMs?: number;
+  fetcher?: RouteAuctionFetcher;
+  providers?: Partial<Record<AuctionBridgeProvider, AuctionProviderFn>>;
+  hasSolanaUsdcAta?: boolean;
+  solPriceUsd?: number;
+  allowHighCost?: boolean;
+  slippageBps?: number;
+}
 
 const RELAY_SOLANA_CHAIN_ID = 792703809;
 const LIFI_SOLANA_CHAIN_ID = 1151111081099710;
@@ -102,13 +133,25 @@ async function fetchQuote(
   url: string,
   init: RequestInit,
   timeoutMs: number,
-  state?: QuoteState
+  state?: QuoteState,
+  opts?: {
+    fetcher?: RouteAuctionFetcher;
+    signal?: AbortSignal;
+    retries?: number;
+  }
 ): Promise<Response | null> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const fetcher = opts?.fetcher ?? globalThis.fetch.bind(globalThis);
+  const maxAttempts = Math.max(1, (opts?.retries ?? 1) + 1);
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (opts?.signal?.aborted) return null;
     const controller = new AbortController();
+    const onParentAbort = () => controller.abort();
+    if (opts?.signal) {
+      opts.signal.addEventListener('abort', onParentAbort, { once: true });
+    }
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { ...init, signal: controller.signal });
+      const res = await fetcher(url, { ...init, signal: controller.signal });
       if (res.status !== 429 && res.status < 500) return res;
       if (state) state.throttled = true;
     } catch {
@@ -116,8 +159,13 @@ async function fetchQuote(
       if (state) state.throttled = true;
     } finally {
       clearTimeout(timer);
+      if (opts?.signal) {
+        opts.signal.removeEventListener('abort', onParentAbort);
+      }
     }
-    if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 900));
+    if (attempt + 1 < maxAttempts && !opts?.signal?.aborted) {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+    }
   }
   return null;
 }
@@ -175,6 +223,8 @@ export interface PreparedExecution {
   action: ScannedAsset['action'];
   provider:
     | 'relay'
+    | 'mayan_swift'
+    | 'debridge_dln'
     | 'lifi'
     | 'circle_cctp'
     | 'enso_multi_input'
@@ -200,6 +250,7 @@ export interface PreparedExecution {
   estimatedFeeUsd?: number;
   feeBreakdown?: FeeBreakdown;
   requestId?: string;
+  routeAuction?: RouteAuctionMetadata;
   defiExitPlan?: DefiExitPlan;
   chainedFollowUpPlan?: ChainedFollowUpPlan;
   transactions: ExecutableEvmTx[];
@@ -254,6 +305,15 @@ export interface PreparedChainBatch {
   };
   feeBreakdown: FeeBreakdown;
   estimatedSeconds: number;
+  routeAuction?: RouteAuctionMetadata;
+  dynamicGasReserve?: {
+    reserveWei: string;
+    reserveNative: number;
+    staticReserveNative: number;
+    recoveredNative: number;
+    recoveredUsd: number;
+    effectiveSafetyRatio: number;
+  };
   defiExitPlans?: Record<string, DefiExitPlan>;
   chainedFollowUpPlans?: ChainedFollowUpPlan[];
   dustConsolidation?: {
@@ -375,6 +435,8 @@ async function buildDefiWithdrawExecution(params: {
   followUpQuoteFn?: FollowUpQuoteFn;
   aaveSafetyCheckFn?: AaveSafetyCheckFn;
   compoundSafetyCheckFn?: CompoundSafetyCheckFn;
+  routeAuctionOptions?: RouteAuctionExecutionOptions;
+  allowanceCheckFn?: Erc20AllowanceCheckFn;
 }): Promise<PreparedExecution> {
   const {
     asset,
@@ -386,12 +448,17 @@ async function buildDefiWithdrawExecution(params: {
     followUpQuoteFn,
     aaveSafetyCheckFn = checkAaveV3AccountSafety,
     compoundSafetyCheckFn = checkCompoundAccountSafety,
+    routeAuctionOptions,
+    allowanceCheckFn,
   } = params;
   assertEvmAddress(userAddress, 'userAddress');
   const evmChain = asEvmChain(asset.chain);
   const cfg = EVM_CHAINS[evmChain];
   const protocolId = identifyProtocolExtractorId(asset);
-  const quoteDirectBridge = followUpQuoteFn ?? buildBridgeExecution;
+  const quoteDirectBridge: FollowUpQuoteFn =
+    followUpQuoteFn ??
+    ((a, u, s, o, b, f) =>
+      buildBridgeExecution(a, u, s, o, b, f, { routeAuctionOptions, allowanceCheckFn }));
 
   // 0. Security guard: verify protocolAddress against canonical trusted contracts before building calldata.
   // Never bypass validation when protocolAddress redirects away from the receipt contract itself.
@@ -666,8 +733,23 @@ async function tryRelayBridgeQuote(params: {
   outputAsset: 'USDC' | 'SOL';
   feeConfig: ProtocolFeeConfig;
   quoteState?: QuoteState;
+  timeoutMs?: number;
+  fetcher?: RouteAuctionFetcher;
+  signal?: AbortSignal;
+  retries?: number;
 }): Promise<PreparedExecution | null> {
-  const { asset, userAddress, solanaDestination, outputAsset, feeConfig, quoteState } = params;
+  const {
+    asset,
+    userAddress,
+    solanaDestination,
+    outputAsset,
+    feeConfig,
+    quoteState,
+    timeoutMs = 7000,
+    fetcher,
+    signal,
+    retries,
+  } = params;
   const evmChain = asEvmChain(asset.chain);
   const cfg = EVM_CHAINS[evmChain];
   const originCurrency = asset.address === 'native' ? ZERO_ADDRESS : asset.address;
@@ -715,8 +797,9 @@ async function tryRelayBridgeQuote(params: {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(bodyPayload),
         },
-        7000,
-        quoteState
+        timeoutMs,
+        quoteState,
+        { fetcher, signal, retries }
       );
       if (!res || !res.ok) continue;
 
@@ -788,6 +871,17 @@ async function tryRelayBridgeQuote(params: {
 
       if (!txs.length) continue;
 
+      const txValidation = validateQuoteTransactions({
+        transactions: txs,
+        asset,
+        chain: evmChain,
+        userAddress,
+        feeRecipientEvm: feeConfig.feeRecipientEvm,
+      });
+      if (!txValidation.valid) {
+        throw new Error(`Relay security validation failed: ${txValidation.reason}`);
+      }
+
       const outFormatted = json.details?.currencyOut?.amountFormatted ?? '0';
       const outSym = json.details?.currencyOut?.currency?.symbol ?? outputAsset;
       const appFeeUsd = Number(json.fees?.app?.amountUsd ?? estFeeUsd);
@@ -834,7 +928,10 @@ async function tryRelayBridgeQuote(params: {
             : `Protocol fee ${feeConfig.feePercent}% modeled (set SIPHON_FEE_RECIPIENT_EVM or enter a treasury address to route onchain).`,
         ],
       };
-    } catch {
+    } catch (err) {
+      if (err instanceof Error && /security validation failed/i.test(err.message)) {
+        throw err;
+      }
       continue;
     }
   }
@@ -851,8 +948,25 @@ async function tryLifiBridgeQuote(params: {
   outputAsset: 'USDC' | 'SOL';
   feeConfig: ProtocolFeeConfig;
   quoteState?: QuoteState;
+  timeoutMs?: number;
+  fetcher?: RouteAuctionFetcher;
+  signal?: AbortSignal;
+  retries?: number;
+  allowanceCheckFn?: Erc20AllowanceCheckFn;
 }): Promise<PreparedExecution | null> {
-  const { asset, userAddress, solanaDestination, outputAsset, feeConfig, quoteState } = params;
+  const {
+    asset,
+    userAddress,
+    solanaDestination,
+    outputAsset,
+    feeConfig,
+    quoteState,
+    timeoutMs = 7500,
+    fetcher,
+    signal,
+    retries,
+    allowanceCheckFn = checkErc20Allowance,
+  } = params;
   const evmChain = asEvmChain(asset.chain);
   const cfg = EVM_CHAINS[evmChain];
   const fromToken = asset.address === 'native' ? ZERO_ADDRESS : asset.address;
@@ -878,8 +992,9 @@ async function tryLifiBridgeQuote(params: {
       url.toString(),
       // Keyless LI.FI is tightly rate-limited; set LIFI_API_KEY for production volume.
       process.env.LIFI_API_KEY ? { headers: { 'x-lifi-api-key': process.env.LIFI_API_KEY } } : {},
-      7500,
-      quoteState
+      timeoutMs,
+      quoteState,
+      { fetcher, signal, retries }
     );
     if (!res || !res.ok) return null;
 
@@ -918,7 +1033,7 @@ async function tryLifiBridgeQuote(params: {
 
     const approvalAddr = json.estimate?.approvalAddress;
     if (asset.address !== 'native' && approvalAddr) {
-      const allowance = await checkErc20Allowance({
+      const allowance = await allowanceCheckFn({
         chain: evmChain,
         tokenAddress: asset.address,
         owner: userAddress,
@@ -955,6 +1070,17 @@ async function tryLifiBridgeQuote(params: {
       value: toHexWei(txReq.value),
       gas: txReq.gasLimit ? toHexWei(txReq.gasLimit) : undefined,
     });
+
+    const txValidation = validateQuoteTransactions({
+      transactions: txs,
+      asset,
+      chain: evmChain,
+      userAddress,
+      feeRecipientEvm: feeConfig.feeRecipientEvm,
+    });
+    if (!txValidation.valid) {
+      throw new Error(`LI.FI security validation failed: ${txValidation.reason}`);
+    }
 
     const outDecimals = json.action?.toToken?.decimals ?? (outputAsset === 'SOL' ? 9 : 6);
     const outRaw = BigInt(json.estimate?.toAmount ?? '0');
@@ -1002,7 +1128,10 @@ async function tryLifiBridgeQuote(params: {
           : `Protocol fee ${feeConfig.feePercent}% modeled (set treasury address to collect onchain).`,
       ],
     };
-  } catch {
+  } catch (err) {
+    if (err instanceof Error && /security validation failed/i.test(err.message)) {
+      throw err;
+    }
     return null;
   }
 }
@@ -1015,8 +1144,15 @@ async function buildDirectCctpUsdcExecution(params: {
   userAddress: string;
   solanaDestination: string;
   feeConfig: ProtocolFeeConfig;
+  allowanceCheckFn?: Erc20AllowanceCheckFn;
 }): Promise<PreparedExecution> {
-  const { asset, userAddress, solanaDestination, feeConfig } = params;
+  const {
+    asset,
+    userAddress,
+    solanaDestination,
+    feeConfig,
+    allowanceCheckFn = checkErc20Allowance,
+  } = params;
   const cfg = EVM_CHAINS[asset.chain as EvmChainId];
   if (!cfg.cctpTokenMessenger || cfg.cctpDomain === null) {
     throw new Error(`${cfg.name} does not support native Circle CCTP — use Relay or LI.FI auto-routing.`);
@@ -1042,7 +1178,7 @@ async function buildDirectCctpUsdcExecution(params: {
     }
   }
 
-  const allowance = await checkErc20Allowance({
+  const allowance = await allowanceCheckFn({
     chain: asset.chain as EvmChainId,
     tokenAddress: cfg.usdcAddress,
     owner: userAddress,
@@ -1129,13 +1265,37 @@ async function buildDirectCctpUsdcExecution(params: {
   };
 }
 
+function preparedToAuctionQuote(
+  prep: PreparedExecution,
+  provider: AuctionBridgeProvider,
+  extra?: Partial<AuctionProviderQuote>
+): AuctionProviderQuote {
+  return {
+    provider,
+    requestId: prep.requestId,
+    estimatedOutput: prep.estimatedOutput,
+    estimatedSeconds: prep.estimatedSeconds,
+    quotedOutUsd: prep.quotedOutUsd ?? 0,
+    estimatedGasUsd: prep.estimatedGasUsd ?? 0,
+    estimatedFeeUsd: prep.estimatedFeeUsd,
+    collectionMethod: prep.feeBreakdown?.collectionMethod,
+    transactions: prep.transactions,
+    notes: prep.notes,
+    ...extra,
+  };
+}
+
 async function buildBridgeExecution(
   asset: ScannedAsset,
   userAddress: string,
   solanaDestination: string,
   outputAsset: 'USDC' | 'SOL',
   bridgePreference: 'auto' | 'relay' | 'lifi' | 'cctp',
-  feeConfig: ProtocolFeeConfig
+  feeConfig: ProtocolFeeConfig,
+  options?: {
+    routeAuctionOptions?: RouteAuctionExecutionOptions;
+    allowanceCheckFn?: Erc20AllowanceCheckFn;
+  }
 ): Promise<PreparedExecution> {
   const evmChain = asEvmChain(asset.chain);
   const cfg = EVM_CHAINS[evmChain];
@@ -1143,12 +1303,21 @@ async function buildBridgeExecution(
     asset.address.toLowerCase() === cfg.usdcAddress.toLowerCase();
   const hasNativeCctp = Boolean(cfg.cctpTokenMessenger && cfg.cctpDomain !== null);
   const quoteState: QuoteState = { throttled: false };
+  const allowanceCheckFn = options?.allowanceCheckFn ?? checkErc20Allowance;
+  const auctionOpts = options?.routeAuctionOptions;
 
   if (bridgePreference === 'cctp' && isNativeUsdc && hasNativeCctp) {
-    return buildDirectCctpUsdcExecution({ asset, userAddress, solanaDestination, feeConfig });
+    return buildDirectCctpUsdcExecution({
+      asset,
+      userAddress,
+      solanaDestination,
+      feeConfig,
+      allowanceCheckFn,
+    });
   }
 
-  if (bridgePreference !== 'lifi') {
+  // Explicit single-provider overrides ('relay' or 'lifi')
+  if (bridgePreference === 'relay') {
     const relay = await tryRelayBridgeQuote({
       asset,
       userAddress,
@@ -1156,33 +1325,166 @@ async function buildBridgeExecution(
       outputAsset,
       feeConfig,
       quoteState,
+      fetcher: auctionOpts?.fetcher,
     });
     if (relay) return relay;
+    if (quoteState.throttled) {
+      throw new Error(
+        `Relay was rate-limited or unreachable for ${asset.symbol} on ${cfg.name}. Retry shortly.`
+      );
+    }
+    throw new Error(
+      `No live Relay route found for ${asset.symbol} on ${cfg.name} (amount may be below bridge minimum or illiquid).`
+    );
   }
 
-  const lifi = await tryLifiBridgeQuote({
+  if (bridgePreference === 'lifi') {
+    const lifi = await tryLifiBridgeQuote({
+      asset,
+      userAddress,
+      solanaDestination,
+      outputAsset,
+      feeConfig,
+      quoteState,
+      fetcher: auctionOpts?.fetcher,
+      allowanceCheckFn,
+    });
+    if (lifi) return lifi;
+    if (quoteState.throttled) {
+      throw new Error(
+        `LI.FI was rate-limited or unreachable for ${asset.symbol} on ${cfg.name}. Retry shortly.`
+      );
+    }
+    throw new Error(
+      `No live LI.FI route found for ${asset.symbol} on ${cfg.name} (amount may be below bridge minimum or illiquid).`
+    );
+  }
+
+  // Default 'auto' mode: True Live Parallel Route Auction across Relay, Mayan Swift, deBridge DLN, LI.FI, and Circle CCTP
+  const customProviders = auctionOpts?.providers ?? {};
+  const auctionTimeoutMs = auctionOpts?.timeoutMs ?? DEFAULT_AUCTION_TIMEOUT_MS;
+
+  const auctionProviders: Partial<Record<AuctionBridgeProvider, AuctionProviderFn>> = {
+    relay:
+      customProviders.relay ??
+      (async ({ signal, timeoutMs }) => {
+        const res = await tryRelayBridgeQuote({
+          asset,
+          userAddress,
+          solanaDestination,
+          outputAsset,
+          feeConfig,
+          quoteState,
+          timeoutMs,
+          fetcher: auctionOpts?.fetcher,
+          signal,
+          retries: 0,
+        });
+        return res
+          ? preparedToAuctionQuote(res, 'relay', {
+              label: 'Relay',
+              sponsorsSolanaAta: true,
+            })
+          : null;
+      }),
+    lifi:
+      customProviders.lifi ??
+      (async ({ signal, timeoutMs }) => {
+        const res = await tryLifiBridgeQuote({
+          asset,
+          userAddress,
+          solanaDestination,
+          outputAsset,
+          feeConfig,
+          quoteState,
+          timeoutMs,
+          fetcher: auctionOpts?.fetcher,
+          signal,
+          retries: 0,
+          allowanceCheckFn,
+        });
+        return res
+          ? preparedToAuctionQuote(res, 'lifi', {
+              label: 'LI.FI',
+              sponsorsSolanaAta: true,
+            })
+          : null;
+      }),
+    ...(customProviders.mayan_swift ? { mayan_swift: customProviders.mayan_swift } : {}),
+    ...(customProviders.debridge_dln ? { debridge_dln: customProviders.debridge_dln } : {}),
+    ...(isNativeUsdc && hasNativeCctp && outputAsset === 'USDC'
+      ? {
+          circle_cctp:
+            customProviders.circle_cctp ??
+            (async () => {
+              const res = await buildDirectCctpUsdcExecution({
+                asset,
+                userAddress,
+                solanaDestination,
+                feeConfig,
+                allowanceCheckFn,
+              });
+              return preparedToAuctionQuote(res, 'circle_cctp', {
+                label: 'Circle CCTP',
+                extraBridgeFeeUsd: 0.01, // Solana receiveMessage tx fee
+                bridgeFeeUsd: 0.01,
+                sponsorsSolanaAta: false,
+              });
+            }),
+        }
+      : {}),
+  };
+
+  const { winner, routeAuction } = await runLiveParallelRouteAuction({
     asset,
     userAddress,
     solanaDestination,
     outputAsset,
     feeConfig,
-    quoteState,
+    timeoutMs: auctionTimeoutMs,
+    allowHighCost: auctionOpts?.allowHighCost ?? false,
+    hasSolanaUsdcAta: auctionOpts?.hasSolanaUsdcAta ?? true,
+    solPriceUsd: auctionOpts?.solPriceUsd,
+    slippageBps: auctionOpts?.slippageBps,
+    fetcher: auctionOpts?.fetcher,
+    allowanceCheckFn,
+    providers: auctionProviders,
   });
-  if (lifi) return lifi;
 
-  if (isNativeUsdc && hasNativeCctp) {
-    return buildDirectCctpUsdcExecution({ asset, userAddress, solanaDestination, feeConfig });
-  }
+  const estFeeUsd = Number(((asset.grossUsd * feeConfig.feeBps) / 10_000).toFixed(2));
+  const auctionNote = routeAuction.runnerUpProvider
+    ? `Live Parallel Auction (${routeAuction.providersSucceeded}/${routeAuction.providersQueried.length} providers in ${routeAuction.totalAuctionDurationMs}ms): ${routeAuction.winnerProvider} won at $${routeAuction.winnerNetUsd.toFixed(2)} net, saving $${routeAuction.dollarsSavedOverRunnerUp.toFixed(2)} (+${routeAuction.bpsSavedOverRunnerUp} bps) vs ${routeAuction.runnerUpProvider}.`
+    : `Live Parallel Auction (${routeAuction.providersSucceeded}/${routeAuction.providersQueried.length} providers in ${routeAuction.totalAuctionDurationMs}ms): ${routeAuction.winnerProvider} selected at $${routeAuction.winnerNetUsd.toFixed(2)} net.`;
 
-  if (quoteState.throttled) {
-    throw new Error(
-      `Quote providers were rate-limited or unreachable for ${asset.symbol} on ${cfg.name}. Not a routing verdict; retry in about a minute.`
-    );
-  }
-
-  throw new Error(
-    `No live bridge route found for ${asset.symbol} on ${cfg.name} (amount may be below bridge minimum or illiquid).`
-  );
+  return {
+    assetId: asset.id,
+    action: asset.action,
+    provider: winner.provider,
+    chain: evmChain,
+    chainId: cfg.chainId,
+    chainName: cfg.name,
+    explorerUrl: cfg.explorerUrl,
+    estimatedOutput: winner.estimatedOutput,
+    estimatedSeconds: winner.estimatedSeconds,
+    quotedOutUsd: winner.quotedOutUsd,
+    liveNetUsd: winner.liveNetUsd,
+    liveHaircutPct: winner.liveHaircutPct,
+    estimatedGasUsd: winner.estimatedGasUsd,
+    estimatedFeeUsd: winner.estimatedFeeUsd ?? estFeeUsd,
+    feeBreakdown: {
+      feeBps: feeConfig.feeBps,
+      feePercent: feeConfig.feePercent,
+      feeRecipientEvm: feeConfig.feeRecipientEvm,
+      feeDestinationType: feeConfig.feeDestinationType,
+      treasuryConfigured: feeConfig.treasuryConfigured,
+      collectionMethod: winner.collectionMethod ?? (feeConfig.feeRecipientEvm ? 'onchain_split' : 'none'),
+      estimatedFeeUsd: winner.estimatedFeeUsd ?? estFeeUsd,
+    },
+    requestId: winner.requestId,
+    routeAuction,
+    transactions: winner.transactions,
+    notes: [auctionNote, ...winner.notes],
+  };
 }
 
 export type FollowUpQuoteFn = (
@@ -1358,6 +1660,8 @@ export async function prepareRealExecution(params: {
   followUpQuoteFn?: FollowUpQuoteFn;
   aaveSafetyCheckFn?: AaveSafetyCheckFn;
   compoundSafetyCheckFn?: CompoundSafetyCheckFn;
+  allowanceCheckFn?: Erc20AllowanceCheckFn;
+  routeAuctionOptions?: RouteAuctionExecutionOptions;
 }): Promise<PreparedExecution> {
   const {
     asset,
@@ -1370,6 +1674,8 @@ export async function prepareRealExecution(params: {
     followUpQuoteFn,
     aaveSafetyCheckFn,
     compoundSafetyCheckFn,
+    allowanceCheckFn,
+    routeAuctionOptions,
   } = params;
   const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
 
@@ -1447,16 +1753,30 @@ export async function prepareRealExecution(params: {
       followUpQuoteFn,
       aaveSafetyCheckFn,
       compoundSafetyCheckFn,
+      routeAuctionOptions,
+      allowanceCheckFn,
     });
   }
 
-  return (followUpQuoteFn ?? buildBridgeExecution)(
+  if (followUpQuoteFn) {
+    return followUpQuoteFn(
+      asset,
+      userAddress,
+      solanaDestination,
+      outputAsset,
+      bridgePreference,
+      feeConfig
+    );
+  }
+
+  return buildBridgeExecution(
     asset,
     userAddress,
     solanaDestination,
     outputAsset,
     bridgePreference,
-    feeConfig
+    feeConfig,
+    { routeAuctionOptions, allowanceCheckFn }
   );
 }
 
@@ -1481,6 +1801,105 @@ function decodeApproveCalldata(data: string): { spender: string; amount: bigint 
  *   3. Returns exact `calls[]` ready for 1-click-per-chain signing via `wallet_sendCalls`,
  *      plus legacy fallback metadata and Permit2 / EIP-2612 capability counts.
  */
+const BRIDGE_EXECUTION_PROVIDERS = new Set<PreparedExecution['provider']>([
+  'relay',
+  'mayan_swift',
+  'debridge_dln',
+  'lifi',
+  'circle_cctp',
+]);
+
+function aggregateBatchRouteAuctions(
+  entries: Array<{ assetId: string; grossUsd: number; auction: RouteAuctionMetadata }>
+): RouteAuctionMetadata | undefined {
+  if (!entries.length) return undefined;
+  if (entries.length === 1) {
+    return {
+      ...entries[0].auction,
+      perAssetAuctions: { [entries[0].assetId]: entries[0].auction },
+    };
+  }
+
+  const perAssetAuctions: Record<string, Omit<RouteAuctionMetadata, 'perAssetAuctions'>> = {};
+  const volumeByWinner = new Map<AuctionBridgeProvider, number>();
+  const aggCandidates = new Map<AuctionBridgeProvider, RouteAuctionCandidateSummary>();
+  const queriedSet = new Set<AuctionBridgeProvider>();
+  let totalWinnerNetUsd = 0;
+  let totalRunnerUpNetUsd = 0;
+  let totalDollarsSaved = 0;
+  let totalGrossUsd = 0;
+  let maxDurationMs = 0;
+  let hasRunnerUp = false;
+
+  for (const { assetId, grossUsd, auction } of entries) {
+    perAssetAuctions[assetId] = auction;
+    totalGrossUsd += grossUsd;
+    totalWinnerNetUsd += auction.winnerNetUsd;
+    totalDollarsSaved += auction.dollarsSavedOverRunnerUp;
+    maxDurationMs = Math.max(maxDurationMs, auction.totalAuctionDurationMs);
+    volumeByWinner.set(
+      auction.winnerProvider,
+      (volumeByWinner.get(auction.winnerProvider) ?? 0) + auction.winnerNetUsd
+    );
+    if (auction.runnerUpProvider && typeof auction.runnerUpNetUsd === 'number') {
+      hasRunnerUp = true;
+      totalRunnerUpNetUsd += auction.runnerUpNetUsd;
+    } else {
+      totalRunnerUpNetUsd += auction.winnerNetUsd;
+    }
+
+    for (const p of auction.providersQueried) queriedSet.add(p);
+    for (const c of auction.candidates) {
+      const existing = aggCandidates.get(c.provider);
+      if (!existing) {
+        aggCandidates.set(c.provider, { ...c });
+      } else {
+        existing.quotedOutUsd = Number((existing.quotedOutUsd + c.quotedOutUsd).toFixed(2));
+        existing.gasUsd = Number((existing.gasUsd + c.gasUsd).toFixed(4));
+        existing.bridgeFeeUsd = Number((existing.bridgeFeeUsd + c.bridgeFeeUsd).toFixed(4));
+        existing.slippageUsd = Number((existing.slippageUsd + c.slippageUsd).toFixed(4));
+        existing.ataRentUsd = Number((existing.ataRentUsd + c.ataRentUsd).toFixed(4));
+        existing.liveNetUsd = Number((existing.liveNetUsd + c.liveNetUsd).toFixed(2));
+        existing.netUsd = existing.liveNetUsd;
+        existing.etaSeconds = Math.max(existing.etaSeconds, c.etaSeconds);
+        existing.latencyMs = Math.max(existing.latencyMs, c.latencyMs);
+        if (existing.status !== 'ok' && c.status === 'ok') {
+          existing.status = 'ok';
+          existing.reason = undefined;
+        }
+      }
+    }
+  }
+
+  const winnerProvider =
+    Array.from(volumeByWinner.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] ??
+    entries[0].auction.winnerProvider;
+  const candidates = Array.from(aggCandidates.values()).sort((a, b) => {
+    if (a.status === 'ok' && b.status !== 'ok') return -1;
+    if (a.status !== 'ok' && b.status === 'ok') return 1;
+    return b.liveNetUsd - a.liveNetUsd;
+  });
+  const okCandidates = candidates.filter((c) => c.status === 'ok');
+  const runnerUpCandidate = okCandidates.find((c) => c.provider !== winnerProvider);
+  const dollarsSavedOverRunnerUp = Number(totalDollarsSaved.toFixed(2));
+  const bpsSavedOverRunnerUp =
+    totalGrossUsd > 0 ? Math.round((dollarsSavedOverRunnerUp / totalGrossUsd) * 10_000) : 0;
+
+  return {
+    winnerProvider,
+    winnerNetUsd: Number(totalWinnerNetUsd.toFixed(2)),
+    runnerUpProvider: hasRunnerUp ? runnerUpCandidate?.provider : undefined,
+    runnerUpNetUsd: hasRunnerUp ? Number(totalRunnerUpNetUsd.toFixed(2)) : undefined,
+    dollarsSavedOverRunnerUp,
+    bpsSavedOverRunnerUp,
+    totalAuctionDurationMs: maxDurationMs,
+    providersQueried: Array.from(queriedSet),
+    providersSucceeded: okCandidates.length,
+    candidates,
+    perAssetAuctions,
+  };
+}
+
 export async function prepareChainBatchExecution(params: {
   chain: EvmChainId;
   assets: ScannedAsset[];
@@ -1498,6 +1917,10 @@ export async function prepareChainBatchExecution(params: {
   allowanceCheckFn?: Erc20AllowanceCheckFn;
   aaveSafetyCheckFn?: AaveSafetyCheckFn;
   compoundSafetyCheckFn?: CompoundSafetyCheckFn;
+  routeAuctionOptions?: RouteAuctionExecutionOptions;
+  liveGasPriceWei?: bigint;
+  gasSponsored?: boolean;
+  nativePriceUsd?: number;
 }): Promise<PreparedChainBatch> {
   const {
     chain,
@@ -1516,7 +1939,16 @@ export async function prepareChainBatchExecution(params: {
     allowanceCheckFn,
     aaveSafetyCheckFn,
     compoundSafetyCheckFn,
+    routeAuctionOptions,
+    liveGasPriceWei,
+    gasSponsored = false,
+    nativePriceUsd,
   } = params;
+  const effectiveAuctionOptions: RouteAuctionExecutionOptions | undefined = routeAuctionOptions
+    ? { ...routeAuctionOptions, allowHighCost: routeAuctionOptions.allowHighCost ?? allowHighCost }
+    : allowHighCost
+    ? { allowHighCost }
+    : undefined;
   const feeConfig = getProtocolFeeConfig({ feeBps: protocolFeeBps, feeRecipientEvm });
 
   const cfg = EVM_CHAINS[chain];
@@ -1572,10 +2004,21 @@ export async function prepareChainBatchExecution(params: {
   const bridgeTrackers: PreparedChainBatch['bridgeTrackers'] = [];
   const chainedFollowUpPlans: ChainedFollowUpPlan[] = [];
   const defiExitPlans: Record<string, DefiExitPlan> = {};
+  const collectedAuctions: Array<{
+    assetId: string;
+    grossUsd: number;
+    auction: RouteAuctionMetadata;
+  }> = [];
   const notes: string[] = [];
   let maxSeconds = 10;
 
-  const quoteFollowUpBridge = followUpQuoteFn ?? buildBridgeExecution;
+  const quoteFollowUpBridge: FollowUpQuoteFn =
+    followUpQuoteFn ??
+    ((a, u, s, o, b, f) =>
+      buildBridgeExecution(a, u, s, o, b, f, {
+        routeAuctionOptions: effectiveAuctionOptions,
+        allowanceCheckFn,
+      }));
   const checkAllowance = allowanceCheckFn ?? checkErc20Allowance;
 
   // Multi-Input Dust Swap Consolidation:
@@ -1746,6 +2189,13 @@ export async function prepareChainBatchExecution(params: {
               estimatedSeconds: bridgePrep.estimatedSeconds,
               requiresSolanaClaim: bridgePrep.provider === 'circle_cctp',
             });
+            if (bridgePrep.routeAuction) {
+              collectedAuctions.push({
+                assetId: syntheticConsolidatedUsdc.id,
+                grossUsd: combinedGrossUsd,
+                auction: bridgePrep.routeAuction,
+              });
+            }
 
             maxSeconds = Math.max(
               maxSeconds,
@@ -1785,6 +2235,8 @@ export async function prepareChainBatchExecution(params: {
       followUpQuoteFn,
       aaveSafetyCheckFn,
       compoundSafetyCheckFn,
+      allowanceCheckFn,
+      routeAuctionOptions: effectiveAuctionOptions,
     })
   );
 
@@ -1819,7 +2271,7 @@ export async function prepareChainBatchExecution(params: {
     // Live Quote Haircut Gate: drop any bridged/swapped quote that turns net-negative or >50% haircut
     if (
       asset.action !== 'BURN_ZERO_LIQUIDITY' &&
-      (prep.provider === 'relay' || prep.provider === 'lifi' || prep.provider === 'circle_cctp') &&
+      BRIDGE_EXECUTION_PROVIDERS.has(prep.provider) &&
       typeof prep.quotedOutUsd === 'number'
     ) {
       const gate = evaluateLiveQuoteHaircut({
@@ -1837,6 +2289,14 @@ export async function prepareChainBatchExecution(params: {
         notes.push(`${asset.symbol}: ${gate.reason}`);
         continue;
       }
+    }
+
+    if (prep.routeAuction) {
+      collectedAuctions.push({
+        assetId: asset.id,
+        grossUsd: asset.grossUsd,
+        auction: prep.routeAuction,
+      });
     }
 
     maxSeconds = Math.max(maxSeconds, prep.estimatedSeconds);
@@ -2051,6 +2511,13 @@ export async function prepareChainBatchExecution(params: {
                 estimatedSeconds: followUpPrep.estimatedSeconds,
                 requiresSolanaClaim: followUpPrep.provider === 'circle_cctp',
               });
+              if (followUpPrep.routeAuction) {
+                collectedAuctions.push({
+                  assetId: syntheticUnderlyingAsset.id,
+                  grossUsd: unlocked.estimatedUsd,
+                  auction: followUpPrep.routeAuction,
+                });
+              }
               notes.push(
                 `Chained ${asset.protocol || prep.provider} ${asset.symbol} unwind → ${unlocked.expectedUiAmount} ${unlocked.symbol} swap & bridge via ${followUpPrep.provider} in 1 EIP-5792 batch.`
               );
@@ -2083,7 +2550,7 @@ export async function prepareChainBatchExecution(params: {
             : prep.chainedFollowUpPlan.plainEnglishSummary,
         });
       }
-    } else if (prep.provider === 'relay' || prep.provider === 'lifi' || prep.provider === 'circle_cctp') {
+    } else if (BRIDGE_EXECUTION_PROVIDERS.has(prep.provider)) {
       bridgeTrackers.push({
         assetId: asset.id,
         assetSymbol: asset.symbol,
@@ -2198,6 +2665,37 @@ export async function prepareChainBatchExecution(params: {
     : 'none';
 
   const consolidatedIds = Array.from(consolidatedAssetIdSet);
+  const routeAuction = aggregateBatchRouteAuctions(collectedAuctions);
+
+  if (routeAuction && routeAuction.dollarsSavedOverRunnerUp > 0 && routeAuction.runnerUpProvider) {
+    notes.push(
+      `Live Route Auction: ${routeAuction.winnerProvider} won at $${routeAuction.winnerNetUsd.toFixed(2)} net (saved $${routeAuction.dollarsSavedOverRunnerUp.toFixed(2)} / +${routeAuction.bpsSavedOverRunnerUp} bps vs ${routeAuction.runnerUpProvider}).`
+    );
+  }
+
+  let dynamicGasReserve: PreparedChainBatch['dynamicGasReserve'];
+  if (liveGasPriceWei !== undefined) {
+    const reserveSummary = computeDynamicGasReserveSummary({
+      chain,
+      liveGasPriceWei,
+      plannedTxCount: Math.max(1, totalCalls),
+      nativePriceUsd,
+      options: { gasSponsored },
+    });
+    dynamicGasReserve = {
+      reserveWei: reserveSummary.reserveWei.toString(),
+      reserveNative: reserveSummary.reserveNative,
+      staticReserveNative: reserveSummary.staticReserveNative,
+      recoveredNative: reserveSummary.recoveredNative,
+      recoveredUsd: reserveSummary.recoveredUsd,
+      effectiveSafetyRatio: reserveSummary.effectiveSafetyRatio,
+    };
+    if (reserveSummary.recoveredNative > 0) {
+      notes.push(
+        `Dynamic gas reserve (${reserveSummary.reserveNative} ${cfg.nativeSymbol} vs ${reserveSummary.staticReserveNative} static) recovers ${reserveSummary.recoveredNative} ${cfg.nativeSymbol}${reserveSummary.recoveredUsd > 0 ? ` (~$${reserveSummary.recoveredUsd.toFixed(2)})` : ''} while preserving ${reserveSummary.effectiveSafetyRatio.toFixed(2)}x safety margin.`
+      );
+    }
+  }
 
   return {
     chain,
@@ -2229,6 +2727,8 @@ export async function prepareChainBatchExecution(params: {
       estimatedFeeUsd: estimatedBatchFeeUsd,
     },
     estimatedSeconds: maxSeconds,
+    routeAuction,
+    dynamicGasReserve,
     defiExitPlans: Object.keys(defiExitPlans).length ? defiExitPlans : undefined,
     chainedFollowUpPlans: chainedFollowUpPlans.length ? chainedFollowUpPlans : undefined,
     dustConsolidation: {
