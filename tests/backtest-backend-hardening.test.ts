@@ -1155,13 +1155,13 @@ test('Preservation routes & fee math: validates protocolFeeBps (allowing 0, reje
   assert.equal(tiny.capitalPreservedPct, 100);
   assert.ok(Number.isFinite(tiny.capitalPreservedPct));
 
-  // 2. Invalid maxFeeUsdCap (NaN / negative) falls back to $50 principal cap instead of disabling it
-  const nanCap = computePreservationFee(100_000, { maxFeeUsdCap: Number.NaN });
+  // 2. Invalid maxFeeUsdCap (NaN / negative) in explicit tiered mode falls back to $50 principal cap instead of disabling it
+  const nanCap = computePreservationFee(100_000, { mode: 'tiered', maxFeeUsdCap: Number.NaN });
   assert.equal(nanCap.feeCapUsd, 50);
   assert.equal(nanCap.feeUsd, 50);
   assert.equal(nanCap.capApplied, true);
 
-  const negCap = computePreservationFee(100_000, { maxFeeUsdCap: -10 });
+  const negCap = computePreservationFee(100_000, { mode: 'tiered', maxFeeUsdCap: -10 });
   assert.equal(negCap.feeCapUsd, 50);
   assert.equal(negCap.feeUsd, 50);
   assert.equal(negCap.capApplied, true);

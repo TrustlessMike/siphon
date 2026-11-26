@@ -800,11 +800,19 @@ export function computeRelayerBreakEven(params: {
   const totalRelayerRevenueUsd = r2(protocolFeeUsd + effectiveReimbursementUsd);
 
   const relayerNetMarginUsd = r2(totalRelayerRevenueUsd - effectiveRelayerCostUsd);
-  const requiredFeeUsd = r2(Math.max(0, requiredRelayerCoverageUsd - effectiveReimbursementUsd));
+  const isZeroFeeAtCost = feeCfg.feeBps === 0 && isReimbursed;
+  const effectiveRequiredCoverageUsd = isZeroFeeAtCost
+    ? effectiveRelayerCostUsd
+    : requiredRelayerCoverageUsd;
+  const requiredFeeUsd = r2(Math.max(0, effectiveRequiredCoverageUsd - effectiveReimbursementUsd));
   const slippageRate = grossUsd > 0 ? Math.min(0.99, slippageUsd / grossUsd) : 0;
   const effectiveFeeRate = rate * (1 - slippageRate);
 
-  const minGrossForFeeUsd = effectiveFeeRate > 0 ? ceil2(requiredFeeUsd / effectiveFeeRate) : Infinity;
+  const minGrossForFeeUsd = isZeroFeeAtCost
+    ? 0
+    : effectiveFeeRate > 0
+      ? ceil2(requiredFeeUsd / effectiveFeeRate)
+      : Infinity;
   const userRetentionRate = (1 - slippageRate) * (1 - rate);
   const minGrossForUserNetUsd =
     isReimbursed && userRetentionRate > 0
@@ -822,7 +830,7 @@ export function computeRelayerBreakEven(params: {
     !isReimbursed || netAfterSlippageUsd > effectiveRelayerCostUsd + protocolFeeUsd;
   const isRelayerProfitable =
     grossUsd > 0 &&
-    totalRelayerRevenueUsd >= requiredRelayerCoverageUsd &&
+    totalRelayerRevenueUsd + 1e-9 >= effectiveRequiredCoverageUsd &&
     userProceedsPositive;
 
   const marginPercentOfGross = grossUsd > 0 ? r2((relayerNetMarginUsd / grossUsd) * 100) : -100;

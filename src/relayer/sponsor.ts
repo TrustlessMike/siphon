@@ -872,10 +872,11 @@ export function buildGaslessSweepIntent(params: {
   const protocolFeeUsd = Number(((grossUsd * feeConfig.feeBps) / 10_000).toFixed(2));
 
   // HIGH-04: Honest break-even check aligned with onchain invariant:
-  // Onchain requires: feeUsdc + gasReimbursementUsdc >= 1.5 * gasReimbursementUsdc  <=>  feeUsdc >= 0.5 * gasReimbursementUsdc.
-  // Therefore evaluate offchain break-even at 1.0x sponsoredGasEstUsd (NEVER inflated 2.5x maxGasReimbursementUsd!).
+  // When feeBps > 0: feeUsdc + gasReimbursementUsdc >= 1.5 * gasReimbursementUsdc  <=>  feeUsdc >= 0.5 * gasReimbursementUsdc.
+  // When feeBps === 0 (open-source zero-fee mode): at-cost gas reimbursement without protocol markup.
+  const isZeroFeeAtCost = feeConfig.feeBps === 0;
   const relayerRequiredCoverageUsd = Number(
-    (sponsoredGasEstUsd * RELAYER_BREAK_EVEN_MULTIPLIER).toFixed(2)
+    (isZeroFeeAtCost ? sponsoredGasEstUsd : sponsoredGasEstUsd * RELAYER_BREAK_EVEN_MULTIPLIER).toFixed(2)
   );
   const relayerExpectedCoverageUsd = Number((protocolFeeUsd + sponsoredGasEstUsd).toFixed(2));
   const relayerCheck = computeRelayerBreakEven({
@@ -883,13 +884,16 @@ export function buildGaslessSweepIntent(params: {
     protocolFeeBps: feeConfig.feeBps,
     grossUsd,
     maxGasReimbursementUsd: sponsoredGasEstUsd,
+    ...(isZeroFeeAtCost ? { fixedRelayerOverheadUsd: 0 } : {}),
   });
 
-  // Cap maxGasReimbursementUsd by BOTH onchain break-even ceiling (2 * protocolFeeUsd) and affordable proceeds
+  // Cap maxGasReimbursementUsd by BOTH onchain break-even ceiling (2 * protocolFeeUsd when fee > 0) and affordable proceeds
   const affordableReimbursementUsd = Number(
     Math.max(0, grossUsd - protocolFeeUsd - estimatedSlippageUsd - 0.01).toFixed(2)
   );
-  const onchainMaxReimbursementCapUsd = Number((protocolFeeUsd * 2).toFixed(2));
+  const onchainMaxReimbursementCapUsd = isZeroFeeAtCost
+    ? Number(Math.max(sponsoredGasEstUsd * 1.5, 0.25).toFixed(2))
+    : Number((protocolFeeUsd * 2).toFixed(2));
   const maxGasReimbursementUsd = Number(
     Math.min(
       Math.max(sponsoredGasEstUsd * 1.5, Math.min(0.25, onchainMaxReimbursementCapUsd)),
@@ -935,9 +939,11 @@ export function buildGaslessSweepIntent(params: {
       : computeEmptySwapsHash();
 
   const userMinNetPositive = BigInt(minNetUsdcOut) > 0n;
-  const onchainFeeCoversGasMargin = protocolFeeUsd + 1e-9 >= sponsoredGasEstUsd * 0.5;
+  const zeroFeeAtCost = feeConfig.feeBps === 0 && relayerExpectedCoverageUsd + 1e-9 >= sponsoredGasEstUsd;
+  const onchainFeeCoversGasMargin =
+    zeroFeeAtCost || protocolFeeUsd + 1e-9 >= sponsoredGasEstUsd * 0.5;
   const sponsorEligible =
-    relayerExpectedCoverageUsd >= relayerRequiredCoverageUsd &&
+    (zeroFeeAtCost || relayerExpectedCoverageUsd >= relayerRequiredCoverageUsd) &&
     onchainFeeCoversGasMargin &&
     userMinNetPositive &&
     relayerCheck.isRelayerProfitable;

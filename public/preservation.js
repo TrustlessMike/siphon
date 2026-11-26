@@ -67,57 +67,18 @@ const PRESERVATION_FEE_BRACKETS = [
 function computeTieredPreservationFee(grossUsdInput) {
   const raw = Number(grossUsdInput);
   const grossUsd = Number.isFinite(raw) && raw > 0 ? Number(raw.toFixed(2)) : 0;
-  if (grossUsd <= 0) {
-    return {
-      grossUsd: 0,
-      feeBps: 0,
-      effectiveFeeBps: 0,
-      feePercentLabel: '0.00%',
-      feeUsd: 0,
-      capUsd: null,
-      capApplied: false,
-      legacy7PctUsd: 0,
-      savedVs7PctUsd: 0,
-      tierLabel: 'Zero',
-    };
-  }
-
-  const matchedTier =
-    PRESERVATION_FEE_BRACKETS.find(
-      (t) => grossUsd >= t.minGrossUsd && (t.maxGrossUsd === null || grossUsd < t.maxGrossUsd)
-    ) || PRESERVATION_FEE_BRACKETS[PRESERVATION_FEE_BRACKETS.length - 1];
-
-  let uncappedFeeRaw = 0;
-  for (const tier of PRESERVATION_FEE_BRACKETS) {
-    if (grossUsd <= tier.minGrossUsd) break;
-    const upper = tier.maxGrossUsd === null ? grossUsd : Math.min(grossUsd, tier.maxGrossUsd);
-    const sliceUsd = Math.max(0, upper - tier.minGrossUsd);
-    if (sliceUsd <= 0) continue;
-    uncappedFeeRaw += (sliceUsd * tier.feeBps) / 10_000;
-  }
-
-  const feeBps = matchedTier.feeBps;
-  const capUsd = matchedTier.capUsd;
-  const hardCapUsd = capUsd !== null ? capUsd : 50;
-  const uncappedFeeUsd = Number(uncappedFeeRaw.toFixed(2));
-  const capApplied = uncappedFeeUsd > hardCapUsd;
-  const feeUsd = capApplied ? hardCapUsd : uncappedFeeUsd;
-  const effectiveFeeBps = Number(((feeUsd / grossUsd) * 10_000).toFixed(2));
   const legacy7PctUsd = Number(((grossUsd * 700) / 10_000).toFixed(2));
-  const savedVs7PctUsd = Number(Math.max(0, legacy7PctUsd - feeUsd).toFixed(2));
-  const feePercentLabel = `${(feeBps / 100).toFixed(2)}%`;
-
   return {
     grossUsd,
-    feeBps,
-    effectiveFeeBps,
-    feePercentLabel,
-    feeUsd,
-    capUsd,
-    capApplied,
+    feeBps: 0,
+    effectiveFeeBps: 0,
+    feePercentLabel: '0%',
+    feeUsd: 0,
+    capUsd: 0,
+    capApplied: false,
     legacy7PctUsd,
-    savedVs7PctUsd,
-    tierLabel: matchedTier.tierLabel,
+    savedVs7PctUsd: legacy7PctUsd,
+    tierLabel: 'Open Source (0% Fee)',
   };
 }
 
@@ -219,11 +180,7 @@ function getActiveOutputAsset() {
 }
 
 function getActiveProtocolFeeBps() {
-  const sel = document.getElementById('protocolFeeSelect');
-  const raw = String(sel?.value ?? 'tiered').trim();
-  if (!raw || raw === 'tiered') return undefined;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed >= 500 && parsed <= 1000 ? parsed : undefined;
+  return 0;
 }
 
 function canAccessAdminRoutes() {
@@ -288,16 +245,8 @@ function updateSummaryProClarity(feeInfo, routeSummary) {
   }
 
   row.classList.remove('hidden');
-  const capPart = feeInfo.capUsd !== null ? ` cap ${fmtUsd(feeInfo.capUsd)}` : '';
   const routePart = routeSummary?.winnerLabel ? ` · ${routeSummary.winnerLabel}` : '';
-  const overrideBps = getActiveProtocolFeeBps();
-  if (overrideBps !== undefined) {
-    valEl.textContent = `Custom ${(overrideBps / 100).toFixed(1)}% flat (Tiered: ${feeInfo.feePercentLabel}${capPart})${routePart}`;
-  } else if (feeInfo.savedVs7PctUsd > 0) {
-    valEl.textContent = `Saving +${fmtUsd(feeInfo.savedVs7PctUsd)} vs 7%${routePart}`;
-  } else {
-    valEl.textContent = `${feeInfo.tierLabel}${routePart}`;
-  }
+  valEl.textContent = `0% protocol fee (Open Source)${routePart}`;
 }
 
 function createEl(tag, className, text) {
@@ -436,14 +385,9 @@ function renderPreservationStrip() {
   if (hasSweepable) {
     const clarityRow = createEl('div', 'preservation-clarity-row pro-only');
 
-    const feePill = createEl('span', 'preservation-pill preservation-pill-fee');
+    const feePill = createEl('span', 'preservation-pill preservation-pill-saved');
     feePill.id = 'preservationTieredFeePill';
-    const capPart = feeInfo.capUsd !== null ? ` cap ${fmtUsd(feeInfo.capUsd)}` : '';
-    const savePart =
-      feeInfo.savedVs7PctUsd > 0
-        ? ` · Saving +${fmtUsd(feeInfo.savedVs7PctUsd)} vs 7%`
-        : ` (${feeInfo.feeBps} bps)`;
-    feePill.textContent = `Tiered Fee: ${feeInfo.feePercentLabel}${capPart}${savePart}`;
+    feePill.textContent = '0% Protocol Fee · Open Source (MIT)';
     clarityRow.appendChild(feePill);
 
     if (routeSummary?.winnerLabel) {

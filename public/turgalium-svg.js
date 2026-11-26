@@ -278,8 +278,11 @@ export function renderConvergenceSvg(plan, scan) {
     },
   ];
 
+  const effectiveFeeRaw = Number.isFinite(Number(totals.effectiveProtocolFeeUsd))
+    ? safeNum(totals.effectiveProtocolFeeUsd)
+    : safeNum(totals.protocolFeeUsd);
   const cctpY = height * 0.34 - 29;
-  const solY = height * 0.27 - 32;
+  const solY = effectiveFeeRaw > 0 ? height * 0.27 - 32 : cctpY - 3;
   const feeY = height * 0.56 - 26;
   const burnSinkY = height * 0.79 - 26;
 
@@ -353,9 +356,6 @@ export function renderConvergenceSvg(plan, scan) {
     <path d="${c2s}" fill="none" stroke="#0284C7" stroke-width="2" marker-end="url(#siphArrowIce)" />
     ${reducedMotion ? '' : `<circle r="2.6" fill="#0284C7"><animateMotion dur="1.6s" repeatCount="indefinite" begin="-0.3s"><mpath href="#p_c2s" /></animateMotion></circle>`}
   `);
-  const effectiveFeeRaw = Number.isFinite(Number(totals.effectiveProtocolFeeUsd))
-    ? safeNum(totals.effectiveProtocolFeeUsd)
-    : safeNum(totals.protocolFeeUsd);
   if (effectiveFeeRaw > 0) {
     edges.push(
       `<path d="${c2f}" fill="none" stroke="#6B7280" stroke-width="1.25" stroke-dasharray="3 2.5" marker-end="url(#siphArrow)" />`
@@ -470,13 +470,17 @@ export function renderConvergenceSvg(plan, scan) {
         <text x="14" y="49" font-family="JetBrains Mono, monospace" font-size="13.2" font-weight="700" fill="#0A0A0A">${escapeXml(outputLabel)}</text>
       </g>
 
-      <!-- Stage 4B: Protocol Treasury Fee Vault -->
+      ${
+        effectiveFeeRaw > 0
+          ? `<!-- Stage 4B: Protocol Treasury Fee Vault -->
       <g transform="translate(${col4X}, ${feeY})">
         <rect width="${col4W}" height="52" rx="10" fill="#FFFFFF" stroke="#E4E6EB" />
         <image href="/logos/turgalium.svg" x="12" y="16" width="18" height="18" />
         <text x="36" y="22" font-family="Inter, sans-serif" font-size="11.5" font-weight="600" fill="#0A0A0A">Fee (${escapeXml(feePctLabel)}) · ${escapeXml(feeDestShort)}</text>
         <text x="36" y="39" font-family="JetBrains Mono, monospace" font-size="10.2" fill="#52525B">$${escapeXml(feeUsd)} → Treasury</text>
-      </g>
+      </g>`
+          : ''
+      }
     </svg>
   `;
 }

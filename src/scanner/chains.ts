@@ -9,13 +9,13 @@ export const SOLANA_CCTP_DOMAIN = 5;
 export const CCTP_V2_TOKEN_MESSENGER = '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d';
 export const CCTP_V2_MESSAGE_TRANSMITTER = '0x81D40F21F12A8F0E3252Bccb954D722d4c464B64';
 
-export const MIN_PROTOCOL_FEE_BPS = 500; // 5.0% (legacy flat floor, kept for backwards compatibility)
-export const MAX_PROTOCOL_FEE_BPS = 1000; // 10.0%
-export const DEFAULT_PROTOCOL_FEE_BPS = 700; // 7.0%
+export const MIN_PROTOCOL_FEE_BPS = 0; // 0.0% — Turgalium is open-source with zero protocol fees
+export const MAX_PROTOCOL_FEE_BPS = 1000; // 10.0% (safety ceiling for optional self-hosted forks)
+export const DEFAULT_PROTOCOL_FEE_BPS = 0; // 0.0% — zero protocol fees by default
 
-// Preservation-first progressive protocol fee schedule constants
-export const MIN_PRESERVATION_FEE_BPS = 0; // 0.0% (self-custody / partner-subsidized mode)
-export const DEFAULT_PRESERVATION_FEE_CAP_USD = 50; // $50 hard ceiling on principal migrations
+// Open-source zero-fee & optional preservation schedule constants
+export const MIN_PRESERVATION_FEE_BPS = 0; // 0.0% (default open-source zero-fee mode)
+export const DEFAULT_PRESERVATION_FEE_CAP_USD = 50; // Optional cap when tiered mode is explicitly selected
 
 export type PreservationFeeMode = 'tiered' | 'self_custody' | 'partner_subsidized' | 'legacy_flat';
 
@@ -140,11 +140,11 @@ export function computePreservationFee(
   grossUsdInput: number,
   opts: PreservationFeeOptions = {}
 ): PreservationFeeResult {
-  const mode: PreservationFeeMode = opts.mode ?? 'tiered';
+  const mode: PreservationFeeMode = opts.mode ?? 'self_custody';
   const baselineBps =
     opts.baselineFlatFeeBps !== undefined && Number.isFinite(opts.baselineFlatFeeBps)
       ? Math.max(0, Math.min(MAX_PROTOCOL_FEE_BPS, Math.round(opts.baselineFlatFeeBps)))
-      : DEFAULT_PROTOCOL_FEE_BPS;
+      : 700;
 
   const grossUsd = round2(grossUsdInput);
   if (!Number.isFinite(grossUsdInput) || grossUsd <= 0) {
@@ -174,7 +174,7 @@ export function computePreservationFee(
       grossUsd,
       mode,
       tierId: mode === 'self_custody' ? 'self_custody_zero' : 'partner_subsidized_zero',
-      tierLabel: mode === 'self_custody' ? 'Self-Custody Zero Fee (0 bps)' : 'Partner-Subsidized Zero Fee (0 bps)',
+      tierLabel: mode === 'self_custody' ? 'Open Source Zero Fee (0%)' : 'Partner-Subsidized Zero Fee (0 bps)',
       nominalFeeBps: 0,
       effectiveFeeBps: 0,
       effectiveFeePercent: 0,
@@ -193,7 +193,7 @@ export function computePreservationFee(
     const flatBps =
       opts.overrideFeeBps !== undefined
         ? resolveProtocolFeeBps(opts.overrideFeeBps)
-        : DEFAULT_PROTOCOL_FEE_BPS;
+        : 700;
     const feeUsd = round2((grossUsd * flatBps) / 10_000);
     const netAfterFeeUsd = round2(Math.max(0, grossUsd - feeUsd));
     const effectiveFeeBps = grossUsd > 0 ? Number(((feeUsd / grossUsd) * 10_000).toFixed(2)) : 0;
@@ -313,7 +313,7 @@ export interface ProtocolFeeConfig {
   feeRecipientSol: string | null;
   feeDestinationType: 'contract' | 'wallet';
   treasuryConfigured: boolean;
-  feeSchedule?: 'tiered' | 'flat';
+  feeSchedule?: 'zero' | 'tiered' | 'flat';
   preservationFee?: PreservationFeeResult;
 }
 
@@ -321,16 +321,16 @@ export function getProtocolFeeConfig(overrides?: {
   feeBps?: number | string | null;
   feeRecipientEvm?: string | null;
   grossUsd?: number;
-  feeSchedule?: 'tiered' | 'flat';
+  feeSchedule?: 'zero' | 'tiered' | 'flat';
   preservationFeeOpts?: PreservationFeeOptions;
 }): ProtocolFeeConfig {
   const hasExplicitBpsOverride =
     overrides?.feeBps !== undefined && overrides?.feeBps !== null && overrides?.feeBps !== '';
   const hasEnvFlatOverride = Boolean(process.env.TURGALIUM_FEE_BPS?.trim());
-  const useTieredForGross =
+  const explicitTieredRequested =
     !hasExplicitBpsOverride &&
-    overrides?.feeSchedule !== 'flat' &&
     !hasEnvFlatOverride &&
+    overrides?.preservationFeeOpts?.mode === 'tiered' &&
     typeof overrides?.grossUsd === 'number' &&
     Number.isFinite(overrides.grossUsd) &&
     overrides.grossUsd > 0;
@@ -338,31 +338,28 @@ export function getProtocolFeeConfig(overrides?: {
   let preservationFee: PreservationFeeResult | undefined;
   let feeBps: number;
   let feePercent: number;
-  let feeSchedule: 'tiered' | 'flat';
+  let feeSchedule: 'zero' | 'tiered' | 'flat';
 
-  if (useTieredForGross) {
+  if (explicitTieredRequested) {
     preservationFee = computePreservationFee(overrides!.grossUsd!, overrides?.preservationFeeOpts);
     feeBps = Math.max(0, Math.round(preservationFee.effectiveFeeBps));
     feePercent = Number((preservationFee.effectiveFeeBps / 100).toFixed(4));
     feeSchedule = 'tiered';
-  } else if (hasExplicitBpsOverride && overrides?.feeSchedule === 'tiered') {
-    feeBps = resolvePreservationFeeBps(overrides.feeBps);
-    feePercent = Number((feeBps / 100).toFixed(2));
-    feeSchedule = 'tiered';
-  } else if (
-    hasExplicitBpsOverride &&
-    Number.isFinite(Number(overrides?.feeBps)) &&
-    Number(overrides?.feeBps) >= 0 &&
-    Number(overrides?.feeBps) < MIN_PROTOCOL_FEE_BPS
-  ) {
-    // Allow explicit preservation-range bps overrides (0..499 bps) while keeping legacy [500..1000] intact
-    feeBps = resolvePreservationFeeBps(overrides?.feeBps);
-    feePercent = Number((feeBps / 100).toFixed(2));
-    feeSchedule = 'flat';
-  } else {
+  } else if (hasExplicitBpsOverride || hasEnvFlatOverride) {
     feeBps = resolveProtocolFeeBps(overrides?.feeBps ?? process.env.TURGALIUM_FEE_BPS);
     feePercent = Number((feeBps / 100).toFixed(2));
-    feeSchedule = 'flat';
+    feeSchedule = feeBps === 0 ? 'zero' : overrides?.feeSchedule === 'tiered' ? 'tiered' : 'flat';
+  } else {
+    // Open-source default: 0% protocol fee (100% of net bridged value goes directly to user)
+    feeBps = 0;
+    feePercent = 0;
+    feeSchedule = 'zero';
+    if (typeof overrides?.grossUsd === 'number' && Number.isFinite(overrides.grossUsd) && overrides.grossUsd > 0) {
+      preservationFee = computePreservationFee(overrides.grossUsd, {
+        ...overrides?.preservationFeeOpts,
+        mode: 'self_custody',
+      });
+    }
   }
 
   // HIGH-01: When server treasury is configured via environment, never allow client overrides to hijack fees.

@@ -85,7 +85,7 @@ function makeAsset(overrides: Partial<ScannedAsset>): ScannedAsset {
 }
 
 describe('Wave 10 Cross-Lane Integration Tie-Ups', () => {
-  it('exact penny-for-penny fee parity between backend chains.ts and frontend app.js & preservation.js', () => {
+  it('exact zero-fee parity ($0.00 / 0 bps) between backend chains.ts and frontend app.js & preservation.js', () => {
     const appFn = extractFrontendFeeFn(path.resolve('public/app.js'));
     const presFn = extractFrontendFeeFn(path.resolve('public/preservation.js'));
 
@@ -95,25 +95,19 @@ describe('Wave 10 Cross-Lane Integration Tie-Ups', () => {
       const app = appFn(amount);
       const pres = presFn(amount);
 
+      assert.equal(backend.feeUsd, 0, `backend feeUsd should be 0 at $${amount}`);
       assert.equal(app.feeUsd, backend.feeUsd, `app.js feeUsd mismatch at $${amount}`);
       assert.equal(pres.feeUsd, backend.feeUsd, `preservation.js feeUsd mismatch at $${amount}`);
-      assert.equal(app.effectiveFeeBps, backend.effectiveFeeBps, `app.js effectiveFeeBps mismatch at $${amount}`);
-      assert.equal(pres.effectiveFeeBps, backend.effectiveFeeBps, `preservation.js effectiveFeeBps mismatch at $${amount}`);
-      assert.equal(app.capApplied, backend.capApplied, `app.js capApplied mismatch at $${amount}`);
-      assert.equal(pres.capApplied, backend.capApplied, `preservation.js capApplied mismatch at $${amount}`);
+      assert.equal(app.effectiveFeeBps, 0, `app.js effectiveFeeBps mismatch at $${amount}`);
+      assert.equal(pres.effectiveFeeBps, 0, `preservation.js effectiveFeeBps mismatch at $${amount}`);
+      assert.equal(app.capApplied, false, `app.js capApplied mismatch at $${amount}`);
+      assert.equal(pres.capApplied, false, `preservation.js capApplied mismatch at $${amount}`);
       assert.equal(app.savedVs7PctUsd, backend.savingsVsFlat7PctUsd, `app.js savedVs7PctUsd mismatch at $${amount}`);
       assert.equal(pres.savedVs7PctUsd, backend.savingsVsFlat7PctUsd, `preservation.js savedVs7PctUsd mismatch at $${amount}`);
     }
-
-    // Explicit sanity checks on the 5 headline amounts
-    assert.equal(appFn(25).feeUsd, 1.25);
-    assert.equal(appFn(100).feeUsd, 3.0);
-    assert.equal(appFn(1_000).feeUsd, 8.25);
-    assert.equal(appFn(10_000).feeUsd, 23.25);
-    assert.equal(appFn(100_000).feeUsd, 50.0);
   });
 
-  it('Noble $10k direct batch and all 6 non-EVM adapters default to tiered preservation fee ($23.25) while honoring explicit overrides', async () => {
+  it('Noble $10k direct batch and all 6 non-EVM adapters default to 0% open-source zero fee ($0.00) while honoring explicit overrides', async () => {
     const nobleUsdc = makeAsset({ chain: 'noble', grossUsd: 10_000 });
     const mockFetcher = async () =>
       new Response(JSON.stringify({ account: { account_number: '1', sequence: '0' } }), {
@@ -129,8 +123,8 @@ describe('Wave 10 Cross-Lane Integration Tie-Ups', () => {
       outputAsset: 'USDC',
       fetcher: mockFetcher,
     });
-    assert.equal(nobleBatch.feeBreakdown.estimatedFeeUsd, 23.25);
-    assert.equal(nobleBatch.feeBreakdown.feeBps, 23);
+    assert.equal(nobleBatch.feeBreakdown.estimatedFeeUsd, 0);
+    assert.equal(nobleBatch.feeBreakdown.feeBps, 0);
 
     // Explicit flat 700 bps override must still be honored
     const nobleFlat = await prepareCosmosDirectBatch({
@@ -145,7 +139,7 @@ describe('Wave 10 Cross-Lane Integration Tie-Ups', () => {
     assert.equal(nobleFlat.feeBreakdown.estimatedFeeUsd, 700);
     assert.equal(nobleFlat.feeBreakdown.feeBps, 700);
 
-    // Verify all 6 non-EVM adapters' buildGaslessIntent produce $23.25 on $10,000
+    // Verify all 6 non-EVM adapters' buildGaslessIntent default to $0.00 (0 bps) on $10,000
     const cosmosIntent = await cosmosAdapter.buildGaslessIntent({
       chain: 'noble',
       userAddress: 'noble1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq5h568l',
@@ -153,8 +147,8 @@ describe('Wave 10 Cross-Lane Integration Tie-Ups', () => {
       assets: [nobleUsdc],
       outputAsset: 'USDC',
     });
-    assert.equal(cosmosIntent.protocolFeeUsd, 23.25);
-    assert.equal(cosmosIntent.protocolFeeBps, 23);
+    assert.equal(cosmosIntent.protocolFeeUsd, 0);
+    assert.equal(cosmosIntent.protocolFeeBps, 0);
 
     const suiIntent = await suiAdapter.buildGaslessIntent({
       chain: 'sui',
@@ -163,8 +157,8 @@ describe('Wave 10 Cross-Lane Integration Tie-Ups', () => {
       assets: [makeAsset({ chain: 'sui', chainName: 'Sui', grossUsd: 10_000 })],
       outputAsset: 'USDC',
     });
-    assert.equal(suiIntent.protocolFeeUsd, 23.25);
-    assert.equal(suiIntent.protocolFeeBps, 23);
+    assert.equal(suiIntent.protocolFeeUsd, 0);
+    assert.equal(suiIntent.protocolFeeBps, 0);
 
     const aptosIntent = await aptosAdapter.buildGaslessIntent({
       chain: 'aptos',
@@ -173,8 +167,8 @@ describe('Wave 10 Cross-Lane Integration Tie-Ups', () => {
       assets: [makeAsset({ chain: 'aptos', chainName: 'Aptos', grossUsd: 10_000 })],
       outputAsset: 'USDC',
     });
-    assert.equal(aptosIntent.protocolFeeUsd, 23.25);
-    assert.equal(aptosIntent.protocolFeeBps, 23);
+    assert.equal(aptosIntent.protocolFeeUsd, 0);
+    assert.equal(aptosIntent.protocolFeeBps, 0);
 
     const btcIntent = await btcAdapter.buildGaslessIntent({
       chain: 'btc',
@@ -195,8 +189,8 @@ describe('Wave 10 Cross-Lane Integration Tie-Ups', () => {
       ],
       outputAsset: 'USDC',
     });
-    assert.equal(btcIntent.protocolFeeUsd, 23.25);
-    assert.equal(btcIntent.protocolFeeBps, 23);
+    assert.equal(btcIntent.protocolFeeUsd, 0);
+    assert.equal(btcIntent.protocolFeeBps, 0);
 
     const tonIntent = await tonAdapter.buildGaslessIntent({
       chain: 'ton',
@@ -215,8 +209,8 @@ describe('Wave 10 Cross-Lane Integration Tie-Ups', () => {
       ],
       outputAsset: 'USDC',
     });
-    assert.equal(tonIntent.protocolFeeUsd, 23.25);
-    assert.equal(tonIntent.protocolFeeBps, 23);
+    assert.equal(tonIntent.protocolFeeUsd, 0);
+    assert.equal(tonIntent.protocolFeeBps, 0);
 
     const tronIntent = await tronAdapter.buildGaslessIntent({
       chain: 'tron',
@@ -234,8 +228,8 @@ describe('Wave 10 Cross-Lane Integration Tie-Ups', () => {
       ],
       outputAsset: 'USDC',
     });
-    assert.equal(tronIntent.protocolFeeUsd, 23.25);
-    assert.equal(tronIntent.protocolFeeBps, 23);
+    assert.equal(tronIntent.protocolFeeUsd, 0);
+    assert.equal(tronIntent.protocolFeeBps, 0);
   });
 
   it('removes dead solana-rpc.publicnode.com from all Solana RPC lists and keeps live endpoints', () => {

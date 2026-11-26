@@ -385,10 +385,11 @@ test('Circle CCTP MessageSent log ABI extractor produces valid message bytes and
   assert.match(extracted.messageHash, /^0x[0-9a-f]{64}$/);
 });
 
-test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain transfers, and exposes TurgaliumFeeVault.sol', async () => {
-  // Clamping: below 5% -> 500 bps, above 10% -> 1000 bps, default -> 700 bps (7%)
-  assert.equal(resolveProtocolFeeBps(undefined), 700);
-  assert.equal(resolveProtocolFeeBps(100), 500);
+test('Protocol fee defaults to 0% (open source), clamps explicit overrides (0-10%), reconciles plan, and exposes TurgaliumFeeVault.sol', async () => {
+  // Open-source default is 0 bps (0%); explicit overrides clamp to [0, 1000] bps
+  assert.equal(resolveProtocolFeeBps(undefined), 0);
+  assert.equal(resolveProtocolFeeBps(-50), 0);
+  assert.equal(resolveProtocolFeeBps(100), 100);
   assert.equal(resolveProtocolFeeBps(750), 750);
   assert.equal(resolveProtocolFeeBps(2500), 1000);
 

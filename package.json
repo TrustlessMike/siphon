@@ -2,7 +2,21 @@
   "name": "turgalium-migrator",
   "version": "0.1.0",
   "license": "MIT",
-  "description": "Open-source multi-chain DeFi & dust migrator to Solana with 1-click DeFi extraction, EIP-5792/7702 batching, signed Two-Level ROI guard, and Claude MCP / ChatGPT plugins",
+  "description": "Zero-fee open-source 30-chain DeFi & dust migrator to Solana with 1-click DeFi extraction, EIP-5792/7702 batching, Circle CCTP V2 Fast Transfer, and Claude MCP / ChatGPT plugins",
+  "homepage": "https://turgalium.vercel.app",
+  "bugs": {
+    "url": "https://github.com/TrustlessMike/turgalium/issues"
+  },
+  "keywords": [
+    "solana",
+    "defi",
+    "cross-chain",
+    "cctp",
+    "eip-7702",
+    "mcp",
+    "open-source",
+    "zero-fee"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/TrustlessMike/turgalium.git"

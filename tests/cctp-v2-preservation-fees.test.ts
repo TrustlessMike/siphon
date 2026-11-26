@@ -434,8 +434,14 @@ test('Preservation Fee Engine: preserves >= 99.5% on $10k and $100k (saving +$67
   assert.equal(DEFAULT_PRESERVATION_FEE_CAP_USD, 50);
   assert.equal(PRESERVATION_FEE_TIERS.length, 4);
 
-  // Tier 1: Micro-dust (<$50) -> 500 bps (5%)
-  const dust = computePreservationFee(20);
+  // Open-source default is 0 bps ($0 protocol fee, 100% preserved)
+  const openSourceDefault = computePreservationFee(10_000);
+  assert.equal(openSourceDefault.feeUsd, 0);
+  assert.equal(openSourceDefault.effectiveFeeBps, 0);
+  assert.equal(openSourceDefault.capitalPreservedPct, 100);
+
+  // Explicit tiered schedule: Tier 1 Micro-dust (<$50) -> 500 bps (5%)
+  const dust = computePreservationFee(20, { mode: 'tiered' });
   assert.equal(dust.tierId, 'dust');
   assert.equal(dust.nominalFeeBps, 500);
   assert.equal(dust.feeUsd, 1.0);
@@ -443,21 +449,21 @@ test('Preservation Fee Engine: preserves >= 99.5% on $10k and $100k (saving +$67
   assert.equal(dust.capitalPreservedPct, 95);
 
   // Tier 2: Small ($50–$500) -> marginal progressive ($50*5% + $200*1% = $4.50, zero cliff at $50!)
-  const small = computePreservationFee(250);
+  const small = computePreservationFee(250, { mode: 'tiered' });
   assert.equal(small.tierId, 'small');
   assert.equal(small.nominalFeeBps, 100);
   assert.equal(small.feeUsd, 4.5);
   assert.equal(small.capitalPreservedPct, 98.2);
 
   // Tier 3: Mid ($500–$5,000) -> marginal progressive ($2.50 + $4.50 + $1,500*0.25% = $10.75)
-  const mid = computePreservationFee(2_000);
+  const mid = computePreservationFee(2_000, { mode: 'tiered' });
   assert.equal(mid.tierId, 'growth');
   assert.equal(mid.nominalFeeBps, 25);
   assert.equal(mid.feeUsd, 10.75);
   assert.equal(mid.capitalPreservedPct, 99.4625);
 
   // Tier 4a: Principal $10,000 -> marginal progressive ($18.25 + $5,000*0.10% = $23.25; 99.7675% preserved, +$676.75 saved vs flat 7% $700)
-  const p10k = computePreservationFee(10_000);
+  const p10k = computePreservationFee(10_000, { mode: 'tiered' });
   assert.equal(p10k.tierId, 'principal');
   assert.equal(p10k.nominalFeeBps, 10);
   assert.equal(p10k.feeUsd, 23.25);
@@ -468,7 +474,7 @@ test('Preservation Fee Engine: preserves >= 99.5% on $10k and $100k (saving +$67
   assert.ok(p10k.savingsVsFlat7PctUsd >= 675);
 
   // Tier 4b: Principal $100,000 -> 10 bps ($100) capped at $50 hard ceiling (99.95% preserved, +$6,950 saved vs flat 7% $7,000!)
-  const p100k = computePreservationFee(100_000);
+  const p100k = computePreservationFee(100_000, { mode: 'tiered' });
   assert.equal(p100k.tierId, 'principal');
   assert.equal(p100k.nominalFeeBps, 10);
   assert.equal(p100k.capApplied, true);
@@ -482,7 +488,7 @@ test('Preservation Fee Engine: preserves >= 99.5% on $10k and $100k (saving +$67
   assert.equal(p100k.savingsVsFlat7PctBps, 695);
 
   // Custom $25 hard ceiling on $100k -> $25 fee, 99.975% preserved, +$6,975 saved
-  const p100kCap25 = computePreservationFee(100_000, { maxFeeUsdCap: 25 });
+  const p100kCap25 = computePreservationFee(100_000, { mode: 'tiered', maxFeeUsdCap: 25 });
   assert.equal(p100kCap25.capApplied, true);
   assert.equal(p100kCap25.feeUsd, 25);
   assert.equal(p100kCap25.savingsVsFlat7PctUsd, 6_975);
@@ -509,9 +515,9 @@ test('Preservation Fee Engine: preserves >= 99.5% on $10k and $100k (saving +$67
     assert.equal(res.netAfterFeeUsd, 0);
   }
 
-  // Backwards compatibility of legacy resolveProtocolFeeBps() (tests/turgalium.test.ts invariants!)
-  assert.equal(resolveProtocolFeeBps(undefined), 700);
-  assert.equal(resolveProtocolFeeBps(100), 500);
+  // Open-source resolveProtocolFeeBps() defaults to 0 bps and clamps to [0, 1000]
+  assert.equal(resolveProtocolFeeBps(undefined), 0);
+  assert.equal(resolveProtocolFeeBps(100), 100);
   assert.equal(resolveProtocolFeeBps(750), 750);
   assert.equal(resolveProtocolFeeBps(2500), 1000);
 
@@ -526,19 +532,22 @@ test('ROI Engine integration: feeSchedule "tiered" preserves >= 99.5% net on $10
   const usdc10k = makeUsdcAsset('base', 10_000);
   const usdc100k = makeUsdcAsset('ethereum', 100_000);
 
-  // Level 1 asset ROI with tiered fee vs legacy flat 7%
+  // Level 1 asset ROI with open-source zero fee vs explicit tiered vs legacy flat 7%
+  const zeroEv = evaluateAssetRoi(usdc10k);
   const flatEv = evaluateAssetRoi(usdc10k, { protocolFeeBps: 700 });
-  const tieredEv = evaluateAssetRoi(usdc10k, { feeSchedule: 'tiered' });
+  const tieredEv = evaluateAssetRoi(usdc10k, { feeSchedule: 'tiered', preservationFeeOpts: { mode: 'tiered' } });
+  assert.equal(zeroEv.protocolFeeUsd, 0);
   assert.equal(flatEv.protocolFeeUsd, 700);
   assert.equal(tieredEv.protocolFeeUsd, 23.25);
   assert.ok(tieredEv.netRoiUsd > 9_970, `Expected >$9,970 net on $10k tiered, got $${tieredEv.netRoiUsd}`);
   assert.ok(tieredEv.effectiveCostPct < 0.5, `Expected <0.5% total cost on $10k tiered, got ${tieredEv.effectiveCostPct}%`);
 
-  // Level 2 chain batch ROI on $100k Ethereum USDC with tiered fee (capped at $50)
+  // Level 2 chain batch ROI on $100k Ethereum USDC with explicit tiered fee (capped at $50)
   const ethBatch = evaluateChainBatchRoi({
     chain: 'ethereum',
     assets: [usdc100k],
     feeSchedule: 'tiered',
+    preservationFeeOpts: { mode: 'tiered' },
     gasSponsored: false,
     hasSolanaUsdcAta: true,
   });
@@ -629,6 +638,7 @@ test('ROI Engine integration: feeSchedule "tiered" preserves >= 99.5% net on $10
 
   const portfolio = evaluatePortfolioRoi(mockReport, {
     feeSchedule: 'tiered',
+    preservationFeeOpts: { mode: 'tiered' },
     hasSolanaUsdcAta: true,
   });
   assert.equal(portfolio.totalProtocolFeeUsd, 73.25); // $23.25 on $10k Base + $50 capped on $100k ETH

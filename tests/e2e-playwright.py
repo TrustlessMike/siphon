@@ -2195,13 +2195,13 @@ def main():
             pgP.wait_for_selector("#appShell:not(.hidden)", timeout=15000)
             pgP.wait_for_selector("#preservationStripCard", timeout=15000)
 
-            # 7A. Verify Preservation Strip surfaces Tiered Preservation Fee + Route Auction Winner
+            # 7A. Verify Preservation Strip surfaces 0% Open-Source Protocol Fee + Route Auction Winner
             strip_info = pgP.evaluate("""() => ({
               feeText: document.getElementById('preservationTieredFeePill')?.textContent?.trim() || '',
               routeText: document.getElementById('preservationRouteWinnerPill')?.textContent?.trim() || '',
               stripText: document.getElementById('preservationStripCard')?.innerText || '',
             })""")
-            assert "Tiered Fee:" in strip_info["feeText"] and "vs 7%" in strip_info["feeText"], strip_info
+            assert "0% Protocol Fee" in strip_info["feeText"] and "Open Source" in strip_info["feeText"], strip_info
             assert "Route Winner:" in strip_info["routeText"], strip_info
 
             # Connect Phantom Solana wallet for Rent Reclaim + Yield Park signing
@@ -2606,9 +2606,9 @@ def main():
                 hasGnosis: Boolean(document.querySelector("#gasWatchChainSelect option[value='gnosis']")),
               };
             }""")
-            # Unified tiered fee: $50 cap + small gas (~$50-$60), definitely NOT $5,600+ (7% flat)!
+            # Zero protocol fee (open source): Lite shows only small network gas (<$15), NEVER 7% flat or $50!
             lite_fee_num = float(w9_lite["liteCost"].replace("~", "").replace("$", "").replace(",", ""))
-            assert 45.0 <= lite_fee_num <= 90.0, f"Lite Est. Fees should reflect $50 tiered cap, got {w9_lite}"
+            assert 0.0 <= lite_fee_num <= 25.0, f"Lite Est. network gas should reflect 0% protocol fee, got {w9_lite}"
             assert not w9_lite["applyBtnVisible"] and not w9_lite["clarityRowVisible"], f"Pro-only controls leaked in Lite Preservation Strip: {w9_lite}"
             assert w9_lite["evmBadgeCount"] == "19", f"Expected dynamic 19 EVM badge, got {w9_lite}"
             assert w9_lite["approvalOptCount"] == 19 and w9_lite["gasWatchOptCount"] == 19, w9_lite
@@ -2650,7 +2650,7 @@ def main():
               bondedRowText: document.querySelector("[data-row-asset='eth-pos-net-neg-roi']")?.innerText || '',
               applyBtnVis: getComputedStyle(document.getElementById('applyOptimalRouteBtn')).display !== 'none',
             })""")
-            assert "0.10%" in pro_fee_check["feeText"] and "$50.00" in pro_fee_check["feeText"], pro_fee_check
+            assert "0%" in pro_fee_check["feeText"] and "Free" in pro_fee_check["feeText"], pro_fee_check
             assert "1 item" in pro_fee_check["queueText"] and "1 items" not in pro_fee_check["queueText"], pro_fee_check
             assert "6,855,593.69" in pro_fee_check["bondedRowText"] and "Negative ROI ($6855593" not in pro_fee_check["bondedRowText"], pro_fee_check
             assert pro_fee_check["applyBtnVis"], pro_fee_check

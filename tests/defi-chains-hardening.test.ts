@@ -225,8 +225,8 @@ test('HIGH-2 & MEDIUM-12: Dead Blast, Polygon, and BNB RPC fallbacks are removed
 // 3. HIGH-3: Monotonic Progressive Tiered Preservation Fee + Default Wiring
 // ============================================================================
 
-test('HIGH-3: computePreservationFee is strictly monotonic (zero downward cliffs) and wired as default across ROI, planning, batching, and optimizer', async () => {
-  // Check strict monotonicity across boundary cliffs ($50, $500, $5,000) and whale range up to $250k
+test('HIGH-3: computePreservationFee defaults to 0% open-source fee across ROI, planning, batching, and optimizer while explicit tiered mode stays strictly monotonic', async () => {
+  // Check strict monotonicity of explicit tiered schedule across boundary cliffs ($50, $500, $5,000) and whale range up to $250k
   const samplePoints = [
     0, 0.01, 1, 10, 49, 49.98, 49.99, 50, 50.01, 51, 100, 250, 499, 499.99, 500, 500.01,
     1_000, 2_000, 4_999, 4_999.99, 5_000, 5_000.01, 10_000, 25_000, 36_750, 50_000, 100_000, 250_000,
@@ -234,7 +234,7 @@ test('HIGH-3: computePreservationFee is strictly monotonic (zero downward cliffs
   let prevFee = -1;
   let prevNet = -1;
   for (const x of samplePoints) {
-    const res = computePreservationFee(x);
+    const res = computePreservationFee(x, { mode: 'tiered' });
     assert.ok(
       res.feeUsd >= prevFee,
       `Fee cliff detected at $${x}: fee($${x}) = $${res.feeUsd} < previous $${prevFee}`
@@ -248,45 +248,41 @@ test('HIGH-3: computePreservationFee is strictly monotonic (zero downward cliffs
     prevNet = res.netAfterFeeUsd;
   }
 
-  // Exact boundary continuity checks
-  assert.equal(computePreservationFee(49.99).feeUsd, 2.5);
-  assert.equal(computePreservationFee(50.0).feeUsd, 2.5);
-  assert.equal(computePreservationFee(4_999.99).feeUsd, 18.25);
-  assert.equal(computePreservationFee(5_000.0).feeUsd, 18.25);
-  assert.equal(computePreservationFee(100_000).feeUsd, 50);
+  // Exact boundary continuity checks (explicit tiered) + default 0% open-source fee
+  assert.equal(computePreservationFee(49.99, { mode: 'tiered' }).feeUsd, 2.5);
+  assert.equal(computePreservationFee(50.0, { mode: 'tiered' }).feeUsd, 2.5);
+  assert.equal(computePreservationFee(4_999.99, { mode: 'tiered' }).feeUsd, 18.25);
+  assert.equal(computePreservationFee(5_000.0, { mode: 'tiered' }).feeUsd, 18.25);
+  assert.equal(computePreservationFee(100_000, { mode: 'tiered' }).feeUsd, 50);
+  assert.equal(computePreservationFee(100_000).feeUsd, 0);
 
-  // Noble / default $10,000 USDC uses tiered preservation fee (~$23.25 / ~23 bps), NOT flat $700 (7%)!
+  // Open-source default on Noble / $10,000 USDC is 0 bps ($0 protocol fee)!
   const noble10kFeeCfg = getProtocolFeeConfig({ grossUsd: 10_000 });
-  assert.equal(noble10kFeeCfg.feeSchedule, 'tiered');
-  assert.equal(noble10kFeeCfg.preservationFee?.feeUsd, 23.25);
-  assert.ok(noble10kFeeCfg.feeBps < 30, `Expected <30 bps on $10k tiered, got ${noble10kFeeCfg.feeBps}`);
+  assert.equal(noble10kFeeCfg.feeSchedule, 'zero');
+  assert.equal(noble10kFeeCfg.preservationFee?.feeUsd, 0);
+  assert.equal(noble10kFeeCfg.feeBps, 0);
 
-  // Explicit Pro override still respected
+  // Explicit override still respected
   const explicitFlat = getProtocolFeeConfig({ feeBps: 700, grossUsd: 10_000 });
   assert.equal(explicitFlat.feeBps, 700);
   assert.equal(explicitFlat.feeSchedule, 'flat');
 
-  // ROI default (no feeSchedule passed) uses tiered fee; explicit protocolFeeBps: 700 uses flat 7%
+  // ROI default uses 0% open-source fee; explicit protocolFeeBps: 700 uses flat 7%
   const usdc10k = mkAsset({ chain: 'base', grossUsd: 10_000 });
   const defaultAssetRoi = evaluateAssetRoi(usdc10k);
   const flatAssetRoi = evaluateAssetRoi(usdc10k, { protocolFeeBps: 700 });
-  assert.equal(defaultAssetRoi.protocolFeeUsd, 23.25);
+  assert.equal(defaultAssetRoi.protocolFeeUsd, 0);
   assert.equal(flatAssetRoi.protocolFeeUsd, 700);
 
   const defaultChainRoi = evaluateChainBatchRoi({ chain: 'base', assets: [usdc10k] });
-  assert.equal(defaultChainRoi.protocolFeeUsd, 23.25);
+  assert.equal(defaultChainRoi.protocolFeeUsd, 0);
 
-  // buildMigrationPlan + evaluatePreservationPlan + applyTwoLevelRoiToReport default to tiered!
+  // buildMigrationPlan + evaluatePreservationPlan + applyTwoLevelRoiToReport default to 0% open-source fee!
   const preset = await scanPresetWallet('veteran_defi');
-  assert.ok(
-    preset.totals.protocolFeeBps < 100,
-    `Preset scan report should default to tiered preservation fee, got ${preset.totals.protocolFeeBps} bps`
-  );
+  assert.equal(preset.totals.protocolFeeBps, 0);
   const plan = buildMigrationPlan({ scan: preset, solanaDestination: USER_SOL });
-  assert.ok(
-    plan.protocolFeeBps < 100,
-    `Migration plan should default to tiered fee, got ${plan.protocolFeeBps} bps`
-  );
+  assert.equal(plan.protocolFeeBps, 0);
+  assert.equal(plan.totals.protocolFeeUsd, 0);
   const flatPlan = buildMigrationPlan({
     scan: preset,
     solanaDestination: USER_SOL,
@@ -295,18 +291,15 @@ test('HIGH-3: computePreservationFee is strictly monotonic (zero downward cliffs
   assert.equal(flatPlan.protocolFeeBps, 700);
 
   const presReport = await evaluatePreservationPlan(preset);
-  assert.ok(
-    presReport.protocolFeeBps < 100,
-    `Preservation optimizer should default to tiered fee, got ${presReport.protocolFeeBps} bps`
-  );
+  assert.equal(presReport.protocolFeeBps, 0);
   assert.ok(
     presReport.totals.preservationRatePct > 98,
-    `Expected >98% preservation rate on tiered schedule, got ${presReport.totals.preservationRatePct}%`
+    `Expected >98% preservation rate with 0% fee, got ${presReport.totals.preservationRatePct}%`
   );
 
-  // applyTwoLevelRoiToReport default uses tiered
+  // applyTwoLevelRoiToReport default uses 0% fee
   const roiApplied = applyTwoLevelRoiToReport(structuredClone(preset));
-  assert.ok(roiApplied.totals.protocolFeeBps < 100);
+  assert.equal(roiApplied.totals.protocolFeeBps, 0);
 });
 
 // ============================================================================
