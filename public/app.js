@@ -87,6 +87,16 @@ let adminSessionToken = (() => {
 
 const ADMIN_SESSION_STORAGE_KEY = 'turgalium_admin_session';
 const FEE_RECIPIENT_STORAGE_KEY = 'turgalium_fee_recipient_evm';
+const INFLIGHT_BRIDGES_STORAGE_KEY = 'turgalium_inflight_bridges_v1';
+const INFLIGHT_BRIDGE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const INFLIGHT_BRIDGE_MAX_ITEMS = 25;
+
+let inFlightBridges = [];
+let inFlightPollTimer = null;
+let inFlightPollInProgress = false;
+let activeReceiptData = null;
+const observedActiveJobIds = new Set();
+const shownReceiptJobIds = new Set();
 
 function isAdminLocked() {
   return Boolean(adminSessionRequired && !adminSessionToken);
@@ -817,6 +827,7 @@ function showWebsite() {
   window.scrollTo({ top: 0, behavior: 'instant' });
   window.dispatchEvent(new Event('resize'));
   renderBackgroundAgentUI();
+  renderInflightBridgeBanner();
 }
 
 function openApp(viewName = 'scanner') {
@@ -829,6 +840,7 @@ function openApp(viewName = 'scanner') {
   heroScene?.setPaused(true);
   ensurePreservationToolsLoaded().catch(() => {});
   switchView(mapped);
+  renderInflightBridgeBanner();
   window.scrollTo({ top: 0, behavior: 'instant' });
 }
 
@@ -2871,6 +2883,13 @@ function renderBackgroundAgentUI() {
             ? `${doneCount}/${total} settled`
             : `${doneCount}/${total} chains · running`;
       }
+      const shareAgentBtn = document.getElementById('agentShareReceiptBtn');
+      if (shareAgentBtn) {
+        const canShareJob = legs.some(
+          (l) => l.status === 'landed' || l.status === 'attested' || l.status === 'relaying'
+        );
+        shareAgentBtn.classList.toggle('hidden', !canShareJob);
+      }
       if (fill) fill.style.width = `${Math.max(activeJob.status === 'active' ? 12 : 0, pct)}%`;
       if (pulse) pulse.classList.toggle('is-idle', activeJob.status !== 'active');
 
@@ -3083,6 +3102,17 @@ function renderBackgroundAgentUI() {
           tdLinks.append(document.createTextNode(' · '), claimBtn);
           hasAny = true;
         }
+        if (leg.status === 'landed' || leg.status === 'attested') {
+          const receiptBtn = document.createElement('button');
+          receiptBtn.type = 'button';
+          receiptBtn.className = 'text-action';
+          receiptBtn.textContent = 'Receipt';
+          receiptBtn.addEventListener('click', () => {
+            openReceiptModal(job);
+          });
+          tdLinks.append(document.createTextNode(' · '), receiptBtn);
+          hasAny = true;
+        }
         void hasAny;
 
         tr.append(tdChain, tdProv, tdOut, tdStat, tdLinks);
@@ -3104,6 +3134,23 @@ async function syncBackgroundJobs() {
     const res = await api('/api/jobs');
     backgroundJobs = Array.isArray(res.jobs) ? res.jobs : [];
     renderBackgroundAgentUI();
+    reconcileJobsIntoInflightBridges(backgroundJobs);
+
+    for (const job of backgroundJobs) {
+      if (!job?.jobId) continue;
+      if (job.status === 'active') {
+        observedActiveJobIds.add(job.jobId);
+      } else if (
+        job.status === 'completed' &&
+        observedActiveJobIds.has(job.jobId) &&
+        !shownReceiptJobIds.has(job.jobId) &&
+        Array.isArray(job.legs) &&
+        job.legs.some((l) => l.status === 'landed' || l.status === 'attested')
+      ) {
+        shownReceiptJobIds.add(job.jobId);
+        openReceiptModal(job);
+      }
+    }
 
     if (defiStepperState?.jobId) {
       const tracked = backgroundJobs.find((j) => j.jobId === defiStepperState.jobId);
@@ -3251,6 +3298,21 @@ async function claimCctpLegOnSolana(job, leg, btnEl = null) {
       attestationStatus: 'claimed',
       statusText: `Claimed ${safeNum(claimPlan.amountUsdc).toFixed(2)} USDC on Solana (${result.walletName})`,
     });
+    upsertInflightBridge({
+      chain: leg.chain,
+      chainName: leg.chainName || leg.chain,
+      provider: leg.provider || 'cctp',
+      txHash: leg.evmTxHash,
+      jobId: job.jobId || '',
+      solanaDestination: job.solanaDestination || '',
+      outputAsset: job.outputAsset || 'USDC',
+      amountUsd: safeNum(claimPlan.amountUsdc) || safeNum(leg.estimatedNetUsd),
+      requiresSolanaClaim: true,
+      status: 'landed',
+      attestationStatus: 'claimed',
+      solanaTxHash: result.signature,
+      statusText: `Claimed ${safeNum(claimPlan.amountUsdc).toFixed(2)} USDC on Solana`,
+    });
     await syncBackgroundJobs();
     refreshSolanaBalance();
     showToast(
@@ -3342,6 +3404,24 @@ async function executeGaslessIntentChain(chain, jobId, chainAssets, userAddress,
     evmTxHash: receipt.txHash,
     statusText: receipt.nextStep,
   });
+  if (receipt.txHash) {
+    const legEst = currentPlan?.legs?.find((l) => l.chain === chain);
+    upsertInflightBridge({
+      chain,
+      chainName: legEst?.chainName || chainAssets[0]?.chainName || chain,
+      provider: intent.mode || 'gasless_intent',
+      txHash: receipt.txHash,
+      jobId: jobId || '',
+      solanaDestination: solDest,
+      outputAsset,
+      amountUsd: safeNum(legEst?.bridgedUsdc),
+      assetCount: chainAssets.length,
+      explorerUrl: currentScan?.chains?.find((c) => c.chain === chain)?.explorerUrl || '',
+      requiresSolanaClaim: false,
+      status: broadcasted ? 'relaying' : 'confirming',
+      statusText: receipt.nextStep || 'Relaying gasless sweep to Solana…',
+    });
+  }
   showToast(receipt.nextStep);
 }
 
@@ -3693,6 +3773,24 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
         requiresSolanaClaim: Boolean(primaryTracker?.requiresSolanaClaim),
         statusText: `Submitted on ${nonEvmBatch.chainName} (${primaryTracker?.estimatedOutput || outputAsset}) · tracking settlement to Solana…`,
       });
+      if (primaryTxHash) {
+        upsertInflightBridge({
+          chain,
+          chainName: nonEvmBatch.chainName || chain,
+          provider: primaryTracker?.provider || execRes.mode || 'bridge',
+          txHash: primaryTxHash,
+          requestId: primaryTracker?.requestId || '',
+          jobId: jobId || '',
+          solanaDestination: solDest,
+          outputAsset,
+          amountUsd: safeNum(legSummary?.bridgedUsdc),
+          assetCount: chainAssets.length,
+          explorerUrl: currentScan?.chains?.find((c) => c.chain === chain)?.explorerUrl || '',
+          requiresSolanaClaim: Boolean(primaryTracker?.requiresSolanaClaim),
+          status: 'relaying',
+          statusText: `Submitted on ${nonEvmBatch.chainName} · tracking settlement to Solana…`,
+        });
+      }
       if (isDefiGuided) {
         updateDefiStepperStep('withdraw', { status: 'done', detail: `Confirmed on ${nonEvmBatch.chainName}` });
         updateDefiStepperStep('bridge', { status: 'done', detail: `Relaying to Solana ${outputAsset}` });
@@ -4005,6 +4103,24 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
             requiresSolanaClaim: s2NeedsClaim,
             statusText: `Withdrawn & bridging unlocked funds on ${batch.chainName} → Solana ${outputAsset}…`,
           });
+          if (stage2TxHash || stage1TxHash) {
+            upsertInflightBridge({
+              chain,
+              chainName: batch.chainName || chain,
+              provider: s2Provider,
+              txHash: stage2TxHash || stage1TxHash,
+              requestId: s2Relay?.requestId || '',
+              jobId: jobId || '',
+              solanaDestination: solDest,
+              outputAsset,
+              amountUsd: safeNum(legSummary?.bridgedUsdc),
+              assetCount: chainAssets.length,
+              explorerUrl: explorerBase,
+              requiresSolanaClaim: s2NeedsClaim,
+              status: stage2Batch.bridgeTrackers.length ? 'relaying' : 'landed',
+              statusText: `Bridging unlocked funds on ${batch.chainName} → Solana ${outputAsset}…`,
+            });
+          }
 
           if (isDefiGuided) {
             updateDefiStepperStep('bridge', {
@@ -4057,6 +4173,24 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
         ? `Confirmed on ${batch.chainName} · relaying to Solana in background…`
         : `Confirmed on ${batch.chainName}`,
     });
+    if (stage1TxHash && (batch.bridgeTrackers.length > 0 || requiresSolanaClaim)) {
+      upsertInflightBridge({
+        chain,
+        chainName: batch.chainName || chain,
+        provider: primaryProvider,
+        txHash: stage1TxHash,
+        requestId: primaryRelay?.requestId || '',
+        jobId: jobId || '',
+        solanaDestination: solDest,
+        outputAsset,
+        amountUsd: safeNum(legSummary?.bridgedUsdc),
+        assetCount: chainAssets.length,
+        explorerUrl: explorerBase,
+        requiresSolanaClaim,
+        status: 'relaying',
+        statusText: `Confirmed on ${batch.chainName} · relaying to Solana…`,
+      });
+    }
 
     if (isDefiGuided) {
       updateDefiStepperStep('withdraw', {
@@ -4254,15 +4388,32 @@ async function executeSelectedLiveQueue() {
       );
     }
 
+    let queueCompletedChains = 0;
+    let queueAborted = false;
     for (const chain of activeChains) {
       const stepRes = await executeChainBatchLive(chain, job.jobId, {
         prequoter,
         snapshotSourceAddress,
       });
       if (stepRes?.userRejected) {
+        queueAborted = true;
         prequoter?.cancel();
         showToast('Wallet signature rejected — aborted remaining chains in sweep queue.');
         break;
+      }
+      if (!stepRes?.failed) {
+        queueCompletedChains += 1;
+      }
+    }
+    if (!queueAborted && queueCompletedChains > 0 && !shownReceiptJobIds.has(job.jobId)) {
+      const latestJob = backgroundJobs.find((j) => j.jobId === job.jobId) || job;
+      const allLegsDone =
+        Array.isArray(latestJob?.legs) &&
+        latestJob.legs.length > 0 &&
+        latestJob.legs.every((l) => l.status === 'landed' || l.status === 'attested');
+      if (allLegsDone) {
+        shownReceiptJobIds.add(job.jobId);
+        openReceiptModal(latestJob);
       }
     }
   } catch (err) {
@@ -5111,8 +5262,29 @@ function wireEvents() {
   document.getElementById('walletModalBackdrop')?.addEventListener('click', (e) => {
     if (e.target === e.currentTarget) closeWalletModal();
   });
+  document.getElementById('receiptModalCloseBtn')?.addEventListener('click', closeReceiptModal);
+  document.getElementById('receiptModalBackdrop')?.addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) closeReceiptModal();
+  });
+  document.getElementById('openReceiptModalBtn')?.addEventListener('click', () => {
+    openReceiptModal();
+  });
+  document.getElementById('agentShareReceiptBtn')?.addEventListener('click', () => {
+    const activeJob =
+      backgroundJobs.find((j) => j.jobId === activeJobId) || backgroundJobs[0] || null;
+    openReceiptModal(activeJob);
+  });
+  document.getElementById('receiptIncludeAddrToggle')?.addEventListener('change', () => {
+    renderActiveReceiptCard();
+  });
+  document.getElementById('receiptDownloadPngBtn')?.addEventListener('click', downloadReceiptPng);
+  document.getElementById('receiptCopySummaryBtn')?.addEventListener('click', copyReceiptSummary);
+  document.getElementById('receiptShareXBtn')?.addEventListener('click', shareReceiptOnX);
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeWalletModal();
+    if (e.key === 'Escape') {
+      closeWalletModal();
+      closeReceiptModal();
+    }
   });
   document.querySelectorAll('.wallet-tab').forEach((tab) => {
     tab.addEventListener('click', () => {
@@ -5632,6 +5804,8 @@ document.getElementById('mobileStickySweepBtn')?.addEventListener('click', () =>
 });
 window.addEventListener('resize', () => syncMobileStickySweepBar());
 renderEmptyScanState();
+initInflightBridgeTracker();
+registerServiceWorker();
 
 async function runUnifiedScan() {
   if (!unifiedWallets.length) return;
@@ -6134,5 +6308,1145 @@ function renderAgentsAndPlugins() {
         });
       });
     }
+  }
+}
+
+
+// =====================================================================
+// PERSISTENT IN-FLIGHT BRIDGE TRACKER (localStorage < 24h)
+// Tracks CCTP V2, Mayan, Relay, LI.FI & cross-chain bridge legs across
+// page reloads with live finality status & 1-tap Solana claiming.
+// =====================================================================
+function normalizeBridgeProviderLabel(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s) return 'Bridge';
+  if (s.includes('cctp') || s.includes('circle')) return 'CCTP V2';
+  if (s.includes('mayan')) return 'Mayan';
+  if (s.includes('relay')) return 'Relay';
+  if (s.includes('lifi') || s.includes('li.fi')) return 'LI.FI';
+  if (s.includes('debridge') || s.includes('dln')) return 'deBridge';
+  if (s.includes('gasless')) return 'Gasless Relay';
+  if (s.includes('eip5792')) return 'Batch Bridge';
+  return String(raw).trim().slice(0, 24);
+}
+
+function isCctpBridgeEntry(entry) {
+  if (!entry) return false;
+  if (entry.requiresSolanaClaim) return true;
+  const p = String(entry.provider || '').toLowerCase();
+  return p.includes('cctp') || p.includes('circle');
+}
+
+function isTrackableBridgeTxHash(hash) {
+  if (typeof hash !== 'string') return false;
+  const h = hash.trim();
+  if (/^0x[0-9a-fA-F]{64}$/.test(h)) return true;
+  return /^[A-Za-z0-9_-]{16,128}$/.test(h);
+}
+
+function formatRelativeAgeShort(ts) {
+  const diffSec = Math.max(0, Math.floor((Date.now() - safeNum(ts)) / 1000));
+  if (diffSec < 60) return 'just now';
+  const mins = Math.floor(diffSec / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  return `${hrs}h ago`;
+}
+
+function sanitizeInflightBridgeRecord(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const chain = String(raw.chain || '').trim().slice(0, 48);
+  const txHash = String(raw.txHash || '').trim();
+  if (!chain || !isTrackableBridgeTxHash(txHash)) return null;
+  const now = Date.now();
+  const timestamp = safeNum(raw.timestamp) > 0 ? safeNum(raw.timestamp) : now;
+  if (now - timestamp >= INFLIGHT_BRIDGE_MAX_AGE_MS) return null;
+  if (raw.dismissed) return null;
+
+  const validStatuses = new Set(['confirming', 'relaying', 'attested', 'landed', 'failed']);
+  const status = validStatuses.has(raw.status) ? raw.status : 'relaying';
+  const id = `${chain.toLowerCase()}:${txHash.toLowerCase()}`;
+  return {
+    id,
+    chain,
+    chainName: String(raw.chainName || chain).trim().slice(0, 48),
+    provider: String(raw.provider || 'bridge').trim().slice(0, 40),
+    txHash,
+    requestId: typeof raw.requestId === 'string' ? raw.requestId.trim().slice(0, 128) : '',
+    jobId: typeof raw.jobId === 'string' ? raw.jobId.trim().slice(0, 80) : '',
+    solanaDestination:
+      typeof raw.solanaDestination === 'string' ? raw.solanaDestination.trim().slice(0, 64) : '',
+    outputAsset: String(raw.outputAsset || 'USDC').toUpperCase() === 'SOL' ? 'SOL' : 'USDC',
+    amountUsd: Math.max(0, safeNum(raw.amountUsd)),
+    assetCount: Math.max(1, safeInt(raw.assetCount) || 1),
+    explorerUrl: safeHttpUrl(raw.explorerUrl) || '',
+    requiresSolanaClaim: Boolean(raw.requiresSolanaClaim),
+    status,
+    statusText: String(raw.statusText || '').trim().slice(0, 180),
+    attestationStatus:
+      typeof raw.attestationStatus === 'string' ? raw.attestationStatus.trim().slice(0, 32) : '',
+    solanaTxHash:
+      typeof raw.solanaTxHash === 'string' && isTrackableBridgeTxHash(raw.solanaTxHash)
+        ? raw.solanaTxHash.trim()
+        : '',
+    timestamp,
+    updatedAt: safeNum(raw.updatedAt) > 0 ? safeNum(raw.updatedAt) : now,
+  };
+}
+
+function saveInflightBridges() {
+  try {
+    const now = Date.now();
+    inFlightBridges = inFlightBridges
+      .filter((item) => item && now - safeNum(item.timestamp) < INFLIGHT_BRIDGE_MAX_AGE_MS)
+      .slice(0, INFLIGHT_BRIDGE_MAX_ITEMS);
+    if (inFlightBridges.length) {
+      window.localStorage?.setItem(INFLIGHT_BRIDGES_STORAGE_KEY, JSON.stringify(inFlightBridges));
+    } else {
+      window.localStorage?.removeItem(INFLIGHT_BRIDGES_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage quota / privacy mode errors
+  }
+}
+
+function loadInflightBridges() {
+  try {
+    const raw = window.localStorage?.getItem(INFLIGHT_BRIDGES_STORAGE_KEY);
+    if (!raw) {
+      inFlightBridges = [];
+      return;
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      inFlightBridges = [];
+      saveInflightBridges();
+      return;
+    }
+    const seen = new Set();
+    const clean = [];
+    for (const item of parsed) {
+      const sanitized = sanitizeInflightBridgeRecord(item);
+      if (sanitized && !seen.has(sanitized.id)) {
+        seen.add(sanitized.id);
+        clean.push(sanitized);
+      }
+    }
+    inFlightBridges = clean.slice(0, INFLIGHT_BRIDGE_MAX_ITEMS);
+    if (inFlightBridges.length !== parsed.length) {
+      saveInflightBridges();
+    }
+  } catch {
+    inFlightBridges = [];
+  }
+}
+
+function ensureInflightPolling() {
+  const hasPending = inFlightBridges.some(
+    (b) => b.status !== 'landed' && b.status !== 'failed'
+  );
+  if (hasPending && !inFlightPollTimer) {
+    inFlightPollTimer = setInterval(() => {
+      pollInflightBridgesFinality({ manual: false });
+    }, 12000);
+  } else if (!hasPending && inFlightPollTimer) {
+    clearInterval(inFlightPollTimer);
+    inFlightPollTimer = null;
+  }
+}
+
+function upsertInflightBridge(record) {
+  const incoming = sanitizeInflightBridgeRecord(record);
+  if (!incoming) return null;
+
+  const idx = inFlightBridges.findIndex((b) => b.id === incoming.id);
+  if (idx >= 0) {
+    const prev = inFlightBridges[idx];
+    inFlightBridges[idx] = {
+      ...prev,
+      ...incoming,
+      timestamp: prev.timestamp || incoming.timestamp,
+      amountUsd: incoming.amountUsd > 0 ? incoming.amountUsd : prev.amountUsd,
+      assetCount: incoming.assetCount > 0 ? incoming.assetCount : prev.assetCount,
+      solanaDestination: incoming.solanaDestination || prev.solanaDestination,
+      explorerUrl: incoming.explorerUrl || prev.explorerUrl,
+      requestId: incoming.requestId || prev.requestId,
+      jobId: incoming.jobId || prev.jobId,
+      solanaTxHash: incoming.solanaTxHash || prev.solanaTxHash,
+      requiresSolanaClaim: Boolean(prev.requiresSolanaClaim || incoming.requiresSolanaClaim),
+      updatedAt: Date.now(),
+    };
+  } else {
+    inFlightBridges.unshift(incoming);
+  }
+  saveInflightBridges();
+  renderInflightBridgeBanner();
+  ensureInflightPolling();
+  return inFlightBridges[idx >= 0 ? idx : 0];
+}
+
+function dismissInflightBridge(id) {
+  inFlightBridges = inFlightBridges.filter((b) => b.id !== id);
+  saveInflightBridges();
+  renderInflightBridgeBanner();
+  ensureInflightPolling();
+}
+
+function dismissAllInflightBridges() {
+  inFlightBridges = [];
+  saveInflightBridges();
+  renderInflightBridgeBanner();
+  ensureInflightPolling();
+}
+
+function reconcileJobsIntoInflightBridges(jobs) {
+  if (!Array.isArray(jobs) || !jobs.length) return;
+  let changed = false;
+  for (const job of jobs) {
+    const legs = Array.isArray(job?.legs) ? job.legs : [];
+    for (const leg of legs) {
+      if (!isTrackableBridgeTxHash(leg?.evmTxHash)) continue;
+      const id = `${String(leg.chain || '').toLowerCase()}:${String(leg.evmTxHash).trim().toLowerCase()}`;
+      const existing = inFlightBridges.find((b) => b.id === id);
+      if (!existing) continue;
+
+      const updated = upsertInflightBridge({
+        chain: leg.chain,
+        chainName: leg.chainName || leg.chain,
+        provider: leg.provider || job.bridgePreference || 'bridge',
+        txHash: leg.evmTxHash,
+        requestId: leg.requestId || '',
+        jobId: job.jobId || '',
+        solanaDestination: job.solanaDestination || '',
+        outputAsset: job.outputAsset || 'USDC',
+        amountUsd: safeNum(leg.estimatedNetUsd),
+        assetCount: safeInt(leg.assetCount) || 1,
+        explorerUrl: leg.explorerUrl || '',
+        requiresSolanaClaim: Boolean(leg.requiresSolanaClaim),
+        status: leg.status || 'relaying',
+        statusText: leg.statusText || '',
+        attestationStatus: leg.attestationStatus || '',
+        solanaTxHash: leg.solanaTxHash || '',
+      });
+      if (updated) changed = true;
+    }
+  }
+  if (changed) {
+    renderInflightBridgeBanner();
+    ensureInflightPolling();
+  }
+}
+
+async function pollInflightBridgesFinality({ manual = false } = {}) {
+  if (inFlightPollInProgress) return;
+  const pending = inFlightBridges.filter(
+    (b) => b.status !== 'landed' && b.status !== 'failed'
+  );
+  if (!pending.length) {
+    ensureInflightPolling();
+    return;
+  }
+
+  inFlightPollInProgress = true;
+  let anyChanged = false;
+  let anyLanded = false;
+
+  try {
+    for (const entry of pending.slice(0, 6)) {
+      const isEvmHash = /^0x[0-9a-fA-F]{64}$/.test(entry.txHash);
+      if (isCctpBridgeEntry(entry) && isEvmHash) {
+        try {
+          const att = await api('/api/cctp/attestation', {
+            method: 'POST',
+            body: JSON.stringify({
+              chain: entry.chain,
+              txHash: entry.txHash,
+              solanaDestination: entry.solanaDestination || undefined,
+            }),
+          });
+          if (att && typeof att === 'object') {
+            const nextAtt = String(att.attestationStatus || '').toLowerCase();
+            if (nextAtt === 'complete') {
+              entry.status = 'attested';
+              entry.attestationStatus = 'complete';
+              entry.requiresSolanaClaim = true;
+              entry.statusText = att.nextStep || 'CCTP V2 attested — ready to claim on Solana';
+              entry.updatedAt = Date.now();
+              anyChanged = true;
+            } else if (att.nextStep) {
+              entry.attestationStatus = nextAtt || entry.attestationStatus;
+              entry.statusText = String(att.nextStep).slice(0, 180);
+              entry.updatedAt = Date.now();
+              anyChanged = true;
+            }
+          }
+        } catch {
+          // non-fatal CCTP poll failure
+        }
+      }
+
+      if (entry.status !== 'attested' && entry.status !== 'landed') {
+        try {
+          const st = await api('/api/tx/status', {
+            method: 'POST',
+            body: JSON.stringify({
+              chain: entry.chain,
+              txHash: entry.txHash,
+              requestId: entry.requestId || undefined,
+              provider: entry.provider || undefined,
+            }),
+          });
+          if (st && typeof st === 'object') {
+            const bridgeSt = String(st.bridgeStatus || st.status || '').toLowerCase();
+            const solHash =
+              typeof st.solanaTxHash === 'string' && isTrackableBridgeTxHash(st.solanaTxHash)
+                ? st.solanaTxHash.trim()
+                : '';
+            if (
+              solHash ||
+              bridgeSt === 'completed' ||
+              bridgeSt === 'success' ||
+              bridgeSt === 'landed' ||
+              bridgeSt === 'settled'
+            ) {
+              entry.status = 'landed';
+              if (solHash) entry.solanaTxHash = solHash;
+              entry.statusText = st.summary || 'Settled on Solana';
+              entry.updatedAt = Date.now();
+              anyChanged = true;
+              anyLanded = true;
+            } else if (
+              st.evmFailed ||
+              bridgeSt === 'failed' ||
+              bridgeSt === 'refunded' ||
+              bridgeSt === 'reverted'
+            ) {
+              entry.status = 'failed';
+              entry.statusText = st.summary || 'Transfer failed or refunded';
+              entry.updatedAt = Date.now();
+              anyChanged = true;
+            } else if (st.evmConfirmed && entry.status === 'confirming') {
+              entry.status = 'relaying';
+              entry.statusText = st.summary || `Confirmed on ${entry.chainName} · relaying to Solana…`;
+              entry.updatedAt = Date.now();
+              anyChanged = true;
+            } else if (st.summary && !entry.statusText) {
+              entry.statusText = String(st.summary).slice(0, 180);
+              entry.updatedAt = Date.now();
+              anyChanged = true;
+            }
+          }
+        } catch {
+          // non-fatal status poll failure
+        }
+      }
+    }
+
+    if (anyChanged) {
+      saveInflightBridges();
+      renderInflightBridgeBanner();
+    }
+    if (anyLanded) {
+      refreshSolanaBalance();
+    }
+    if (manual) {
+      showToast('Checked live bridge finality status.');
+    }
+  } finally {
+    inFlightPollInProgress = false;
+    ensureInflightPolling();
+  }
+}
+
+async function claimInflightBridgeOnSolana(entry, btnEl) {
+  if (!entry) return;
+  const solDest =
+    entry.solanaDestination ||
+    getVerifiedSolanaDestination() ||
+    getConnectedSolanaAddress() ||
+    '';
+  if (!solDest) {
+    showToast('Connect your Solana wallet to claim this bridge transfer.');
+    openWalletModal('solana');
+    return;
+  }
+  const syntheticJob = {
+    jobId: entry.jobId || '',
+    solanaDestination: solDest,
+    outputAsset: entry.outputAsset || 'USDC',
+  };
+  const syntheticLeg = {
+    chain: entry.chain,
+    chainName: entry.chainName,
+    provider: entry.provider,
+    evmTxHash: entry.txHash,
+    estimatedNetUsd: entry.amountUsd,
+    status: entry.status,
+    requiresSolanaClaim: true,
+  };
+  await claimCctpLegOnSolana(syntheticJob, syntheticLeg, btnEl);
+  if (btnEl && !btnEl.disabled) {
+    btnEl.textContent = 'Claim on Solana';
+  }
+}
+
+function getInflightStatusMeta(entry) {
+  if (entry.status === 'landed') {
+    return { label: 'Settled', cls: 'is-settled', icon: 'check-circle' };
+  }
+  if (entry.status === 'attested' || entry.attestationStatus === 'complete') {
+    return { label: 'Ready to Claim', cls: 'is-ready', icon: 'shield-check' };
+  }
+  if (entry.status === 'failed') {
+    return { label: 'Attention', cls: 'is-failed', icon: 'alert-triangle' };
+  }
+  if (entry.status === 'confirming') {
+    return { label: 'Confirming', cls: 'is-pending', icon: 'clock' };
+  }
+  return { label: 'In Flight', cls: 'is-pending', icon: 'activity-dot' };
+}
+
+function renderInflightBridgeBanner() {
+  const banner = document.getElementById('inflightBridgeBanner');
+  const sitePill = document.getElementById('inflightSitePill');
+  const siteVisible = !document.getElementById('siteShell')?.classList.contains('hidden');
+
+  const now = Date.now();
+  const activeEntries = inFlightBridges.filter(
+    (b) => b && now - safeNum(b.timestamp) < INFLIGHT_BRIDGE_MAX_AGE_MS
+  );
+
+  if (banner) {
+    if (!activeEntries.length) {
+      banner.classList.add('hidden');
+      banner.replaceChildren();
+    } else {
+      banner.classList.remove('hidden');
+      banner.replaceChildren();
+
+      const header = document.createElement('div');
+      header.className = 'inflight-head';
+
+      const titleGroup = document.createElement('div');
+      titleGroup.className = 'inflight-title-group';
+      const dot = document.createElement('span');
+      const hasPending = activeEntries.some((e) => e.status !== 'landed' && e.status !== 'failed');
+      dot.className = `inflight-live-dot${hasPending ? '' : ' is-idle'}`;
+      const titleStrong = document.createElement('strong');
+      titleStrong.textContent =
+        activeEntries.length === 1
+          ? 'In-Flight Bridge Transfer'
+          : `In-Flight Bridge Transfers (${activeEntries.length})`;
+      const subtitle = document.createElement('span');
+      subtitle.className = 'muted-xs';
+      subtitle.textContent = 'Restored locally · <24h window';
+      titleGroup.append(dot, titleStrong, subtitle);
+
+      const headActions = document.createElement('div');
+      headActions.className = 'inflight-head-actions';
+      if (hasPending) {
+        const refreshBtn = document.createElement('button');
+        refreshBtn.type = 'button';
+        refreshBtn.className = 'text-action';
+        refreshBtn.textContent = 'Refresh';
+        refreshBtn.addEventListener('click', () => pollInflightBridgesFinality({ manual: true }));
+        headActions.append(refreshBtn);
+      }
+      if (activeEntries.length > 1) {
+        const dismissAllBtn = document.createElement('button');
+        dismissAllBtn.type = 'button';
+        dismissAllBtn.className = 'text-action muted';
+        dismissAllBtn.textContent = 'Dismiss all';
+        dismissAllBtn.addEventListener('click', dismissAllInflightBridges);
+        headActions.append(dismissAllBtn);
+      }
+      header.append(titleGroup, headActions);
+
+      const list = document.createElement('div');
+      list.className = 'inflight-rows';
+
+      for (const entry of activeEntries) {
+        const meta = getInflightStatusMeta(entry);
+        const row = document.createElement('div');
+        row.className = 'inflight-row';
+        row.dataset.inflightId = entry.id;
+
+        const left = document.createElement('div');
+        left.className = 'inflight-row-left';
+
+        const logo = document.createElement('img');
+        logo.src = getChainLogoPath(entry.chain);
+        logo.alt = '';
+        logo.width = 16;
+        logo.height = 16;
+        logo.className = `chain-logo-xs${needsDarkLogoBacking(entry.chain) ? ' logo-dark-backing' : ''}`;
+
+        const info = document.createElement('div');
+        info.className = 'inflight-row-info';
+
+        const topLine = document.createElement('div');
+        topLine.className = 'inflight-row-top';
+        const chainSpan = document.createElement('strong');
+        chainSpan.textContent = entry.chainName;
+        const provPill = document.createElement('span');
+        provPill.className = 'inflight-provider-pill';
+        provPill.textContent = normalizeBridgeProviderLabel(entry.provider);
+        const amtSpan = document.createElement('span');
+        amtSpan.className = 'mono inflight-amount';
+        amtSpan.textContent =
+          entry.amountUsd > 0
+            ? `+$${entry.amountUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${entry.outputAsset}`
+            : `→ Solana ${entry.outputAsset}`;
+        const ageSpan = document.createElement('span');
+        ageSpan.className = 'muted-xs';
+        ageSpan.textContent = formatRelativeAgeShort(entry.timestamp);
+        topLine.append(chainSpan, provPill, amtSpan, ageSpan);
+
+        const subLine = document.createElement('div');
+        subLine.className = 'inflight-row-sub';
+        const statusPill = document.createElement('span');
+        statusPill.className = `inflight-status-pill ${meta.cls}`;
+        statusPill.innerHTML = uiIcon(meta.icon, 11);
+        statusPill.appendChild(document.createTextNode(meta.label));
+        subLine.append(statusPill);
+
+        const detailText = document.createElement('span');
+        detailText.className = 'inflight-detail-text';
+        detailText.textContent =
+          entry.statusText ||
+          (entry.status === 'landed'
+            ? `Arrived on Solana (${entry.outputAsset})`
+            : `Tracking ${normalizeBridgeProviderLabel(entry.provider)} finality to Solana`);
+        subLine.append(detailText);
+
+        const srcUrl = safeExplorerTxUrl(entry.explorerUrl, entry.txHash);
+        if (srcUrl) {
+          const a = document.createElement('a');
+          a.className = 'explorer-link mono';
+          a.href = srcUrl;
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          a.textContent = 'Tx ↗';
+          subLine.append(a);
+        }
+        const solUrl = safeExplorerTxUrl('https://solscan.io', entry.solanaTxHash);
+        if (solUrl) {
+          const a = document.createElement('a');
+          a.className = 'explorer-link mono';
+          a.href = solUrl;
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          a.textContent = 'Solscan ↗';
+          subLine.append(a);
+        }
+
+        info.append(topLine, subLine);
+        left.append(logo, info);
+
+        const right = document.createElement('div');
+        right.className = 'inflight-row-actions';
+
+        const canClaim =
+          (isCctpBridgeEntry(entry) ||
+            entry.status === 'attested' ||
+            entry.attestationStatus === 'complete') &&
+          !entry.solanaTxHash &&
+          entry.status !== 'landed';
+
+        if (canClaim) {
+          const claimBtn = document.createElement('button');
+          claimBtn.type = 'button';
+          claimBtn.className = 'btn-pill-dark inflight-claim-btn';
+          claimBtn.textContent = 'Claim on Solana';
+          claimBtn.addEventListener('click', () => claimInflightBridgeOnSolana(entry, claimBtn));
+          right.append(claimBtn);
+        } else if (entry.status === 'landed') {
+          const receiptBtn = document.createElement('button');
+          receiptBtn.type = 'button';
+          receiptBtn.className = 'btn-outline-sm inflight-mini-btn';
+          receiptBtn.textContent = 'Receipt';
+          receiptBtn.addEventListener('click', () => {
+            openReceiptModal(buildReceiptDataFromBridges([entry]));
+          });
+          right.append(receiptBtn);
+        }
+
+        const dismissBtn = document.createElement('button');
+        dismissBtn.type = 'button';
+        dismissBtn.className = 'inflight-dismiss-btn';
+        dismissBtn.setAttribute('aria-label', `Dismiss ${entry.chainName} bridge tracker`);
+        dismissBtn.title = 'Dismiss';
+        dismissBtn.innerHTML = uiIcon('x', 13);
+        dismissBtn.addEventListener('click', () => dismissInflightBridge(entry.id));
+        right.append(dismissBtn);
+
+        row.append(left, right);
+        list.append(row);
+      }
+
+      banner.append(header, list);
+    }
+  }
+
+  // Compact porcelain pill on the landing page when restored transfers exist
+  if (sitePill) {
+    if (!siteVisible || !activeEntries.length) {
+      sitePill.classList.add('hidden');
+      sitePill.replaceChildren();
+    } else {
+      const lead = activeEntries[0];
+      const meta = getInflightStatusMeta(lead);
+      sitePill.classList.remove('hidden');
+      sitePill.replaceChildren();
+
+      const dot = document.createElement('span');
+      dot.className = `inflight-live-dot${lead.status === 'landed' ? ' is-idle' : ''}`;
+
+      const textWrap = document.createElement('div');
+      textWrap.className = 'inflight-site-pill-copy';
+      const label = document.createElement('strong');
+      label.textContent =
+        activeEntries.length === 1
+          ? `${lead.chainName} · ${normalizeBridgeProviderLabel(lead.provider)} (${meta.label})`
+          : `${activeEntries.length} in-flight bridges · ${meta.label}`;
+      textWrap.append(label);
+
+      const actionBtn = document.createElement('button');
+      actionBtn.type = 'button';
+      actionBtn.className = 'btn-pill-dark inflight-claim-btn';
+      const needsClaim =
+        (isCctpBridgeEntry(lead) ||
+          lead.status === 'attested' ||
+          lead.attestationStatus === 'complete') &&
+        !lead.solanaTxHash &&
+        lead.status !== 'landed';
+      if (needsClaim) {
+        actionBtn.textContent = 'Claim on Solana';
+        actionBtn.addEventListener('click', () => {
+          openApp('activity');
+          claimInflightBridgeOnSolana(lead, actionBtn);
+        });
+      } else {
+        actionBtn.textContent = 'Track';
+        actionBtn.addEventListener('click', () => openApp('activity'));
+      }
+
+      const dismissBtn = document.createElement('button');
+      dismissBtn.type = 'button';
+      dismissBtn.className = 'inflight-dismiss-btn';
+      dismissBtn.setAttribute('aria-label', 'Dismiss in-flight bridge notice');
+      dismissBtn.innerHTML = uiIcon('x', 13);
+      dismissBtn.addEventListener('click', dismissAllInflightBridges);
+
+      sitePill.append(dot, textWrap, actionBtn, dismissBtn);
+    }
+  }
+}
+
+function initInflightBridgeTracker() {
+  loadInflightBridges();
+  renderInflightBridgeBanner();
+  if (inFlightBridges.some((b) => b.status !== 'landed' && b.status !== 'failed')) {
+    ensureInflightPolling();
+    pollInflightBridgesFinality({ manual: false });
+  }
+}
+
+// =====================================================================
+// SHAREABLE DAYLIGHT-PORCELAIN SWEEP RECEIPT CARD MODAL
+// Privacy-safe by default: NEVER includes wallet addresses unless the
+// user explicitly toggles "Include truncated address".
+// =====================================================================
+function buildReceiptDataFromBridges(bridges) {
+  const list = Array.isArray(bridges) ? bridges : [];
+  const chains = Array.from(new Set(list.map((b) => b.chainName || b.chain).filter(Boolean)));
+  const providers = Array.from(
+    new Set(list.map((b) => normalizeBridgeProviderLabel(b.provider)).filter(Boolean))
+  );
+  const netUsd = list.reduce((sum, b) => sum + safeNum(b.amountUsd), 0);
+  const assetCount = list.reduce((sum, b) => sum + Math.max(1, safeInt(b.assetCount) || 1), 0);
+  const outAsset = list[0]?.outputAsset || outputAsset || 'USDC';
+  const solDest = list.find((b) => b.solanaDestination)?.solanaDestination || '';
+  return {
+    assetCount: Math.max(1, assetCount),
+    chainCount: Math.max(1, chains.length),
+    chainNames: chains,
+    netUsd,
+    outputAsset: outAsset,
+    providerLabel: providers.slice(0, 2).join(' + ') || 'Auto Route',
+    solanaDestination: solDest,
+    timestamp: list[0]?.timestamp || Date.now(),
+    isPreview: false,
+  };
+}
+
+function buildReceiptData(source = null) {
+  if (source && typeof source === 'object' && typeof source.assetCount === 'number' && !source.legs) {
+    return source;
+  }
+
+  const job =
+    (source && Array.isArray(source.legs) ? source : null) ||
+    backgroundJobs.find(
+      (j) =>
+        Array.isArray(j.legs) &&
+        j.legs.some((l) => l.status === 'landed' || l.status === 'attested')
+    ) ||
+    backgroundJobs[0] ||
+    null;
+
+  if (job && Array.isArray(job.legs) && job.legs.length) {
+    const legs = job.legs;
+    const chains = Array.from(new Set(legs.map((l) => l.chainName || l.chain).filter(Boolean)));
+    const providers = Array.from(
+      new Set(
+        legs
+          .map((l) => normalizeBridgeProviderLabel(l.provider || job.bridgePreference))
+          .filter(Boolean)
+      )
+    );
+    const assetCount = legs.reduce((sum, l) => sum + Math.max(1, safeInt(l.assetCount) || 1), 0);
+    const netUsd = legs.reduce((sum, l) => sum + safeNum(l.estimatedNetUsd), 0);
+    return {
+      assetCount: Math.max(1, assetCount),
+      chainCount: Math.max(1, chains.length),
+      chainNames: chains,
+      netUsd,
+      outputAsset: String(job.outputAsset || outputAsset || 'USDC').toUpperCase() === 'SOL' ? 'SOL' : 'USDC',
+      providerLabel: providers.slice(0, 2).join(' + ') || 'Auto Route',
+      solanaDestination: String(job.solanaDestination || '').trim(),
+      timestamp: safeNum(job.updatedAt) || safeNum(job.createdAt) || Date.now(),
+      isPreview: false,
+    };
+  }
+
+  if (inFlightBridges.length) {
+    return buildReceiptDataFromBridges(inFlightBridges);
+  }
+
+  if (currentPlan && Array.isArray(currentPlan.legs) && currentPlan.legs.length) {
+    const legs = currentPlan.legs;
+    const chains = Array.from(new Set(legs.map((l) => l.chainName || l.chain).filter(Boolean)));
+    const assetCount = legs.reduce(
+      (sum, l) => sum + safeInt(l.defiExits) + safeInt(l.swaps) + safeInt(l.burns),
+      0
+    );
+    const netUsd = safeNum(currentPlan.totals?.estimatedNetSolanaUsdc);
+    const pref = getActiveBridgePreference();
+    return {
+      assetCount: Math.max(1, assetCount),
+      chainCount: Math.max(1, chains.length),
+      chainNames: chains,
+      netUsd,
+      outputAsset: outputAsset || 'USDC',
+      providerLabel: pref === 'auto' ? 'Best Route' : normalizeBridgeProviderLabel(pref),
+      solanaDestination: getVerifiedSolanaDestination() || getConnectedSolanaAddress() || '',
+      timestamp: Date.now(),
+      isPreview: true,
+    };
+  }
+
+  return {
+    assetCount: 0,
+    chainCount: 0,
+    chainNames: [],
+    netUsd: 0,
+    outputAsset: outputAsset || 'USDC',
+    providerLabel: 'Multi-Bridge',
+    solanaDestination: getVerifiedSolanaDestination() || getConnectedSolanaAddress() || '',
+    timestamp: Date.now(),
+    isPreview: true,
+  };
+}
+
+function formatReceiptSummaryText(data, includeTruncatedAddr = false) {
+  const assets = safeInt(data?.assetCount);
+  const chains = safeInt(data?.chainCount);
+  const usdStr = safeNum(data?.netUsd).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const assetWord = assets === 1 ? 'asset' : 'assets';
+  const chainWord = chains === 1 ? 'chain' : 'chains';
+  const out = data?.outputAsset === 'SOL' ? 'SOL' : 'USDC';
+  let text = `Swept ${assets} ${assetWord} across ${chains} ${chainWord} → +$${usdStr} ${out} on Solana · 0% protocol fee · MIT Open Source`;
+  if (includeTruncatedAddr && data?.solanaDestination) {
+    text += ` · ${shortAddr(data.solanaDestination)}`;
+  }
+  return text;
+}
+
+function drawRoundedRectPath(ctx, x, y, w, h, r) {
+  const rad = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rad);
+  ctx.arcTo(x + w, y + h, x, y + h, rad);
+  ctx.arcTo(x, y + h, x, y, rad);
+  ctx.arcTo(x, y, x + w, y, rad);
+  ctx.closePath();
+}
+
+function drawReceiptCardCanvas(canvas, data, includeTruncatedAddr = false) {
+  if (!canvas || !canvas.getContext) return;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  const W = 1200;
+  const H = 630;
+  canvas.width = W;
+  canvas.height = H;
+
+  // 1. Daylight Porcelain canvas backdrop (#FCFCFC -> subtle cool tint)
+  const bgGrad = ctx.createLinearGradient(0, 0, W, H);
+  bgGrad.addColorStop(0, '#FCFCFC');
+  bgGrad.addColorStop(1, '#F3F6F9');
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Soft Kamino ice-cyan ambient glow top-right
+  const glow = ctx.createRadialGradient(W - 140, 80, 10, W - 140, 80, 420);
+  glow.addColorStop(0, 'rgba(198, 244, 255, 0.55)');
+  glow.addColorStop(1, 'rgba(198, 244, 255, 0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, W, H);
+
+  // Subtle architectural hairline grid
+  ctx.strokeStyle = 'rgba(10, 10, 10, 0.03)';
+  ctx.lineWidth = 1;
+  for (let gx = 48; gx < W; gx += 72) {
+    ctx.beginPath();
+    ctx.moveTo(gx, 0);
+    ctx.lineTo(gx, H);
+    ctx.stroke();
+  }
+  for (let gy = 48; gy < H; gy += 72) {
+    ctx.beginPath();
+    ctx.moveTo(0, gy);
+    ctx.lineTo(W, gy);
+    ctx.stroke();
+  }
+
+  // 2. Main Porcelain Surface Card (#FFFFFF)
+  const cardX = 48;
+  const cardY = 44;
+  const cardW = W - 96;
+  const cardH = H - 88;
+  ctx.save();
+  ctx.shadowColor = 'rgba(10, 10, 10, 0.06)';
+  ctx.shadowBlur = 32;
+  ctx.shadowOffsetY = 12;
+  drawRoundedRectPath(ctx, cardX, cardY, cardW, cardH, 28);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fill();
+  ctx.restore();
+
+  drawRoundedRectPath(ctx, cardX, cardY, cardW, cardH, 28);
+  ctx.strokeStyle = '#E4E6EB';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Top ice-cyan accent bar clipped cleanly inside card
+  ctx.save();
+  drawRoundedRectPath(ctx, cardX, cardY, cardW, cardH, 28);
+  ctx.clip();
+  const topBarGrad = ctx.createLinearGradient(cardX, cardY, cardX + cardW, cardY);
+  topBarGrad.addColorStop(0, '#0A0A0A');
+  topBarGrad.addColorStop(0.55, '#C6F4FF');
+  topBarGrad.addColorStop(1, '#7DD3FC');
+  ctx.fillStyle = topBarGrad;
+  ctx.fillRect(cardX, cardY, cardW, 7);
+  ctx.restore();
+
+  // 3. Header row: Turgalium Vector Logo + Wordmark + Status Pill + Date
+  const padX = cardX + 48;
+  const headY = cardY + 46;
+
+  // Draw crisp Turgalium vector mark (#0A0A0A tile + #C6F4FF prism)
+  drawRoundedRectPath(ctx, padX, headY, 44, 44, 11);
+  ctx.fillStyle = '#0A0A0A';
+  ctx.fill();
+
+  const scale = 44 / 32;
+  ctx.save();
+  ctx.translate(padX, headY);
+  ctx.scale(scale, scale);
+  ctx.beginPath();
+  ctx.moveTo(7, 9);
+  ctx.lineTo(25, 9);
+  ctx.lineTo(18.5, 16.5);
+  ctx.lineTo(22, 23);
+  ctx.lineTo(10, 23);
+  ctx.lineTo(13.5, 16.5);
+  ctx.closePath();
+  ctx.fillStyle = '#C6F4FF';
+  ctx.fill();
+  ctx.restore();
+
+  ctx.fillStyle = '#0A0A0A';
+  ctx.font = '800 28px "Plus Jakarta Sans", "Inter", -apple-system, BlinkMacSystemFont, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Turgalium', padX + 58, headY + 23);
+
+  // Mode pill next to wordmark
+  const pillLabel = data.isPreview ? 'SWEEP PREVIEW' : 'SWEEP RECEIPT';
+  ctx.font = '700 13px "Inter", -apple-system, BlinkMacSystemFont, sans-serif';
+  const pillW = ctx.measureText(pillLabel).width + 28;
+  drawRoundedRectPath(ctx, padX + 216, headY + 8, pillW, 28, 999);
+  ctx.fillStyle = '#E8FAFF';
+  ctx.fill();
+  ctx.strokeStyle = '#7DD3FC';
+  ctx.lineWidth = 1.25;
+  ctx.stroke();
+  ctx.fillStyle = '#0369A1';
+  ctx.fillText(pillLabel, padX + 230, headY + 22);
+
+  // Right-side MIT Open Source badge + UTC Date
+  const dateObj = new Date(safeNum(data.timestamp) || Date.now());
+  const dateLabel = dateObj.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+  ctx.font = '600 15px "JetBrains Mono", ui-monospace, monospace';
+  ctx.fillStyle = '#52525B';
+  ctx.textAlign = 'right';
+  ctx.fillText(`${dateLabel} · MIT OPEN SOURCE`, cardX + cardW - 48, headY + 23);
+  ctx.textAlign = 'left';
+
+  // 4. Center Hero Statement
+  const assets = safeInt(data.assetCount);
+  const chains = safeInt(data.chainCount);
+  const usdFormatted = safeNum(data.netUsd).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const outSymbol = data.outputAsset === 'SOL' ? 'SOL' : 'USDC';
+  const assetWord = assets === 1 ? 'asset' : 'assets';
+  const chainWord = chains === 1 ? 'chain' : 'chains';
+
+  const heroLine1 = `Swept ${assets} ${assetWord} across ${chains} ${chainWord}`;
+  const heroLine2 = `→ +$${usdFormatted} ${outSymbol} on Solana`;
+
+  ctx.fillStyle = '#0A0A0A';
+  ctx.font = '700 40px "Plus Jakarta Sans", "Inter", -apple-system, BlinkMacSystemFont, sans-serif';
+  ctx.fillText(heroLine1, padX, headY + 114);
+
+  // Highlighted arrival row with Kamino ice-cyan pill backdrop
+  ctx.font = '800 54px "Plus Jakarta Sans", "Inter", -apple-system, BlinkMacSystemFont, sans-serif';
+  const hero2Width = Math.min(cardW - 96, ctx.measureText(heroLine2).width + 36);
+  drawRoundedRectPath(ctx, padX - 8, headY + 148, hero2Width, 74, 16);
+  ctx.fillStyle = '#C6F4FF';
+  ctx.fill();
+  ctx.fillStyle = '#0A0A0A';
+  ctx.fillText(heroLine2, padX + 10, headY + 187, cardW - 116);
+
+  ctx.fillStyle = '#52525B';
+  ctx.font = '500 20px "Inter", -apple-system, BlinkMacSystemFont, sans-serif';
+  ctx.fillText('0% protocol fee · Non-custodial · Direct to Solana', padX, headY + 252);
+
+  // 5. Four Porcelain Metric Wells
+  const wellY = cardY + 344;
+  const wellH = 114;
+  const gap = 18;
+  const wellW = (cardW - 96 - gap * 3) / 4;
+  const chainSubtitle =
+    data.chainNames && data.chainNames.length
+      ? data.chainNames.slice(0, 3).join(', ') +
+        (data.chainNames.length > 3 ? ` +${data.chainNames.length - 3}` : '')
+      : '30 chains supported';
+
+  const metrics = [
+    {
+      label: 'ASSETS SWEPT',
+      value: `${assets} ${assetWord}`,
+      sub: 'Consolidated in 1 pass',
+      accent: '#0A0A0A',
+    },
+    {
+      label: 'SOURCE NETWORKS',
+      value: `${chains} ${chainWord}`,
+      sub: chainSubtitle,
+      accent: '#0A0A0A',
+    },
+    {
+      label: 'PROTOCOL FEE',
+      value: '0% ($0.00)',
+      sub: 'MIT Open Source',
+      accent: '#059669',
+    },
+    {
+      label: 'BRIDGE ROUTE',
+      value: data.providerLabel || 'Auto Route',
+      sub: `Settled as ${outSymbol}`,
+      accent: '#0369A1',
+    },
+  ];
+
+  metrics.forEach((m, i) => {
+    const x = padX + i * (wellW + gap);
+    drawRoundedRectPath(ctx, x, wellY, wellW, wellH, 16);
+    ctx.fillStyle = '#F4F5F7';
+    ctx.fill();
+    ctx.strokeStyle = '#E4E6EB';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.fillStyle = '#71717A';
+    ctx.font = '700 12px "Inter", -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.fillText(m.label, x + 18, wellY + 28);
+
+    ctx.fillStyle = m.accent;
+    ctx.font = '800 24px "Plus Jakarta Sans", "Inter", -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.fillText(m.value, x + 18, wellY + 62, wellW - 36);
+
+    ctx.fillStyle = '#52525B';
+    ctx.font = '500 13.5px "Inter", -apple-system, BlinkMacSystemFont, sans-serif';
+    ctx.fillText(m.sub, x + 18, wellY + 91, wellW - 36);
+  });
+
+  // 6. Footer hairline + privacy-safe address line
+  const footY = cardY + cardH - 42;
+  ctx.strokeStyle = '#E4E6EB';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(padX, footY - 26);
+  ctx.lineTo(cardX + cardW - 48, footY - 26);
+  ctx.stroke();
+
+  ctx.fillStyle = '#52525B';
+  ctx.font = '600 15px "JetBrains Mono", ui-monospace, monospace';
+  const leftFoot =
+    includeTruncatedAddr && data.solanaDestination
+      ? `turgalium · Solana ${shortAddr(data.solanaDestination)}`
+      : 'turgalium · Privacy-safe receipt (0 wallet addresses exposed)';
+  ctx.fillText(leftFoot, padX, footY);
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#0A0A0A';
+  ctx.font = '700 15px "Inter", -apple-system, BlinkMacSystemFont, sans-serif';
+  ctx.fillText('0% Protocol Fee · MIT Open Source', cardX + cardW - 48, footY);
+  ctx.textAlign = 'left';
+}
+
+function renderActiveReceiptCard() {
+  if (!activeReceiptData) return;
+  const includeToggle = document.getElementById('receiptIncludeAddrToggle');
+  const privacyStatus = document.getElementById('receiptPrivacyStatus');
+  const summaryBox = document.getElementById('receiptSummaryPreview');
+  const canvas = document.getElementById('receiptCardCanvas');
+
+  const canIncludeAddr = Boolean(activeReceiptData.solanaDestination);
+  if (includeToggle) {
+    includeToggle.disabled = !canIncludeAddr;
+    if (!canIncludeAddr) includeToggle.checked = false;
+  }
+  const includeTruncated = Boolean(includeToggle?.checked && canIncludeAddr);
+
+  if (privacyStatus) {
+    privacyStatus.textContent = includeTruncated
+      ? `Showing truncated Solana destination (${shortAddr(activeReceiptData.solanaDestination)})`
+      : 'No wallet addresses included';
+  }
+
+  const summary = formatReceiptSummaryText(activeReceiptData, includeTruncated);
+  if (summaryBox) {
+    summaryBox.textContent = summary;
+  }
+  drawReceiptCardCanvas(canvas, activeReceiptData, includeTruncated);
+}
+
+function openReceiptModal(source = null) {
+  const backdrop = document.getElementById('receiptModalBackdrop');
+  if (!backdrop) return;
+  activeReceiptData = buildReceiptData(source);
+  const includeToggle = document.getElementById('receiptIncludeAddrToggle');
+  if (includeToggle) includeToggle.checked = false; // Privacy-safe default!
+  const sub = document.getElementById('receiptModalSub');
+  if (sub) {
+    sub.textContent = activeReceiptData.isPreview
+      ? 'Preview of your active sweep plan — wallet addresses hidden by default.'
+      : 'Privacy-safe porcelain card — wallet addresses hidden by default.';
+  }
+  renderActiveReceiptCard();
+  backdrop.classList.remove('hidden');
+}
+
+function closeReceiptModal() {
+  document.getElementById('receiptModalBackdrop')?.classList.add('hidden');
+}
+
+function downloadReceiptPng() {
+  const canvas = document.getElementById('receiptCardCanvas');
+  if (!canvas) return;
+  const stamp = new Date().toISOString().slice(0, 10);
+  const filename = `turgalium-sweep-receipt-${stamp}.png`;
+  const triggerUrl = (url, revoke = false) => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    if (revoke) setTimeout(() => URL.revokeObjectURL(url), 1500);
+    showToast('Downloaded sweep receipt PNG.');
+  };
+
+  if (typeof canvas.toBlob === 'function') {
+    canvas.toBlob((blob) => {
+      if (blob) {
+        triggerUrl(URL.createObjectURL(blob), true);
+      } else {
+        triggerUrl(canvas.toDataURL('image/png'), false);
+      }
+    }, 'image/png');
+  } else {
+    triggerUrl(canvas.toDataURL('image/png'), false);
+  }
+}
+
+async function copyReceiptSummary() {
+  if (!activeReceiptData) return;
+  const includeTruncated = Boolean(document.getElementById('receiptIncludeAddrToggle')?.checked);
+  const summary = formatReceiptSummaryText(activeReceiptData, includeTruncated);
+  try {
+    await navigator.clipboard?.writeText(summary);
+    showToast('Copied sweep receipt summary.');
+  } catch {
+    showToast('Could not copy summary to clipboard.');
+  }
+}
+
+function shareReceiptOnX() {
+  if (!activeReceiptData) return;
+  const includeTruncated = Boolean(document.getElementById('receiptIncludeAddrToggle')?.checked);
+  const summary = formatReceiptSummaryText(activeReceiptData, includeTruncated);
+  const intentUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(summary)}`;
+  window.open(intentUrl, '_blank', 'noopener,noreferrer');
+}
+
+// =====================================================================
+// PWA SERVICE WORKER REGISTRATION (HTTPS or localhost only, silent fail)
+// =====================================================================
+function registerServiceWorker() {
+  if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
+  const proto = window.location?.protocol || '';
+  const host = window.location?.hostname || '';
+  const isSecureOrLocal =
+    proto === 'https:' || host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+  if (!isSecureOrLocal) return;
+
+  const registerNow = () => {
+    try {
+      navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+    } catch {
+      // ignore service worker registration errors
+    }
+  };
+
+  if (document.readyState === 'complete') {
+    registerNow();
+  } else {
+    window.addEventListener('load', registerNow, { once: true });
   }
 }

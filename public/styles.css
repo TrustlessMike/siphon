@@ -4048,3 +4048,350 @@ label {
     height: 40px;
   }
 }
+
+
+/* =====================================================================
+   WAVE 16/17 — PERSISTENT IN-FLIGHT BRIDGE TRACKER & RECEIPT CARD MODAL
+   Daylight Porcelain palette: #FCFCFC canvas, #FFFFFF surface,
+   #0A0A0A ink/CTAs, #C6F4FF highlights, 0px overflow on 390px mobile.
+   ===================================================================== */
+
+.inflight-bridge-banner {
+  background: var(--bg-surface);
+  border: 1px solid var(--ice-border);
+  border-radius: 16px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  box-shadow: 0 4px 18px rgba(10, 10, 10, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.inflight-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+}
+
+.inflight-title-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--ink-0);
+}
+
+.inflight-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.inflight-live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-teal);
+  box-shadow: 0 0 0 4px var(--ice-soft);
+  flex-shrink: 0;
+}
+
+.inflight-live-dot.is-idle {
+  background: var(--accent-mint);
+  box-shadow: 0 0 0 4px var(--allow-bg);
+}
+
+.inflight-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 192px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.inflight-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 12px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border);
+  min-width: 0;
+}
+
+.inflight-row-left {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.inflight-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.inflight-row-top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--ink-0);
+}
+
+.inflight-provider-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--ice-soft);
+  border: 1px solid var(--ice-border);
+  color: var(--accent-teal);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.inflight-amount {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-0);
+}
+
+.inflight-row-sub {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--ink-2);
+  min-width: 0;
+}
+
+.inflight-detail-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 420px;
+}
+
+.inflight-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.inflight-status-pill.is-pending {
+  background: var(--ice-soft);
+  color: var(--accent-teal);
+  border: 1px solid var(--ice-border);
+}
+
+.inflight-status-pill.is-ready {
+  background: var(--ice);
+  color: var(--ink-0);
+  border: 1px solid var(--ice-border);
+}
+
+.inflight-status-pill.is-settled {
+  background: var(--allow-bg);
+  color: var(--accent-mint);
+  border: 1px solid var(--allow-border);
+}
+
+.inflight-status-pill.is-failed {
+  background: var(--block-bg);
+  color: var(--block);
+  border: 1px solid var(--block-border);
+}
+
+.inflight-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.inflight-claim-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-radius: 10px;
+  min-height: 32px;
+}
+
+.inflight-mini-btn {
+  padding: 5px 10px;
+  font-size: 11.5px;
+  min-height: 30px;
+}
+
+.inflight-dismiss-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--ink-2);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.inflight-dismiss-btn:hover {
+  background: var(--bg-well);
+  border-color: var(--border-strong);
+  color: var(--ink-0);
+}
+
+/* Floating Homepage In-Flight Pill */
+.inflight-site-pill {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  max-width: calc(100vw - 28px);
+  border-radius: 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--ice-border);
+  box-shadow: 0 12px 32px rgba(10, 10, 10, 0.12);
+}
+
+.inflight-site-pill-copy {
+  font-size: 12.5px;
+  color: var(--ink-0);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Shareable Daylight-Porcelain Receipt Modal */
+.receipt-modal {
+  width: 100%;
+  max-width: 620px;
+  display: flex;
+  flex-direction: column;
+}
+
+.receipt-modal-body {
+  padding: 16px 20px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+}
+
+.receipt-canvas-stage {
+  background: var(--bg-well);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 10px;
+  overflow: hidden;
+}
+
+.receipt-card-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1200 / 630;
+  border-radius: 12px;
+  background: var(--bg-canvas);
+}
+
+.receipt-summary-box {
+  background: var(--bg-well);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ink-1);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.receipt-privacy-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+  padding: 2px 2px;
+}
+
+.receipt-privacy-toggle {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-0);
+}
+
+.receipt-modal-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.receipt-modal-actions .btn-pill-dark,
+.receipt-modal-actions .btn-outline-sm {
+  width: 100%;
+  min-height: 42px;
+  justify-content: center;
+}
+
+@media (max-width: 720px) {
+  .inflight-bridge-banner {
+    padding: 8px 10px;
+    margin-bottom: 8px;
+  }
+  .inflight-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .inflight-detail-text {
+    max-width: 100%;
+    white-space: normal;
+  }
+  .inflight-row-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+  .inflight-site-pill {
+    left: 14px;
+    right: 14px;
+    bottom: calc(14px + env(safe-area-inset-bottom));
+    justify-content: space-between;
+  }
+  .receipt-modal-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
