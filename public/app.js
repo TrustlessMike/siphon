@@ -1,5 +1,5 @@
 import { mountTurgaliumFunnelScene } from './turgalium-3d.js?v=3';
-import { renderConvergenceSvg } from './turgalium-svg.js?v=3';
+import { renderConvergenceSvg } from './turgalium-svg.js?v=4';
 import {
   claimCctpOnSolana,
   connectCoinbaseSmartWallet,
@@ -344,55 +344,18 @@ const PRESERVATION_FEE_BRACKETS = [
 function computeTieredPreservationFee(grossUsdInput) {
   const raw = Number(grossUsdInput);
   const grossUsd = Number.isFinite(raw) && raw > 0 ? Number(raw.toFixed(2)) : 0;
-  if (grossUsd <= 0) {
-    return {
-      grossUsd: 0,
-      feeBps: 0,
-      effectiveFeeBps: 0,
-      feePercentLabel: '0.00%',
-      feeUsd: 0,
-      capUsd: null,
-      capApplied: false,
-      legacy7PctUsd: 0,
-      savedVs7PctUsd: 0,
-      tierLabel: 'Zero',
-    };
-  }
-  const matchedTier =
-    PRESERVATION_FEE_BRACKETS.find(
-      (t) => grossUsd >= t.minGrossUsd && (t.maxGrossUsd === null || grossUsd < t.maxGrossUsd)
-    ) || PRESERVATION_FEE_BRACKETS[PRESERVATION_FEE_BRACKETS.length - 1];
-
-  let uncappedFeeRaw = 0;
-  for (const tier of PRESERVATION_FEE_BRACKETS) {
-    if (grossUsd <= tier.minGrossUsd) break;
-    const upper = tier.maxGrossUsd === null ? grossUsd : Math.min(grossUsd, tier.maxGrossUsd);
-    const sliceUsd = Math.max(0, upper - tier.minGrossUsd);
-    if (sliceUsd <= 0) continue;
-    uncappedFeeRaw += (sliceUsd * tier.feeBps) / 10_000;
-  }
-
-  const feeBps = matchedTier.feeBps;
-  const capUsd = matchedTier.capUsd;
-  const hardCapUsd = capUsd !== null ? capUsd : 50;
-  const uncappedFeeUsd = Number(uncappedFeeRaw.toFixed(2));
-  const capApplied = uncappedFeeUsd > hardCapUsd;
-  const feeUsd = capApplied ? hardCapUsd : uncappedFeeUsd;
-  const effectiveFeeBps = Number(((feeUsd / grossUsd) * 10_000).toFixed(2));
   const legacy7PctUsd = Number(((grossUsd * 700) / 10_000).toFixed(2));
-  const savedVs7PctUsd = Number(Math.max(0, legacy7PctUsd - feeUsd).toFixed(2));
-  const feePercentLabel = `${(feeBps / 100).toFixed(2)}%`;
   return {
     grossUsd,
-    feeBps,
-    effectiveFeeBps,
-    feePercentLabel,
-    feeUsd,
-    capUsd,
-    capApplied,
+    feeBps: 0,
+    effectiveFeeBps: 0,
+    feePercentLabel: '0%',
+    feeUsd: 0,
+    capUsd: 0,
+    capApplied: false,
     legacy7PctUsd,
-    savedVs7PctUsd,
-    tierLabel: matchedTier.tierLabel,
+    savedVs7PctUsd: legacy7PctUsd,
+    tierLabel: 'Open Source (0% Fee)',
   };
 }
 
@@ -682,28 +645,14 @@ function getBridgeProviderLogosHtml(pref) {
 }
 
 function isTieredFeeMode() {
-  if (!isProMode()) return true;
-  const sel = document.getElementById('protocolFeeSelect');
-  const val = String(sel?.value ?? 'tiered').trim();
-  return !val || val === 'tiered';
+  return true;
 }
 
 function getActiveProtocolFeeBps() {
-  if (isTieredFeeMode()) return undefined;
-  const sel = document.getElementById('protocolFeeSelect');
-  const val = String(sel?.value ?? 'tiered').trim();
-  if (!val || val === 'tiered') return undefined;
-  const raw = Number(val);
-  if (!Number.isFinite(raw)) return 700;
-  return Math.min(1000, Math.max(500, Math.round(raw)));
+  return 0;
 }
 
 function getActiveFeeRecipientEvm() {
-  const input = document.getElementById('feeRecipientInput');
-  const val = input?.value?.trim();
-  if (val && /^0x[0-9a-fA-F]{40}$/.test(val)) return val;
-  const serverCfg = getWalletConnectorConfig()?.protocolFee?.feeRecipientEvm;
-  if (serverCfg && /^0x[0-9a-fA-F]{40}$/.test(serverCfg)) return serverCfg;
   return null;
 }
 
@@ -1010,9 +959,7 @@ function renderEmptyScanState() {
   if (gasEl) gasEl.textContent = '$0.00 · 1 click / chain';
   const feeEl = document.getElementById('summaryFeeText');
   if (feeEl) {
-    feeEl.textContent = isTieredFeeMode()
-      ? 'Tiered · $0.00'
-      : `${((getActiveProtocolFeeBps() ?? 700) / 100).toFixed(1)}% flat · $0.00`;
+    feeEl.textContent = '0% · Free (MIT)';
   }
   const burnCount = document.getElementById('burnManifestCount');
   if (burnCount) burnCount.textContent = '0 tokens';
@@ -1410,16 +1357,7 @@ function renderAll() {
 
   const feeEl = document.getElementById('summaryFeeText');
   if (feeEl) {
-    if (fin.useTiered) {
-      if (currentPlan.legs.length === 0 || fin.tieredInfo.grossUsd <= 0) {
-        feeEl.textContent = 'Tiered · $0.00';
-      } else {
-        const capPart = fin.tieredInfo.capApplied ? ` cap $${fin.tieredInfo.capUsd}` : '';
-        feeEl.textContent = `${fin.tieredInfo.feePercentLabel}${capPart} · $${fin.tieredInfo.feeUsd.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-      }
-    } else {
-      feeEl.textContent = `${feePct}% flat · $${safeNum(t.protocolFeeUsd).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-    }
+    feeEl.textContent = '0% · Free (MIT)';
   }
 
   // Activity view topology SVG
