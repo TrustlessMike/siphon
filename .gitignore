@@ -5,3 +5,6 @@ dist/
 *.log
 .DS_Store
 docs/audits/
+out/
+cache/
+broadcast/

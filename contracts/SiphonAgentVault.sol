@@ -39,6 +39,9 @@ contract SiphonAgentVault {
     ///         permitted to consume mandate budgets after verifying actual on-chain transfer amounts.
     address public authorizedRouter;
 
+    /// @notice Allowlist of approved execution routers/delegates (supports both SiphonRouter & SiphonSweepDelegate).
+    mapping(address => bool) public authorizedRouters;
+
     struct AgentMandate {
         address owner;
         address agentKey;
@@ -59,6 +62,7 @@ contract SiphonAgentVault {
     uint256 public mandateNonce;
 
     event AuthorizedRouterUpdated(address indexed previousRouter, address indexed newRouter);
+    event AuthorizedRouterStatusUpdated(address indexed router, bool allowed);
     event MandateRouterUpdated(bytes32 indexed mandateId, address indexed owner, address indexed newRouter);
     event VaultAdminTransferStarted(address indexed currentAdmin, address indexed pendingAdmin);
     event VaultAdminTransferred(address indexed previousAdmin, address indexed newAdmin);
@@ -104,7 +108,9 @@ contract SiphonAgentVault {
         if (initialRouter == address(0)) revert RouterNotConfigured();
         vaultAdmin = msg.sender;
         authorizedRouter = initialRouter;
+        authorizedRouters[initialRouter] = true;
         emit AuthorizedRouterUpdated(address(0), initialRouter);
+        emit AuthorizedRouterStatusUpdated(initialRouter, true);
     }
 
     modifier onlyVaultAdmin() {
@@ -117,7 +123,21 @@ contract SiphonAgentVault {
         if (newRouter == address(0)) revert RouterNotConfigured();
         address prev = authorizedRouter;
         authorizedRouter = newRouter;
+        authorizedRouters[newRouter] = true;
         emit AuthorizedRouterUpdated(prev, newRouter);
+        emit AuthorizedRouterStatusUpdated(newRouter, true);
+    }
+
+    /// @notice Grants or revokes an additional authorized execution router or delegate contract.
+    function setAuthorizedRouter(address router, bool allowed) external onlyVaultAdmin {
+        if (router == address(0)) revert RouterNotConfigured();
+        authorizedRouters[router] = allowed;
+        emit AuthorizedRouterStatusUpdated(router, allowed);
+    }
+
+    /// @notice Returns the full AgentMandate struct for on-chain router/delegate verification.
+    function getMandate(bytes32 mandateId) external view returns (AgentMandate memory) {
+        return mandates[mandateId];
     }
 
     /// @notice Initiates two-step transfer of vault admin ownership.
@@ -271,7 +291,11 @@ contract SiphonAgentVault {
         // Only the owner-approved execution router/delegate may consume mandate budget.
         address expectedRouter = m.authorizedRouter != address(0) ? m.authorizedRouter : authorizedRouter;
         if (expectedRouter == address(0)) revert RouterNotConfigured();
-        if (msg.sender != expectedRouter) revert UnauthorizedRouter(msg.sender, expectedRouter);
+        bool callerAllowed = (msg.sender == expectedRouter) ||
+            (m.authorizedRouter == authorizedRouter && authorizedRouters[msg.sender]);
+        if (!callerAllowed) {
+            if (msg.sender != expectedRouter) revert UnauthorizedRouter(msg.sender, expectedRouter);
+        }
 
         if (agentCaller != m.agentKey && agentCaller != m.owner) revert Unauthorized();
         if (solanaRecipient != m.lockedSolanaRecipient) revert RecipientMismatch();

@@ -459,7 +459,7 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
   assert.ok(addr && typeof addr !== 'string');
   try {
     const c = await fetch(`http://127.0.0.1:${addr.port}/api/contract`).then((r) => r.json());
-    assert.ok(c.source.includes('MIN_FEE_BPS = 500'));
+    assert.ok(c.source.includes('MIN_FEE_BPS = 0'));
     assert.ok(c.source.includes('MAX_FEE_BPS = 1000'));
     assert.ok(c.source.includes('permitWitnessTransferFrom'));
     assert.ok(c.feeVaultSource.includes('contract SiphonFeeVault'));

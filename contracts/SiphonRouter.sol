@@ -10,10 +10,11 @@ pragma solidity 0.8.24;
  *   2. Enforces strictly disjoint allowlists: allowedDefiProtocols vs allowedSwapAggregators
  *   3. Validates Aave v3 aToken against Pool.getReserveData(underlyingAsset) and tracks exact per-call received deltas
  *   4. Binds swapsHash in Permit2 witness, enforces owner-allowlisted feeRecipient & relayers, refunds residual tokens
- *   5. Bridges consolidated net native USDC via Circle CCTP V1 or V2 to the user's 32-byte Solana USDC ATA PDA
- *      (NEVER pass a raw Solana wallet owner pubkey — Circle Solana TokenMessengerMinter requires the canonical USDC ATA!)
+ *   5. Bridges consolidated net native USDC via Circle CCTP V1 or V2 (Standard, Fast Transfer, or Forwarding Hooks)
+ *      to the user's 32-byte Solana USDC ATA PDA (NEVER pass a raw Solana wallet owner pubkey!)
  *   6. Executes isolated zero-liquidity token burns LAST with capped gas & 32-byte bounded return copy (return-bomb safe)
- *   7. Two-step ownership transfer, hard-bounded protocol fee (500 - 1000 bps), and safe ETH/ERC-20 rescue
+ *   7. Two-step ownership transfer, hard-bounded tiered preservation protocol fee (0 - 1000 bps + optional USDC cap),
+ *      on-chain SiphonAgentVault mandate enforcement (`sweepWithMandate`), and safe ETH/ERC-20 rescue
  */
 
 interface IERC20 {
@@ -42,6 +43,48 @@ interface ITokenMessengerCCTPV2 {
         bytes32 destinationCaller,
         uint256 maxFee,
         uint32 minFinalityThreshold
+    ) external;
+
+    function depositForBurnWithHook(
+        uint256 amount,
+        uint32 destinationDomain,
+        bytes32 mintRecipient,
+        address burnToken,
+        bytes32 destinationCaller,
+        uint256 maxFee,
+        uint32 minFinalityThreshold,
+        bytes calldata hookData
+    ) external;
+}
+
+interface ISiphonAgentVault {
+    struct AgentMandate {
+        address owner;
+        address agentKey;
+        address authorizedRouter;
+        bytes32 lockedSolanaRecipient;
+        uint256 maxPerTxUsd6;
+        uint256 dailyCapUsd6;
+        uint256 spentTodayUsd6;
+        uint64 dayWindowStart;
+        uint64 expiresAt;
+        uint16 maxFeeBps;
+        uint16 minNetOutBps;
+        uint8 allowedActionsMask;
+        bool active;
+    }
+
+    function getMandate(bytes32 mandateId) external view returns (AgentMandate memory);
+
+    function authorizeAgentAction(
+        bytes32 mandateId,
+        address agentCaller,
+        uint8 actionBit,
+        bytes32 solanaRecipient,
+        uint256 grossUsd6,
+        uint256 netOutUsd6,
+        uint16 feeBps,
+        bytes32 intentDigest
     ) external;
 }
 
@@ -169,8 +212,18 @@ contract SiphonRouter {
     /// @notice Gas cap for isolated zero-liquidity burn calls to prevent 63/64ths gas griefing.
     uint256 public constant BURN_GAS_STIPEND = 100_000;
 
-    /// @notice Circle CCTP V2 standard finality threshold (2000 = finalized, 1000 = fast transfer).
+    /// @notice Circle CCTP V2 finality thresholds (1000 = Fast Transfer, 2000 = Standard Finality).
+    uint32 public constant CCTP_V2_FAST_FINALITY = 1000;
     uint32 public constant CCTP_V2_STANDARD_FINALITY = 2000;
+
+    /// @notice Hard upper bound on Circle CCTP V2 fast-transfer fee as a share of bridged principal (5.00% = 500 bps).
+    uint16 public constant MAX_CCTP_FEE_BPS = 500;
+
+    /// @notice SiphonAgentVault action bitmap flags (must mirror SiphonAgentVault.sol).
+    uint8 public constant ACTION_DUST_CONVERT = 1 << 0;
+    uint8 public constant ACTION_DEFI_WITHDRAW = 1 << 1;
+    uint8 public constant ACTION_BRIDGE_SOLANA = 1 << 2;
+    uint8 public constant ACTION_BURN_ZERO_LIQ = 1 << 3;
 
     bytes32 public constant SIPHON_WITNESS_TYPEHASH = keccak256(
         "SiphonSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient,bytes32 swapsHash)"
@@ -189,22 +242,31 @@ contract SiphonRouter {
         bytes32 swapsHash;
     }
 
+    struct CctpV2Options {
+        bytes32 destinationCaller;
+        uint256 maxFee;
+        uint32 minFinalityThreshold; // 0 defaults to CCTP_V2_STANDARD_FINALITY (2000); 1000 = Fast Transfer
+        bytes hookData;              // Non-empty invokes TokenMessengerV2.depositForBurnWithHook
+    }
+
     /// @notice Circle CCTP destination domain ID for Solana Mainnet.
     uint32 public constant SOLANA_CCTP_DOMAIN = 5;
 
-    /// @notice Protocol fee bounds: 5.00% (500 bps) minimum, 10.00% (1000 bps) maximum. Default: 700 bps (7.0%).
-    uint16 public constant MIN_FEE_BPS = 500;
+    /// @notice Protocol fee bounds: 0.00% (0 bps) minimum for whale/preservation tiers, 10.00% (1000 bps) hard ceiling.
+    uint16 public constant MIN_FEE_BPS = 0;
     uint16 public constant MAX_FEE_BPS = 1000;
 
     address public immutable usdc;
     address public immutable cctpMessenger;
-    /// @notice Circle CCTP version deployed on this chain: 1 (4-arg TokenMessenger) or 2 (7-arg TokenMessengerV2).
+    /// @notice Circle CCTP version deployed on this chain: 1 (4-arg TokenMessenger) or 2 (7/8-arg TokenMessengerV2).
     uint8 public immutable cctpVersion;
 
     address public owner;
     address public pendingOwner;
     address public feeRecipient;
     uint16 public feeBps;
+    /// @notice Optional protocol fee cap in USDC base units (0 = uncapped beyond feeBps; e.g. 25e6 = $25 whale cap).
+    uint256 public maxFeeUsdcCap;
     uint256 private _reentrancyGuard = 1;
 
     /// @notice Disjoint allowlist for DEX swap aggregators (callable via swapCalldata). Never contains DeFi protocols or tokens.
@@ -218,6 +280,9 @@ contract SiphonRouter {
 
     /// @notice Owner-configured sponsor relayer allowlist (prevents MEV frontrunning of gasReimbursementUsdc).
     mapping(address => bool) public allowedRelayers;
+
+    /// @notice Owner-configured SiphonAgentVault allowlist permitted for `sweepWithMandate`.
+    mapping(address => bool) public allowedAgentVaults;
 
     enum DefiKind {
         AAVE_V3_WITHDRAW,
@@ -250,7 +315,10 @@ contract SiphonRouter {
         /// @dev Canonical 32-byte Solana USDC Associated Token Account (ATA) PDA — NEVER a raw wallet pubkey.
         bytes32 solanaRecipient;
         uint256 minNetUsdcOut;
+        /// @dev Optional user-side fee ceiling in USDC base units (0 = no extra cap check; reverts if charged fee exceeds it).
+        uint256 maxFeeUsdcCap;
         uint256 deadline;
+        CctpV2Options cctp;
         DefiExitStep[] defiExits;
         SwapStep[] swaps;
         BurnStep[] burns;
@@ -267,15 +335,26 @@ contract SiphonRouter {
         uint256 skippedBurns
     );
 
+    event MandateSweepExecuted(
+        bytes32 indexed mandateId,
+        address indexed agentVault,
+        address indexed capitalOwner,
+        address agentCaller,
+        uint256 grossUsdc,
+        uint256 bridgedUsdc
+    );
+
     event DeadTokenBurned(address indexed user, address indexed token, uint256 amount);
     event DeadTokenSkipped(address indexed user, address indexed token, string reason);
     event SwapAggregatorUpdated(address indexed aggregator, bool allowed);
     event DefiProtocolUpdated(address indexed protocol, bool allowed);
     event FeeRecipientAllowlistUpdated(address indexed recipient, bool allowed);
     event RelayerUpdated(address indexed relayer, bool allowed);
+    event AgentVaultUpdated(address indexed vault, bool allowed);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event FeeUpdated(address indexed feeRecipient, uint16 feeBps);
+    event MaxFeeUsdcCapUpdated(uint256 previousCap, uint256 newCap);
     event TokensRescued(address indexed token, address indexed to, uint256 amount);
     event NativeRescued(address indexed to, uint256 amount);
 
@@ -283,6 +362,8 @@ contract SiphonRouter {
     error InvalidAddress();
     error InvalidSolanaRecipient();
     error InvalidCctpVersion(uint8 version);
+    error CctpV2Required();
+    error CctpMaxFeeTooHigh(uint256 requestedMaxFee, uint256 maxAllowedFee);
     error TargetNotAllowed(address target);
     error DisjointAllowlistViolation(address target);
     error UnauthorizedFeeRecipient(address recipient);
@@ -295,6 +376,8 @@ contract SiphonRouter {
     error RelayerBreakEvenNotMet(uint256 relayerRevenueUsdc, uint256 requiredCoverageUsdc);
     error Unauthorized();
     error FeeOutOfBounds(uint16 feeBps);
+    error FeeCapExceeded(uint256 feeUsdc, uint256 maxAllowedCap);
+    error MandateActionNotPermitted(uint8 requiredBit);
     error NativeTransferFailed(address to);
     error Reentrancy();
 
@@ -384,6 +467,13 @@ contract SiphonRouter {
         emit RelayerUpdated(relayer, allowed);
     }
 
+    function setAllowedAgentVault(address vault, bool allowed) external onlyOwner {
+        if (vault == address(0)) revert InvalidAddress();
+        if (allowed && vault.code.length == 0) revert InvalidAddress();
+        allowedAgentVaults[vault] = allowed;
+        emit AgentVaultUpdated(vault, allowed);
+    }
+
     function setFeeParams(address _feeRecipient, uint16 _feeBps) external onlyOwner {
         if (_feeRecipient == address(0)) revert InvalidAddress();
         if (_feeBps < MIN_FEE_BPS || _feeBps > MAX_FEE_BPS) revert FeeOutOfBounds(_feeBps);
@@ -392,6 +482,13 @@ contract SiphonRouter {
         allowedFeeRecipients[_feeRecipient] = true;
         emit FeeUpdated(_feeRecipient, _feeBps);
         emit FeeRecipientAllowlistUpdated(_feeRecipient, true);
+    }
+
+    /// @notice Configures an optional hard protocol fee cap in USDC base units (0 = uncapped beyond feeBps).
+    function setMaxFeeUsdcCap(uint256 _maxFeeUsdcCap) external onlyOwner {
+        uint256 prev = maxFeeUsdcCap;
+        maxFeeUsdcCap = _maxFeeUsdcCap;
+        emit MaxFeeUsdcCapUpdated(prev, _maxFeeUsdcCap);
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
@@ -419,6 +516,27 @@ contract SiphonRouter {
         (bool ok, ) = to.call{ value: amount }("");
         if (!ok) revert NativeTransferFailed(to);
         emit NativeRescued(to, amount);
+    }
+
+    function _computeProtocolFee(
+        uint256 grossUsdc,
+        uint16 appliedFeeBps,
+        uint256 userMaxFeeCap
+    ) private view returns (uint256 feeUsdc, uint16 effectiveFeeBps) {
+        uint256 uncappedFee = (grossUsdc * appliedFeeBps) / 10_000;
+        feeUsdc = uncappedFee;
+        if (maxFeeUsdcCap > 0 && feeUsdc > maxFeeUsdcCap) {
+            feeUsdc = maxFeeUsdcCap;
+        }
+        if (userMaxFeeCap > 0 && feeUsdc > userMaxFeeCap) {
+            revert FeeCapExceeded(feeUsdc, userMaxFeeCap);
+        }
+        if (feeUsdc < uncappedFee && grossUsdc > 0) {
+            uint256 ceilBps = (feeUsdc * 10_000 + grossUsdc - 1) / grossUsdc;
+            effectiveFeeBps = ceilBps > MAX_FEE_BPS ? MAX_FEE_BPS : uint16(ceilBps);
+        } else {
+            effectiveFeeBps = appliedFeeBps;
+        }
     }
 
     function _creditToken(
@@ -474,20 +592,45 @@ contract SiphonRouter {
         }
     }
 
-    function _bridgeUsdcViaCctp(uint256 amount, bytes32 solanaUsdcAta) private returns (uint64 cctpNonce) {
+    function _bridgeUsdcViaCctp(
+        uint256 amount,
+        bytes32 solanaUsdcAta,
+        CctpV2Options memory opts
+    ) private returns (uint64 cctpNonce) {
         usdc.forceApprove(cctpMessenger, amount);
         if (cctpVersion == 2) {
-            ITokenMessengerCCTPV2(cctpMessenger).depositForBurn(
-                amount,
-                SOLANA_CCTP_DOMAIN,
-                solanaUsdcAta,
-                usdc,
-                bytes32(0),
-                0,
-                CCTP_V2_STANDARD_FINALITY
-            );
+            uint32 finality = opts.minFinalityThreshold == 0
+                ? CCTP_V2_STANDARD_FINALITY
+                : opts.minFinalityThreshold;
+            uint256 maxAllowedCctpFee = (amount * MAX_CCTP_FEE_BPS) / 10_000;
+            if (opts.maxFee >= amount || opts.maxFee > maxAllowedCctpFee) {
+                revert CctpMaxFeeTooHigh(opts.maxFee, maxAllowedCctpFee);
+            }
+            if (opts.hookData.length > 0) {
+                ITokenMessengerCCTPV2(cctpMessenger).depositForBurnWithHook(
+                    amount,
+                    SOLANA_CCTP_DOMAIN,
+                    solanaUsdcAta,
+                    usdc,
+                    opts.destinationCaller,
+                    opts.maxFee,
+                    finality,
+                    opts.hookData
+                );
+            } else {
+                ITokenMessengerCCTPV2(cctpMessenger).depositForBurn(
+                    amount,
+                    SOLANA_CCTP_DOMAIN,
+                    solanaUsdcAta,
+                    usdc,
+                    opts.destinationCaller,
+                    opts.maxFee,
+                    finality
+                );
+            }
             cctpNonce = 0;
         } else {
+            if (opts.hookData.length > 0 || opts.maxFee > 0) revert CctpV2Required();
             cctpNonce = ITokenMessengerCCTP(cctpMessenger).depositForBurn(
                 amount,
                 SOLANA_CCTP_DOMAIN,
@@ -496,6 +639,156 @@ contract SiphonRouter {
             );
         }
         usdc.forceApprove(cctpMessenger, 0);
+    }
+
+    function _bridgeUsdcViaCctp(uint256 amount, bytes32 solanaUsdcAta) private returns (uint64 cctpNonce) {
+        CctpV2Options memory defaults;
+        return _bridgeUsdcViaCctp(amount, solanaUsdcAta, defaults);
+    }
+
+    function _executeExitsAndSwaps(
+        address capitalOwner,
+        DefiExitStep[] calldata defiExits,
+        SwapStep[] calldata swaps
+    ) private {
+        // Track exact per-token received deltas from DeFi exits so pullFromUser=false can NEVER touch residual router balances.
+        uint256 maxCredits = defiExits.length;
+        address[] memory creditedTokens = new address[](maxCredits);
+        uint256[] memory creditedAmounts = new uint256[](maxCredits);
+        uint256 creditCount = 0;
+
+        // 1. Withdraw user capital from strictly allowlisted DeFi protocols
+        for (uint256 i = 0; i < defiExits.length; i++) {
+            DefiExitStep calldata exitStep = defiExits[i];
+            if (!allowedDefiProtocols[exitStep.protocol]) revert TargetNotAllowed(exitStep.protocol);
+            if (exitStep.amount == 0) continue;
+            if (exitStep.underlyingAsset == address(0)) revert InvalidAddress();
+
+            uint256 underBefore = IERC20(exitStep.underlyingAsset).balanceOf(address(this));
+
+            if (exitStep.kind == DefiKind.AAVE_V3_WITHDRAW) {
+                address expectedAToken = IAaveV3Pool(exitStep.protocol)
+                    .getReserveData(exitStep.underlyingAsset)
+                    .aTokenAddress;
+                if (expectedAToken == address(0) || exitStep.receiptToken != expectedAToken) {
+                    revert InvalidAddress();
+                }
+                uint256 pullAmount = exitStep.amount == type(uint256).max
+                    ? IERC20(exitStep.receiptToken).balanceOf(capitalOwner)
+                    : exitStep.amount;
+                if (pullAmount == 0) continue;
+
+                uint256 aBalBefore = IERC20(exitStep.receiptToken).balanceOf(address(this));
+                exitStep.receiptToken.safeTransferFrom(capitalOwner, address(this), pullAmount);
+                uint256 aReceived = IERC20(exitStep.receiptToken).balanceOf(address(this)) - aBalBefore;
+
+                IAaveV3Pool(exitStep.protocol).withdraw(
+                    exitStep.underlyingAsset,
+                    aReceived,
+                    address(this)
+                );
+            } else if (exitStep.kind == DefiKind.COMPOUND_V3_WITHDRAW) {
+                ICompoundV3Comet(exitStep.protocol).withdrawFrom(
+                    capitalOwner,
+                    address(this),
+                    exitStep.underlyingAsset,
+                    exitStep.amount
+                );
+            } else if (exitStep.kind == DefiKind.ERC4626_REDEEM) {
+                IERC4626Vault(exitStep.protocol).redeem(
+                    exitStep.amount,
+                    address(this),
+                    capitalOwner
+                );
+            }
+
+            uint256 underAfter = IERC20(exitStep.underlyingAsset).balanceOf(address(this));
+            if (underAfter > underBefore && exitStep.underlyingAsset != usdc) {
+                creditCount = _creditToken(
+                    creditedTokens,
+                    creditedAmounts,
+                    creditCount,
+                    exitStep.underlyingAsset,
+                    underAfter - underBefore
+                );
+            }
+        }
+
+        // 2. Pull liquid ERC-20 dust (or consume exact DeFi exit credit) & swap via allowlisted swap aggregators
+        for (uint256 i = 0; i < swaps.length; i++) {
+            SwapStep calldata s = swaps[i];
+            if (s.amountIn == 0) continue;
+
+            if (s.tokenIn == usdc) {
+                if (s.pullFromUser) {
+                    usdc.safeTransferFrom(capitalOwner, address(this), s.amountIn);
+                }
+                continue;
+            }
+
+            if (!allowedSwapAggregators[s.aggregator] || s.aggregator.code.length == 0) {
+                revert TargetNotAllowed(s.aggregator);
+            }
+
+            uint256 swapAmount;
+            uint256 creditIdx = type(uint256).max;
+            if (s.pullFromUser) {
+                uint256 balBefore = IERC20(s.tokenIn).balanceOf(address(this));
+                s.tokenIn.safeTransferFrom(capitalOwner, address(this), s.amountIn);
+                swapAmount = IERC20(s.tokenIn).balanceOf(address(this)) - balBefore;
+            } else {
+                (creditIdx, swapAmount) = _consumeCredit(
+                    creditedTokens,
+                    creditedAmounts,
+                    creditCount,
+                    s.tokenIn,
+                    s.amountIn
+                );
+                if (swapAmount == 0) {
+                    revert InsufficientCreditedBalance(s.tokenIn, s.amountIn, 0);
+                }
+            }
+
+            if (swapAmount == 0) continue;
+
+            uint256 tokenBeforeSwap = IERC20(s.tokenIn).balanceOf(address(this));
+            s.tokenIn.forceApprove(s.aggregator, swapAmount);
+            (bool ok, ) = s.aggregator.call(s.swapCalldata);
+            if (!ok) revert AggregatorSwapFailed(s.aggregator);
+            s.tokenIn.forceApprove(s.aggregator, 0);
+
+            if (creditIdx != type(uint256).max) {
+                uint256 tokenAfterSwap = IERC20(s.tokenIn).balanceOf(address(this));
+                uint256 spent = tokenBeforeSwap > tokenAfterSwap ? (tokenBeforeSwap - tokenAfterSwap) : 0;
+                creditedAmounts[creditIdx] = spent >= creditedAmounts[creditIdx]
+                    ? 0
+                    : creditedAmounts[creditIdx] - spent;
+            }
+        }
+
+        // Refund any unswapped non-USDC tokens withdrawn from user's DeFi positions back to capitalOwner
+        for (uint256 i = 0; i < creditCount; i++) {
+            if (creditedAmounts[i] > 0) {
+                creditedTokens[i].safeTransfer(capitalOwner, creditedAmounts[i]);
+            }
+        }
+    }
+
+    function _executeTrailingBurns(
+        address capitalOwner,
+        BurnStep[] calldata burns
+    ) private returns (uint256 burnedCount, uint256 skippedBurns) {
+        for (uint256 i = 0; i < burns.length; i++) {
+            BurnStep calldata b = burns[i];
+            if (b.amount == 0) continue;
+            if (_safeBurnTransferFrom(b.token, capitalOwner, b.amount)) {
+                burnedCount++;
+                emit DeadTokenBurned(capitalOwner, b.token, b.amount);
+            } else {
+                skippedBurns++;
+                emit DeadTokenSkipped(capitalOwner, b.token, "HONEYPOT_OR_REVERT");
+            }
+        }
     }
 
     /**
@@ -513,136 +806,14 @@ contract SiphonRouter {
 
         uint256 usdcBefore = IERC20(usdc).balanceOf(address(this));
 
-        {
-            // Track exact per-token received deltas from DeFi exits so pullFromUser=false can NEVER touch residual router balances.
-            uint256 maxCredits = params.defiExits.length;
-            address[] memory creditedTokens = new address[](maxCredits);
-            uint256[] memory creditedAmounts = new uint256[](maxCredits);
-            uint256 creditCount = 0;
-
-            // 1. Withdraw user capital from strictly allowlisted DeFi protocols
-            for (uint256 i = 0; i < params.defiExits.length; i++) {
-                DefiExitStep calldata exitStep = params.defiExits[i];
-                if (!allowedDefiProtocols[exitStep.protocol]) revert TargetNotAllowed(exitStep.protocol);
-                if (exitStep.amount == 0) continue;
-                if (exitStep.underlyingAsset == address(0)) revert InvalidAddress();
-
-                uint256 underBefore = IERC20(exitStep.underlyingAsset).balanceOf(address(this));
-
-                if (exitStep.kind == DefiKind.AAVE_V3_WITHDRAW) {
-                    address expectedAToken = IAaveV3Pool(exitStep.protocol)
-                        .getReserveData(exitStep.underlyingAsset)
-                        .aTokenAddress;
-                    if (expectedAToken == address(0) || exitStep.receiptToken != expectedAToken) {
-                        revert InvalidAddress();
-                    }
-                    uint256 pullAmount = exitStep.amount == type(uint256).max
-                        ? IERC20(exitStep.receiptToken).balanceOf(msg.sender)
-                        : exitStep.amount;
-                    if (pullAmount == 0) continue;
-
-                    uint256 aBalBefore = IERC20(exitStep.receiptToken).balanceOf(address(this));
-                    exitStep.receiptToken.safeTransferFrom(msg.sender, address(this), pullAmount);
-                    uint256 aReceived = IERC20(exitStep.receiptToken).balanceOf(address(this)) - aBalBefore;
-
-                    IAaveV3Pool(exitStep.protocol).withdraw(
-                        exitStep.underlyingAsset,
-                        aReceived,
-                        address(this)
-                    );
-                } else if (exitStep.kind == DefiKind.COMPOUND_V3_WITHDRAW) {
-                    ICompoundV3Comet(exitStep.protocol).withdrawFrom(
-                        msg.sender,
-                        address(this),
-                        exitStep.underlyingAsset,
-                        exitStep.amount
-                    );
-                } else if (exitStep.kind == DefiKind.ERC4626_REDEEM) {
-                    IERC4626Vault(exitStep.protocol).redeem(
-                        exitStep.amount,
-                        address(this),
-                        msg.sender
-                    );
-                }
-
-                uint256 underAfter = IERC20(exitStep.underlyingAsset).balanceOf(address(this));
-                if (underAfter > underBefore && exitStep.underlyingAsset != usdc) {
-                    creditCount = _creditToken(
-                        creditedTokens,
-                        creditedAmounts,
-                        creditCount,
-                        exitStep.underlyingAsset,
-                        underAfter - underBefore
-                    );
-                }
-            }
-
-            // 2. Pull liquid ERC-20 dust (or consume exact DeFi exit credit) & swap via allowlisted swap aggregators
-            for (uint256 i = 0; i < params.swaps.length; i++) {
-                SwapStep calldata s = params.swaps[i];
-                if (s.amountIn == 0) continue;
-
-                if (s.tokenIn == usdc) {
-                    if (s.pullFromUser) {
-                        usdc.safeTransferFrom(msg.sender, address(this), s.amountIn);
-                    }
-                    continue;
-                }
-
-                if (!allowedSwapAggregators[s.aggregator] || s.aggregator.code.length == 0) {
-                    revert TargetNotAllowed(s.aggregator);
-                }
-
-                uint256 swapAmount;
-                uint256 creditIdx = type(uint256).max;
-                if (s.pullFromUser) {
-                    uint256 balBefore = IERC20(s.tokenIn).balanceOf(address(this));
-                    s.tokenIn.safeTransferFrom(msg.sender, address(this), s.amountIn);
-                    swapAmount = IERC20(s.tokenIn).balanceOf(address(this)) - balBefore;
-                } else {
-                    (creditIdx, swapAmount) = _consumeCredit(
-                        creditedTokens,
-                        creditedAmounts,
-                        creditCount,
-                        s.tokenIn,
-                        s.amountIn
-                    );
-                    if (swapAmount == 0) {
-                        revert InsufficientCreditedBalance(s.tokenIn, s.amountIn, 0);
-                    }
-                }
-
-                if (swapAmount == 0) continue;
-
-                uint256 tokenBeforeSwap = IERC20(s.tokenIn).balanceOf(address(this));
-                s.tokenIn.forceApprove(s.aggregator, swapAmount);
-                (bool ok, ) = s.aggregator.call(s.swapCalldata);
-                if (!ok) revert AggregatorSwapFailed(s.aggregator);
-                s.tokenIn.forceApprove(s.aggregator, 0);
-
-                if (creditIdx != type(uint256).max) {
-                    uint256 tokenAfterSwap = IERC20(s.tokenIn).balanceOf(address(this));
-                    uint256 spent = tokenBeforeSwap > tokenAfterSwap ? (tokenBeforeSwap - tokenAfterSwap) : 0;
-                    creditedAmounts[creditIdx] = spent >= creditedAmounts[creditIdx]
-                        ? 0
-                        : creditedAmounts[creditIdx] - spent;
-                }
-            }
-
-            // Refund any unswapped non-USDC tokens withdrawn from user's DeFi positions back to msg.sender
-            for (uint256 i = 0; i < creditCount; i++) {
-                if (creditedAmounts[i] > 0) {
-                    creditedTokens[i].safeTransfer(msg.sender, creditedAmounts[i]);
-                }
-            }
-        }
+        _executeExitsAndSwaps(msg.sender, params.defiExits, params.swaps);
 
         // 3. Compute exact USDC delta, enforce slippage floor, route protocol fee, and bridge 1:1 via Circle CCTP FIRST
         uint256 usdcAfter = IERC20(usdc).balanceOf(address(this));
         if (usdcAfter <= usdcBefore) revert ZeroUsdcOutput();
         uint256 grossUsdc = usdcAfter - usdcBefore;
 
-        uint256 feeUsdc = (grossUsdc * feeBps) / 10_000;
+        (uint256 feeUsdc, ) = _computeProtocolFee(grossUsdc, feeBps, params.maxFeeUsdcCap);
         bridgedUsdc = grossUsdc - feeUsdc;
         if (bridgedUsdc < params.minNetUsdcOut) {
             revert SlippageExceeded(bridgedUsdc, params.minNetUsdcOut);
@@ -652,25 +823,99 @@ contract SiphonRouter {
             usdc.safeTransfer(feeRecipient, feeUsdc);
         }
 
-        cctpNonce = _bridgeUsdcViaCctp(bridgedUsdc, params.solanaRecipient);
+        cctpNonce = _bridgeUsdcViaCctp(bridgedUsdc, params.solanaRecipient, params.cctp);
 
         // 4. Execute isolated zero-liquidity burns LAST (after CCTP settlement) with capped gas & 32-byte bounded return copy
-        uint256 burnedCount = 0;
-        uint256 skippedBurns = 0;
-        for (uint256 i = 0; i < params.burns.length; i++) {
-            BurnStep calldata b = params.burns[i];
-            if (b.amount == 0) continue;
-            if (_safeBurnTransferFrom(b.token, msg.sender, b.amount)) {
-                burnedCount++;
-                emit DeadTokenBurned(msg.sender, b.token, b.amount);
-            } else {
-                skippedBurns++;
-                emit DeadTokenSkipped(msg.sender, b.token, "HONEYPOT_OR_REVERT");
-            }
-        }
+        (uint256 burnedCount, uint256 skippedBurns) = _executeTrailingBurns(msg.sender, params.burns);
 
         emit SiphonMigrated(
             msg.sender,
+            params.solanaRecipient,
+            grossUsdc,
+            feeUsdc,
+            bridgedUsdc,
+            cctpNonce,
+            burnedCount,
+            skippedBurns
+        );
+    }
+
+    /**
+     * @notice Executes a policy-bounded autonomous agent sweep gated by on-chain `SiphonAgentVault.authorizeAgentAction`.
+     * @dev Measures actual on-chain post-exit/post-swap USDC deltas before invoking `SiphonAgentVault.authorizeAgentAction`,
+     *      guaranteeing locked Solana recipient, per-tx USD cap, rolling 24h cap, maxFeeBps, minNetOutBps, and action mask.
+     */
+    function sweepWithMandate(
+        address agentVault,
+        bytes32 mandateId,
+        uint8 actionBit,
+        SweepParams calldata params
+    ) external nonReentrant returns (uint256 bridgedUsdc, uint64 cctpNonce) {
+        if (block.timestamp > params.deadline) revert ExpiredDeadline();
+        if (params.solanaRecipient == bytes32(0)) revert InvalidSolanaRecipient();
+        if (params.minNetUsdcOut == 0) revert ZeroMinNetOutput();
+        if (agentVault == address(0) || !allowedAgentVaults[agentVault]) {
+            revert TargetNotAllowed(agentVault);
+        }
+
+        ISiphonAgentVault.AgentMandate memory m = ISiphonAgentVault(agentVault).getMandate(mandateId);
+        if (m.owner == address(0)) revert Unauthorized();
+        if (msg.sender != m.agentKey && msg.sender != m.owner) revert Unauthorized();
+
+        // Ensure mandate bitmap permits every step class present in params (not only the single reported actionBit)
+        if ((m.allowedActionsMask & ACTION_BRIDGE_SOLANA) == 0) {
+            revert MandateActionNotPermitted(ACTION_BRIDGE_SOLANA);
+        }
+        if (params.defiExits.length > 0 && (m.allowedActionsMask & ACTION_DEFI_WITHDRAW) == 0) {
+            revert MandateActionNotPermitted(ACTION_DEFI_WITHDRAW);
+        }
+        if (params.swaps.length > 0 && (m.allowedActionsMask & ACTION_DUST_CONVERT) == 0) {
+            revert MandateActionNotPermitted(ACTION_DUST_CONVERT);
+        }
+        if (params.burns.length > 0 && (m.allowedActionsMask & ACTION_BURN_ZERO_LIQ) == 0) {
+            revert MandateActionNotPermitted(ACTION_BURN_ZERO_LIQ);
+        }
+
+        uint256 usdcBefore = IERC20(usdc).balanceOf(address(this));
+
+        _executeExitsAndSwaps(m.owner, params.defiExits, params.swaps);
+
+        uint256 usdcAfter = IERC20(usdc).balanceOf(address(this));
+        if (usdcAfter <= usdcBefore) revert ZeroUsdcOutput();
+        uint256 grossUsdc = usdcAfter - usdcBefore;
+
+        (uint256 feeUsdc, uint16 effectiveFeeBps) = _computeProtocolFee(grossUsdc, feeBps, params.maxFeeUsdcCap);
+        bridgedUsdc = grossUsdc - feeUsdc;
+        if (bridgedUsdc < params.minNetUsdcOut) {
+            revert SlippageExceeded(bridgedUsdc, params.minNetUsdcOut);
+        }
+
+        // Enforce on-chain SiphonAgentVault policy caps & locked Solana recipient BEFORE moving fees or bridging
+        bytes32 intentDigest = keccak256(
+            abi.encode(mandateId, m.owner, msg.sender, params.solanaRecipient, grossUsdc, bridgedUsdc, block.chainid)
+        );
+        ISiphonAgentVault(agentVault).authorizeAgentAction(
+            mandateId,
+            msg.sender,
+            actionBit,
+            params.solanaRecipient,
+            grossUsdc,
+            bridgedUsdc,
+            effectiveFeeBps,
+            intentDigest
+        );
+
+        if (feeUsdc > 0 && feeRecipient != address(0)) {
+            usdc.safeTransfer(feeRecipient, feeUsdc);
+        }
+
+        cctpNonce = _bridgeUsdcViaCctp(bridgedUsdc, params.solanaRecipient, params.cctp);
+
+        (uint256 burnedCount, uint256 skippedBurns) = _executeTrailingBurns(m.owner, params.burns);
+
+        emit MandateSweepExecuted(mandateId, agentVault, m.owner, msg.sender, grossUsdc, bridgedUsdc);
+        emit SiphonMigrated(
+            m.owner,
             params.solanaRecipient,
             grossUsdc,
             feeUsdc,
@@ -844,7 +1089,7 @@ contract SiphonRouter {
         if (usdcAfter <= usdcBefore) revert ZeroUsdcOutput();
         uint256 grossUsdc = usdcAfter - usdcBefore;
 
-        uint256 feeUsdc = (grossUsdc * witness.feeBps) / 10_000;
+        (uint256 feeUsdc, ) = _computeProtocolFee(grossUsdc, witness.feeBps, 0);
         // Onchain Relayer Break-Even Protection: require protocolFee + gasReimbursement >= ceil(1.5x sponsored gas)
         if (gasReimbursementUsdc > 0) {
             uint256 relayerRevenue = feeUsdc + gasReimbursementUsdc;

@@ -420,9 +420,14 @@ test('Smart Contract Adversarial Backtest: SiphonRouter, SiphonSweepDelegate, an
   assert.ok(routerSol.includes('BURN_GAS_STIPEND'), 'HIGH-03: Burn gas stipend cap required');
   assert.ok(!routerSol.includes('abi.decode(ret, (bool))'), 'HIGH-03: Burn loop must NOT call abi.decode(ret, (bool))');
   // MED-01: In sweepAndBridgeToSolana, CCTP bridge executes BEFORE untrusted burn loop
-  const routerBridgeIdx = routerSol.indexOf('cctpNonce = _bridgeUsdcViaCctp(bridgedUsdc, params.solanaRecipient);');
-  const routerBurnIdx = routerSol.indexOf('if (_safeBurnTransferFrom(b.token, msg.sender, b.amount))');
+  const routerBridgeIdx = routerSol.indexOf('cctpNonce = _bridgeUsdcViaCctp(bridgedUsdc, params.solanaRecipient, params.cctp);');
+  const routerBurnIdx = routerSol.indexOf('_executeTrailingBurns(msg.sender, params.burns)');
   assert.ok(routerBridgeIdx > 0 && routerBurnIdx > routerBridgeIdx, 'MED-01: Router must bridge via CCTP BEFORE untrusted burn calls');
+  assert.ok(routerSol.includes('uint16 public constant MIN_FEE_BPS = 0;'), 'Preservation tier: Router MIN_FEE_BPS must be 0');
+  assert.ok(routerSol.includes('uint16 public constant MAX_FEE_BPS = 1000;'), 'Router MAX_FEE_BPS ceiling must remain 1000');
+  assert.ok(routerSol.includes('depositForBurnWithHook('), 'CCTP V2 hook support required in SiphonRouter');
+  assert.ok(routerSol.includes('function sweepWithMandate('), 'SiphonAgentVault on-chain mandate linkage required in SiphonRouter');
+  assert.ok(routerSol.includes('authorizeAgentAction('), 'Router must call SiphonAgentVault.authorizeAgentAction');
 
   // --- SiphonSweepDelegate.sol ---
   assert.ok(delegateSol.includes('pragma solidity 0.8.24;'), 'Delegate pragma must be pinned');
@@ -458,6 +463,16 @@ test('Smart Contract Adversarial Backtest: SiphonRouter, SiphonSweepDelegate, an
     delRevokeIdx > 0 && delBridgeIdx > delRevokeIdx && delBurnIdx > delBridgeIdx,
     'MED-01: Delegate must execute revokes FIRST, CCTP bridge BEFORE untrusted burns, and burns LAST'
   );
+
+  // --- SiphonDelegateRegistry.sol ---
+  const registrySol = fs.readFileSync(path.join(ROOT_DIR, 'contracts/SiphonDelegateRegistry.sol'), 'utf8');
+  assert.ok(registrySol.includes('pragma solidity 0.8.24;'), 'Registry pragma must be pinned');
+  assert.ok(registrySol.includes('function isAllowedRelayer(') && registrySol.includes('function isApprovedRelayer('), 'Registry relayer views required');
+  assert.ok(registrySol.includes('function isAllowedSwapRouter(') && registrySol.includes('function isApprovedRouter('), 'Registry router views required');
+  assert.ok(registrySol.includes('function pause(') && registrySol.includes('function unpause('), 'Registry kill-switch required');
+  assert.ok(delegateSol.includes('uint16 public constant MIN_FEE_BPS = 0;'), 'Preservation tier: Delegate MIN_FEE_BPS must be 0');
+  assert.ok(delegateSol.includes('depositForBurnWithHook('), 'CCTP V2 hook support required in SiphonSweepDelegate');
+  assert.ok(delegateSol.includes('function executeSponsoredSweepWithMandate('), 'SiphonAgentVault on-chain mandate linkage required in SiphonSweepDelegate');
 
   // --- SiphonFeeVault.sol ---
   assert.ok(vaultSol.includes('pragma solidity 0.8.24;'), 'FeeVault pragma must be pinned');
