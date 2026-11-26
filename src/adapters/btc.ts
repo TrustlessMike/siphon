@@ -11,6 +11,7 @@ import {
   RELAY_BITCOIN_CHAIN_ID,
   RELAY_BTC_NATIVE_CURRENCY,
 } from '../execution/non-evm-converter.js';
+import type { RouteAuctionFetcher } from '../execution/route-auction.js';
 import { getProtocolFeeConfig } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
@@ -86,6 +87,108 @@ export function estimateInputVbytes(address: string): number {
   return 148; // Legacy P2PKH
 }
 
+function readCompactSize(bytes: Uint8Array, offset: number): { value: number; bytesRead: number } | null {
+  if (offset >= bytes.length) return null;
+  const first = bytes[offset];
+  if (first < 0xfd) {
+    return { value: first, bytesRead: 1 };
+  }
+  if (first === 0xfd) {
+    if (offset + 3 > bytes.length) return null;
+    const value = bytes[offset + 1] | (bytes[offset + 2] << 8);
+    return { value, bytesRead: 3 };
+  }
+  if (first === 0xfe) {
+    if (offset + 5 > bytes.length) return null;
+    const value =
+      (bytes[offset + 1] |
+        (bytes[offset + 2] << 8) |
+        (bytes[offset + 3] << 16) |
+        (bytes[offset + 4] << 24)) >>>
+      0;
+    return { value, bytesRead: 5 };
+  }
+  // 0xff (uint64) — read lower 53-bit safe integer if within JS safe range
+  if (offset + 9 > bytes.length) return null;
+  let value = 0n;
+  for (let i = 0; i < 8; i += 1) {
+    value |= BigInt(bytes[offset + 1 + i]) << BigInt(i * 8);
+  }
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return { value: Number(value), bytesRead: 9 };
+}
+
+/**
+ * Lightweight zero-dependency BIP-174 / BIP-370 PSBT binary parser that extracts the exact
+ * input count from `PSBT_GLOBAL_UNSIGNED_TX` (key type 0x00) or `PSBT_GLOBAL_INPUT_COUNT` (0x04).
+ * Returns `null` if the payload is not a valid BIP-174 PSBT or has 0 inputs.
+ */
+export function parsePsbtInputCount(psbtHex: string): number | null {
+  const clean = psbtHex.trim().toLowerCase().replace(/^0x/, '');
+  if (!clean || clean.length % 2 !== 0 || !/^[0-9a-f]+$/.test(clean)) return null;
+  if (!clean.startsWith('70736274ff')) return null;
+
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < bytes.length; i += 1) {
+    bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+
+  let offset = 5; // skip 5-byte magic "psbt\xff"
+  let foundInputCount: number | null = null;
+
+  // Walk BIP-174 global key-value map until 0x00 separator
+  while (offset < bytes.length) {
+    const keyLen = readCompactSize(bytes, offset);
+    if (!keyLen) return null;
+    offset += keyLen.bytesRead;
+    if (keyLen.value === 0) {
+      break; // end of global map
+    }
+    if (offset + keyLen.value > bytes.length) return null;
+    const keyType = bytes[offset];
+    offset += keyLen.value;
+
+    const valLen = readCompactSize(bytes, offset);
+    if (!valLen) return null;
+    offset += valLen.bytesRead;
+    if (offset + valLen.value > bytes.length) return null;
+    const valStart = offset;
+    offset += valLen.value;
+
+    // 0x00 = PSBT_GLOBAL_UNSIGNED_TX (BIP-174 v0): 4-byte nVersion + CompactSize inputCount
+    if (keyType === 0x00 && keyLen.value === 1) {
+      if (valLen.value < 6) return null;
+      const inCount = readCompactSize(bytes, valStart + 4);
+      if (!inCount || inCount.value <= 0) return null;
+      foundInputCount = inCount.value;
+    } else if (keyType === 0x04 && keyLen.value === 1) {
+      // 0x04 = PSBT_GLOBAL_INPUT_COUNT (BIP-370 PSBT v2)
+      const inCount = readCompactSize(bytes, valStart);
+      if (!inCount || inCount.value <= 0) return null;
+      foundInputCount = inCount.value;
+    }
+  }
+
+  return foundInputCount;
+}
+
+export function buildBtcInputsToSign(
+  btcAddress: string,
+  psbtHex?: string,
+  fallbackCount = 1
+): {
+  inputCount: number;
+  inputsToSign: Array<{ address: string; signingIndexes: number[] }>;
+} {
+  const parsedCount = psbtHex ? parsePsbtInputCount(psbtHex) : null;
+  const inputCount = parsedCount && parsedCount > 0 ? parsedCount : Math.max(1, fallbackCount);
+  const signingIndexes = Array.from({ length: inputCount }, (_, idx) => idx);
+  return {
+    inputCount,
+    inputsToSign: [{ address: btcAddress, signingIndexes }],
+  };
+}
+
 export function classifyBtcUtxos(params: {
   utxos: MempoolUtxo[];
   address: string;
@@ -151,6 +254,198 @@ export function classifyBtcUtxos(params: {
     protectedSats,
     spendableFeeSats,
     spendableFeeUsd,
+  };
+}
+
+export async function prepareBtcDirectBatch(
+  params: Parameters<NonNullable<ChainFamilyAdapter['prepareDirectBatch']>>[0] & {
+    fetcher?: RouteAuctionFetcher;
+  }
+): Promise<PreparedNonEvmBatch> {
+  const outputAsset = params.outputAsset ?? 'USDC';
+  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+  const solanaUsdcAtaBytes32 = solanaAddressToBytes32(params.solanaDestination);
+  const sweepable = filterChainSweepableAssets('btc', params.assets);
+
+  const calls: PreparedNonEvmCall[] = [];
+  const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
+  const skippedAssets: PreparedNonEvmBatch['skippedAssets'] = [];
+  const notes: string[] = [];
+  let maxSeconds = 600;
+  let liveExecutable = false;
+
+  for (const asset of sweepable) {
+    const utxoCountMatch = asset.defiPositionType?.match(/^utxos:(\d+)$/);
+    const fallbackUtxoCount = utxoCountMatch ? Math.max(1, Number(utxoCountMatch[1])) : 1;
+
+    // 1. Primary: Live Relay Bitcoin quote -> returns REAL ready-to-sign BIP-174 hex PSBT!
+    const relayQuote =
+      params.bridgePreference !== 'lifi'
+        ? await quoteRelayNonEvm({
+            originChainId: RELAY_BITCOIN_CHAIN_ID,
+            originCurrency: RELAY_BTC_NATIVE_CURRENCY,
+            amountRaw: asset.rawBalance,
+            userAddress: params.userAddress,
+            solanaDestination: params.solanaDestination,
+            outputAsset,
+            protocolFeeBps: feeCfg.feeBps,
+            fetcher: params.fetcher,
+          })
+        : null;
+
+    if (relayQuote) {
+      const haircut = checkQuoteHaircutPass({
+        grossUsd: asset.grossUsd,
+        quotedOutUsd: relayQuote.quotedOutUsd,
+        estimatedGasUsd: relayQuote.estimatedGasUsd,
+        allowHighCost: params.allowHighCost,
+      });
+      if (!haircut.passed) {
+        skippedAssets.push({ assetId: asset.id, assetSymbol: asset.symbol, reason: haircut.reason });
+        continue;
+      }
+      maxSeconds = Math.max(maxSeconds, relayQuote.estimatedSeconds);
+      for (const step of relayQuote.steps) {
+        const psbtHex = typeof step.data.psbt === 'string' ? step.data.psbt : undefined;
+        if (psbtHex) liveExecutable = true;
+        const { inputCount, inputsToSign } = buildBtcInputsToSign(
+          params.userAddress,
+          psbtHex,
+          fallbackUtxoCount
+        );
+        calls.push({
+          stepId: `btc_relay_${step.id}`,
+          assetId: asset.id,
+          assetSymbol: asset.symbol,
+          action: asset.action,
+          provider: 'relay',
+          label: `Sign Bitcoin PSBT → ${relayQuote.estimatedOutputUi} (Relay)`,
+          description: step.description,
+          nativePayload: {
+            standard: 'PSBT-BIP174',
+            psbtHex,
+            inputCount,
+            inputsToSign,
+            depositAddress: step.data.depositAddress,
+            amountSats: asset.rawBalance,
+            requestId: relayQuote.requestId,
+            solanaDestination: params.solanaDestination,
+          },
+        });
+      }
+      bridgeTrackers.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        provider: 'relay',
+        requestId: relayQuote.requestId,
+        estimatedOutput: relayQuote.estimatedOutputUi,
+        estimatedSeconds: relayQuote.estimatedSeconds,
+      });
+      continue;
+    }
+
+    // 2. Fallback: Live LI.FI UTXO quote
+    const lifiQuote = await quoteLifiNonEvm({
+      fromChainId: LIFI_BITCOIN_CHAIN_ID,
+      fromToken: 'bitcoin',
+      fromAmount: asset.rawBalance,
+      fromAddress: params.userAddress,
+      solanaDestination: params.solanaDestination,
+      outputAsset,
+      fetcher: params.fetcher,
+    });
+
+    if (lifiQuote) {
+      const haircut = checkQuoteHaircutPass({
+        grossUsd: asset.grossUsd,
+        quotedOutUsd: lifiQuote.quotedOutUsd,
+        estimatedGasUsd: lifiQuote.estimatedGasUsd,
+        allowHighCost: params.allowHighCost,
+      });
+      if (!haircut.passed) {
+        skippedAssets.push({ assetId: asset.id, assetSymbol: asset.symbol, reason: haircut.reason });
+        continue;
+      }
+      if (lifiQuote.liveExecutable) liveExecutable = true;
+      maxSeconds = Math.max(maxSeconds, lifiQuote.estimatedSeconds);
+      const { inputCount, inputsToSign } = buildBtcInputsToSign(
+        params.userAddress,
+        undefined,
+        fallbackUtxoCount
+      );
+      calls.push({
+        stepId: 'btc_lifi_deposit',
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        action: asset.action,
+        provider: 'lifi',
+        label: `Convert ${asset.uiBalance} BTC → ${lifiQuote.estimatedOutputUi} (${lifiQuote.tool})`,
+        description: `Live LI.FI UTXO swap to Solana ${outputAsset}`,
+        nativePayload: {
+          standard: 'PSBT-BIP174',
+          transactionRequest: lifiQuote.transactionRequest,
+          inputCount,
+          inputsToSign,
+          amountSats: asset.rawBalance,
+          solanaDestination: params.solanaDestination,
+        },
+      });
+      bridgeTrackers.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        provider: 'lifi',
+        requestId: lifiQuote.requestId,
+        estimatedOutput: lifiQuote.estimatedOutputUi,
+        estimatedSeconds: lifiQuote.estimatedSeconds,
+      });
+    } else {
+      skippedAssets.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        reason: 'No live Bitcoin → Solana PSBT quote returned (check amount vs bridge minimum).',
+      });
+    }
+  }
+
+  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+  const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+  if (liveExecutable) {
+    notes.push('Live BIP-174 PSBT assembled — sign once in UniSat, Xverse, or Phantom (Bitcoin) to convert directly to Solana.');
+  }
+
+  return {
+    family: 'btc',
+    chain: 'btc',
+    chainId: 'bitcoin-mainnet',
+    chainName: 'Bitcoin',
+    explorerUrl: 'https://mempool.space',
+    userAddress: params.userAddress,
+    solanaDestination: params.solanaDestination,
+    solanaUsdcAtaBytes32,
+    outputAsset,
+    executionKind: 'btc_psbt',
+    signingStandard: 'BIP-174 PSBT (UniSat / Xverse / Phantom Bitcoin)',
+    liveExecutable,
+    calls,
+    bridgeTrackers,
+    skippedAssets,
+    savings: {
+      totalCalls: calls.length,
+      walletPopupsBatched: calls.length ? 1 : 0,
+      walletPopupsLegacy: calls.length,
+      popupsSaved: Math.max(0, calls.length - 1),
+    },
+    feeBreakdown: {
+      feeBps: feeCfg.feeBps,
+      feePercent: feeCfg.feePercent,
+      feeRecipient: `siphon:${feeCfg.feeBps}bps`,
+      collectionMethod: 'relay_psbt_or_affiliate_bps',
+      estimatedFeeUsd,
+    },
+    estimatedSeconds: maxSeconds,
+    gaslessAvailable: true,
+    gaslessMechanism: 'Miner fee deducted directly from UTXO output (no separate gas token needed)',
+    notes,
   };
 }
 
@@ -354,172 +649,7 @@ export const btcAdapter: ChainFamilyAdapter = {
   },
 
   async prepareDirectBatch(params): Promise<PreparedNonEvmBatch> {
-    const outputAsset = params.outputAsset ?? 'USDC';
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
-    const solanaUsdcAtaBytes32 = solanaAddressToBytes32(params.solanaDestination);
-    const sweepable = filterChainSweepableAssets('btc', params.assets);
-
-    const calls: PreparedNonEvmCall[] = [];
-    const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
-    const skippedAssets: PreparedNonEvmBatch['skippedAssets'] = [];
-    const notes: string[] = [];
-    let maxSeconds = 600;
-    let liveExecutable = false;
-
-    for (const asset of sweepable) {
-      // 1. Primary: Live Relay Bitcoin quote -> returns REAL ready-to-sign BIP-174 hex PSBT!
-      const relayQuote =
-        params.bridgePreference !== 'lifi'
-          ? await quoteRelayNonEvm({
-              originChainId: RELAY_BITCOIN_CHAIN_ID,
-              originCurrency: RELAY_BTC_NATIVE_CURRENCY,
-              amountRaw: asset.rawBalance,
-              userAddress: params.userAddress,
-              solanaDestination: params.solanaDestination,
-              outputAsset,
-              protocolFeeBps: feeCfg.feeBps,
-            })
-          : null;
-
-      if (relayQuote) {
-        const haircut = checkQuoteHaircutPass({
-          grossUsd: asset.grossUsd,
-          quotedOutUsd: relayQuote.quotedOutUsd,
-          estimatedGasUsd: relayQuote.estimatedGasUsd,
-          allowHighCost: params.allowHighCost,
-        });
-        if (!haircut.passed) {
-          skippedAssets.push({ assetId: asset.id, assetSymbol: asset.symbol, reason: haircut.reason });
-          continue;
-        }
-        maxSeconds = Math.max(maxSeconds, relayQuote.estimatedSeconds);
-        for (const step of relayQuote.steps) {
-          const psbtHex = typeof step.data.psbt === 'string' ? step.data.psbt : undefined;
-          if (psbtHex) liveExecutable = true;
-          calls.push({
-            stepId: `btc_relay_${step.id}`,
-            assetId: asset.id,
-            assetSymbol: asset.symbol,
-            action: asset.action,
-            provider: 'relay',
-            label: `Sign Bitcoin PSBT → ${relayQuote.estimatedOutputUi} (Relay)`,
-            description: step.description,
-            nativePayload: {
-              standard: 'PSBT-BIP174',
-              psbtHex,
-              depositAddress: step.data.depositAddress,
-              amountSats: asset.rawBalance,
-              requestId: relayQuote.requestId,
-              solanaDestination: params.solanaDestination,
-            },
-          });
-        }
-        bridgeTrackers.push({
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          provider: 'relay',
-          requestId: relayQuote.requestId,
-          estimatedOutput: relayQuote.estimatedOutputUi,
-          estimatedSeconds: relayQuote.estimatedSeconds,
-        });
-        continue;
-      }
-
-      // 2. Fallback: Live LI.FI UTXO quote
-      const lifiQuote = await quoteLifiNonEvm({
-        fromChainId: LIFI_BITCOIN_CHAIN_ID,
-        fromToken: 'bitcoin',
-        fromAmount: asset.rawBalance,
-        fromAddress: params.userAddress,
-        solanaDestination: params.solanaDestination,
-        outputAsset,
-      });
-
-      if (lifiQuote) {
-        const haircut = checkQuoteHaircutPass({
-          grossUsd: asset.grossUsd,
-          quotedOutUsd: lifiQuote.quotedOutUsd,
-          estimatedGasUsd: lifiQuote.estimatedGasUsd,
-          allowHighCost: params.allowHighCost,
-        });
-        if (!haircut.passed) {
-          skippedAssets.push({ assetId: asset.id, assetSymbol: asset.symbol, reason: haircut.reason });
-          continue;
-        }
-        if (lifiQuote.liveExecutable) liveExecutable = true;
-        maxSeconds = Math.max(maxSeconds, lifiQuote.estimatedSeconds);
-        calls.push({
-          stepId: 'btc_lifi_deposit',
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          action: asset.action,
-          provider: 'lifi',
-          label: `Convert ${asset.uiBalance} BTC → ${lifiQuote.estimatedOutputUi} (${lifiQuote.tool})`,
-          description: `Live LI.FI UTXO swap to Solana ${outputAsset}`,
-          nativePayload: {
-            standard: 'PSBT-BIP174',
-            transactionRequest: lifiQuote.transactionRequest,
-            amountSats: asset.rawBalance,
-            solanaDestination: params.solanaDestination,
-          },
-        });
-        bridgeTrackers.push({
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          provider: 'lifi',
-          requestId: lifiQuote.requestId,
-          estimatedOutput: lifiQuote.estimatedOutputUi,
-          estimatedSeconds: lifiQuote.estimatedSeconds,
-        });
-      } else {
-        skippedAssets.push({
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          reason: 'No live Bitcoin → Solana PSBT quote returned (check amount vs bridge minimum).',
-        });
-      }
-    }
-
-    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
-    if (liveExecutable) {
-      notes.push('Live BIP-174 PSBT assembled — sign once in UniSat, Xverse, or Phantom (Bitcoin) to convert directly to Solana.');
-    }
-
-    return {
-      family: 'btc',
-      chain: 'btc',
-      chainId: 'bitcoin-mainnet',
-      chainName: 'Bitcoin',
-      explorerUrl: 'https://mempool.space',
-      userAddress: params.userAddress,
-      solanaDestination: params.solanaDestination,
-      solanaUsdcAtaBytes32,
-      outputAsset,
-      executionKind: 'btc_psbt',
-      signingStandard: 'BIP-174 PSBT (UniSat / Xverse / Phantom Bitcoin)',
-      liveExecutable,
-      calls,
-      bridgeTrackers,
-      skippedAssets,
-      savings: {
-        totalCalls: calls.length,
-        walletPopupsBatched: calls.length ? 1 : 0,
-        walletPopupsLegacy: calls.length,
-        popupsSaved: Math.max(0, calls.length - 1),
-      },
-      feeBreakdown: {
-        feeBps: feeCfg.feeBps,
-        feePercent: feeCfg.feePercent,
-        feeRecipient: `siphon:${feeCfg.feeBps}bps`,
-        collectionMethod: 'relay_psbt_or_affiliate_bps',
-        estimatedFeeUsd,
-      },
-      estimatedSeconds: maxSeconds,
-      gaslessAvailable: true,
-      gaslessMechanism: 'Miner fee deducted directly from UTXO output (no separate gas token needed)',
-      notes,
-    };
+    return prepareBtcDirectBatch(params);
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {

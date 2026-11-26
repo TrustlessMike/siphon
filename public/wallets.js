@@ -3733,6 +3733,663 @@ export async function signFamilyGaslessIntent(family, intent, opts = {}) {
   throw new Error(`Unsupported signing family: ${family}`);
 }
 
+// =========================================================================
+// BITCOIN BIP-174 PSBT PARSER, FINALIZED TX EXTRACTOR & BROADCAST HELPERS
+// =========================================================================
+
+function hexToUint8(hex) {
+  const clean = String(hex || '').trim().toLowerCase().replace(/^0x/, '');
+  if (!clean || clean.length % 2 !== 0 || !/^[0-9a-f]+$/.test(clean)) return null;
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i += 1) {
+    out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+function uint8ToHex(bytes) {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    out += bytes[i].toString(16).padStart(2, '0');
+  }
+  return out;
+}
+
+function uint8ToBase64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return btoa(bin);
+}
+
+function base64ToUint8(b64) {
+  const clean = String(b64 || '').trim();
+  if (!clean) return null;
+  try {
+    const bin = atob(clean);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) {
+      out[i] = bin.charCodeAt(i);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+function toPsbtBytes(input) {
+  if (input instanceof Uint8Array) return input;
+  if (ArrayBuffer.isView(input)) {
+    return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+  }
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    const asHex = hexToUint8(trimmed);
+    if (asHex) return asHex;
+    const asB64 = base64ToUint8(trimmed);
+    if (asB64) return asB64;
+  }
+  return null;
+}
+
+function hasPsbtMagic(bytes) {
+  return (
+    bytes &&
+    bytes.length >= 5 &&
+    bytes[0] === 0x70 &&
+    bytes[1] === 0x73 &&
+    bytes[2] === 0x62 &&
+    bytes[3] === 0x74 &&
+    bytes[4] === 0xff
+  );
+}
+
+function readBtcCompactSize(bytes, offset) {
+  if (!bytes || offset >= bytes.length) return null;
+  const first = bytes[offset];
+  if (first < 0xfd) return { value: first, bytesRead: 1 };
+  if (first === 0xfd) {
+    if (offset + 3 > bytes.length) return null;
+    return { value: bytes[offset + 1] | (bytes[offset + 2] << 8), bytesRead: 3 };
+  }
+  if (first === 0xfe) {
+    if (offset + 5 > bytes.length) return null;
+    return {
+      value:
+        (bytes[offset + 1] |
+          (bytes[offset + 2] << 8) |
+          (bytes[offset + 3] << 16) |
+          (bytes[offset + 4] << 24)) >>>
+        0,
+      bytesRead: 5,
+    };
+  }
+  if (offset + 9 > bytes.length) return null;
+  let val = 0n;
+  for (let i = 0; i < 8; i += 1) {
+    val |= BigInt(bytes[offset + 1 + i]) << BigInt(i * 8);
+  }
+  if (val > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return { value: Number(val), bytesRead: 9 };
+}
+
+function writeBtcCompactSize(n) {
+  if (n < 0xfd) return Uint8Array.of(n);
+  if (n <= 0xffff) return Uint8Array.of(0xfd, n & 0xff, (n >> 8) & 0xff);
+  return Uint8Array.of(0xfe, n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff);
+}
+
+function concatUint8(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (const c of chunks) {
+    out.set(c, pos);
+    pos += c.length;
+  }
+  return out;
+}
+
+/**
+ * Lightweight zero-dependency BIP-174 / BIP-370 PSBT input counter.
+ * Parses `PSBT_GLOBAL_UNSIGNED_TX` (0x00) or `PSBT_GLOBAL_INPUT_COUNT` (0x04).
+ */
+export function parsePsbtInputCount(psbtInput) {
+  const bytes = toPsbtBytes(psbtInput);
+  if (!hasPsbtMagic(bytes)) return null;
+  let offset = 5;
+  let found = null;
+  while (offset < bytes.length) {
+    const keyLen = readBtcCompactSize(bytes, offset);
+    if (!keyLen) return null;
+    offset += keyLen.bytesRead;
+    if (keyLen.value === 0) break;
+    if (offset + keyLen.value > bytes.length) return null;
+    const keyType = bytes[offset];
+    offset += keyLen.value;
+
+    const valLen = readBtcCompactSize(bytes, offset);
+    if (!valLen) return null;
+    offset += valLen.bytesRead;
+    if (offset + valLen.value > bytes.length) return null;
+    const valStart = offset;
+    offset += valLen.value;
+
+    if (keyType === 0x00 && keyLen.value === 1) {
+      if (valLen.value < 6) return null;
+      const inCount = readBtcCompactSize(bytes, valStart + 4);
+      if (!inCount || inCount.value <= 0) return null;
+      found = inCount.value;
+    } else if (keyType === 0x04 && keyLen.value === 1) {
+      const inCount = readBtcCompactSize(bytes, valStart);
+      if (!inCount || inCount.value <= 0) return null;
+      found = inCount.value;
+    }
+  }
+  return found;
+}
+
+/**
+ * Extracts a finalized raw Bitcoin transaction hex from a finalized BIP-174 PSBT.
+ * Returns `null` if ANY input lacks both `PSBT_IN_FINAL_SCRIPTSIG` (0x07) and
+ * `PSBT_IN_FINAL_SCRIPTWITNESS` (0x08) — i.e. the PSBT is unfinalized.
+ */
+export function extractFinalizedTxFromPsbt(psbtInput) {
+  const bytes = toPsbtBytes(psbtInput);
+  if (!hasPsbtMagic(bytes)) return null;
+
+  let offset = 5;
+  let unsignedTx = null;
+  while (offset < bytes.length) {
+    const keyLen = readBtcCompactSize(bytes, offset);
+    if (!keyLen) return null;
+    offset += keyLen.bytesRead;
+    if (keyLen.value === 0) break;
+    if (offset + keyLen.value > bytes.length) return null;
+    const keyType = bytes[offset];
+    offset += keyLen.value;
+
+    const valLen = readBtcCompactSize(bytes, offset);
+    if (!valLen) return null;
+    offset += valLen.bytesRead;
+    if (offset + valLen.value > bytes.length) return null;
+    if (keyType === 0x00 && keyLen.value === 1) {
+      unsignedTx = bytes.subarray(offset, offset + valLen.value);
+    }
+    offset += valLen.value;
+  }
+  if (!unsignedTx || unsignedTx.length < 10) return null;
+
+  // Parse non-witness unsigned Bitcoin transaction
+  let txOff = 0;
+  const version = unsignedTx.subarray(0, 4);
+  txOff = 4;
+  const inCountRes = readBtcCompactSize(unsignedTx, txOff);
+  if (!inCountRes || inCountRes.value <= 0) return null;
+  txOff += inCountRes.bytesRead;
+  const inCount = inCountRes.value;
+
+  const inputs = [];
+  for (let i = 0; i < inCount; i += 1) {
+    if (txOff + 36 > unsignedTx.length) return null;
+    const prevOut = unsignedTx.subarray(txOff, txOff + 36);
+    txOff += 36;
+    const scriptLenRes = readBtcCompactSize(unsignedTx, txOff);
+    if (!scriptLenRes) return null;
+    txOff += scriptLenRes.bytesRead + scriptLenRes.value;
+    if (txOff + 4 > unsignedTx.length) return null;
+    const sequence = unsignedTx.subarray(txOff, txOff + 4);
+    txOff += 4;
+    inputs.push({ prevOut, sequence });
+  }
+
+  const outputsStart = txOff;
+  const outCountRes = readBtcCompactSize(unsignedTx, txOff);
+  if (!outCountRes) return null;
+  txOff += outCountRes.bytesRead;
+  for (let o = 0; o < outCountRes.value; o += 1) {
+    if (txOff + 8 > unsignedTx.length) return null;
+    txOff += 8;
+    const pkLenRes = readBtcCompactSize(unsignedTx, txOff);
+    if (!pkLenRes) return null;
+    txOff += pkLenRes.bytesRead + pkLenRes.value;
+  }
+  if (txOff + 4 !== unsignedTx.length) return null;
+  const outputsSection = unsignedTx.subarray(outputsStart, txOff);
+  const lockTime = unsignedTx.subarray(txOff, txOff + 4);
+
+  // Walk each PSBT input map for finalScriptSig (0x07) and finalScriptWitness (0x08)
+  const finalInputs = [];
+  let hasWitness = false;
+  for (let i = 0; i < inCount; i += 1) {
+    let finalScriptSig = null;
+    let finalScriptWitness = null;
+    while (offset < bytes.length) {
+      const keyLen = readBtcCompactSize(bytes, offset);
+      if (!keyLen) return null;
+      offset += keyLen.bytesRead;
+      if (keyLen.value === 0) break;
+      if (offset + keyLen.value > bytes.length) return null;
+      const keyType = bytes[offset];
+      offset += keyLen.value;
+
+      const valLen = readBtcCompactSize(bytes, offset);
+      if (!valLen) return null;
+      offset += valLen.bytesRead;
+      if (offset + valLen.value > bytes.length) return null;
+      if (keyType === 0x07 && keyLen.value === 1) {
+        finalScriptSig = bytes.subarray(offset, offset + valLen.value);
+      } else if (keyType === 0x08 && keyLen.value === 1) {
+        finalScriptWitness = bytes.subarray(offset, offset + valLen.value);
+        hasWitness = true;
+      }
+      offset += valLen.value;
+    }
+    if (!finalScriptSig && !finalScriptWitness) {
+      return null; // Unfinalized input!
+    }
+    finalInputs.push({
+      scriptSig: finalScriptSig || new Uint8Array(0),
+      witness: finalScriptWitness,
+    });
+  }
+
+  const parts = [version];
+  if (hasWitness) parts.push(Uint8Array.of(0x00, 0x01));
+  parts.push(writeBtcCompactSize(inCount));
+  for (let i = 0; i < inCount; i += 1) {
+    parts.push(inputs[i].prevOut);
+    parts.push(writeBtcCompactSize(finalInputs[i].scriptSig.length));
+    if (finalInputs[i].scriptSig.length > 0) parts.push(finalInputs[i].scriptSig);
+    parts.push(inputs[i].sequence);
+  }
+  parts.push(outputsSection);
+  if (hasWitness) {
+    for (let i = 0; i < inCount; i += 1) {
+      parts.push(finalInputs[i].witness || Uint8Array.of(0x00));
+    }
+  }
+  parts.push(lockTime);
+  return uint8ToHex(concatUint8(parts));
+}
+
+async function broadcastBtcRawTxHex(rawTxHex, fetchFn = fetch) {
+  const clean = String(rawTxHex || '').trim().toLowerCase().replace(/^0x/, '');
+  if (!clean || clean.length < 120 || clean.length % 2 !== 0 || !/^[0-9a-f]+$/.test(clean)) {
+    throw new Error('Cannot broadcast Bitcoin transaction: invalid or truncated raw transaction hex.');
+  }
+  if (clean.startsWith('70736274ff')) {
+    throw new Error('Cannot broadcast unfinalized BIP-174 PSBT directly to mempool.space.');
+  }
+  const res = await fetchFn('https://mempool.space/api/tx', {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: clean,
+  });
+  const text = (await res.text()).trim();
+  if (!res.ok) {
+    throw new Error(`Bitcoin broadcast via mempool.space failed (HTTP ${res.status}): ${text || 'rejected'}`);
+  }
+  if (!/^[0-9a-f]{64}$/i.test(text)) {
+    throw new Error(`Bitcoin broadcast returned unexpected response instead of 64-hex txid: ${text.slice(0, 80)}`);
+  }
+  return text;
+}
+
+// =========================================================================
+// COSMOS AMINO MAPPING, LIVE ACCOUNT LOOKUP, PROTOBUF TXRAW & BROADCAST
+// =========================================================================
+
+export const COSMOS_PROTO_TO_AMINO_TYPE = {
+  '/ibc.applications.transfer.v1.MsgTransfer': 'cosmos-sdk/MsgTransfer',
+  '/cosmos.bank.v1beta1.MsgSend': 'cosmos-sdk/MsgSend',
+  '/cosmwasm.wasm.v1.MsgExecuteContract': 'wasm/MsgExecuteContract',
+  '/circle.cctp.v1.MsgDepositForBurn': 'cctp/MsgDepositForBurn',
+  '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward': 'cosmos-sdk/MsgWithdrawDelegationReward',
+  '/cosmos.staking.v1beta1.MsgDelegate': 'cosmos-sdk/MsgDelegate',
+  '/cosmos.staking.v1beta1.MsgUndelegate': 'cosmos-sdk/MsgUndelegate',
+};
+
+export function convertCosmosProtoMsgToAmino(msg) {
+  const rawType = String(msg?.msg_type_url || msg?.typeUrl || msg?.type || '').trim();
+  if (!rawType) {
+    throw new Error('Cosmos message is missing msg_type_url / type.');
+  }
+  const parsedVal =
+    typeof msg?.msg === 'string'
+      ? JSON.parse(msg.msg)
+      : msg?.msg && typeof msg.msg === 'object'
+      ? { ...msg.msg }
+      : msg?.value && typeof msg.value === 'object'
+      ? { ...msg.value }
+      : {};
+
+  if (!rawType.startsWith('/')) {
+    return { type: rawType, value: parsedVal };
+  }
+
+  const aminoType = COSMOS_PROTO_TO_AMINO_TYPE[rawType];
+  if (!aminoType) {
+    throw new Error(
+      `Unsupported Cosmos protobuf message "${rawType}" for Amino signing. Provide protobuf bodyBytes/authInfoBytes for signDirect.`
+    );
+  }
+
+  // Amino wasm/MsgExecuteContract expects `msg` as a parsed JSON object (not string/base64)
+  if (rawType === '/cosmwasm.wasm.v1.MsgExecuteContract' && typeof parsedVal.msg === 'string') {
+    try {
+      parsedVal.msg = JSON.parse(parsedVal.msg);
+    } catch {
+      try {
+        const decoded = new TextDecoder().decode(base64ToUint8(parsedVal.msg) || new Uint8Array());
+        parsedVal.msg = JSON.parse(decoded);
+      } catch {
+        // leave as string if already raw
+      }
+    }
+  }
+
+  return { type: aminoType, value: parsedVal };
+}
+
+export function extractCosmosAccountFromLcdResponse(json) {
+  if (!json || typeof json !== 'object') return null;
+  const account = json.account && typeof json.account === 'object' ? json.account : json;
+  const candidates = [account];
+  if (account.base_account && typeof account.base_account === 'object') {
+    candidates.push(account.base_account);
+  }
+  if (account.base_vesting_account && typeof account.base_vesting_account === 'object') {
+    candidates.push(account.base_vesting_account);
+    if (account.base_vesting_account.base_account && typeof account.base_vesting_account.base_account === 'object') {
+      candidates.push(account.base_vesting_account.base_account);
+    }
+  }
+  for (const c of candidates) {
+    if (c?.account_number !== undefined && c?.account_number !== null && c?.sequence !== undefined && c?.sequence !== null) {
+      const accountNumber = String(c.account_number).trim();
+      const sequence = String(c.sequence).trim();
+      if (/^\d+$/.test(accountNumber) && /^\d+$/.test(sequence)) {
+        return { accountNumber, sequence };
+      }
+    }
+  }
+  return null;
+}
+
+export async function fetchCosmosAccountFromLcds(lcdUrls, signerAddr, fetchFn = fetch) {
+  const urls = (Array.isArray(lcdUrls) ? lcdUrls : []).map((u) => String(u || '').trim()).filter(Boolean);
+  if (!urls.length) {
+    throw new Error(
+      `Cannot fetch live Cosmos account_number/sequence for ${signerAddr}: no LCD endpoints configured (refusing to sign with fake 0/0).`
+    );
+  }
+  let lastErr = '';
+  for (const base of urls) {
+    try {
+      const res = await fetchFn(
+        `${base.replace(/\/$/, '')}/cosmos/auth/v1beta1/accounts/${encodeURIComponent(signerAddr)}`,
+        { headers: { Accept: 'application/json' } }
+      );
+      if (!res.ok) {
+        lastErr = `${base} returned HTTP ${res.status}`;
+        continue;
+      }
+      const json = await res.json();
+      const parsed = extractCosmosAccountFromLcdResponse(json);
+      if (parsed) {
+        return { ...parsed, lcdUrl: base };
+      }
+      lastErr = `${base} returned unrecognized account schema`;
+    } catch (err) {
+      lastErr = err?.message || String(err);
+    }
+  }
+  throw new Error(
+    `Failed to fetch live Cosmos account_number/sequence for ${signerAddr} from chain LCD (${lastErr || 'unreachable'}). Verify the account is funded on-chain and retry — Siphon refuses to sign with placeholder 0/0.`
+  );
+}
+
+// Minimal zero-dependency Cosmos Protobuf wire encoder for TxRaw / TxBody / AuthInfo / core messages
+function pbVarint(val) {
+  let n = typeof val === 'bigint' ? val : BigInt(val);
+  if (n < 0n) n = 0n;
+  const out = [];
+  while (n >= 0x80n) {
+    out.push(Number((n & 0x7fn) | 0x80n));
+    n >>= 7n;
+  }
+  out.push(Number(n));
+  return new Uint8Array(out);
+}
+
+function pbTag(fieldNumber, wireType) {
+  return pbVarint((fieldNumber << 3) | wireType);
+}
+
+function pbBytes(fieldNumber, bytes) {
+  if (!bytes || !bytes.length) return new Uint8Array(0);
+  return concatUint8([pbTag(fieldNumber, 2), pbVarint(bytes.length), bytes]);
+}
+
+function pbString(fieldNumber, str) {
+  if (!str) return new Uint8Array(0);
+  return pbBytes(fieldNumber, new TextEncoder().encode(String(str)));
+}
+
+function pbUint64(fieldNumber, val) {
+  const n = typeof val === 'bigint' ? val : BigInt(val || 0);
+  if (n === 0n) return new Uint8Array(0);
+  return concatUint8([pbTag(fieldNumber, 0), pbVarint(n)]);
+}
+
+function encodeCosmosCoinProto(coin) {
+  if (!coin) return new Uint8Array(0);
+  return concatUint8([pbString(1, coin.denom || ''), pbString(2, String(coin.amount || '0'))]);
+}
+
+function encodeCosmosAnyProto(typeUrl, valueBytes) {
+  return concatUint8([pbString(1, typeUrl), pbBytes(2, valueBytes)]);
+}
+
+function encodeCosmosMsgToProtoAny(rawMsg) {
+  const typeUrl = String(rawMsg?.msg_type_url || rawMsg?.typeUrl || '').trim();
+  const val =
+    typeof rawMsg?.msg === 'string'
+      ? JSON.parse(rawMsg.msg)
+      : rawMsg?.msg && typeof rawMsg.msg === 'object'
+      ? rawMsg.msg
+      : rawMsg?.value || {};
+
+  if (typeUrl === '/cosmos.bank.v1beta1.MsgSend') {
+    const coins = Array.isArray(val.amount) ? val.amount : [];
+    const body = concatUint8([
+      pbString(1, val.from_address || val.fromAddress || ''),
+      pbString(2, val.to_address || val.toAddress || ''),
+      ...coins.map((c) => pbBytes(3, encodeCosmosCoinProto(c))),
+    ]);
+    return encodeCosmosAnyProto(typeUrl, body);
+  }
+
+  if (typeUrl === '/ibc.applications.transfer.v1.MsgTransfer') {
+    const th = val.timeout_height || val.timeoutHeight;
+    const thBytes =
+      th && (th.revision_number || th.revision_height || th.revisionNumber || th.revisionHeight)
+        ? concatUint8([
+            pbUint64(1, th.revision_number || th.revisionNumber || 0),
+            pbUint64(2, th.revision_height || th.revisionHeight || 0),
+          ])
+        : new Uint8Array(0);
+    const body = concatUint8([
+      pbString(1, val.source_port || val.sourcePort || 'transfer'),
+      pbString(2, val.source_channel || val.sourceChannel || ''),
+      val.token ? pbBytes(3, encodeCosmosCoinProto(val.token)) : new Uint8Array(0),
+      pbString(4, val.sender || ''),
+      pbString(5, val.receiver || ''),
+      thBytes.length ? pbBytes(6, thBytes) : new Uint8Array(0),
+      pbUint64(7, val.timeout_timestamp || val.timeoutTimestamp || 0),
+      pbString(8, val.memo || ''),
+    ]);
+    return encodeCosmosAnyProto(typeUrl, body);
+  }
+
+  if (typeUrl === '/cosmwasm.wasm.v1.MsgExecuteContract') {
+    const msgJsonBytes =
+      typeof val.msg === 'string'
+        ? new TextEncoder().encode(val.msg)
+        : new TextEncoder().encode(JSON.stringify(val.msg || {}));
+    const funds = Array.isArray(val.funds) ? val.funds : [];
+    const body = concatUint8([
+      pbString(1, val.sender || ''),
+      pbString(2, val.contract || ''),
+      pbBytes(3, msgJsonBytes),
+      ...funds.map((c) => pbBytes(5, encodeCosmosCoinProto(c))),
+    ]);
+    return encodeCosmosAnyProto(typeUrl, body);
+  }
+
+  if (typeUrl === '/circle.cctp.v1.MsgDepositForBurn') {
+    const mintRecipient = val.mint_recipient || val.mintRecipient || '';
+    const recipientBytes =
+      typeof mintRecipient === 'string' && /^0x?[0-9a-f]{64}$/i.test(mintRecipient)
+        ? hexToUint8(mintRecipient)
+        : base64ToUint8(mintRecipient) || new Uint8Array(0);
+    const body = concatUint8([
+      pbString(1, val.from || ''),
+      pbString(2, String(val.amount || '0')),
+      pbUint64(3, val.destination_domain ?? val.destinationDomain ?? 5),
+      pbBytes(4, recipientBytes),
+      pbString(5, val.burn_token || val.burnToken || 'uusdc'),
+    ]);
+    return encodeCosmosAnyProto(typeUrl, body);
+  }
+
+  if (typeUrl === '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward') {
+    const body = concatUint8([
+      pbString(1, val.delegator_address || val.delegatorAddress || ''),
+      pbString(2, val.validator_address || val.validatorAddress || ''),
+    ]);
+    return encodeCosmosAnyProto(typeUrl, body);
+  }
+
+  // Generic UTF-8 JSON fallback value bytes for any other typeUrl
+  return encodeCosmosAnyProto(typeUrl, new TextEncoder().encode(JSON.stringify(val)));
+}
+
+export function encodeCosmosTxRaw({ bodyBytes, authInfoBytes, signatureBytes }) {
+  return concatUint8([
+    pbBytes(1, bodyBytes),
+    pbBytes(2, authInfoBytes),
+    pbBytes(3, signatureBytes),
+  ]);
+}
+
+export function encodeCosmosAminoSignedTxRaw({ msgs, signedSignDoc, signatureObj }) {
+  const sigBytes = base64ToUint8(signatureObj?.signature || '');
+  if (!sigBytes || !sigBytes.length) {
+    throw new Error('Cosmos wallet returned an empty or invalid signature.');
+  }
+
+  // 1. TxBody
+  const encodedMsgs = msgs.map((m) => pbBytes(1, encodeCosmosMsgToProtoAny(m)));
+  const bodyBytes = concatUint8([
+    ...encodedMsgs,
+    pbString(2, signedSignDoc?.memo || ''),
+  ]);
+
+  // 2. AuthInfo (SIGN_MODE_LEGACY_AMINO_JSON = 127)
+  const pubKeyTypeRaw = String(signatureObj?.pub_key?.type || 'tendermint/PubKeySecp256k1');
+  const pubKeyProtoUrl = pubKeyTypeRaw.toLowerCase().includes('ethsecp256k1')
+    ? '/injective.crypto.v1beta1.ethsecp256k1.PubKey'
+    : '/cosmos.crypto.secp256k1.PubKey';
+  const pubKeyRawBytes = base64ToUint8(signatureObj?.pub_key?.value || '') || new Uint8Array(0);
+  const pubKeyAny = pubKeyRawBytes.length
+    ? encodeCosmosAnyProto(pubKeyProtoUrl, pbBytes(1, pubKeyRawBytes))
+    : new Uint8Array(0);
+
+  const singleMode = pbUint64(1, 127); // SIGN_MODE_LEGACY_AMINO_JSON
+  const modeInfo = pbBytes(1, singleMode);
+  const signerInfo = concatUint8([
+    pubKeyAny.length ? pbBytes(1, pubKeyAny) : new Uint8Array(0),
+    pbBytes(2, modeInfo),
+    pbUint64(3, signedSignDoc?.sequence || '0'),
+  ]);
+
+  const feeCoins = Array.isArray(signedSignDoc?.fee?.amount) ? signedSignDoc.fee.amount : [];
+  const feeProto = concatUint8([
+    ...feeCoins.map((c) => pbBytes(1, encodeCosmosCoinProto(c))),
+    pbUint64(2, signedSignDoc?.fee?.gas || '250000'),
+  ]);
+
+  const authInfoBytes = concatUint8([
+    pbBytes(1, signerInfo),
+    pbBytes(2, feeProto),
+  ]);
+
+  return encodeCosmosTxRaw({ bodyBytes, authInfoBytes, signatureBytes: sigBytes });
+}
+
+async function broadcastCosmosTxRaw({ prov, chainId, txRawBytes, lcdUrls, fetchFn = fetch }) {
+  // 1. Prefer Keplr/Leap native sendTx(chainId, txBytes, 'sync') when exposed
+  if (typeof prov?.sendTx === 'function') {
+    const sent = await prov.sendTx(chainId, txRawBytes, 'sync');
+    if (sent instanceof Uint8Array && sent.length > 0) {
+      return uint8ToHex(sent).toUpperCase();
+    }
+    if (typeof sent === 'string' && /^[0-9a-fA-F]{64}$/.test(sent.trim())) {
+      return sent.trim().toUpperCase();
+    }
+  }
+
+  // 2. Broadcast signed Protobuf TxRaw via chain LCD POST /cosmos/tx/v1beta1/txs
+  const urls = (Array.isArray(lcdUrls) ? lcdUrls : []).map((u) => String(u || '').trim()).filter(Boolean);
+  if (!urls.length) {
+    throw new Error(
+      `Cosmos transaction was signed on ${chainId}, but neither wallet.sendTx nor chain LCD URLs were available to broadcast it on-chain.`
+    );
+  }
+
+  const txBytesBase64 = uint8ToBase64(txRawBytes);
+  let lastErr = '';
+  for (const base of urls) {
+    let res;
+    try {
+      res = await fetchFn(`${base.replace(/\/$/, '')}/cosmos/tx/v1beta1/txs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          tx_bytes: txBytesBase64,
+          mode: 'BROADCAST_MODE_SYNC',
+        }),
+      });
+    } catch (err) {
+      lastErr = err?.message || String(err);
+      continue;
+    }
+
+    const json = await res.json().catch(() => null);
+    const txResp = json?.tx_response;
+    if (txResp) {
+      const code = Number(txResp.code ?? 0);
+      if (code !== 0) {
+        throw new Error(
+          `Cosmos on-chain broadcast rejected on ${chainId} (code ${code}): ${txResp.raw_log || 'CheckTx failed'}`
+        );
+      }
+      if (typeof txResp.txhash === 'string' && txResp.txhash.trim().length > 0) {
+        return txResp.txhash.trim();
+      }
+    }
+    lastErr = json?.message || `${base} returned HTTP ${res.status}`;
+  }
+
+  throw new Error(
+    `Cosmos transaction was signed on ${chainId}, but broadcast failed across all LCD endpoints (${lastErr || 'unreachable'}). Transaction was NOT submitted on-chain.`
+  );
+}
+
 /**
  * Executes a prepared direct non-EVM conversion batch (`PreparedNonEvmBatch`) using each
  * ecosystem's real native wallet signing & broadcast standard — mirroring EVM/Rabby's
@@ -3756,6 +4413,7 @@ export async function executeNonEvmDirectBatch(family, batch, opts = {}) {
 
   const txHashes = [];
   const onStep = typeof opts?.onStep === 'function' ? opts.onStep : () => {};
+  const fetchFn = typeof opts?.fetchFn === 'function' ? opts.fetchFn : fetch;
 
   if (family === 'btc') {
     for (let i = 0; i < batch.calls.length; i += 1) {
@@ -3767,31 +4425,125 @@ export async function executeNonEvmDirectBatch(family, batch, opts = {}) {
           `Bitcoin step "${call.label}" does not include a live BIP-174 PSBT payload from Relay.`
         );
       }
+      const psbtBytes = hexToUint8(psbtHex);
+      if (!psbtBytes || !hasPsbtMagic(psbtBytes)) {
+        throw new Error(`Bitcoin step "${call.label}" contains an invalid BIP-174 PSBT hex payload.`);
+      }
+
+      // Resolve non-empty inputsToSign from prepared metadata or binary PSBT parser
+      const payloadInputsToSign = Array.isArray(call.nativePayload?.inputsToSign)
+        ? call.nativePayload.inputsToSign
+            .filter((entry) => entry && Array.isArray(entry.signingIndexes) && entry.signingIndexes.length > 0)
+            .map((entry) => ({
+              address: String(entry.address || session.address),
+              signingIndexes: entry.signingIndexes.map((idx) => Number(idx)),
+            }))
+        : [];
+      const derivedInputCount =
+        Number(call.nativePayload?.inputCount) > 0
+          ? Number(call.nativePayload.inputCount)
+          : parsePsbtInputCount(psbtBytes);
+      const inputsToSign =
+        payloadInputsToSign.length > 0
+          ? payloadInputsToSign
+          : derivedInputCount && derivedInputCount > 0
+          ? [
+              {
+                address: session.address,
+                signingIndexes: Array.from({ length: derivedInputCount }, (_, idx) => idx),
+              },
+            ]
+          : [];
+
       if (session.walletId === 'unisat' && typeof session.provider.signPsbt === 'function') {
         const signedPsbt = await session.provider.signPsbt(psbtHex, { autoFinalized: true });
         if (typeof session.provider.pushPsbt === 'function') {
           const txid = await session.provider.pushPsbt(signedPsbt);
-          if (txid) txHashes.push(String(txid));
+          if (!txid) {
+            throw new Error(`UniSat pushPsbt did not return a Bitcoin txid for "${call.label}".`);
+          }
+          txHashes.push(String(txid));
         } else {
-          txHashes.push(String(signedPsbt).slice(0, 64));
+          const rawTxHex = extractFinalizedTxFromPsbt(signedPsbt);
+          if (!rawTxHex) {
+            throw new Error(
+              `UniSat signed the PSBT for "${call.label}" but does not expose pushPsbt and returned an unfinalized PSBT.`
+            );
+          }
+          const txid = await broadcastBtcRawTxHex(rawTxHex, fetchFn);
+          txHashes.push(txid);
         }
         continue;
       }
       if (session.walletId === 'xverse' && typeof session.provider.request === 'function') {
-        const psbtBytes = new Uint8Array(psbtHex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
-        const psbtBase64 = btoa(String.fromCharCode(...psbtBytes));
+        const psbtBase64 = uint8ToBase64(psbtBytes);
+        const signInputs = {};
+        for (const entry of inputsToSign) {
+          signInputs[entry.address] = entry.signingIndexes;
+        }
         const res = await session.provider.request('signPsbt', {
           psbt: psbtBase64,
+          ...(Object.keys(signInputs).length ? { signInputs } : {}),
           broadcast: true,
         });
         const txid = res?.result?.txid || res?.txid;
-        if (txid) txHashes.push(String(txid));
+        if (!txid) {
+          throw new Error(`Xverse signPsbt did not return a broadcast Bitcoin txid for "${call.label}".`);
+        }
+        txHashes.push(String(txid));
         continue;
       }
       if (session.walletId === 'phantom-btc' && typeof session.provider.signPSBT === 'function') {
-        const psbtBytes = new Uint8Array(psbtHex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
-        const signed = await session.provider.signPSBT(psbtBytes, { inputsToSign: [] });
-        if (signed) txHashes.push(String(signed).slice(0, 64));
+        if (!inputsToSign.length) {
+          throw new Error(
+            `Cannot sign Bitcoin PSBT with Phantom for "${call.label}": unable to determine PSBT input indexes (refusing to pass empty inputsToSign).`
+          );
+        }
+        const signed = await session.provider.signPSBT(psbtBytes, { inputsToSign });
+        if (!signed) {
+          throw new Error(`Phantom Bitcoin signPSBT returned an empty response for "${call.label}".`);
+        }
+
+        // Case 1: Wallet already returned a broadcast 64-hex txid
+        if (typeof signed === 'object' && !(signed instanceof Uint8Array) && typeof signed.txid === 'string') {
+          const txid = signed.txid.trim();
+          if (!/^[0-9a-f]{64}$/i.test(txid)) {
+            throw new Error(`Phantom Bitcoin returned an invalid txid: ${txid}`);
+          }
+          txHashes.push(txid);
+          continue;
+        }
+
+        // Case 2: Wallet returned finalized raw tx hex or signed PSBT bytes/hex/base64
+        const rawPayload =
+          typeof signed === 'object' && !(signed instanceof Uint8Array)
+            ? signed.txHex || signed.rawTx || signed.psbt || signed.signedPsbt
+            : signed;
+
+        if (typeof rawPayload === 'string' && /^[0-9a-f]{64}$/i.test(rawPayload.trim())) {
+          txHashes.push(rawPayload.trim());
+          continue;
+        }
+
+        const signedBytes = toPsbtBytes(rawPayload);
+        if (!signedBytes || signedBytes.length === 0) {
+          throw new Error(`Phantom Bitcoin returned an unrecognized signed PSBT payload for "${call.label}".`);
+        }
+
+        let rawTxHex = null;
+        if (hasPsbtMagic(signedBytes)) {
+          rawTxHex = extractFinalizedTxFromPsbt(signedBytes);
+          if (!rawTxHex) {
+            throw new Error(
+              `Phantom Bitcoin signed PSBT for "${call.label}" but returned an unfinalized PSBT without broadcast support. Transaction was NOT broadcast — use UniSat or Xverse for automatic PSBT finalization & broadcast.`
+            );
+          }
+        } else {
+          rawTxHex = uint8ToHex(signedBytes);
+        }
+
+        const txid = await broadcastBtcRawTxHex(rawTxHex, fetchFn);
+        txHashes.push(txid);
         continue;
       }
       throw new Error(`Connected Bitcoin wallet (${session.walletName}) does not expose BIP-174 signPsbt.`);
@@ -3946,39 +4698,128 @@ export async function executeNonEvmDirectBatch(family, batch, opts = {}) {
     if (typeof prov.enable === 'function') {
       await prov.enable(chainId);
     }
+
+    const defaultRestUrl = COSMOS_CONNECT_CHAINS.find((c) => c.chainId === chainId)?.suggestInfo?.rest;
+    let cachedAccountNumber = null;
+    let cachedSequence = null;
+
     for (let i = 0; i < batch.calls.length; i += 1) {
       const call = batch.calls[i];
       onStep(i, batch.calls.length, call);
-      const cosmosTx = call.nativePayload?.cosmosTx;
-      const msgs = cosmosTx?.msgs || call.nativePayload?.msgs;
-      if (!Array.isArray(msgs) || !msgs.length) {
-        throw new Error(`Cosmos step "${call.label}" did not receive executable Skip Go messages.`);
+      const np = call.nativePayload || {};
+      const cosmosTx = np.cosmosTx;
+      const msgs = cosmosTx?.msgs || np.msgs;
+      const hasDirectBytes = Boolean(np.bodyBytes && np.authInfoBytes);
+      if (!hasDirectBytes && (!Array.isArray(msgs) || !msgs.length)) {
+        throw new Error(`Cosmos step "${call.label}" did not receive executable Cosmos messages.`);
       }
       const signerAddr =
-        call.nativePayload?.signerAddress ||
+        np.signerAddress ||
         session.addressesByChain?.[batch.chain] ||
         session.address;
-      if (typeof prov.signAmino === 'function') {
-        const aminoMsgs = msgs.map((m) => ({
-          type: m.msg_type_url,
-          value: typeof m.msg === 'string' ? JSON.parse(m.msg) : m.msg,
-        }));
-        const feeDenom = call.nativePayload?.feeDenom || 'uatom';
+      const lcdUrls = Array.isArray(np.lcdUrls) && np.lcdUrls.length
+        ? np.lcdUrls
+        : [np.lcdUrl, defaultRestUrl].filter(Boolean);
+
+      // Resolve live account_number & sequence (never silently default to '0'/'0'!)
+      let accountNumber = cachedAccountNumber;
+      let sequence = cachedSequence;
+      if (accountNumber === null || sequence === null) {
+        const hasPayloadNums =
+          np.accountNumber !== undefined &&
+          np.accountNumber !== null &&
+          /^\d+$/.test(String(np.accountNumber).trim()) &&
+          np.sequence !== undefined &&
+          np.sequence !== null &&
+          /^\d+$/.test(String(np.sequence).trim());
+        if (hasPayloadNums) {
+          accountNumber = String(np.accountNumber).trim();
+          sequence = String(np.sequence).trim();
+        } else {
+          const liveAcct = await fetchCosmosAccountFromLcds(lcdUrls, signerAddr, fetchFn);
+          accountNumber = liveAcct.accountNumber;
+          sequence = liveAcct.sequence;
+        }
+        cachedAccountNumber = accountNumber;
+        cachedSequence = sequence;
+      }
+
+      let txRawBytes = null;
+
+      // Path A: signDirect when Protobuf bodyBytes & authInfoBytes are supplied
+      if (hasDirectBytes && typeof prov.signDirect === 'function') {
+        const bodyBytes = toPsbtBytes(np.bodyBytes);
+        const authInfoBytes = toPsbtBytes(np.authInfoBytes);
+        if (!bodyBytes || !authInfoBytes) {
+          throw new Error(`Cosmos step "${call.label}" provided invalid bodyBytes/authInfoBytes for signDirect.`);
+        }
+        const directRes = await prov.signDirect(chainId, signerAddr, {
+          bodyBytes,
+          authInfoBytes,
+          chainId,
+          accountNumber: BigInt(accountNumber),
+        });
+        const sigBytes = base64ToUint8(directRes?.signature?.signature || '');
+        if (!sigBytes || !sigBytes.length) {
+          throw new Error(`Cosmos wallet signDirect returned an empty signature for "${call.label}".`);
+        }
+        const signedBody = toPsbtBytes(directRes?.signed?.bodyBytes) || bodyBytes;
+        const signedAuthInfo = toPsbtBytes(directRes?.signed?.authInfoBytes) || authInfoBytes;
+        txRawBytes = encodeCosmosTxRaw({
+          bodyBytes: signedBody,
+          authInfoBytes: signedAuthInfo,
+          signatureBytes: sigBytes,
+        });
+      } else if (typeof prov.signAmino === 'function') {
+        // Path B: Proper Cosmos Amino-mapped message conversion + live accountNumber/sequence
+        const aminoMsgs = msgs.map((m) => convertCosmosProtoMsgToAmino(m));
+        const feeDenom = np.feeDenom || 'uatom';
+        const gasLimit = 250_000 + aminoMsgs.length * 80_000;
+        const gasPrice = Number(np.gasPrice);
+        const feeAmount =
+          Number.isFinite(gasPrice) && gasPrice > 0
+            ? String(Math.max(1, Math.ceil(gasLimit * gasPrice)))
+            : feeDenom === 'inj'
+            ? String(Math.ceil(gasLimit * 500_000_000))
+            : '5000';
         const signDoc = {
           chain_id: chainId,
-          account_number: '0',
-          sequence: '0',
-          fee: { amount: [{ denom: feeDenom, amount: '5000' }], gas: String(250_000 + aminoMsgs.length * 80_000) },
+          account_number: accountNumber,
+          sequence,
+          fee: {
+            amount: [{ denom: feeDenom, amount: feeAmount }],
+            gas: String(gasLimit),
+          },
           msgs: aminoMsgs,
-          memo: `Siphon Skip Go → Solana`,
+          memo: call.provider === 'noble_cctp' ? 'Siphon Noble CCTP → Solana' : 'Siphon Skip Go → Solana',
         };
         const signed = await prov.signAmino(chainId, signerAddr, signDoc);
-        if (signed?.signature?.signature) {
-          txHashes.push(`cosmos_signed_${signed.signature.signature.slice(0, 24)}`);
+        if (!signed?.signature?.signature) {
+          throw new Error(`Cosmos wallet signAmino returned an empty signature for "${call.label}".`);
         }
-        continue;
+        txRawBytes = encodeCosmosAminoSignedTxRaw({
+          msgs,
+          signedSignDoc: signed.signed || signDoc,
+          signatureObj: signed.signature,
+        });
+      } else {
+        throw new Error(
+          `${session.walletName} does not expose Cosmos transaction signing (signAmino / signDirect).`
+        );
       }
-      throw new Error(`${session.walletName} does not expose Cosmos transaction signing (signAmino).`);
+
+      // Broadcast signed TxRaw on-chain via prov.sendTx OR chain LCD POST /cosmos/tx/v1beta1/txs
+      const txHash = await broadcastCosmosTxRaw({
+        prov,
+        chainId,
+        txRawBytes,
+        lcdUrls,
+        fetchFn,
+      });
+      txHashes.push(txHash);
+
+      // Increment local sequence for subsequent calls in the same batch
+      cachedSequence = String(BigInt(sequence) + 1n);
     }
     return { txHashes, mode: 'cosmos_skip_tx' };
   }

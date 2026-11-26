@@ -1,15 +1,20 @@
 import crypto from 'node:crypto';
 import {
   checkQuoteHaircutPass,
+  DEFAULT_NON_EVM_AUCTION_TIMEOUT_MS,
   deriveNonEvmCctpRecipientBytes32,
   evaluateNonEvmGaslessBreakEven,
   fetchWithRetry,
   filterChainSweepableAssets,
   getNonEvmFeeRecipient,
   LIFI_SUI_CHAIN_ID,
+  type NonEvmRouteAuctionCandidate,
+  type NonEvmRouteAuctionMetadata,
   normalizeMoveCoinType,
   quoteLifiNonEvm,
+  quoteMayanSwiftNonEvm,
 } from '../execution/non-evm-converter.js';
+import type { RouteAuctionFetcher } from '../execution/route-auction.js';
 import { getProtocolFeeConfig, SOLANA_CCTP_DOMAIN } from '../scanner/chains.js';
 import { fetchSolanaWalletBalances } from '../scanner/discovery.js';
 import { fetchLiveUsdPrices } from '../scanner/prices.js';
@@ -181,6 +186,498 @@ function unitsToUi(raw: string, decimals: number): number {
   } catch {
     return Number(raw) / 10 ** decimals;
   }
+}
+
+const SUI_CCTP_SOLANA_CLAIM_COST_USD = 0.25;
+
+export async function prepareSuiDirectBatch(
+  params: Parameters<NonNullable<ChainFamilyAdapter['prepareDirectBatch']>>[0] & {
+    fetcher?: RouteAuctionFetcher;
+    auctionTimeoutMs?: number;
+  }
+): Promise<PreparedNonEvmBatch> {
+  const outputAsset = params.outputAsset ?? 'USDC';
+  const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
+  const feeRecipient = getNonEvmFeeRecipient('sui');
+  const solanaUsdcAtaBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
+  const sweepable = filterChainSweepableAssets('sui', params.assets);
+  const timeoutMs = params.auctionTimeoutMs ?? DEFAULT_NON_EVM_AUCTION_TIMEOUT_MS;
+
+  const calls: PreparedNonEvmCall[] = [];
+  const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
+  const skippedAssets: PreparedNonEvmBatch['skippedAssets'] = [];
+  const notes: string[] = [];
+  const perAssetAuctions: Record<string, Omit<NonEvmRouteAuctionMetadata, 'perAsset'>> = {};
+  let maxSeconds = 20;
+  let liveExecutable = false;
+
+  for (const asset of sweepable) {
+    if (asset.id === 'sui:native_stake' || asset.address.startsWith('staked:')) {
+      const stakeIds = asset.address.startsWith('staked:')
+        ? asset.address.slice('staked:'.length).split(',').filter(Boolean)
+        : [];
+      calls.push({
+        stepId: 'sui_withdraw_stake',
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        action: asset.action,
+        provider: 'sui_native_staking',
+        label: `Unstake ${asset.uiBalance} SUI in PTB`,
+        description: `Calls 0x3::sui_system::request_withdraw_stake for ${Math.max(1, stakeIds.length)} active StakedSui object(s)`,
+        nativePayload: {
+          kind: 'moveCall',
+          target: '0x3::sui_system::request_withdraw_stake',
+          arguments: ['0x5', stakeIds],
+        },
+      });
+      continue;
+    }
+
+    const normCoin = normalizeMoveCoinType(asset.address);
+    const isNativeUsdc = normCoin === SUI_NATIVE_USDC_TYPE;
+    const fullCoinTag =
+      normCoin === '0x2::sui::SUI'
+        ? '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI'
+        : normCoin;
+    const mayanCoinTag = normCoin === '0x2::sui::SUI' ? '0x2::sui::SUI' : normCoin;
+
+    const auctionStart = Date.now();
+    const providersQueried: string[] = ['lifi', 'mayan_swift'];
+    if (isNativeUsdc && outputAsset === 'USDC') {
+      providersQueried.push('circle_cctp');
+    }
+
+    const raceWithTimeout = <T>(p: Promise<T>, ms: number): Promise<{ timedOut: true } | { timedOut: false; value: T }> =>
+      Promise.race([
+        p.then((value) => ({ timedOut: false as const, value })),
+        new Promise<{ timedOut: true }>((resolve) => setTimeout(() => resolve({ timedOut: true }), ms)),
+      ]);
+
+    const lifiStart = Date.now();
+    const mayanStart = Date.now();
+
+    const [lifiRace, mayanRace] =
+      params.bridgePreference === 'cctp' && isNativeUsdc && outputAsset === 'USDC'
+        ? [
+            { timedOut: false as const, value: null },
+            { timedOut: false as const, value: null },
+          ]
+        : await Promise.all([
+            raceWithTimeout(
+              quoteLifiNonEvm({
+                fromChainId: LIFI_SUI_CHAIN_ID,
+                fromToken: fullCoinTag,
+                fromAmount: asset.rawBalance,
+                fromAddress: params.userAddress,
+                solanaDestination: params.solanaDestination,
+                outputAsset,
+                tradeUsd: asset.grossUsd,
+                liquidityUsd: asset.liquidityUsd,
+                symbol: asset.symbol,
+                fetcher: params.fetcher,
+              }).catch(() => null),
+              timeoutMs
+            ),
+            raceWithTimeout(
+              quoteMayanSwiftNonEvm({
+                fromChain: 'sui',
+                fromToken: mayanCoinTag,
+                fromAmount: asset.rawBalance,
+                fromDecimals: asset.decimals,
+                fromAddress: params.userAddress,
+                solanaDestination: params.solanaDestination,
+                outputAsset,
+                tradeUsd: asset.grossUsd,
+                liquidityUsd: asset.liquidityUsd,
+                symbol: asset.symbol,
+                timeoutMs,
+                fetcher: params.fetcher,
+              }).catch(() => null),
+              timeoutMs
+            ),
+          ]);
+
+    const lifiLatencyMs = Date.now() - lifiStart;
+    const mayanLatencyMs = Date.now() - mayanStart;
+
+    const candidates: NonEvmRouteAuctionCandidate[] = [];
+    const lifiQuote = !lifiRace.timedOut ? lifiRace.value : null;
+    const mayanQuote = !mayanRace.timedOut ? mayanRace.value : null;
+
+    // Candidate 1: LI.FI Sui
+    if (params.bridgePreference === 'cctp' && isNativeUsdc && outputAsset === 'USDC') {
+      candidates.push({
+        provider: 'lifi',
+        label: 'LI.FI Sui',
+        status: 'ineligible',
+        quotedOutUsd: 0,
+        gasUsd: 0.01,
+        bridgeFeeUsd: 0,
+        netUsd: 0,
+        etaSeconds: 0,
+        latencyMs: 0,
+        liveExecutable: false,
+        reason: 'Skipped because bridgePreference="cctp" was explicitly requested.',
+      });
+    } else if (lifiRace.timedOut) {
+      candidates.push({
+        provider: 'lifi',
+        label: 'LI.FI Sui',
+        status: 'timeout',
+        quotedOutUsd: 0,
+        gasUsd: 0.01,
+        bridgeFeeUsd: 0,
+        netUsd: 0,
+        etaSeconds: 0,
+        latencyMs: lifiLatencyMs,
+        liveExecutable: false,
+        reason: `LI.FI Sui timed out after ${timeoutMs}ms`,
+      });
+    } else if (!lifiQuote) {
+      candidates.push({
+        provider: 'lifi',
+        label: 'LI.FI Sui',
+        status: 'error',
+        quotedOutUsd: 0,
+        gasUsd: 0.01,
+        bridgeFeeUsd: 0,
+        netUsd: 0,
+        etaSeconds: 0,
+        latencyMs: lifiLatencyMs,
+        liveExecutable: false,
+        reason: 'LI.FI returned no live Sui → Solana quote.',
+      });
+    } else {
+      const haircut = checkQuoteHaircutPass({
+        grossUsd: asset.grossUsd,
+        quotedOutUsd: lifiQuote.quotedOutUsd,
+        estimatedGasUsd: lifiQuote.estimatedGasUsd,
+        allowHighCost: params.allowHighCost,
+      });
+      const netUsd = Number(Math.max(0, lifiQuote.quotedOutUsd - lifiQuote.estimatedGasUsd).toFixed(2));
+      candidates.push({
+        provider: 'lifi',
+        label: `LI.FI (${lifiQuote.tool})`,
+        status: haircut.passed ? 'ok' : 'rejected_haircut',
+        quotedOutUsd: lifiQuote.quotedOutUsd,
+        gasUsd: lifiQuote.estimatedGasUsd,
+        bridgeFeeUsd: Number(Math.max(0, asset.grossUsd - lifiQuote.quotedOutUsd).toFixed(2)),
+        netUsd,
+        etaSeconds: lifiQuote.estimatedSeconds,
+        latencyMs: lifiLatencyMs,
+        liveExecutable: lifiQuote.liveExecutable,
+        requestId: lifiQuote.requestId,
+        reason: haircut.passed ? undefined : haircut.reason,
+      });
+    }
+
+    // Candidate 2: Mayan Swift
+    if (params.bridgePreference === 'cctp' && isNativeUsdc && outputAsset === 'USDC') {
+      candidates.push({
+        provider: 'mayan_swift',
+        label: 'Mayan Swift',
+        status: 'ineligible',
+        quotedOutUsd: 0,
+        gasUsd: 0.01,
+        bridgeFeeUsd: 0,
+        netUsd: 0,
+        etaSeconds: 0,
+        latencyMs: 0,
+        liveExecutable: false,
+        reason: 'Skipped because bridgePreference="cctp" was explicitly requested.',
+      });
+    } else if (mayanRace.timedOut) {
+      candidates.push({
+        provider: 'mayan_swift',
+        label: 'Mayan Swift',
+        status: 'timeout',
+        quotedOutUsd: 0,
+        gasUsd: 0.01,
+        bridgeFeeUsd: 0,
+        netUsd: 0,
+        etaSeconds: 0,
+        latencyMs: mayanLatencyMs,
+        liveExecutable: false,
+        reason: `Mayan Swift timed out after ${timeoutMs}ms`,
+      });
+    } else if (!mayanQuote) {
+      candidates.push({
+        provider: 'mayan_swift',
+        label: 'Mayan Swift',
+        status: 'error',
+        quotedOutUsd: 0,
+        gasUsd: 0.01,
+        bridgeFeeUsd: 0,
+        netUsd: 0,
+        etaSeconds: 0,
+        latencyMs: mayanLatencyMs,
+        liveExecutable: false,
+        reason: 'Mayan Swift returned no live Sui → Solana quote.',
+      });
+    } else {
+      const haircut = checkQuoteHaircutPass({
+        grossUsd: asset.grossUsd,
+        quotedOutUsd: mayanQuote.quotedOutUsd,
+        estimatedGasUsd: mayanQuote.estimatedGasUsd,
+        allowHighCost: params.allowHighCost,
+      });
+      const netUsd = Number(Math.max(0, mayanQuote.quotedOutUsd - mayanQuote.estimatedGasUsd).toFixed(2));
+      candidates.push({
+        provider: 'mayan_swift',
+        label: mayanQuote.tool,
+        status: haircut.passed ? 'ok' : 'rejected_haircut',
+        quotedOutUsd: mayanQuote.quotedOutUsd,
+        gasUsd: mayanQuote.estimatedGasUsd,
+        bridgeFeeUsd: mayanQuote.bridgeFeeUsd,
+        netUsd,
+        etaSeconds: mayanQuote.estimatedSeconds,
+        latencyMs: mayanLatencyMs,
+        liveExecutable: mayanQuote.liveExecutable,
+        requestId: mayanQuote.requestId,
+        reason: haircut.passed ? undefined : haircut.reason,
+      });
+    }
+
+    // Candidate 3: Circle CCTP Domain 8 -> 5 (0 bps) for Native Sui USDC
+    if (isNativeUsdc && outputAsset === 'USDC') {
+      const usdcUi = unitsToUi(asset.rawBalance, 6);
+      const cctpOutUsd = Number(usdcUi.toFixed(2));
+      const cctpGasUsd = 0.01;
+      const cctpNetUsd = Number(
+        Math.max(0, cctpOutUsd - cctpGasUsd - SUI_CCTP_SOLANA_CLAIM_COST_USD).toFixed(2)
+      );
+      const cctpHaircut = checkQuoteHaircutPass({
+        grossUsd: asset.grossUsd,
+        quotedOutUsd: cctpOutUsd,
+        estimatedGasUsd: cctpGasUsd + SUI_CCTP_SOLANA_CLAIM_COST_USD,
+        allowHighCost: params.allowHighCost,
+      });
+      candidates.push({
+        provider: 'circle_cctp',
+        label: 'Circle CCTP Domain 8 → 5 (0 bps)',
+        status: cctpHaircut.passed ? 'ok' : 'rejected_haircut',
+        quotedOutUsd: cctpOutUsd,
+        gasUsd: cctpGasUsd,
+        bridgeFeeUsd: 0,
+        netUsd: cctpNetUsd,
+        etaSeconds: 18,
+        latencyMs: 0,
+        // Honest semantics: raw Move call blueprint requires serialized BCS PTB bytes for Wallet Standard execution
+        liveExecutable: false,
+        reason: cctpHaircut.passed
+          ? '0 bps Circle CCTP burn blueprint (requires PTB serialization & Solana claim)'
+          : cctpHaircut.reason,
+      });
+    }
+
+    candidates.sort((a, b) => b.netUsd - a.netUsd);
+    const passing = candidates.filter((c) => c.status === 'ok');
+    const executablePassing = passing.filter((c) => c.liveExecutable);
+
+    let winner: NonEvmRouteAuctionCandidate | undefined;
+    if (params.bridgePreference === 'cctp' && isNativeUsdc && outputAsset === 'USDC') {
+      winner = passing.find((c) => c.provider === 'circle_cctp') ?? executablePassing[0] ?? passing[0];
+    } else if (params.bridgePreference === 'lifi') {
+      winner = passing.find((c) => c.provider === 'lifi') ?? executablePassing[0] ?? passing[0];
+    } else {
+      // Pick the highest net USD executable route; if none returned live PTB bytes, pick highest net USD quote honestly
+      winner = executablePassing[0] ?? passing[0];
+    }
+
+    if (!winner) {
+      const reasons = candidates
+        .map((c) => c.reason)
+        .filter(Boolean)
+        .join(' | ');
+      skippedAssets.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        reason:
+          reasons ||
+          `No live Sui → Solana route returned for ${asset.symbol} (amount may be below bridge minimum).`,
+      });
+      continue;
+    }
+
+    const comparablePool = winner.liveExecutable ? executablePassing : passing;
+    const runnerUp =
+      comparablePool.find((c) => c.provider !== winner.provider) ??
+      passing.find((c) => c.provider !== winner.provider);
+    const savingsOverRunnerUpUsd =
+      runnerUp ? Number(Math.max(0, winner.netUsd - runnerUp.netUsd).toFixed(2)) : 0;
+    const bpsSavedOverRunnerUp =
+      runnerUp && asset.grossUsd > 0
+        ? Math.round((savingsOverRunnerUpUsd / asset.grossUsd) * 10_000)
+        : 0;
+
+    perAssetAuctions[asset.id] = {
+      winner: winner.provider,
+      winnerNetUsd: winner.netUsd,
+      ...(runnerUp ? { runnerUp: runnerUp.provider, runnerUpNetUsd: runnerUp.netUsd } : {}),
+      savingsOverRunnerUpUsd,
+      bpsSavedOverRunnerUp,
+      totalAuctionDurationMs: Date.now() - auctionStart,
+      providersQueried,
+      providersSucceeded: passing.length,
+      candidates,
+    };
+
+    if (winner.provider === 'circle_cctp') {
+      maxSeconds = Math.max(maxSeconds, 18);
+      calls.push({
+        stepId: 'sui_cctp_burn',
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        action: asset.action,
+        provider: 'circle_cctp',
+        label: `Circle CCTP Domain 8 → Solana USDC ATA (${asset.uiBalance} USDC)`,
+        description: `Burns Native Sui USDC (0 bps) to canonical Solana USDC ATA PDA (${solanaUsdcAtaBytes32.slice(0, 14)}…)`,
+        nativePayload: {
+          kind: 'moveCall',
+          target: 'cctp::token_messenger_minter::deposit_for_burn',
+          coinType: SUI_NATIVE_USDC_TYPE,
+          amountRaw: asset.rawBalance,
+          sourceDomain: SUI_CCTP_DOMAIN,
+          destinationDomain: SOLANA_CCTP_DOMAIN,
+          mintRecipientBytes32: solanaUsdcAtaBytes32,
+        },
+      });
+      bridgeTrackers.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        provider: 'circle_cctp',
+        estimatedOutput: `${asset.uiBalance.toFixed(2)} USDC`,
+        estimatedSeconds: 18,
+        requiresSolanaClaim: true,
+      });
+    } else if (winner.provider === 'mayan_swift' && mayanQuote) {
+      if (mayanQuote.liveExecutable) liveExecutable = true;
+      maxSeconds = Math.max(maxSeconds, mayanQuote.estimatedSeconds);
+      calls.push({
+        stepId: 'sui_mayan_swift_convert',
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        action: asset.action,
+        provider: 'mayan_swift',
+        label: `Convert ${asset.uiBalance} ${asset.symbol} → ${mayanQuote.estimatedOutputUi} (${mayanQuote.tool})`,
+        description: mayanQuote.liveExecutable
+          ? `Live Sui PTB via ${mayanQuote.tool} directly to Solana ${outputAsset}`
+          : `Live ${mayanQuote.tool} quote (${mayanQuote.estimatedOutputUi}); connect funded Sui wallet to build live PTB bytes`,
+        nativePayload: {
+          kind: 'sui_ptb_transaction',
+          transactionRequest: mayanQuote.transactionRequest,
+          mayanQuote: mayanQuote.rawQuote,
+          fromCoinType: mayanCoinTag,
+          amountRaw: asset.rawBalance,
+          solanaDestination: params.solanaDestination,
+        },
+      });
+      bridgeTrackers.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        provider: 'mayan_swift',
+        requestId: mayanQuote.requestId,
+        estimatedOutput: mayanQuote.estimatedOutputUi,
+        estimatedSeconds: mayanQuote.estimatedSeconds,
+      });
+    } else if (lifiQuote) {
+      if (lifiQuote.liveExecutable) liveExecutable = true;
+      maxSeconds = Math.max(maxSeconds, lifiQuote.estimatedSeconds);
+      calls.push({
+        stepId: 'sui_lifi_convert',
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        action: asset.action,
+        provider: 'lifi',
+        label: `Convert ${asset.uiBalance} ${asset.symbol} → ${lifiQuote.estimatedOutputUi} (${lifiQuote.tool})`,
+        description: lifiQuote.liveExecutable
+          ? `Live Sui PTB via LI.FI (${lifiQuote.tool}) directly to Solana ${outputAsset}`
+          : `Live LI.FI route quoted (${lifiQuote.estimatedOutputUi}); connect funded Sui wallet to build live PTB bytes`,
+        nativePayload: {
+          kind: 'sui_ptb_transaction',
+          transactionRequest: lifiQuote.transactionRequest,
+          routeSummary: lifiQuote.routeSummary,
+          fromCoinType: fullCoinTag,
+          amountRaw: asset.rawBalance,
+          solanaDestination: params.solanaDestination,
+        },
+      });
+      bridgeTrackers.push({
+        assetId: asset.id,
+        assetSymbol: asset.symbol,
+        provider: 'lifi',
+        requestId: lifiQuote.requestId,
+        estimatedOutput: lifiQuote.estimatedOutputUi,
+        estimatedSeconds: lifiQuote.estimatedSeconds,
+      });
+    }
+  }
+
+  const auctionEntries = Object.values(perAssetAuctions);
+  let routeAuction: NonEvmRouteAuctionMetadata | undefined;
+  if (auctionEntries.length === 1) {
+    routeAuction = { ...auctionEntries[0], perAsset: perAssetAuctions };
+  } else if (auctionEntries.length > 1) {
+    const primary = auctionEntries.reduce((best, cur) =>
+      cur.winnerNetUsd > best.winnerNetUsd ? cur : best
+    );
+    const totalSavings = Number(
+      auctionEntries.reduce((s, a) => s + a.savingsOverRunnerUpUsd, 0).toFixed(2)
+    );
+    routeAuction = {
+      ...primary,
+      savingsOverRunnerUpUsd: totalSavings,
+      perAsset: perAssetAuctions,
+    };
+  }
+
+  if (routeAuction && routeAuction.runnerUp && routeAuction.savingsOverRunnerUpUsd > 0) {
+    notes.push(
+      `Sui Parallel Auction: ${routeAuction.winner} won at $${routeAuction.winnerNetUsd.toFixed(2)} net, saving $${routeAuction.savingsOverRunnerUpUsd.toFixed(2)} (+${routeAuction.bpsSavedOverRunnerUp} bps) vs ${routeAuction.runnerUp}.`
+    );
+  }
+
+  const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
+  const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
+  if (!liveExecutable && calls.length > 0) {
+    notes.push('Connect a funded Slush or Phantom (Sui) wallet to serialize and execute live PTB bytes via Wallet Standard.');
+  }
+
+  return {
+    family: 'sui',
+    chain: 'sui',
+    chainId: 'sui:mainnet',
+    chainName: 'Sui',
+    explorerUrl: 'https://suiscan.xyz/mainnet',
+    userAddress: params.userAddress,
+    solanaDestination: params.solanaDestination,
+    solanaUsdcAtaBytes32,
+    outputAsset,
+    executionKind: 'sui_ptb',
+    signingStandard: 'Sui Wallet Standard (sui:signAndExecuteTransaction)',
+    liveExecutable,
+    calls,
+    bridgeTrackers,
+    skippedAssets,
+    savings: {
+      totalCalls: calls.length,
+      walletPopupsBatched: calls.length ? 1 : 0,
+      walletPopupsLegacy: calls.length,
+      popupsSaved: Math.max(0, calls.length - 1),
+    },
+    feeBreakdown: {
+      feeBps: feeCfg.feeBps,
+      feePercent: feeCfg.feePercent,
+      feeRecipient,
+      collectionMethod: feeRecipient ? 'sui_ptb_split_coins' : 'bridge_quote_only',
+      estimatedFeeUsd,
+    },
+    estimatedSeconds: maxSeconds,
+    gaslessAvailable: Boolean(process.env.SIPHON_SUI_SPONSOR_PRIVATE_KEY?.trim()),
+    gaslessMechanism: 'Sui Native Sponsored PTB (gasData.owner = Siphon Sponsor)',
+    notes,
+    ...(routeAuction ? { routeAuction } : {}),
+  };
 }
 
 export const suiAdapter: ChainFamilyAdapter = {
@@ -456,175 +953,7 @@ export const suiAdapter: ChainFamilyAdapter = {
   },
 
   async prepareDirectBatch(params): Promise<PreparedNonEvmBatch> {
-    const outputAsset = params.outputAsset ?? 'USDC';
-    const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
-    const feeRecipient = getNonEvmFeeRecipient('sui');
-    const solanaUsdcAtaBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
-    const sweepable = filterChainSweepableAssets('sui', params.assets);
-
-    const calls: PreparedNonEvmCall[] = [];
-    const bridgeTrackers: PreparedNonEvmBatch['bridgeTrackers'] = [];
-    const skippedAssets: PreparedNonEvmBatch['skippedAssets'] = [];
-    const notes: string[] = [];
-    let maxSeconds = 20;
-    let liveExecutable = false;
-
-    for (const asset of sweepable) {
-      if (asset.id === 'sui:native_stake' || asset.address.startsWith('staked:')) {
-        const stakeIds = asset.address.startsWith('staked:')
-          ? asset.address.slice('staked:'.length).split(',').filter(Boolean)
-          : [];
-        calls.push({
-          stepId: 'sui_withdraw_stake',
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          action: asset.action,
-          provider: 'sui_native_staking',
-          label: `Unstake ${asset.uiBalance} SUI in PTB`,
-          description: `Calls 0x3::sui_system::request_withdraw_stake for ${Math.max(1, stakeIds.length)} active StakedSui object(s)`,
-          nativePayload: {
-            kind: 'moveCall',
-            target: '0x3::sui_system::request_withdraw_stake',
-            arguments: ['0x5', stakeIds],
-          },
-        });
-        continue;
-      }
-
-      const normCoin = normalizeMoveCoinType(asset.address);
-      const isNativeUsdc = normCoin === SUI_NATIVE_USDC_TYPE;
-
-      if (isNativeUsdc && outputAsset === 'USDC' && params.bridgePreference === 'cctp') {
-        calls.push({
-          stepId: 'sui_cctp_burn',
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          action: asset.action,
-          provider: 'circle_cctp',
-          label: `Circle CCTP Domain 8 → Solana USDC ATA (${asset.uiBalance} USDC)`,
-          description: `Burns Native Sui USDC to canonical Solana USDC ATA PDA (${solanaUsdcAtaBytes32.slice(0, 14)}…)`,
-          nativePayload: {
-            kind: 'moveCall',
-            target: 'cctp::token_messenger_minter::deposit_for_burn',
-            coinType: SUI_NATIVE_USDC_TYPE,
-            amountRaw: asset.rawBalance,
-            sourceDomain: SUI_CCTP_DOMAIN,
-            destinationDomain: SOLANA_CCTP_DOMAIN,
-            mintRecipientBytes32: solanaUsdcAtaBytes32,
-          },
-        });
-        bridgeTrackers.push({
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          provider: 'circle_cctp',
-          estimatedOutput: `${asset.uiBalance.toFixed(2)} USDC`,
-          estimatedSeconds: 18,
-          requiresSolanaClaim: true,
-        });
-        continue;
-      }
-
-      const fullCoinTag = normCoin === '0x2::sui::SUI'
-        ? '0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI'
-        : normCoin;
-      const quote = await quoteLifiNonEvm({
-        fromChainId: LIFI_SUI_CHAIN_ID,
-        fromToken: fullCoinTag,
-        fromAmount: asset.rawBalance,
-        fromAddress: params.userAddress,
-        solanaDestination: params.solanaDestination,
-        outputAsset,
-      });
-
-      if (quote) {
-        const haircut = checkQuoteHaircutPass({
-          grossUsd: asset.grossUsd,
-          quotedOutUsd: quote.quotedOutUsd,
-          estimatedGasUsd: quote.estimatedGasUsd,
-          allowHighCost: params.allowHighCost,
-        });
-        if (!haircut.passed) {
-          skippedAssets.push({ assetId: asset.id, assetSymbol: asset.symbol, reason: haircut.reason });
-          continue;
-        }
-        if (quote.liveExecutable) liveExecutable = true;
-        maxSeconds = Math.max(maxSeconds, quote.estimatedSeconds);
-        calls.push({
-          stepId: 'sui_lifi_convert',
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          action: asset.action,
-          provider: 'lifi',
-          label: `Convert ${asset.uiBalance} ${asset.symbol} → ${quote.estimatedOutputUi} (${quote.tool})`,
-          description: quote.liveExecutable
-            ? `Live Sui PTB via LI.FI (${quote.tool}) directly to Solana ${outputAsset}`
-            : `Live LI.FI route quoted (${quote.estimatedOutputUi}); connect funded Sui wallet to build live PTB bytes`,
-          nativePayload: {
-            kind: 'sui_ptb_transaction',
-            transactionRequest: quote.transactionRequest,
-            routeSummary: quote.routeSummary,
-            fromCoinType: fullCoinTag,
-            amountRaw: asset.rawBalance,
-            solanaDestination: params.solanaDestination,
-          },
-        });
-        bridgeTrackers.push({
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          provider: 'lifi',
-          requestId: quote.requestId,
-          estimatedOutput: quote.estimatedOutputUi,
-          estimatedSeconds: quote.estimatedSeconds,
-        });
-      } else {
-        skippedAssets.push({
-          assetId: asset.id,
-          assetSymbol: asset.symbol,
-          reason: `No live Sui → Solana route returned for ${asset.symbol} (amount may be below bridge minimum).`,
-        });
-      }
-    }
-
-    const grossUsd = Number(sweepable.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
-    const estimatedFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
-    if (!liveExecutable && calls.length > 0) {
-      notes.push('Connect a funded Slush or Phantom (Sui) wallet to serialize and execute live PTB bytes via Wallet Standard.');
-    }
-
-    return {
-      family: 'sui',
-      chain: 'sui',
-      chainId: 'sui:mainnet',
-      chainName: 'Sui',
-      explorerUrl: 'https://suiscan.xyz/mainnet',
-      userAddress: params.userAddress,
-      solanaDestination: params.solanaDestination,
-      solanaUsdcAtaBytes32,
-      outputAsset,
-      executionKind: 'sui_ptb',
-      signingStandard: 'Sui Wallet Standard (sui:signAndExecuteTransaction)',
-      liveExecutable,
-      calls,
-      bridgeTrackers,
-      skippedAssets,
-      savings: {
-        totalCalls: calls.length,
-        walletPopupsBatched: calls.length ? 1 : 0,
-        walletPopupsLegacy: calls.length,
-        popupsSaved: Math.max(0, calls.length - 1),
-      },
-      feeBreakdown: {
-        feeBps: feeCfg.feeBps,
-        feePercent: feeCfg.feePercent,
-        feeRecipient,
-        collectionMethod: feeRecipient ? 'sui_ptb_split_coins' : 'bridge_quote_only',
-        estimatedFeeUsd,
-      },
-      estimatedSeconds: maxSeconds,
-      gaslessAvailable: Boolean(process.env.SIPHON_SUI_SPONSOR_PRIVATE_KEY?.trim()),
-      gaslessMechanism: 'Sui Native Sponsored PTB (gasData.owner = Siphon Sponsor)',
-      notes,
-    };
+    return prepareSuiDirectBatch(params);
   },
 
   async buildGaslessIntent(params): Promise<UniversalGaslessIntent> {

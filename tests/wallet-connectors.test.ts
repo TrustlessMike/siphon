@@ -41,6 +41,11 @@ interface WalletsModule {
     batch: Record<string, unknown>,
     opts?: Record<string, unknown>
   ) => Promise<{ txHashes: string[]; mode: string }>;
+  COSMOS_PROTO_TO_AMINO_TYPE: Record<string, string>;
+  convertCosmosProtoMsgToAmino: (msg: Record<string, unknown>) => { type: string; value: Record<string, unknown> };
+  extractCosmosAccountFromLcdResponse: (json: unknown) => { accountNumber: string; sequence: string } | null;
+  parsePsbtInputCount: (psbtInput: string | Uint8Array) => number | null;
+  extractFinalizedTxFromPsbt: (psbtInput: string | Uint8Array) => string | null;
   refreshInstalledWallets: () => void;
 }
 
@@ -865,4 +870,441 @@ test('Bitcoin: wires UniSat accountsChanged / networkChanged and rejects testnet
     },
   };
   await assert.rejects(() => wallets.connectFamilyWallet('btc', { walletId: 'xverse' }), /non-mainnet Bitcoin address/i);
+});
+
+// =========================================================================
+// 4. WAVE 7A: REAL COSMOS SIGNING & BROADCAST BACKTESTS
+// =========================================================================
+
+test('Cosmos executeNonEvmDirectBatch: fetches live account_number/sequence, maps Amino types, broadcasts on-chain, and never fabricates hashes', async () => {
+  resetMockWalletGlobals();
+  const cosmosAddr = 'cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh';
+  const nobleAddr = 'noble1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0eh';
+
+  // Verify Amino message mapping for all 4 core Protobuf URLs
+  assert.equal(
+    wallets.convertCosmosProtoMsgToAmino({
+      msg_type_url: '/ibc.applications.transfer.v1.MsgTransfer',
+      msg: JSON.stringify({ sender: cosmosAddr, receiver: nobleAddr }),
+    }).type,
+    'cosmos-sdk/MsgTransfer'
+  );
+  assert.equal(
+    wallets.convertCosmosProtoMsgToAmino({
+      msg_type_url: '/cosmos.bank.v1beta1.MsgSend',
+      msg: JSON.stringify({ from_address: cosmosAddr, to_address: nobleAddr, amount: [] }),
+    }).type,
+    'cosmos-sdk/MsgSend'
+  );
+  assert.equal(
+    wallets.convertCosmosProtoMsgToAmino({
+      msg_type_url: '/cosmwasm.wasm.v1.MsgExecuteContract',
+      msg: JSON.stringify({ sender: cosmosAddr, contract: 'osmo1contract', msg: '{"swap":{}}' }),
+    }).type,
+    'wasm/MsgExecuteContract'
+  );
+  assert.equal(
+    wallets.convertCosmosProtoMsgToAmino({
+      msg_type_url: '/circle.cctp.v1.MsgDepositForBurn',
+      msg: JSON.stringify({ from: nobleAddr, amount: '5000000', destination_domain: 5, burn_token: 'uusdc' }),
+    }).type,
+    'cctp/MsgDepositForBurn'
+  );
+
+  // Connect Keplr mock that records signAmino calls (NO sendTx -> forces LCD POST /cosmos/tx/v1beta1/txs)
+  const capturedSignDocs: Array<Record<string, unknown>> = [];
+  mockWindow.keplr = {
+    enable: async () => true,
+    getKey: async (chainId: string) => ({
+      bech32Address: chainId === 'noble-1' ? nobleAddr : cosmosAddr,
+    }),
+    signAmino: async (_chainId: string, _signer: string, signDoc: Record<string, unknown>) => {
+      capturedSignDocs.push(signDoc);
+      return {
+        signed: signDoc,
+        signature: {
+          pub_key: { type: 'tendermint/PubKeySecp256k1', value: Buffer.alloc(33, 2).toString('base64') },
+          signature: Buffer.alloc(64, 7).toString('base64'),
+        },
+      };
+    },
+  };
+
+  await wallets.connectFamilyWallet('cosmos', { walletId: 'keplr' });
+
+  const realTxHash1 = 'A1B2C3D4E5F60718293A4B5C6D7E8F9011223344556677889900AABBCCDDEEFF';
+  const realTxHash2 = 'F0E1D2C3B4A5968778695A4B3C2D1E0F00112233445566778899AABBCCDDEEFF';
+  const lcdBroadcastPayloads: Array<Record<string, unknown>> = [];
+
+  const mockFetch = async (url: string, init?: RequestInit): Promise<Response> => {
+    if (url.includes('/cosmos/auth/v1beta1/accounts/')) {
+      // Return ContinuousVestingAccount wrapper to test nested unwrapping
+      return new Response(
+        JSON.stringify({
+          account: {
+            '@type': '/cosmos.vesting.v1beta1.ContinuousVestingAccount',
+            base_vesting_account: {
+              base_account: {
+                account_number: '77441',
+                sequence: '42',
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    if (url.includes('/cosmos/tx/v1beta1/txs') && init?.method === 'POST') {
+      const body = JSON.parse(String(init.body || '{}')) as Record<string, unknown>;
+      lcdBroadcastPayloads.push(body);
+      const txhash = lcdBroadcastPayloads.length === 1 ? realTxHash1 : realTxHash2;
+      return new Response(
+        JSON.stringify({ tx_response: { code: 0, txhash, raw_log: '' } }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    return new Response('not found', { status: 404 });
+  };
+
+  const result = await wallets.executeNonEvmDirectBatch(
+    'cosmos',
+    {
+      chain: 'cosmoshub',
+      chainId: 'cosmoshub-4',
+      solanaDestination: SOL_ADDR_A,
+      calls: [
+        {
+          label: 'IBC Transfer to Noble',
+          provider: 'skip_go',
+          nativePayload: {
+            signerAddress: cosmosAddr,
+            lcdUrls: ['https://mock-cosmos-lcd.example'],
+            feeDenom: 'uatom',
+            gasPrice: 0.025,
+            cosmosTx: {
+              chain_id: 'cosmoshub-4',
+              msgs: [
+                {
+                  msg_type_url: '/ibc.applications.transfer.v1.MsgTransfer',
+                  msg: JSON.stringify({
+                    source_port: 'transfer',
+                    source_channel: 'channel-536',
+                    token: { denom: 'uatom', amount: '1000000' },
+                    sender: cosmosAddr,
+                    receiver: nobleAddr,
+                  }),
+                },
+              ],
+            },
+          },
+        },
+        {
+          label: 'Bank Send Fee',
+          provider: 'skip_go',
+          nativePayload: {
+            signerAddress: cosmosAddr,
+            lcdUrls: ['https://mock-cosmos-lcd.example'],
+            feeDenom: 'uatom',
+            gasPrice: 0.025,
+            msgs: [
+              {
+                msg_type_url: '/cosmos.bank.v1beta1.MsgSend',
+                msg: JSON.stringify({
+                  from_address: cosmosAddr,
+                  to_address: nobleAddr,
+                  amount: [{ denom: 'uatom', amount: '10000' }],
+                }),
+              },
+            ],
+          },
+        },
+      ],
+    },
+    { expectedSolanaDestination: SOL_ADDR_A, fetchFn: mockFetch }
+  );
+
+  // Verify live account_number/sequence used and sequence incremented between steps
+  assert.equal(capturedSignDocs.length, 2);
+  assert.equal(capturedSignDocs[0].account_number, '77441');
+  assert.equal(capturedSignDocs[0].sequence, '42');
+  assert.equal(capturedSignDocs[1].account_number, '77441');
+  assert.equal(capturedSignDocs[1].sequence, '43');
+  assert.equal((capturedSignDocs[0].msgs as Array<{ type: string }>)[0].type, 'cosmos-sdk/MsgTransfer');
+  assert.equal((capturedSignDocs[1].msgs as Array<{ type: string }>)[0].type, 'cosmos-sdk/MsgSend');
+
+  // Verify real broadcast occurred via LCD POST /cosmos/tx/v1beta1/txs with BROADCAST_MODE_SYNC
+  assert.equal(lcdBroadcastPayloads.length, 2);
+  assert.equal(lcdBroadcastPayloads[0].mode, 'BROADCAST_MODE_SYNC');
+  assert.ok(typeof lcdBroadcastPayloads[0].tx_bytes === 'string' && lcdBroadcastPayloads[0].tx_bytes.length > 20);
+  assert.deepEqual(result.txHashes, [realTxHash1, realTxHash2]);
+  assert.ok(!result.txHashes.some((h) => h.startsWith('cosmos_signed_')));
+
+  // Adversarial A: LCD unreachable when account_number/sequence missing -> fails closed (never '0'/'0'!)
+  await assert.rejects(
+    () =>
+      wallets.executeNonEvmDirectBatch(
+        'cosmos',
+        {
+          chain: 'cosmoshub',
+          chainId: 'cosmoshub-4',
+          calls: [
+            {
+              label: 'Should Fail Closed',
+              nativePayload: {
+                signerAddress: cosmosAddr,
+                lcdUrls: ['https://unreachable-lcd.example'],
+                msgs: [{ msg_type_url: '/cosmos.bank.v1beta1.MsgSend', msg: '{}' }],
+              },
+            },
+          ],
+        },
+        { fetchFn: async () => new Response('down', { status: 503 }) }
+      ),
+    /0\/0|Failed to fetch live Cosmos account_number\/sequence/i
+  );
+
+  // Adversarial B: Broadcast CheckTx returns non-zero code -> rejects honestly!
+  await assert.rejects(
+    () =>
+      wallets.executeNonEvmDirectBatch(
+        'cosmos',
+        {
+          chain: 'cosmoshub',
+          chainId: 'cosmoshub-4',
+          calls: [
+            {
+              label: 'Rejected CheckTx',
+              nativePayload: {
+                signerAddress: cosmosAddr,
+                lcdUrls: ['https://mock-cosmos-lcd.example'],
+                accountNumber: '77441',
+                sequence: '44',
+                msgs: [{ msg_type_url: '/cosmos.bank.v1beta1.MsgSend', msg: '{}' }],
+              },
+            },
+          ],
+        },
+        {
+          fetchFn: async () =>
+            new Response(
+              JSON.stringify({ tx_response: { code: 5, txhash: 'BADHASH', raw_log: 'insufficient funds' } }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } }
+            ),
+        }
+      ),
+    /code 5.*insufficient funds/i
+  );
+
+  // Path C: signDirect + prov.sendTx(chainId, txBytes, 'sync') returns real on-chain hex hash
+  let sendTxCalled = false;
+  let signDirectCalled = false;
+  (mockWindow.keplr as Record<string, unknown>).signDirect = async (
+    _chainId: string,
+    _signer: string,
+    doc: { bodyBytes: Uint8Array; authInfoBytes: Uint8Array; accountNumber: bigint }
+  ) => {
+    signDirectCalled = true;
+    assert.equal(doc.accountNumber, 77441n);
+    return {
+      signed: doc,
+      signature: { signature: Buffer.alloc(64, 9).toString('base64') },
+    };
+  };
+  (mockWindow.keplr as Record<string, unknown>).sendTx = async (
+    _chainId: string,
+    txBytes: Uint8Array,
+    mode: string
+  ) => {
+    sendTxCalled = true;
+    assert.equal(mode, 'sync');
+    assert.ok(txBytes instanceof Uint8Array && txBytes.length > 64);
+    return Uint8Array.from(Buffer.from(realTxHash1, 'hex'));
+  };
+
+  const directRes = await wallets.executeNonEvmDirectBatch('cosmos', {
+    chain: 'noble',
+    chainId: 'noble-1',
+    calls: [
+      {
+        label: 'Direct Protobuf Noble CCTP',
+        nativePayload: {
+          signerAddress: nobleAddr,
+          accountNumber: '77441',
+          sequence: '45',
+          bodyBytes: Buffer.from([0x0a, 0x04, 0x01, 0x02, 0x03, 0x04]).toString('base64'),
+          authInfoBytes: Buffer.from([0x12, 0x04, 0x05, 0x06, 0x07, 0x08]).toString('base64'),
+        },
+      },
+    ],
+  });
+  assert.equal(signDirectCalled, true);
+  assert.equal(sendTxCalled, true);
+  assert.equal(directRes.txHashes[0], realTxHash1);
+});
+
+// =========================================================================
+// 5. WAVE 7A: PHANTOM BITCOIN PSBT inputsToSign & BROADCAST BACKTESTS
+// =========================================================================
+
+function buildTestPsbt(inputCount: number, finalized: boolean): Uint8Array {
+  const txParts: number[] = [0x02, 0x00, 0x00, 0x00, inputCount];
+  for (let i = 0; i < inputCount; i += 1) {
+    for (let b = 0; b < 32; b += 1) txParts.push((i + 10) & 0xff);
+    txParts.push(i, 0, 0, 0); // vout
+    txParts.push(0x00); // empty scriptSig
+    txParts.push(0xfd, 0xff, 0xff, 0xff); // sequence
+  }
+  txParts.push(0x01); // 1 output
+  txParts.push(0x10, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00); // 10,000 sats
+  txParts.push(0x16, 0x00, 0x14, ...new Array(20).fill(0xcd)); // P2WPKH output
+  txParts.push(0x00, 0x00, 0x00, 0x00); // lockTime
+
+  const txBytes = Buffer.from(txParts);
+  const chunks: Buffer[] = [
+    Buffer.from([0x70, 0x73, 0x62, 0x74, 0xff]), // magic
+    Buffer.from([0x01, 0x00]), // PSBT_GLOBAL_UNSIGNED_TX
+    txBytes.length < 0xfd
+      ? Buffer.from([txBytes.length])
+      : Buffer.from([0xfd, txBytes.length & 0xff, (txBytes.length >> 8) & 0xff]),
+    txBytes,
+    Buffer.from([0x00]), // end global map
+  ];
+
+  // Input maps
+  for (let i = 0; i < inputCount; i += 1) {
+    if (finalized) {
+      // PSBT_IN_FINAL_SCRIPTWITNESS (keyType 0x08): 2 stack items (fake sig + 33-byte pubkey)
+      const witnessStack = Buffer.concat([
+        Buffer.from([0x02]), // 2 items
+        Buffer.from([0x47]),
+        Buffer.alloc(0x47, 0x30),
+        Buffer.from([0x21]),
+        Buffer.alloc(0x21, 0x02),
+      ]);
+      chunks.push(Buffer.from([0x01, 0x08]));
+      chunks.push(Buffer.from([witnessStack.length]));
+      chunks.push(witnessStack);
+    }
+    chunks.push(Buffer.from([0x00])); // end input map
+  }
+  chunks.push(Buffer.from([0x00])); // end output 0 map
+  return Uint8Array.from(Buffer.concat(chunks));
+}
+
+test('Bitcoin Phantom executeNonEvmDirectBatch: passes non-empty inputsToSign, extracts finalized tx, broadcasts to mempool.space, and rejects unfinalized PSBT', async () => {
+  resetMockWalletGlobals();
+  const unsigned2In = buildTestPsbt(2, false);
+  const finalized2In = buildTestPsbt(2, true);
+  const unsigned2InHex = Buffer.from(unsigned2In).toString('hex');
+
+  assert.equal(wallets.parsePsbtInputCount(unsigned2In), 2);
+  assert.equal(wallets.extractFinalizedTxFromPsbt(unsigned2In), null);
+  const extractedHex = wallets.extractFinalizedTxFromPsbt(finalized2In);
+  assert.ok(extractedHex && extractedHex.startsWith('02000000000102'), 'Expected valid BIP-141 SegWit raw tx hex');
+
+  // Connect Phantom BTC mock
+  let capturedSignPsbtOpts: Record<string, unknown> | null = null;
+  let phantomReturnPayload: unknown = finalized2In;
+  mockWindow.phantom = {
+    bitcoin: {
+      requestAccounts: async () => [{ purpose: 'payment', address: BTC_MAINNET_A }],
+      signPSBT: async (_psbtBytes: Uint8Array, opts: Record<string, unknown>) => {
+        capturedSignPsbtOpts = opts;
+        return phantomReturnPayload;
+      },
+    },
+  };
+
+  const session = await wallets.connectFamilyWallet('btc', { walletId: 'phantom-btc' });
+  assert.equal(session.walletId, 'phantom-btc');
+  assert.equal(session.address, BTC_MAINNET_A);
+
+  const realBtcTxid = 'b'.repeat(64);
+  let broadcastedBody = '';
+  const mockMempoolFetch = async (url: string, init?: RequestInit): Promise<Response> => {
+    assert.equal(url, 'https://mempool.space/api/tx');
+    assert.equal(init?.method, 'POST');
+    broadcastedBody = String(init?.body || '');
+    return new Response(realBtcTxid, { status: 200 });
+  };
+
+  // Even without nativePayload.inputsToSign, wallets.js parses the 2-input PSBT and passes signingIndexes: [0, 1]!
+  const res = await wallets.executeNonEvmDirectBatch(
+    'btc',
+    {
+      solanaDestination: SOL_ADDR_A,
+      calls: [
+        {
+          label: 'Relay 2-input BTC PSBT',
+          nativePayload: { psbtHex: unsigned2InHex },
+        },
+      ],
+    },
+    { expectedSolanaDestination: SOL_ADDR_A, fetchFn: mockMempoolFetch }
+  );
+
+  assert.deepEqual(capturedSignPsbtOpts, {
+    inputsToSign: [{ address: BTC_MAINNET_A, signingIndexes: [0, 1] }],
+  });
+  assert.equal(broadcastedBody, extractedHex);
+  assert.deepEqual(res.txHashes, [realBtcTxid]);
+
+  // Adversarial: Phantom returns an UNFINALIZED PSBT -> fails honestly instead of pretending it broadcast!
+  phantomReturnPayload = unsigned2In;
+  await assert.rejects(
+    () =>
+      wallets.executeNonEvmDirectBatch(
+        'btc',
+        {
+          solanaDestination: SOL_ADDR_A,
+          calls: [{ label: 'Unfinalized Phantom PSBT', nativePayload: { psbtHex: unsigned2InHex } }],
+        },
+        { expectedSolanaDestination: SOL_ADDR_A, fetchFn: mockMempoolFetch }
+      ),
+    /unfinalized PSBT/i
+  );
+
+  // Verify Xverse receives signInputs alongside psbt & broadcast:true and enforces expectedSolanaDestination
+  resetMockWalletGlobals();
+  const xverseCapture: { params: Record<string, unknown> | null } = { params: null };
+  mockWindow.XverseProviders = {
+    BitcoinProvider: {
+      request: async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'getAccounts') {
+          return { result: [{ purpose: 'payment', address: BTC_MAINNET_A }] };
+        }
+        if (method === 'signPsbt') {
+          xverseCapture.params = params || null;
+          return { result: { txid: 'c'.repeat(64) } };
+        }
+        throw new Error(`unexpected ${method}`);
+      },
+    },
+  };
+  await wallets.connectFamilyWallet('btc', { walletId: 'xverse' });
+  const xverseRes = await wallets.executeNonEvmDirectBatch(
+    'btc',
+    {
+      solanaDestination: SOL_ADDR_A,
+      calls: [{ label: 'Xverse PSBT', nativePayload: { psbtHex: unsigned2InHex } }],
+    },
+    { expectedSolanaDestination: SOL_ADDR_A }
+  );
+  assert.deepEqual(xverseRes.txHashes, ['c'.repeat(64)]);
+  assert.deepEqual(xverseCapture.params?.signInputs, { [BTC_MAINNET_A]: [0, 1] });
+  assert.equal(xverseCapture.params?.broadcast, true);
+
+  // Destination mismatch guard still rejects fail-closed
+  await assert.rejects(
+    () =>
+      wallets.executeNonEvmDirectBatch(
+        'btc',
+        {
+          solanaDestination: SOL_ADDR_B,
+          calls: [{ label: 'Xverse PSBT', nativePayload: { psbtHex: unsigned2InHex } }],
+        },
+        { expectedSolanaDestination: SOL_ADDR_A }
+      ),
+    /Pre-sign check failed/i
+  );
 });
