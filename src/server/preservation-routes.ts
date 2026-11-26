@@ -5,6 +5,10 @@ import {
   type GasWatchTrigger,
   type PreservationAgentStore,
 } from '../agent/preservation-agents.js';
+import type {
+  UnlockHarvesterStore,
+  UnlockQueuesReaderFn,
+} from '../agent/unlock-harvester.js';
 import {
   type AttestedCctpLegInput,
   evaluatePreservationPlan,
@@ -22,10 +26,14 @@ export interface PreservationRouteContext {
   scanCache: BoundedTtlCache<string, ScanReport>;
   agentEngine: TurgaliumAgentEngine;
   preservationAgents: PreservationAgentStore;
+  unlockHarvester?: UnlockHarvesterStore;
+  unlockQueuesReader?: UnlockQueuesReaderFn;
   maxPrivilegedBodyBytes: number;
   nowMs?: () => number;
   liveGasFetcher?: (chain: EvmChainId) => Promise<number | null>;
 }
+
+const MAX_UNLOCK_WATCH_BODY_BYTES = 32_768; // 32 KiB strict cap for unlock-watch payloads
 
 const GAS_CACHE_TTL_MS = 15_000;
 const FALLBACK_ETHEREUM_GWEI = 18;
@@ -266,6 +274,7 @@ export async function handlePreservationRoute(ctx: PreservationRouteContext): Pr
       readyCount: evalResult.readyTriggers.length,
       maxTriggers: preservationAgents.capacity,
       triggers: evalResult.triggers,
+      poller: preservationAgents.getPollerStatus(),
     });
     return true;
   }
@@ -346,6 +355,108 @@ export async function handlePreservationRoute(ctx: PreservationRouteContext): Pr
       return true;
     }
     reply(200, cancelled);
+    return true;
+  }
+
+  // ================= DEFI UNLOCK & UNBONDING HARVESTER =================
+  const unlockHarvester = ctx.unlockHarvester;
+  const unlockBodyLimit = Math.min(ctx.maxPrivilegedBodyBytes, MAX_UNLOCK_WATCH_BODY_BYTES);
+
+  if (unlockHarvester && method === 'GET' && pathname === '/api/agents/unlock-watch') {
+    const watches = unlockHarvester.listWatches();
+    const alerts = unlockHarvester.listAlerts();
+    const poller = unlockHarvester.getPollerStatus();
+    reply(200, {
+      watches,
+      alerts,
+      summary: {
+        totalWatches: watches.length,
+        activeWatches: poller.activeWatches,
+        readyWatches: poller.readyWatches,
+        pausedWatches: poller.pausedWatches,
+        cancelledWatches: poller.cancelledWatches,
+        totalReadyUnlocks: poller.totalReadyUnlocks,
+        totalPendingUnlocks: poller.totalPendingUnlocks,
+        alertsCount: alerts.length,
+      },
+      maxWatches: unlockHarvester.capacity,
+      poller,
+    });
+    return true;
+  }
+
+  if (unlockHarvester && method === 'POST' && pathname === '/api/agents/unlock-watch') {
+    const body = await readJsonBody<{
+      walletAddress?: unknown;
+      evmAddresses?: unknown;
+      cosmosAddresses?: unknown;
+      solanaDestination?: unknown;
+      label?: unknown;
+    }>(req, unlockBodyLimit);
+
+    try {
+      const created = unlockHarvester.createWatch({
+        walletAddress: body.walletAddress as string | undefined,
+        evmAddresses: body.evmAddresses as string[] | undefined,
+        cosmosAddresses: body.cosmosAddresses as string[] | undefined,
+        solanaDestination: body.solanaDestination as string | undefined,
+        label: body.label as string | undefined,
+      });
+      reply(200, created);
+    } catch (err) {
+      reply(400, {
+        error: err instanceof Error ? err.message : 'Invalid unlock-watch parameters.',
+      });
+    }
+    return true;
+  }
+
+  if (unlockHarvester && method === 'POST' && pathname === '/api/agents/unlock-watch/check') {
+    let timeoutMs: number | undefined;
+    const hasBodyHeaders =
+      Boolean(req.headers['content-type']) ||
+      (req.headers['content-length'] !== undefined && Number(req.headers['content-length']) > 0);
+    if (hasBodyHeaders) {
+      const body = await readJsonBody<{ timeoutMs?: unknown }>(req, unlockBodyLimit);
+      if (body.timeoutMs !== undefined) {
+        if (typeof body.timeoutMs !== 'number' || !Number.isFinite(body.timeoutMs) || body.timeoutMs < 10 || body.timeoutMs > 30_000) {
+          reply(400, { error: 'timeoutMs must be a finite number between 10 and 30000.' });
+          return true;
+        }
+        timeoutMs = Math.floor(body.timeoutMs);
+      }
+    }
+
+    const result = await unlockHarvester.checkAllWatches({
+      readUnlockQueues: ctx.unlockQueuesReader,
+      timeoutMs,
+    });
+    reply(200, {
+      ...result,
+      poller: unlockHarvester.getPollerStatus(),
+    });
+    return true;
+  }
+
+  if (
+    unlockHarvester &&
+    method === 'DELETE' &&
+    pathname.startsWith('/api/agents/unlock-watch/')
+  ) {
+    const watchId = pathname.slice('/api/agents/unlock-watch/'.length).trim();
+    if (!watchId || watchId.includes('/')) {
+      reply(400, { error: 'Invalid unlock-watch id.' });
+      return true;
+    }
+    const removed = unlockHarvester.deleteWatch(watchId);
+    if (!removed) {
+      reply(404, { error: 'Unlock watch not found.' });
+      return true;
+    }
+    reply(200, {
+      ...removed,
+      deleted: true,
+    });
     return true;
   }
 

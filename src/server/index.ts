@@ -86,9 +86,16 @@ export function parseServerPort(raw?: string): number {
   return parsed;
 }
 
+export function parsePollersEnabled(raw?: string): boolean {
+  if (raw === undefined || raw.trim() === '') return true;
+  const lower = raw.trim().toLowerCase();
+  return !['false', '0', 'no', 'off'].includes(lower);
+}
+
 export function startTurgaliumProcess(env: NodeJS.ProcessEnv = process.env) {
   const port = parseServerPort(env.PORT);
   const host = env.HOST?.trim() || '127.0.0.1';
+  const enableBackgroundPollers = parsePollersEnabled(env.TURGALIUM_ENABLE_POLLERS);
 
   const check = assertSafeStartupConfig({
     host,
@@ -101,8 +108,8 @@ export function startTurgaliumProcess(env: NodeJS.ProcessEnv = process.env) {
     logJson('warn', 'startup_warning', { host, warning });
   }
 
-  const instance = createTurgaliumServer();
-  const { server, jobStore, stateStore, rateLimiter } = instance;
+  const instance = createTurgaliumServer({ enableBackgroundPollers });
+  const { server, jobStore, stateStore, rateLimiter, preservationAgents, unlockHarvester } = instance;
 
   let shuttingDown = false;
   const shutdown = (signal: NodeJS.Signals) => {
@@ -111,6 +118,8 @@ export function startTurgaliumProcess(env: NodeJS.ProcessEnv = process.env) {
     logJson('info', 'shutdown_started', { signal });
 
     jobStore.dispose();
+    preservationAgents.stopPoller();
+    unlockHarvester.stopPoller();
 
     const forceTimer = setTimeout(() => {
       logJson('error', 'shutdown_forced_timeout', { signal, timeoutMs: 10_000 });
@@ -141,6 +150,7 @@ export function startTurgaliumProcess(env: NodeJS.ProcessEnv = process.env) {
       rateLimitEnabled: rateLimiter.enabled,
       rateLimitMax: rateLimiter.maxRequests,
       rateLimitWindowMs: rateLimiter.windowMs,
+      pollersEnabled: enableBackgroundPollers,
     });
   });
 

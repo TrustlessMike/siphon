@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { solanaAddressToBytes32 } from '../bridge/cctp.js';
+import { fetchLiveChainGasGwei } from '../execution/preservation-optimizer.js';
 import { DEAD_BURN_ADDRESS, EVM_CHAINS } from '../scanner/chains.js';
 import { planDustConversion } from '../scanner/dust.js';
 import { sanitizeFreeText } from '../scanner/sanitize.js';
@@ -53,6 +54,43 @@ export interface PreservationAgentStoreOptions {
   stateStore?: TurgaliumStateStore;
 }
 
+export interface GasWatchPollerOptions {
+  /** Polling interval in milliseconds (default 30_000 ms; min 25 ms for tests). */
+  intervalMs?: number;
+  /** Optional gas price fetcher; defaults to live RPC via `fetchLiveChainGasGwei`. */
+  fetchGasGwei?: (chain: EvmChainId) => Promise<number | null>;
+  /** Optional fail-closed mandate validator re-checked on every evaluation. */
+  mandateValidator?: (mandateId: string, trigger: GasWatchTrigger) => boolean;
+  /**
+   * Optional human-permissioned / notification hook fired whenever a trigger transitions
+   * `watching` -> `ready`. Wrapped in try/catch so callback errors never crash the poller.
+   */
+  onTriggered?: (
+    trigger: GasWatchTrigger,
+    evalResult: GasWatchEvaluationResult
+  ) => void | Promise<void>;
+  /** Optionally execute an immediate tick upon starting (default false). */
+  runImmediately?: boolean;
+}
+
+export interface GasWatchPollerStatus {
+  running: boolean;
+  intervalMs: number;
+  tickInFlight: boolean;
+  armedCount: number;
+  readyCount: number;
+  totalTriggers: number;
+  ticksTotal: number;
+  skippedIdleTicks: number;
+  rpcFetchCount: number;
+  triggeredCount: number;
+  errorCount: number;
+  lastTickAt: string | null;
+  lastTriggeredAt: string | null;
+  lastError: string | null;
+  lastObservedGasGwei: Partial<Record<EvmChainId, number>>;
+}
+
 export interface DustAutoHarvestOptions {
   minHarvestUsd?: number;
   minPreservationRatePct?: number;
@@ -82,6 +120,7 @@ export interface DustAutoHarvestEvaluation {
 
 const DEFAULT_MAX_TRIGGERS = 50;
 const DEFAULT_TTL_MS = 72 * 3600 * 1000; // 72 hours
+const DEFAULT_GAS_POLL_INTERVAL_MS = 30_000; // 30 seconds
 const ZERO_EVM_ADDRESS = '0x0000000000000000000000000000000000000000';
 
 function r2(n: number): number {
@@ -137,6 +176,20 @@ export class PreservationAgentStore {
   private readonly defaultTtlMs: number;
   private readonly nowMs: () => number;
   private readonly stateStore?: TurgaliumStateStore;
+
+  private pollerTimer: ReturnType<typeof setInterval> | null = null;
+  private pollerOptions: GasWatchPollerOptions | null = null;
+  private pollerIntervalMs = DEFAULT_GAS_POLL_INTERVAL_MS;
+  private tickInFlight = false;
+  private ticksTotal = 0;
+  private skippedIdleTicks = 0;
+  private rpcFetchCount = 0;
+  private triggeredCount = 0;
+  private errorCount = 0;
+  private lastTickAt: string | null = null;
+  private lastTriggeredAt: string | null = null;
+  private lastError: string | null = null;
+  private lastObservedGasGwei: Partial<Record<EvmChainId, number>> = {};
 
   constructor(opts: PreservationAgentStoreOptions = {}) {
     this.maxTriggers = Math.max(1, Math.floor(opts.maxTriggers ?? DEFAULT_MAX_TRIGGERS));
@@ -374,6 +427,167 @@ export class PreservationAgentStore {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Executes a single non-overlapping gas-watch poller tick.
+   * Zero idle cost: skips immediately without calling `fetchGasGwei` or any RPC
+   * when `armedCount === 0`.
+   */
+  async runPollerTick(
+    overrideOpts?: GasWatchPollerOptions
+  ): Promise<GasWatchEvaluationResult | null> {
+    if (this.tickInFlight) {
+      return null;
+    }
+    this.tickInFlight = true;
+    try {
+      this.ticksTotal += 1;
+      const now = this.nowMs();
+      this.lastTickAt = new Date(now).toISOString();
+
+      let expiredAny = false;
+      const armedChains = new Set<EvmChainId>();
+      for (const trigger of this.triggers.values()) {
+        if (this.expireIfStale(trigger, now)) {
+          expiredAny = true;
+          continue;
+        }
+        if (trigger.status === 'watching') {
+          armedChains.add(trigger.chain);
+        }
+      }
+      if (expiredAny) {
+        this.persistTriggers();
+      }
+
+      if (armedChains.size === 0) {
+        this.skippedIdleTicks += 1;
+        return null;
+      }
+
+      const activeOpts = overrideOpts ?? this.pollerOptions ?? {};
+      const liveGasByChain: Partial<Record<EvmChainId, number>> = {};
+
+      for (const chain of armedChains) {
+        this.rpcFetchCount += 1;
+        try {
+          let reading: number | null;
+          if (activeOpts.fetchGasGwei) {
+            reading = await activeOpts.fetchGasGwei(chain);
+          } else {
+            const live = await fetchLiveChainGasGwei(chain, { timeoutMs: 2_000 });
+            reading = live ? live.gwei : null;
+          }
+          if (typeof reading === 'number' && Number.isFinite(reading) && reading >= 0) {
+            const rounded = r2(reading);
+            liveGasByChain[chain] = rounded;
+            this.lastObservedGasGwei[chain] = rounded;
+          }
+        } catch (err) {
+          this.errorCount += 1;
+          this.lastError = err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      if (Object.keys(liveGasByChain).length === 0) {
+        return null;
+      }
+
+      const evalResult = this.evaluateGasWatchTriggers(liveGasByChain, {
+        mandateValidator: activeOpts.mandateValidator,
+      });
+
+      if (evalResult.transitionedToReady.length > 0) {
+        this.triggeredCount += evalResult.transitionedToReady.length;
+        this.lastTriggeredAt = evalResult.evaluatedAt;
+        if (activeOpts.onTriggered) {
+          for (const triggered of evalResult.transitionedToReady) {
+            try {
+              await activeOpts.onTriggered({ ...triggered }, evalResult);
+            } catch (cbErr) {
+              this.errorCount += 1;
+              this.lastError = cbErr instanceof Error ? cbErr.message : String(cbErr);
+            }
+          }
+        }
+      }
+
+      return evalResult;
+    } finally {
+      this.tickInFlight = false;
+    }
+  }
+
+  /**
+   * Starts the autonomous `.unref()` background poller loop for Gas-Window Watchdog triggers.
+   * Safe for unit tests & graceful shutdown: the timer is always `.unref()`'d.
+   */
+  startPoller(opts: GasWatchPollerOptions = {}): GasWatchPollerStatus {
+    this.stopPoller();
+    const rawInterval = opts.intervalMs ?? DEFAULT_GAS_POLL_INTERVAL_MS;
+    const intervalMs = Math.max(
+      25,
+      Math.min(3_600_000, Math.floor(Number.isFinite(rawInterval) ? rawInterval : DEFAULT_GAS_POLL_INTERVAL_MS))
+    );
+    this.pollerIntervalMs = intervalMs;
+    this.pollerOptions = { ...opts, intervalMs };
+
+    this.pollerTimer = setInterval(() => {
+      void this.runPollerTick();
+    }, intervalMs);
+    this.pollerTimer.unref?.();
+
+    if (opts.runImmediately) {
+      void this.runPollerTick();
+    }
+
+    return this.getPollerStatus();
+  }
+
+  stopPoller(): void {
+    if (this.pollerTimer) {
+      clearInterval(this.pollerTimer);
+      this.pollerTimer = null;
+    }
+  }
+
+  dispose(): void {
+    this.stopPoller();
+  }
+
+  getPollerStatus(): GasWatchPollerStatus {
+    const now = this.nowMs();
+    let armedCount = 0;
+    let readyCount = 0;
+    for (const trigger of this.triggers.values()) {
+      if (trigger.status === 'watching' && Date.parse(trigger.expiresAt) > now) {
+        armedCount += 1;
+      } else if (trigger.status === 'ready') {
+        readyCount += 1;
+      }
+    }
+    return {
+      running: this.pollerTimer !== null,
+      intervalMs: this.pollerIntervalMs,
+      tickInFlight: this.tickInFlight,
+      armedCount,
+      readyCount,
+      totalTriggers: this.triggers.size,
+      ticksTotal: this.ticksTotal,
+      skippedIdleTicks: this.skippedIdleTicks,
+      rpcFetchCount: this.rpcFetchCount,
+      triggeredCount: this.triggeredCount,
+      errorCount: this.errorCount,
+      lastTickAt: this.lastTickAt,
+      lastTriggeredAt: this.lastTriggeredAt,
+      lastError: this.lastError,
+      lastObservedGasGwei: { ...this.lastObservedGasGwei },
+    };
+  }
+
+  getPollerMetrics(): GasWatchPollerStatus {
+    return this.getPollerStatus();
   }
 }
 
