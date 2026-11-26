@@ -4510,7 +4510,7 @@ label {
   color: var(--ink-0);
   margin-bottom: 2px;
 }
-.ai-trust-step span {
+.ai-trust-step > div > span {
   display: block;
   font-size: 12px;
   color: var(--ink-2);
