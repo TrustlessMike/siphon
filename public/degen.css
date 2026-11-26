@@ -1,14 +1,13 @@
 /* =====================================================================
-   TURGALIUM DEGEN TAB — EDITORIAL JUPITER PREDICTION MARKETS & SIDE-POCKET
-   Matches Turgalium daylight protocol palette: paper white (#FCFCFC),
-   surface (#FFFFFF), stark black ink (#0A0A0A), 1px hairlines (#E4E6EB),
-   and Kamino ice-cyan (#C6F4FF) active highlights.
+   TURGALIUM DEGEN TAB — JUPITER PREDICTION MARKETS & SIDE-POCKET
+   Jupiter Dark Obsidian Token System (#0B0E13 / #131820 / #1A212B)
+   with #C7F284 lime CTAs, #14F195 mint, and #24C1D9 teal highlights.
    ===================================================================== */
 
 .degen-root {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 16px;
   width: 100%;
   max-width: 100%;
   min-width: 0;
@@ -24,7 +23,7 @@
 .degen-pocket-card {
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: 20px;
   padding: 18px 20px;
   display: flex;
   flex-direction: column;
@@ -57,11 +56,12 @@
 }
 
 .degen-eyebrow {
-  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--ink-3);
+  color: var(--ink-2);
 }
 
 .degen-pill-safe {
@@ -70,11 +70,11 @@
   gap: 5px;
   font-size: 11px;
   font-weight: 600;
-  padding: 2px 8px;
+  padding: 2px 9px;
   border-radius: 999px;
   background: var(--allow-bg);
-  color: #065f46;
-  border: 1px solid #a7f3d0;
+  color: var(--accent-mint);
+  border: 1px solid var(--allow-border);
 }
 
 .degen-pill-live {
@@ -83,10 +83,10 @@
   gap: 5px;
   font-size: 11px;
   font-weight: 600;
-  padding: 2px 8px;
+  padding: 2px 9px;
   border-radius: 999px;
   background: var(--ice-soft);
-  color: var(--ink-0);
+  color: var(--accent-teal);
   border: 1px solid var(--ice-border);
 }
 
@@ -96,18 +96,18 @@
   gap: 5px;
   font-size: 11px;
   font-weight: 600;
-  padding: 2px 8px;
+  padding: 2px 9px;
   border-radius: 999px;
   background: var(--hold-bg);
-  color: var(--hold);
-  border: 1px solid #fcd34d;
+  color: #fbbf24;
+  border: 1px solid var(--hold-border);
 }
 
 .degen-live-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--allow);
+  background: var(--accent-mint);
   display: inline-block;
   flex-shrink: 0;
 }
@@ -115,24 +115,25 @@
 .degen-split-summary {
   margin: 0;
   font-family: var(--font-display);
-  font-size: 19px;
+  font-size: 18px;
   font-weight: 700;
   letter-spacing: -0.02em;
   color: var(--ink-0);
   line-height: 1.35;
   overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
 }
 
 .degen-split-summary .degen-safe-num {
-  color: #065f46;
+  color: var(--accent-mint);
 }
 
 .degen-split-summary .degen-cap-num {
   color: var(--ink-0);
-  background: var(--ice-soft);
-  border: 1px solid var(--ice-border);
-  border-radius: 6px;
-  padding: 1px 7px;
+  background: var(--bg-well);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 1px 8px;
   white-space: nowrap;
 }
 
@@ -147,13 +148,13 @@
 }
 
 .degen-split-bar-safe {
-  background: var(--allow);
+  background: var(--accent-mint);
   height: 100%;
   transition: width 160ms ease;
 }
 
 .degen-split-bar-cap {
-  background: var(--ink-0);
+  background: var(--accent-lime);
   height: 100%;
   transition: width 160ms ease;
 }
@@ -175,7 +176,7 @@
 }
 
 .degen-control-label {
-  font-size: 11px;
+  font-size: 11.5px;
   font-weight: 600;
   color: var(--ink-2);
   display: flex;
@@ -186,17 +187,16 @@
 .degen-balance-input-wrap {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  background: var(--bg-paper);
+  gap: 5px;
+  background: var(--bg-well);
   border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  padding: 0 9px;
-  height: 34px;
+  border-radius: 10px;
+  padding: 0 10px;
+  height: 36px;
 }
 
 .degen-balance-input-wrap:focus-within {
-  border-color: var(--ink-0);
-  background: var(--bg-surface);
+  border-color: var(--accent-teal);
 }
 
 .degen-balance-input {
@@ -207,6 +207,7 @@
   font-size: 13px;
   font-weight: 600;
   color: var(--ink-0);
+  font-variant-numeric: tabular-nums;
 }
 
 .degen-preset-row {
@@ -217,39 +218,40 @@
 }
 
 .degen-pct-pill {
-  height: 34px;
+  height: 36px;
   padding: 0 11px;
-  border-radius: 8px;
+  border-radius: 10px;
   border: 1px solid var(--border-strong);
-  background: var(--bg-surface);
+  background: var(--bg-well);
   color: var(--ink-1);
   font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
   transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
 .degen-pct-pill:hover {
-  border-color: var(--ink-0);
+  border-color: var(--accent-lime);
   color: var(--ink-0);
 }
 
 .degen-pct-pill.active {
-  background: var(--ink-0);
-  border-color: var(--ink-0);
-  color: #ffffff;
+  background: var(--accent-lime);
+  border-color: var(--accent-lime);
+  color: #0b0e13;
 }
 
 .degen-custom-pct-wrap {
   display: inline-flex;
   align-items: center;
   gap: 2px;
-  height: 34px;
-  padding: 0 8px;
-  border-radius: 8px;
+  height: 36px;
+  padding: 0 9px;
+  border-radius: 10px;
   border: 1px solid var(--border-strong);
-  background: var(--bg-paper);
+  background: var(--bg-well);
 }
 
 .degen-custom-pct-input {
@@ -261,22 +263,23 @@
   font-weight: 600;
   text-align: right;
   color: var(--ink-0);
+  font-variant-numeric: tabular-nums;
 }
 
 .degen-risk-warning {
   padding: 10px 13px;
-  border-radius: 9px;
+  border-radius: 12px;
   background: var(--hold-bg);
-  border: 1px solid #fcd34d;
-  color: #92400e;
+  border: 1px solid var(--hold-border);
+  color: #fbbf24;
   font-size: 12.5px;
   line-height: 1.45;
 }
 
 .degen-risk-warning.is-clamped {
   background: var(--block-bg);
-  border-color: #fca5a5;
-  color: #991b1b;
+  border-color: var(--block-border);
+  color: var(--block);
 }
 
 .degen-pocket-foot {
@@ -288,14 +291,14 @@
   padding-top: 10px;
   border-top: 1px solid var(--border);
   font-size: 12px;
-  color: var(--ink-3);
+  color: var(--ink-2);
 }
 
 .degen-sync-btn {
   background: transparent;
   border: none;
   padding: 0;
-  color: var(--ink-1);
+  color: var(--accent-teal);
   font-size: 12px;
   font-weight: 600;
   text-decoration: underline;
@@ -308,16 +311,17 @@
 }
 
 .degen-yield-meta {
-  font-size: 11.5px;
-  color: #065f46;
+  font-size: 12px;
+  color: var(--accent-mint);
   line-height: 1.4;
   overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
 }
 
 .degen-split-presets {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  gap: 10px;
   width: 100%;
 }
 
@@ -326,10 +330,10 @@
   flex-direction: column;
   align-items: flex-start;
   gap: 3px;
-  padding: 10px 12px;
-  border-radius: 10px;
+  padding: 11px 13px;
+  border-radius: 14px;
   border: 1px solid var(--border-strong);
-  background: var(--bg-paper);
+  background: var(--bg-well);
   color: var(--ink-0);
   text-align: left;
   cursor: pointer;
@@ -338,20 +342,18 @@
 }
 
 .degen-split-preset-btn:hover {
-  border-color: var(--ink-0);
-  background: var(--bg-surface);
+  border-color: rgba(255, 255, 255, 0.24);
+  background: var(--bg-hover);
 }
 
 .degen-split-preset-btn.active {
-  border-color: var(--ink-0);
+  border-color: var(--accent-teal);
   background: var(--ice-soft);
-  box-shadow: 0 0 0 1px var(--ink-0);
 }
 
 .degen-split-preset-btn.is-yield-safe.active {
-  border-color: #065f46;
+  border-color: var(--accent-mint);
   background: var(--allow-bg);
-  box-shadow: 0 0 0 1px #065f46;
 }
 
 .degen-preset-title {
@@ -360,21 +362,25 @@
   font-weight: 700;
   color: var(--ink-0);
   line-height: 1.3;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .degen-preset-sub {
-  font-size: 11px;
+  font-size: 11.5px;
   color: var(--ink-2);
   line-height: 1.35;
   overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
 }
 
 /* 1B. MY POSITIONS & CLAIMS STRIP */
 .degen-positions-card {
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 14px 16px;
+  border-radius: 20px;
+  padding: 14px 18px;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -408,47 +414,43 @@
 .degen-pos-pill {
   font-size: 11px;
   font-weight: 600;
-  padding: 2px 8px;
+  padding: 2px 9px;
   border-radius: 999px;
   background: var(--bg-well);
   border: 1px solid var(--border);
   color: var(--ink-1);
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
-.degen-pos-pill.is-claimable {
-  background: var(--allow-bg);
-  border-color: #a7f3d0;
-  color: #065f46;
-}
-
+.degen-pos-pill.is-claimable,
 .degen-pos-pill.is-pos {
-  color: #065f46;
   background: var(--allow-bg);
-  border-color: #a7f3d0;
+  border-color: var(--allow-border);
+  color: var(--accent-mint);
 }
 
 .degen-pos-pill.is-neg {
-  color: #991b1b;
+  color: var(--block);
   background: var(--block-bg);
-  border-color: #fca5a5;
+  border-color: var(--block-border);
 }
 
 .degen-pos-connect-btn {
-  height: 32px;
-  padding: 0 12px;
-  border-radius: 8px;
-  border: 1px solid var(--ink-0);
-  background: var(--ink-0);
-  color: #ffffff;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 10px;
+  border: none;
+  background: var(--accent-lime);
+  color: #0b0e13;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
   white-space: nowrap;
 }
 
 .degen-pos-connect-btn:hover {
-  background: #232327;
+  background: var(--accent-lime-hover, #d7f89e);
 }
 
 .degen-positions-list {
@@ -464,16 +466,16 @@
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
-  padding: 11px 12px;
-  border-radius: 10px;
-  background: var(--bg-paper);
+  padding: 11px 13px;
+  border-radius: 12px;
+  background: var(--bg-well);
   border: 1px solid var(--border);
   min-width: 0;
 }
 
 .degen-position-row.is-claimable {
   background: var(--allow-bg);
-  border-color: #a7f3d0;
+  border-color: var(--allow-border);
 }
 
 .degen-pos-main {
@@ -494,24 +496,24 @@
 .degen-pos-side {
   font-size: 10.5px;
   font-weight: 700;
-  padding: 1px 7px;
+  padding: 1px 8px;
   border-radius: 999px;
 }
 
 .degen-pos-side.is-yes {
-  background: #065f46;
-  color: #ffffff;
+  background: var(--accent-mint);
+  color: #0b0e13;
 }
 
 .degen-pos-side.is-no {
-  background: var(--ink-0);
-  color: #ffffff;
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--ink-0);
 }
 
 .degen-pos-status {
-  font-size: 10px;
-  font-weight: 700;
-  padding: 1px 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 8px;
   border-radius: 999px;
   background: var(--bg-surface);
   border: 1px solid var(--border-strong);
@@ -519,9 +521,9 @@
 }
 
 .degen-pos-status.is-claimable {
-  background: #065f46;
-  border-color: #065f46;
-  color: #ffffff;
+  background: var(--accent-mint);
+  border-color: var(--accent-mint);
+  color: #0b0e13;
 }
 
 .degen-pos-title {
@@ -552,14 +554,15 @@
   align-items: flex-end;
   gap: 2px;
   font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .degen-pos-pnl strong.is-pos {
-  color: #065f46;
+  color: var(--accent-mint);
 }
 
 .degen-pos-pnl strong.is-neg {
-  color: #991b1b;
+  color: var(--block);
 }
 
 .degen-pos-actions {
@@ -571,30 +574,30 @@
 .degen-claim-btn {
   height: 32px;
   padding: 0 12px;
-  border-radius: 8px;
-  border: 1px solid #065f46;
-  background: #065f46;
-  color: #ffffff;
+  border-radius: 9px;
+  border: none;
+  background: var(--accent-mint);
+  color: #0b0e13;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
   white-space: nowrap;
 }
 
 .degen-claim-btn:hover:not(:disabled) {
-  background: #047857;
+  filter: brightness(1.08);
 }
 
 .degen-claim-btn:disabled,
 .degen-exit-btn:disabled {
-  opacity: 0.55;
+  opacity: 0.5;
   cursor: not-allowed;
 }
 
 .degen-exit-btn {
   height: 32px;
   padding: 0 11px;
-  border-radius: 8px;
+  border-radius: 9px;
   border: 1px solid var(--border-strong);
   background: var(--bg-surface);
   color: var(--ink-0);
@@ -605,14 +608,14 @@
 }
 
 .degen-exit-btn:hover:not(:disabled) {
-  border-color: var(--ink-0);
-  background: var(--bg-well);
+  border-color: rgba(255, 255, 255, 0.25);
+  background: var(--bg-hover);
 }
 
 .degen-pos-link-btn {
   font-size: 12px;
   font-weight: 600;
-  color: var(--ink-0);
+  color: var(--accent-teal);
   white-space: nowrap;
 }
 
@@ -625,16 +628,16 @@
   flex-wrap: wrap;
   font-size: 12.5px;
   color: var(--ink-2);
-  padding: 8px 10px;
-  border-radius: 9px;
-  background: var(--bg-paper);
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--bg-well);
   border: 1px solid var(--border);
 }
 
 .degen-pos-banner.is-warn {
   background: var(--hold-bg);
-  border-color: #fcd34d;
-  color: #92400e;
+  border-color: var(--hold-border);
+  color: #fbbf24;
 }
 
 .degen-pos-feedback,
@@ -645,7 +648,7 @@
   gap: 8px;
   flex-wrap: wrap;
   padding: 9px 11px;
-  border-radius: 9px;
+  border-radius: 10px;
   font-size: 11.5px;
   line-height: 1.4;
 }
@@ -653,20 +656,20 @@
 .degen-pos-feedback.is-info {
   background: var(--ice-soft);
   border: 1px solid var(--ice-border);
-  color: var(--ink-0);
+  color: var(--accent-teal);
 }
 
 .degen-pos-feedback.is-success,
 .degen-tx-success {
   background: var(--allow-bg);
-  border: 1px solid #a7f3d0;
-  color: #065f46;
+  border: 1px solid var(--allow-border);
+  color: var(--accent-mint);
 }
 
 .degen-pos-feedback.is-error {
   background: var(--block-bg);
-  border: 1px solid #fca5a5;
-  color: #991b1b;
+  border: 1px solid var(--block-border);
+  color: var(--block);
 }
 
 .degen-solscan-link {
@@ -700,6 +703,9 @@
   font-weight: 700;
   letter-spacing: -0.01em;
   color: var(--ink-0);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
 }
 
 .degen-games-grid {
@@ -716,16 +722,15 @@
   gap: 8px;
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 16px;
   padding: 13px 14px;
   min-width: 0;
-  transition: border-color 130ms ease, background 130ms ease, transform 130ms ease;
+  transition: border-color 130ms ease, background 130ms ease;
 }
 
 .degen-game-card:hover {
-  border-color: var(--ink-0);
+  border-color: var(--border-strong);
   background: var(--bg-hover);
-  transform: translateY(-1px);
 }
 
 .degen-game-top {
@@ -776,7 +781,7 @@
 }
 
 .degen-game-launch {
-  color: var(--ink-0);
+  color: var(--accent-lime);
   font-weight: 600;
   white-space: nowrap;
 }
@@ -806,7 +811,7 @@
   flex-wrap: wrap;
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 16px;
   padding: 10px 12px;
 }
 
@@ -820,7 +825,7 @@
 
 .degen-cat-pill {
   border: 1px solid var(--border);
-  background: var(--bg-paper);
+  background: var(--bg-well);
   color: var(--ink-2);
   border-radius: 999px;
   padding: 5px 11px;
@@ -832,14 +837,14 @@
 }
 
 .degen-cat-pill:hover {
-  border-color: var(--ink-0);
+  border-color: var(--border-strong);
   color: var(--ink-0);
 }
 
 .degen-cat-pill.active {
-  background: var(--ink-0);
-  border-color: var(--ink-0);
-  color: #ffffff;
+  background: var(--accent-lime);
+  border-color: var(--accent-lime);
+  color: #0b0e13;
 }
 
 .degen-search-form {
@@ -854,27 +859,30 @@
 .degen-search-input {
   width: 100%;
   min-width: 0;
-  height: 32px;
-  border-radius: 8px;
+  height: 34px;
+  border-radius: 10px;
   border: 1px solid var(--border-strong);
-  background: var(--bg-paper);
-  padding: 0 10px;
+  background: var(--bg-well);
+  padding: 0 11px;
   font-size: 12.5px;
   color: var(--ink-0);
   outline: none;
 }
 
+.degen-search-input::placeholder {
+  color: var(--ink-3);
+}
+
 .degen-search-input:focus {
-  border-color: var(--ink-0);
-  background: var(--bg-surface);
+  border-color: var(--accent-teal);
 }
 
 .degen-refresh-btn {
-  height: 32px;
-  padding: 0 10px;
-  border-radius: 8px;
+  height: 34px;
+  padding: 0 11px;
+  border-radius: 10px;
   border: 1px solid var(--border-strong);
-  background: var(--bg-surface);
+  background: var(--bg-well);
   color: var(--ink-1);
   font-size: 12px;
   font-weight: 600;
@@ -884,8 +892,9 @@
 }
 
 .degen-refresh-btn:hover {
-  border-color: var(--ink-0);
+  border-color: rgba(255, 255, 255, 0.25);
   color: var(--ink-0);
+  background: var(--bg-hover);
 }
 
 .degen-feed-status {
@@ -895,7 +904,7 @@
   gap: 8px;
   flex-wrap: wrap;
   font-size: 12px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   padding: 0 2px;
 }
 
@@ -914,7 +923,7 @@
   gap: 11px;
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 16px;
   padding: 14px;
   min-width: 0;
   max-width: 100%;
@@ -926,8 +935,7 @@
 }
 
 .degen-market-card.is-selected {
-  border-color: var(--ink-0);
-  box-shadow: 0 0 0 1px var(--ink-0);
+  border-color: var(--accent-lime);
 }
 
 .degen-event-head {
@@ -940,7 +948,7 @@
 .degen-event-thumb {
   width: 40px;
   height: 40px;
-  border-radius: 9px;
+  border-radius: 10px;
   border: 1px solid var(--border);
   background: var(--bg-well);
   object-fit: cover;
@@ -950,17 +958,22 @@
 .degen-event-thumb-fallback {
   width: 40px;
   height: 40px;
-  border-radius: 9px;
+  border-radius: 10px;
   border: 1px solid var(--border);
   background: var(--bg-well);
   color: var(--ink-1);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 700;
+  padding: 7px;
   flex-shrink: 0;
+}
+
+.degen-thumb-jup-logo {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  display: block;
 }
 
 .degen-event-meta {
@@ -981,23 +994,22 @@
 }
 
 .degen-cat-tag {
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
   font-weight: 600;
   color: var(--ink-2);
+  text-transform: capitalize;
 }
 
 .degen-live-tag {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  color: #065f46;
+  color: var(--accent-mint);
   background: var(--allow-bg);
-  border: 1px solid #a7f3d0;
+  border: 1px solid var(--allow-border);
   border-radius: 999px;
-  padding: 0 6px;
+  padding: 0 7px;
   font-weight: 600;
-  font-size: 10px;
+  font-size: 10.5px;
 }
 
 .degen-event-title {
@@ -1027,8 +1039,8 @@
   justify-content: space-between;
   gap: 8px;
   padding: 7px 9px;
-  border-radius: 8px;
-  background: var(--bg-paper);
+  border-radius: 10px;
+  background: var(--bg-well);
   border: 1px solid var(--border);
   min-width: 0;
 }
@@ -1055,31 +1067,32 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 4px 8px;
-  border-radius: 6px;
+  padding: 4px 9px;
+  border-radius: 8px;
   font-size: 11.5px;
   font-weight: 600;
   cursor: pointer;
   border: 1px solid transparent;
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
   transition: background 110ms ease, border-color 110ms ease, color 110ms ease;
 }
 
 .degen-quote-btn.is-yes {
   background: var(--allow-bg);
-  border-color: #a7f3d0;
-  color: #065f46;
+  border-color: var(--allow-border);
+  color: var(--accent-mint);
 }
 
 .degen-quote-btn.is-yes:hover,
 .degen-quote-btn.is-yes.active {
-  background: #065f46;
-  border-color: #065f46;
-  color: #ffffff;
+  background: var(--accent-mint);
+  border-color: var(--accent-mint);
+  color: #0b0e13;
 }
 
 .degen-quote-btn.is-no {
-  background: var(--bg-well);
+  background: var(--bg-surface);
   border-color: var(--border-strong);
   color: var(--ink-1);
 }
@@ -1088,11 +1101,11 @@
 .degen-quote-btn.is-no.active {
   background: var(--ink-0);
   border-color: var(--ink-0);
-  color: #ffffff;
+  color: #0b0e13;
 }
 
 .degen-quote-btn:disabled {
-  opacity: 0.45;
+  opacity: 0.4;
   cursor: not-allowed;
 }
 
@@ -1104,12 +1117,12 @@
   padding-top: 8px;
   border-top: 1px solid var(--border);
   font-size: 11.5px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   flex-wrap: wrap;
 }
 
 .degen-jup-link {
-  color: var(--ink-0);
+  color: var(--accent-teal);
   font-weight: 600;
   white-space: nowrap;
 }
@@ -1123,7 +1136,7 @@
   grid-column: 1 / -1;
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 16px;
   padding: 28px 18px;
   text-align: center;
   color: var(--ink-2);
@@ -1137,7 +1150,7 @@
 /* 4. RIGHT STICKY QUICK BET SLIP / PAYOUT CALCULATOR */
 .degen-slip-col {
   position: sticky;
-  top: 80px;
+  top: 72px;
   min-width: 0;
   max-width: 100%;
 }
@@ -1145,11 +1158,11 @@
 .degen-slip-card {
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: 20px;
   padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 13px;
   min-width: 0;
 }
 
@@ -1173,18 +1186,19 @@
 .degen-cap-badge {
   font-size: 11px;
   font-weight: 600;
-  padding: 3px 8px;
+  padding: 3px 9px;
   border-radius: 999px;
   background: var(--ice-soft);
   border: 1px solid var(--ice-border);
-  color: var(--ink-0);
+  color: var(--accent-teal);
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .degen-slip-selection {
-  background: var(--bg-paper);
+  background: var(--bg-well);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 14px;
   padding: 11px 12px;
   display: flex;
   flex-direction: column;
@@ -1215,7 +1229,7 @@
 
 .degen-side-opt {
   padding: 7px 8px;
-  border-radius: 8px;
+  border-radius: 9px;
   border: 1px solid var(--border-strong);
   background: var(--bg-surface);
   font-size: 12px;
@@ -1226,15 +1240,15 @@
 }
 
 .degen-side-opt.active-yes {
-  background: #065f46;
-  border-color: #065f46;
-  color: #ffffff;
+  background: var(--accent-mint);
+  border-color: var(--accent-mint);
+  color: #0b0e13;
 }
 
 .degen-side-opt.active-no {
   background: var(--ink-0);
   border-color: var(--ink-0);
-  color: #ffffff;
+  color: #0b0e13;
 }
 
 .degen-stake-block {
@@ -1256,15 +1270,14 @@
   align-items: center;
   gap: 6px;
   border: 1px solid var(--border-strong);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 0 11px;
-  height: 40px;
-  background: var(--bg-paper);
+  height: 42px;
+  background: var(--bg-well);
 }
 
 .degen-stake-input-row:focus-within {
-  border-color: var(--ink-0);
-  background: var(--bg-surface);
+  border-color: var(--accent-teal);
 }
 
 .degen-stake-input {
@@ -1276,6 +1289,7 @@
   font-size: 16px;
   font-weight: 700;
   color: var(--ink-0);
+  font-variant-numeric: tabular-nums;
 }
 
 .degen-quick-stakes {
@@ -1286,7 +1300,7 @@
 
 .degen-quick-btn {
   height: 28px;
-  border-radius: 7px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg-well);
   font-size: 11.5px;
@@ -1296,14 +1310,14 @@
 }
 
 .degen-quick-btn:hover {
-  border-color: var(--ink-0);
+  border-color: var(--accent-teal);
   color: var(--ink-0);
 }
 
 .degen-payout-hero {
-  background: var(--bg-paper);
+  background: var(--bg-well);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 14px;
   padding: 12px;
   display: flex;
   flex-direction: column;
@@ -1323,12 +1337,13 @@
   font-weight: 800;
   letter-spacing: -0.02em;
   color: var(--ink-0);
+  font-variant-numeric: tabular-nums;
 }
 
 .degen-payout-roi {
   font-size: 12.5px;
   font-weight: 700;
-  color: #065f46;
+  color: var(--accent-mint);
 }
 
 .degen-receipt-list {
@@ -1344,6 +1359,7 @@
   justify-content: space-between;
   gap: 8px;
   color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
 }
 
 .degen-receipt-row strong {
@@ -1353,10 +1369,10 @@
 
 .degen-slip-error {
   padding: 9px 11px;
-  border-radius: 8px;
+  border-radius: 10px;
   background: var(--block-bg);
-  border: 1px solid #fca5a5;
-  color: #991b1b;
+  border: 1px solid var(--block-border);
+  color: var(--block);
   font-size: 12px;
   line-height: 1.4;
 }
@@ -1367,20 +1383,20 @@
   justify-content: center;
   gap: 6px;
   width: 100%;
-  height: 42px;
-  border-radius: 10px;
-  background: var(--ink-0);
-  color: #ffffff;
-  border: 1px solid var(--ink-0);
+  height: 44px;
+  border-radius: 14px;
+  background: var(--accent-lime);
+  color: #0b0e13;
+  border: none;
   font-size: 13.5px;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
   text-align: center;
   transition: background 120ms ease;
 }
 
-.degen-trade-cta:hover {
-  background: #232327;
+.degen-trade-cta:hover:not(:disabled) {
+  background: var(--accent-lime-hover, #d7f89e);
 }
 
 .degen-trade-cta.is-disabled {
@@ -1391,9 +1407,9 @@
 .degen-live-tx-btn {
   width: 100%;
   height: 36px;
-  border-radius: 9px;
+  border-radius: 10px;
   border: 1px solid var(--border-strong);
-  background: var(--bg-surface);
+  background: var(--bg-well);
   color: var(--ink-0);
   font-size: 12px;
   font-weight: 600;
@@ -1401,8 +1417,8 @@
 }
 
 .degen-live-tx-btn:hover {
-  border-color: var(--ink-0);
-  background: var(--ice-soft);
+  border-color: var(--accent-teal);
+  background: var(--bg-hover);
 }
 
 .degen-fallback-link {
@@ -1418,16 +1434,16 @@
 }
 
 .degen-trade-cta.is-inline-sign {
-  background: #065f46;
-  border-color: #065f46;
+  background: var(--accent-lime);
+  color: #0b0e13;
 }
 
 .degen-trade-cta.is-inline-sign:hover:not(:disabled) {
-  background: #047857;
+  background: var(--accent-lime-hover, #d7f89e);
 }
 
 .degen-trade-cta:disabled {
-  opacity: 0.55;
+  opacity: 0.45;
   cursor: not-allowed;
 }
 

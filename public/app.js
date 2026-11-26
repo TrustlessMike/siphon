@@ -1,5 +1,5 @@
-import { mountTurgaliumFunnelScene } from './turgalium-3d.js?v=7';
-import { renderConvergenceSvg } from './turgalium-svg.js?v=7';
+import { mountTurgaliumFunnelScene } from './turgalium-3d.js?v=2';
+import { renderConvergenceSvg } from './turgalium-svg.js?v=2';
 import {
   claimCctpOnSolana,
   connectCoinbaseSmartWallet,
@@ -40,7 +40,7 @@ import {
   signGaslessTypedData,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
-} from './wallets.js?v=7';
+} from './wallets.js?v=8';
 
 let currentScan = null;
 let currentPlan = null;
@@ -424,6 +424,99 @@ async function api(path, opts = {}) {
   return data;
 }
 
+function hasExtendedLogos() {
+  return Boolean(
+    typeof window !== 'undefined' &&
+      (typeof window.renderTurgaliumUiIcon === 'function' ||
+        typeof window.renderUiIcon === 'function')
+  );
+}
+
+function resolveLogo(preferred, fallback) {
+  return hasExtendedLogos() ? preferred : fallback;
+}
+
+function needsLightLogoBacking(str) {
+  if (hasExtendedLogos()) return false;
+  const s = String(str || '').toLowerCase();
+  return (
+    s.includes('aptos') ||
+    s.includes('linea') ||
+    s.includes('sonic') ||
+    s.includes('worldchain') ||
+    s.includes('ledger') ||
+    s.includes('okx')
+  );
+}
+
+const LOCAL_UI_ICONS = {
+  zap: '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
+  'refresh-cw':
+    '<path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/>',
+  'shield-alert':
+    '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',
+  'shield-check':
+    '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  ban: '<circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>',
+  'alert-triangle':
+    '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+  x: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+  'x-circle':
+    '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>',
+  check: '<polyline points="20 6 9 17 4 12"/>',
+  'check-circle':
+    '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>',
+  'activity-dot': '<circle cx="12" cy="12" r="4" fill="currentColor"/><circle cx="12" cy="12" r="9"/>',
+  circle: '<circle cx="12" cy="12" r="8"/>',
+  'external-link':
+    '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>',
+};
+
+function uiIcon(name, size = 13) {
+  if (!name) return '';
+  if (typeof window !== 'undefined') {
+    if (typeof window.renderTurgaliumUiIcon === 'function') {
+      return window.renderTurgaliumUiIcon(name, size);
+    }
+    if (typeof window.renderUiIcon === 'function') {
+      return window.renderUiIcon(name, size);
+    }
+  }
+  const paths = LOCAL_UI_ICONS[name];
+  if (!paths) return '';
+  const s = Number(size) || 13;
+  return `<span class="ui-icon" aria-hidden="true"><svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round">${paths}</svg></span>`;
+}
+
+function detectAddressFamily(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  const first = s.includes(',') ? s.split(',')[0].trim() : s;
+  if (/^0x[0-9a-fA-F]{40}$/.test(first) || /^[a-z0-9-]+(\.[a-z0-9-]+)*\.eth$/i.test(first)) {
+    return 'evm';
+  }
+  if (/^0x[0-9a-fA-F]{64}$/.test(first)) {
+    return activeFamily === 'aptos' ? 'aptos' : 'sui';
+  }
+  if (/^(cosmos|osmo|celestia|noble|inj|neutron)1[0-9a-z]{20,}$/i.test(first)) {
+    return 'cosmos';
+  }
+  if (/^(EQ|UQ|kQ|0Q)[A-Za-z0-9_-]{46}$/.test(first) || /^-?[0-9]+:[0-9a-fA-F]{64}$/.test(first)) {
+    return 'ton';
+  }
+  if (/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(first)) {
+    return 'tron';
+  }
+  if (/^(bc1[0-9a-z]{25,87}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$/i.test(first)) {
+    return 'btc';
+  }
+  return null;
+}
+
+window.__turgaliumDetectAddressFamily = detectAddressFamily;
+
 function getWalletLogoPath(name, rdns = '') {
   const s = `${name || ''} ${rdns || ''}`.toLowerCase();
   if (s.includes('metamask')) return '/logos/metamask.svg';
@@ -440,6 +533,7 @@ function getWalletLogoPath(name, rdns = '') {
   if (s.includes('ledger')) return '/logos/ledger.svg';
   if (s.includes('keplr')) return '/logos/keplr.svg';
   if (s.includes('leap')) return '/logos/leap.svg';
+  if (s.includes('cosmostation')) return resolveLogo('/logos/cosmostation.svg', '/logos/cosmos.svg');
   if (s.includes('slush') || s.includes('sui')) return '/logos/slush.svg';
   if (s.includes('petra')) return '/logos/petra.svg';
   if (s.includes('tonkeeper') || s.includes('openmask')) return '/logos/tonkeeper.svg';
@@ -458,8 +552,9 @@ function getFamilyLogoPath(family) {
 
 function getChainLogoPath(chain) {
   const c = String(chain || '').toLowerCase();
-  if (['cosmoshub', 'noble', 'celestia', 'injective', 'neutron'].includes(c)) {
-    return '/logos/cosmos.svg';
+  if (c === 'cosmoshub') return '/logos/cosmos.svg';
+  if (['celestia', 'noble', 'injective', 'neutron'].includes(c)) {
+    return resolveLogo(`/logos/${c}.svg`, '/logos/cosmos.svg');
   }
   if (
     [
@@ -506,20 +601,84 @@ function getProtocolLogoPath(protocol) {
   if (p.includes('uniswap')) return '/logos/uniswap.svg';
   if (p.includes('curve')) return '/logos/curve.svg';
   if (p.includes('spark')) return '/logos/spark.svg';
+  if (p.includes('ethena')) return resolveLogo('/logos/ethena.svg', '/logos/vault.svg');
+  if (p.includes('sky') || p.includes('maker')) return resolveLogo('/logos/sky.svg', '/logos/vault.svg');
+  if (p.includes('yearn')) return resolveLogo('/logos/yearn.svg', '/logos/vault.svg');
+  if (p.includes('aerodrome')) return resolveLogo('/logos/aerodrome.svg', '/logos/vault.svg');
+  if (p.includes('velodrome')) return resolveLogo('/logos/velodrome.svg', '/logos/vault.svg');
+  if (p.includes('hyperlend')) return resolveLogo('/logos/hyperlend.svg', '/logos/hyperevm.svg');
+  if (p.includes('kodiak')) return resolveLogo('/logos/kodiak.svg', '/logos/berachain.svg');
+  if (p.includes('bex') || p.includes('balancer')) return resolveLogo('/logos/bex.svg', '/logos/berachain.svg');
+  if (p.includes('moonwell')) return resolveLogo('/logos/moonwell.svg', '/logos/base.svg');
+  if (p.includes('pendle')) return resolveLogo('/logos/pendle.svg', '/logos/vault.svg');
+  if (p.includes('jupiter')) return resolveLogo('/logos/jupiter.svg', '/logos/solana.svg');
+  if (p.includes('kamino')) return resolveLogo('/logos/kamino.svg', '/logos/vault.svg');
+  if (p.includes('sanctum')) return resolveLogo('/logos/sanctum.svg', '/logos/solana.svg');
   if (p.includes('osmosis')) return '/logos/osmosis.svg';
   if (p.includes('cosmos')) return '/logos/cosmos.svg';
   if (p.includes('sui')) return '/logos/sui.svg';
-  if (p.includes('vault') || p.includes('4626') || p.includes('sky') || p.includes('ethena') || p.includes('yearn')) {
-    return '/logos/vault.svg';
-  }
+  if (p.includes('vault') || p.includes('4626')) return '/logos/vault.svg';
   return '/logos/vault.svg';
 }
 
+function getTokenLogoPath(symbol, chain) {
+  const sym = String(symbol || '').trim().toUpperCase();
+  const chainLogo = getChainLogoPath(chain);
+  if (!sym) return chainLogo;
+  if (sym === 'USDC' || sym === 'USDBC' || sym === 'USDC.E' || sym === 'USDCE') return '/logos/usdc.svg';
+  if (sym === 'USDT' || sym === 'USDT0' || sym === 'USD₮0') return resolveLogo('/logos/usdt.svg', chainLogo);
+  if (sym === 'WBTC' || sym === 'BTCB' || sym === 'CBBTC' || sym === 'BTC') {
+    return resolveLogo('/logos/wbtc.svg', '/logos/btc.svg');
+  }
+  if (sym === 'DAI' || sym === 'SDAI' || sym === 'USDS' || sym === 'SUSDS') {
+    return resolveLogo('/logos/dai.svg', '/logos/ethereum.svg');
+  }
+  if (sym === 'JUPSOL') return resolveLogo('/logos/jupsol.svg', '/logos/solana.svg');
+  if (sym === 'WSTETH' || sym === 'STETH') return resolveLogo('/logos/wsteth.svg', '/logos/lido.svg');
+  if (sym === 'USDE' || sym === 'SUSDE') return resolveLogo('/logos/usde.svg', '/logos/vault.svg');
+  if (sym === 'ETH' || sym === 'WETH') return '/logos/ethereum.svg';
+  if (sym === 'SOL' || sym === 'WSOL') return '/logos/solana.svg';
+  if (sym === 'ARB') return '/logos/arbitrum.svg';
+  if (sym === 'OP') return '/logos/optimism.svg';
+  if (sym === 'AAVE') return '/logos/aave.svg';
+  if (sym === 'UNI') return '/logos/uniswap.svg';
+  if (sym === 'GNO') return '/logos/gnosis.svg';
+  if (sym === 'ZK') return '/logos/zksync.svg';
+  if (sym === 'BNB' || sym === 'WBNB') return '/logos/bnb.svg';
+  if (sym === 'AVAX' || sym === 'WAVAX') return '/logos/avalanche.svg';
+  if (sym === 'POL' || sym === 'MATIC' || sym === 'WMATIC') return '/logos/polygon.svg';
+  if (sym === 'HYPE' || sym === 'WHYPE') return '/logos/hyperevm.svg';
+  if (sym === 'BERA' || sym === 'WBERA') return '/logos/berachain.svg';
+  if (sym === 'S' || sym === 'WS') return '/logos/sonic.svg';
+  if (sym === 'WLD') return '/logos/worldchain.svg';
+  if (sym === 'AERO') return resolveLogo('/logos/aerodrome.svg', chainLogo);
+  if (sym === 'TIA') return resolveLogo('/logos/celestia.svg', '/logos/cosmos.svg');
+  if (sym === 'INJ') return resolveLogo('/logos/injective.svg', '/logos/cosmos.svg');
+  if (sym === 'NTRN') return resolveLogo('/logos/neutron.svg', '/logos/cosmos.svg');
+  if (sym === 'OSMO') return '/logos/osmosis.svg';
+  if (sym === 'ATOM') return '/logos/cosmos.svg';
+  if (sym === 'SUI') return '/logos/sui.svg';
+  if (sym === 'APT') return '/logos/aptos.svg';
+  if (sym === 'TON') return '/logos/ton.svg';
+  if (sym === 'TRX') return '/logos/tron.svg';
+  return chainLogo;
+}
+
 function getBridgeProviderLogosHtml(pref) {
-  if (pref === 'cctp') return `<img src="/logos/circle.svg" alt="" class="chain-logo-xs" />`;
-  if (pref === 'lifi') return `<img src="/logos/lifi.svg" alt="" class="chain-logo-xs" />`;
-  if (pref === 'relay') return `<img src="/logos/relay.svg" alt="" class="chain-logo-xs" />`;
-  return `<img src="/logos/relay.svg" alt="" class="chain-logo-xs" /><img src="/logos/lifi.svg" alt="" class="chain-logo-xs" />`;
+  const p = String(pref || '').toLowerCase();
+  if (p === 'cctp' || p === 'circle_cctp') return `<img src="/logos/circle.svg" width="14" height="14" alt="" class="chain-logo-xs" />`;
+  if (p === 'lifi') return `<img src="/logos/lifi.svg" width="14" height="14" alt="" class="chain-logo-xs" />`;
+  if (p === 'relay') return `<img src="/logos/relay.svg" width="14" height="14" alt="" class="chain-logo-xs" />`;
+  if (p === 'mayan' || p === 'mayan_swift') {
+    return `<img src="${resolveLogo('/logos/mayan.svg', '/logos/relay.svg')}" width="14" height="14" alt="" class="chain-logo-xs" />`;
+  }
+  if (p === 'debridge' || p === 'debridge_dln') {
+    return `<img src="${resolveLogo('/logos/debridge.svg', '/logos/lifi.svg')}" width="14" height="14" alt="" class="chain-logo-xs" />`;
+  }
+  if (p === 'skip') {
+    return `<img src="${resolveLogo('/logos/skip.svg', '/logos/cosmos.svg')}" width="14" height="14" alt="" class="chain-logo-xs" />`;
+  }
+  return `<img src="/logos/relay.svg" width="14" height="14" alt="" class="chain-logo-xs" /><img src="/logos/lifi.svg" width="14" height="14" alt="" class="chain-logo-xs" />`;
 }
 
 function isTieredFeeMode() {
@@ -842,7 +1001,9 @@ function renderEmptyScanState() {
   const subEl = document.getElementById('kpiNetSub');
   if (subEl) subEl.textContent = outputAsset === 'SOL' ? '≈ $0.00 USDC · ~2–15s auto-fill' : '≈ 0.00 SOL · ~2–15s auto-fill';
   const selTextEl = document.getElementById('summarySelectedText');
-  if (selTextEl) selTextEl.textContent = '0 assets · 0 chains';
+  if (selTextEl) selTextEl.textContent = '0 assets (0 chains)';
+  const fromSumEl = document.getElementById('sweepFromSummary');
+  if (fromSumEl) fromSumEl.textContent = '0 assets (0 chains)';
   const liteCostEl = document.getElementById('summaryLiteCostText');
   if (liteCostEl) liteCostEl.textContent = '$0.00';
   const gasEl = document.getElementById('summaryGasText');
@@ -881,26 +1042,31 @@ function updateFamilyChrome() {
     }
   });
   const appIn = document.getElementById('appEvmInput');
-  if (appIn && meta?.addressHint) {
-    appIn.placeholder = `Scan ${meta.addressHint}`;
+  if (appIn) {
+    appIn.placeholder =
+      activeFamily === 'evm'
+        ? 'Paste any wallet address or .eth name'
+        : meta?.addressHint
+        ? `Paste ${meta.addressHint} or any address`
+        : 'Paste any wallet address or .eth name';
   }
   if (!currentScan) {
     const famShort = meta?.shortLabel || (activeFamily === 'evm' ? 'EVM' : activeFamily.toUpperCase());
     const sourceSummaryEl = document.getElementById('sourceSummaryText');
     if (sourceSummaryEl) {
-      sourceSummaryEl.textContent = `Connect a ${famShort} wallet or enter an address to scan`;
+      sourceSummaryEl.textContent = `Connect a ${famShort} wallet or paste any address to scan`;
     }
     const assetListBody = document.getElementById('assetListBody');
     if (assetListBody) {
-      assetListBody.innerHTML = `<div style="text-align:center; padding:42px 16px; color:var(--ink-3); font-size:13px;">Connect a ${escapeHtml(famShort)} wallet or enter an address above to scan balances across chains.</div>`;
+      assetListBody.innerHTML = `<div style="text-align:center; padding:36px 16px; color:var(--ink-2); font-size:13px;">Connect a ${escapeHtml(famShort)} wallet or paste an address above to scan balances across chains.</div>`;
     }
   }
   const proofBtn = document.getElementById('verifyProofBtn');
   if (proofBtn) {
     proofBtn.textContent =
       activeFamily === 'evm'
-        ? 'Prove Swap & Gas Before Signing (Live eth_call)'
-        : `Prove ${meta?.shortLabel || activeFamily.toUpperCase()} Sweep Before Signing`;
+        ? 'Simulate before signing'
+        : `Simulate ${meta?.shortLabel || activeFamily.toUpperCase()} before signing`;
   }
   updateWalletButtons();
 }
@@ -1008,13 +1174,13 @@ function updateWalletButtons() {
         : `Connect ${famShort} Wallet to Sweep`;
       ctaBtn.disabled = false;
     } else if (!isProMode()) {
-      ctaBtn.textContent = `Sweep to Solana →`;
+      ctaBtn.textContent = 'Sweep to Solana';
       ctaBtn.disabled = false;
     } else if (executionMode === 'gasless') {
-      ctaBtn.textContent = `Gasless 1-Sig Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'}) →`;
+      ctaBtn.textContent = `Gasless 1-Sig Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`;
       ctaBtn.disabled = false;
     } else {
-      ctaBtn.textContent = `Convert & Sweep ${n} ${n === 1 ? 'Chain' : 'Chains'} to Solana →`;
+      ctaBtn.textContent = `Sweep ${n} ${n === 1 ? 'Chain' : 'Chains'} to Solana`;
       ctaBtn.disabled = false;
     }
   }
@@ -1208,13 +1374,22 @@ function renderAll() {
         : `≈ ${fin.effectiveNetSol.toFixed(2)} SOL · ${eta}`;
   }
 
-  // Receipt Summary Rows
+  // Receipt Summary Rows & From Well
   const selTextEl = document.getElementById('summarySelectedText');
-  if (selTextEl) {
+  const fromSumEl = document.getElementById('sweepFromSummary');
+  {
     const assetCount = t.tokensSoldCount + t.defiWithdrawnCount;
     const chainCount = currentPlan.legs.length;
     const burnPart = isProMode() && t.tokensBurnedCount > 0 ? ` · ${t.tokensBurnedCount} burns` : '';
-    selTextEl.textContent = `${assetCount} ${assetCount === 1 ? 'asset' : 'assets'}${burnPart} (${chainCount} ${chainCount === 1 ? 'chain' : 'chains'})`;
+    const summaryStr = `${assetCount} ${assetCount === 1 ? 'asset' : 'assets'}${burnPart} (${chainCount} ${chainCount === 1 ? 'chain' : 'chains'})`;
+    if (selTextEl) selTextEl.textContent = summaryStr;
+    if (fromSumEl) {
+      const grossSelectedUsd = safeNum(t.grossUsd);
+      fromSumEl.textContent =
+        assetCount > 0 && grossSelectedUsd > 0
+          ? `${fmtUsd(grossSelectedUsd)} · ${assetCount} ${assetCount === 1 ? 'asset' : 'assets'} (${chainCount} ${chainCount === 1 ? 'chain' : 'chains'})`
+          : summaryStr;
+    }
   }
   const liteCostEl = document.getElementById('summaryLiteCostText');
   if (liteCostEl) {
@@ -1500,16 +1675,19 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
   else if (isExternalApp) category = 'external_app';
 
   const defaultBadges = {
-    one_click: '⚡ 1-Click Extract → Solana',
-    instant_swap: '🔄 Instant Swap (Skips Cooldown)',
-    debt_guard: isExternalApp ? '🛡️ Active Borrow · Protocol App' : '🛡️ Safe Partial (Debt Guard)',
-    cooldown: '⏳ Cooldown / Locked',
-    external_app: '↗ Protocol App Position',
+    one_click: { icon: 'zap', text: '1-Click Extract → Solana' },
+    instant_swap: { icon: 'refresh-cw', text: 'Instant Swap (Skips Cooldown)' },
+    debt_guard: isExternalApp
+      ? { icon: 'shield-alert', text: 'Active Borrow · Protocol App' }
+      : { icon: 'shield-check', text: 'Safe Partial (Debt Guard)' },
+    cooldown: { icon: 'clock', text: 'Cooldown / Locked' },
+    external_app: { icon: 'external-link', text: 'Protocol App Position' },
   };
+  let badgeIcon = defaultBadges[category]?.icon || 'zap';
   const badgeText =
     plan?.badgeLabel || plan?.humanBadge
       ? sanitizePlainDefiText(plan.badgeLabel || plan.humanBadge)
-      : defaultBadges[category];
+      : defaultBadges[category].text;
 
   const underlyingSym = String(plan?.underlyingSymbol || asset?.underlyingSymbol || asset?.symbol || 'USDC');
   const displayToken = getPlainDisplayToken(asset, plan);
@@ -1544,7 +1722,8 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
 
   // Pre-flight status pill & plain-English warning reason
   let preflightLevel = 'verified'; // 'verified' | 'warn' | 'blocked'
-  let preflightLabel = '✓ Verified withdrawable';
+  let preflightIcon = 'check';
+  let preflightLabel = 'Verified withdrawable';
   let warningReason = '';
 
   const isZeroValueDefi =
@@ -1569,6 +1748,7 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
 
   if (explicitlyBlocked && hasCooldown) {
     preflightLevel = 'blocked';
+    preflightIcon = 'lock';
     const unlockStr =
       unlockAt > 0
         ? new Date(unlockAt * 1000).toLocaleDateString('en-US', {
@@ -1578,38 +1758,43 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
             timeZone: 'UTC',
           })
         : '';
-    preflightLabel = unlockStr ? `⏳ Locked until ${unlockStr}` : '⏳ Locked';
+    preflightLabel = unlockStr ? `Locked until ${unlockStr}` : 'Locked';
     warningReason =
       planReason || 'This position is currently locked and must unlock before it can be withdrawn.';
   } else if (explicitlyBlocked && hasDebt) {
     preflightLevel = 'blocked';
+    preflightIcon = 'shield-alert';
     preflightLabel =
       healthFactor !== null
-        ? `🛡️ Debt guard · HF ${healthFactor.toFixed(2)}`
-        : '🛡️ Debt guard active';
+        ? `Debt guard · HF ${healthFactor.toFixed(2)}`
+        : 'Debt guard active';
     warningReason =
       planReason ||
       `Active borrow of $${debtUsd.toFixed(2)}. Repay debt or manage directly on ${protocolGroup}.`;
   } else if (explicitlyBlocked && isExternalApp) {
     preflightLevel = 'blocked';
-    preflightLabel = `↗ Manage on ${protocolGroup}`;
+    preflightIcon = 'external-link';
+    preflightLabel = `Manage on ${protocolGroup}`;
     warningReason =
       planReason ||
       `Withdraw on ${protocolGroup}, then sweep unlocked ${displayToken} to Solana.`;
   } else if (explicitlyBlocked) {
     preflightLevel = 'blocked';
-    preflightLabel = '✕ Cannot withdraw';
+    preflightIcon = 'x-circle';
+    preflightLabel = 'Cannot withdraw';
     warningReason = planReason || 'Pre-flight check detected a restriction on this position.';
   } else if (hasCooldown) {
     preflightLevel = 'warn';
-    preflightLabel = '⏳ Cooldown required';
+    preflightIcon = 'clock';
+    preflightLabel = 'Cooldown required';
     warningReason =
       planReason ||
       sanitizePlainDefiText(plan?.cooldownLabel) ||
       'This protocol requires an unbonding cooldown period before tokens can be bridged to Solana.';
   } else if (hasDebt) {
     preflightLevel = safePartialReady ? 'warn' : 'blocked';
-    preflightLabel = safePartialReady ? '🛡️ Safe partial ready' : '🛡️ Debt guard active';
+    preflightIcon = safePartialReady ? 'shield-check' : 'shield-alert';
+    preflightLabel = safePartialReady ? 'Safe partial ready' : 'Debt guard active';
     const debtStr = debtUsd > 0 ? `$${debtUsd.toFixed(2)}` : 'active';
     const hfStr = healthFactor !== null ? ` (health factor ${healthFactor.toFixed(2)})` : '';
     warningReason =
@@ -1619,11 +1804,13 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
         : `Active borrow of ${debtStr}${hfStr}. Repay borrow before full withdrawal to protect your position.`);
   } else if (isZeroValueDefi) {
     preflightLevel = 'blocked';
-    preflightLabel = '⊘ Zero Liquidity · Unextractable';
+    preflightIcon = 'ban';
+    preflightLabel = 'Zero Liquidity · Unextractable';
     warningReason = 'No verified withdrawable liquidity ($0.00). Position cannot be extracted to Solana.';
   } else if (asset?.roiVerdict === 'negative_roi') {
     preflightLevel = 'blocked';
-    preflightLabel = '⊘ Fees exceed value';
+    preflightIcon = 'ban';
+    preflightLabel = 'Fees exceed value';
     const cleanedReason = sanitizePlainDefiText(plan?.preflightMessage || asset?.actionReason);
     warningReason =
       cleanedReason && !/opt-in burn|0x\.\.\.dead/i.test(cleanedReason)
@@ -1631,23 +1818,26 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
         : 'Estimated network and bridge costs exceed the withdrawable value.';
   } else if (asset?.roiVerdict === 'low_efficiency') {
     preflightLevel = 'warn';
-    preflightLabel = '⚠ High network cost';
+    preflightIcon = 'alert-triangle';
+    preflightLabel = 'High network cost';
     const pct = typeof asset?.effectiveCostPct === 'number' ? `${asset.effectiveCostPct.toFixed(0)}%` : 'elevated';
     warningReason = `Verified withdrawable, though total fees are ${pct} of position value.`;
   } else if (statusRaw === 'warn' || statusRaw === 'warning' || statusRaw === 'caution') {
     preflightLevel = 'warn';
-    preflightLabel = sanitizePlainDefiText(plan?.preflightLabel) || '⚠ Review before exit';
+    preflightIcon = 'alert-triangle';
+    preflightLabel = sanitizePlainDefiText(plan?.preflightLabel) || 'Review before exit';
     warningReason = planReason || '';
   }
 
   let finalBadgeText = badgeText;
   if (preflightLevel === 'blocked' && (category === 'one_click' || category === 'instant_swap')) {
     category = 'blocked';
+    badgeIcon = 'ban';
     finalBadgeText = isZeroValueDefi
-      ? '⊘ Zero Liquidity · Unextractable'
+      ? 'Zero Liquidity · Unextractable'
       : asset?.roiVerdict === 'negative_roi'
-      ? '⊘ Unextractable · Fees Exceed Value'
-      : '⊘ Blocked · Cannot Extract';
+      ? 'Unextractable · Fees Exceed Value'
+      : 'Blocked · Cannot Extract';
   }
 
   const posType = asset?.defiPositionType || plan?.positionType || '';
@@ -1683,9 +1873,11 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
     protocolUrl,
     chainLogo,
     category,
+    badgeIcon,
     badgeText: finalBadgeText,
     routeLine,
     preflightLevel,
+    preflightIcon,
     preflightLabel,
     warningReason,
     isReady,
@@ -1715,22 +1907,22 @@ function renderDefiGuidedStepper() {
   const st = defiStepperState;
   const stepsHtml = st.steps
     .map((step, idx) => {
-      const icon =
+      const dotHtml =
         step.status === 'done'
-          ? '✓'
+          ? uiIcon('check', 11)
           : step.status === 'failed'
-          ? '!'
+          ? uiIcon('alert-triangle', 11)
           : step.status === 'active'
-          ? '◉'
-          : String(idx + 1);
+          ? uiIcon('activity-dot', 11)
+          : escHtml(String(idx + 1));
       const safeTxUrl = safeHttpUrl(step.txUrl);
       const txHtml = safeTxUrl
-        ? ` <a class="explorer-link" href="${escHtml(safeTxUrl)}" target="_blank" rel="noopener noreferrer">${escHtml(step.txLabel || 'View tx ↗')}</a>`
+        ? ` <a class="explorer-link" href="${escHtml(safeTxUrl)}" target="_blank" rel="noopener noreferrer">${escHtml(step.txLabel || 'View tx')}</a>`
         : '';
       return `
         <div class="defi-step is-${escHtml(step.status)}" data-stepper-step="${escHtml(step.id)}">
           <div class="defi-step-top">
-            <span class="defi-step-dot mono">${escHtml(icon)}</span>
+            <span class="defi-step-dot">${dotHtml}</span>
             <strong class="defi-step-title">${escHtml(step.title)}</strong>
           </div>
           <div class="defi-step-detail">${escHtml(step.detail || '')}${txHtml}</div>
@@ -1744,12 +1936,12 @@ function renderDefiGuidedStepper() {
       <div class="inline-logo-row">
         <span class="agent-pulse-dot ${st.active ? '' : 'is-idle'}"></span>
         <strong>${escHtml(st.title)}</strong>
-        <span class="mono muted-xs pro-only">${escHtml(st.mode === 'two_stage' ? 'Guided 2-Stage Auto-Bridge' : '1-Click Atomic Extract')}</span>
+        <span class="muted-xs pro-only">${escHtml(st.mode === 'two_stage' ? 'Guided 2-Stage Auto-Bridge' : '1-Click Atomic Extract')}</span>
       </div>
       ${
         st.dismissible
           ? `<button type="button" class="text-action muted" id="dismissDefiStepperBtn">Dismiss</button>`
-          : `<span class="mono muted-xs">Auto-continuing…</span>`
+          : `<span class="muted-xs">Auto-continuing…</span>`
       }
     </div>
     <div class="defi-stepper-rail">${stepsHtml}</div>
@@ -1838,11 +2030,11 @@ function renderDefiUnwindPanel() {
     extractAllBtn.disabled = readyPositions.length === 0;
     extractAllBtn.textContent =
       readyPositions.length > 0
-        ? `Extract All Ready DeFi → Solana (${fmtUsd(readyUsd)})`
+        ? `Extract Ready DeFi (${fmtUsd(readyUsd)})`
         : 'No Ready DeFi Positions';
   }
 
-  // Group by normalized protocol name, sorted by descending USD value
+  // Group by normalized protocol name; sort Ready positions & Ready groups FIRST
   const groupMap = new Map();
   for (const pos of normalized) {
     const key = pos.protocolGroup;
@@ -1853,6 +2045,7 @@ function renderDefiUnwindPanel() {
         protocolUrl: pos.protocolUrl || '',
         positions: [],
         totalUsd: 0,
+        readyUsd: 0,
         readyCount: 0,
       });
     }
@@ -1860,131 +2053,159 @@ function renderDefiUnwindPanel() {
     grp.positions.push(pos);
     grp.totalUsd += Number(pos.asset.grossUsd || 0);
     if (!grp.protocolUrl && pos.protocolUrl) grp.protocolUrl = pos.protocolUrl;
-    if (pos.isReady) grp.readyCount += 1;
+    if (pos.isReady) {
+      grp.readyCount += 1;
+      grp.readyUsd += Number(pos.asset.grossUsd || 0);
+    }
   }
-  const groups = Array.from(groupMap.values()).sort((a, b) => b.totalUsd - a.totalUsd);
+  const allGroups = Array.from(groupMap.values()).map((grp) => {
+    grp.positions.sort((a, b) => {
+      if (a.isReady !== b.isReady) return a.isReady ? -1 : 1;
+      return Number(b.asset.grossUsd || 0) - Number(a.asset.grossUsd || 0);
+    });
+    return grp;
+  });
+  const readyGroups = allGroups
+    .filter((g) => g.readyCount > 0)
+    .sort((a, b) => b.readyUsd - a.readyUsd || b.totalUsd - a.totalUsd);
+  const unavailableGroups = allGroups
+    .filter((g) => g.readyCount === 0)
+    .sort((a, b) => b.totalUsd - a.totalUsd);
+  const unavailablePositionsCount = unavailableGroups.reduce((s, g) => s + g.positions.length, 0);
 
-  groupsHost.innerHTML = groups
-    .map((grp) => {
-      const posRowsHtml = grp.positions
-        .map((pos) => {
-          const a = pos.asset;
-          const checked = selectedAssetIds.has(a.id);
-          const badgeClass =
-            pos.category === 'one_click'
-              ? 'defi-badge-oneclick'
-              : pos.category === 'instant_swap' || pos.category === 'external_app'
-              ? 'defi-badge-swap'
-              : pos.category === 'debt_guard'
-              ? 'defi-badge-guard'
-              : pos.category === 'blocked'
-              ? 'defi-badge-blocked'
-              : 'defi-badge-cooldown';
-          const statusClass =
-            pos.preflightLevel === 'verified'
-              ? 'defi-status-verified'
-              : pos.preflightLevel === 'warn'
-              ? 'defi-status-warn'
-              : 'defi-status-blocked';
-          const usdStr = `$${Number(a.grossUsd || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
-          const netSubStr =
-            pos.debtUsd > 0 && pos.netUsd !== null
-              ? `Net $${pos.netUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
-              : a.chainName;
+  const renderGroupCard = (grp) => {
+    const posRowsHtml = grp.positions
+      .map((pos) => {
+        const a = pos.asset;
+        const checked = selectedAssetIds.has(a.id);
+        const badgeClass =
+          pos.category === 'one_click'
+            ? 'defi-badge-oneclick'
+            : pos.category === 'instant_swap' || pos.category === 'external_app'
+            ? 'defi-badge-swap'
+            : pos.category === 'debt_guard'
+            ? 'defi-badge-guard'
+            : pos.category === 'blocked'
+            ? 'defi-badge-blocked'
+            : 'defi-badge-cooldown';
+        const statusClass =
+          pos.preflightLevel === 'verified'
+            ? 'defi-status-verified'
+            : pos.preflightLevel === 'warn'
+            ? 'defi-status-warn'
+            : 'defi-status-blocked';
+        const usdStr = `$${Number(a.grossUsd || 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+        const netSubStr =
+          pos.debtUsd > 0 && pos.netUsd !== null
+            ? `Net $${pos.netUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
+            : a.chainName;
+        const chainLogoCls = needsLightLogoBacking(a.chain) ? ' logo-light-backing' : '';
 
-          const techDetailsRows = [
-            `<div class="defi-tech-kv"><span>Protocol contract</span><code class="mono">${escHtml(pos.contractAddress)}</code></div>`,
-            `<div class="defi-tech-kv"><span>Position token</span><code class="mono">${escHtml(a.symbol)} (${escHtml(a.address)})</code></div>`,
-            `<div class="defi-tech-kv"><span>Raw balance</span><code class="mono">${escHtml(String(a.rawBalance || '0'))} (${escHtml(String(a.decimals ?? 18))} dec)</code></div>`,
-            pos.methodLabel
-              ? `<div class="defi-tech-kv"><span>Method</span><code class="mono">${escHtml(pos.methodLabel)}</code></div>`
-              : '',
-            pos.calldataPreview
-              ? `<div class="defi-tech-kv"><span>Calldata preview</span><code class="mono">${escHtml(pos.calldataPreview)}</code></div>`
-              : '',
-          ]
-            .filter(Boolean)
-            .join('');
+        const techDetailsRows = [
+          `<div class="defi-tech-kv"><span>Protocol contract</span><code class="mono">${escHtml(pos.contractAddress)}</code></div>`,
+          `<div class="defi-tech-kv"><span>Position token</span><code class="mono">${escHtml(a.symbol)} (${escHtml(a.address)})</code></div>`,
+          `<div class="defi-tech-kv"><span>Raw balance</span><code class="mono">${escHtml(String(a.rawBalance || '0'))} (${escHtml(String(a.decimals ?? 18))} dec)</code></div>`,
+          pos.methodLabel
+            ? `<div class="defi-tech-kv"><span>Method</span><code class="mono">${escHtml(pos.methodLabel)}</code></div>`
+            : '',
+          pos.calldataPreview
+            ? `<div class="defi-tech-kv"><span>Calldata preview</span><code class="mono">${escHtml(pos.calldataPreview)}</code></div>`
+            : '',
+        ]
+          .filter(Boolean)
+          .join('');
 
-          return `
-            <div class="defi-pos-row ${checked ? 'is-checked' : ''} ${pos.isReady ? '' : 'is-restricted'}" data-defi-asset-id="${escHtml(a.id)}">
-              <div class="defi-pos-main">
-                <label class="defi-pos-check-wrap" title="Include in Sweep">
-                  <input type="checkbox" class="defi-pos-chk" data-defi-chk="${escHtml(a.id)}" ${checked ? 'checked' : ''} ${pos.preflightLevel === 'blocked' ? 'disabled' : ''} aria-label="Select ${escHtml(pos.routeLine)}" />
-                </label>
-                <div class="defi-pos-body">
-                  <div class="defi-pos-route-line">
-                    <img src="${escHtml(pos.chainLogo)}" alt="" class="chain-logo-xs" />
-                    <span class="defi-route-text">${escHtml(pos.routeLine)}</span>
-                  </div>
-                  <div class="defi-pos-badges">
-                    <span class="defi-exit-badge ${badgeClass}">${escHtml(pos.badgeText)}</span>
-                    ${
-                      pos.category === 'blocked'
-                        ? ''
-                        : `<span class="defi-status-pill ${statusClass}">${escHtml(pos.preflightLabel)}</span>`
-                    }
-                  </div>
+        return `
+          <div class="defi-pos-row ${checked ? 'is-checked' : ''} ${pos.isReady ? '' : 'is-restricted'}" data-defi-asset-id="${escHtml(a.id)}">
+            <div class="defi-pos-main">
+              <label class="defi-pos-check-wrap" title="Include in Sweep">
+                <input type="checkbox" class="defi-pos-chk" data-defi-chk="${escHtml(a.id)}" ${checked ? 'checked' : ''} ${pos.preflightLevel === 'blocked' ? 'disabled' : ''} aria-label="Select ${escHtml(pos.routeLine)}" />
+              </label>
+              <div class="defi-pos-body">
+                <div class="defi-pos-route-line">
+                  <img src="${escHtml(pos.chainLogo)}" width="15" height="15" alt="" class="chain-logo-xs${chainLogoCls}" />
+                  <span class="defi-route-text">${escHtml(pos.routeLine)}</span>
+                </div>
+                <div class="defi-pos-badges">
+                  <span class="defi-exit-badge ${badgeClass}">${uiIcon(pos.badgeIcon, 12)}<span>${escHtml(pos.badgeText)}</span></span>
                   ${
-                    pos.warningReason
-                      ? `<div class="defi-pos-warning is-${escHtml(pos.preflightLevel)}">${escHtml(pos.warningReason)}</div>`
-                      : ''
+                    pos.category === 'blocked'
+                      ? ''
+                      : `<span class="defi-status-pill ${statusClass}">${uiIcon(pos.preflightIcon, 12)}<span>${escHtml(pos.preflightLabel)}</span></span>`
                   }
-                  <details class="defi-tech-details pro-only">
-                    <summary>Technical details</summary>
-                    <div class="defi-tech-grid">${techDetailsRows}</div>
-                  </details>
                 </div>
-                <div class="defi-pos-right">
-                  <strong class="mono defi-pos-usd">${escHtml(usdStr)}</strong>
-                  <span class="mono muted-xs">${escHtml(netSubStr)}</span>
-                </div>
+                ${
+                  pos.warningReason
+                    ? `<div class="defi-pos-warning is-${escHtml(pos.preflightLevel)}">${escHtml(pos.warningReason)}</div>`
+                    : ''
+                }
+                <details class="defi-tech-details pro-only">
+                  <summary>Technical details</summary>
+                  <div class="defi-tech-grid">${techDetailsRows}</div>
+                </details>
+              </div>
+              <div class="defi-pos-right">
+                <strong class="defi-pos-usd">${escHtml(usdStr)}</strong>
+                <span class="muted-xs">${escHtml(netSubStr)}</span>
               </div>
             </div>
-          `;
-        })
-        .join('');
-
-      const headerActionHtml =
-        grp.readyCount > 0
-          ? `<button
-              type="button"
-              class="btn-outline-sm defi-proto-extract-btn"
-              data-extract-protocol="${escHtml(grp.name)}"
-            >Extract ${escHtml(grp.name)} →</button>`
-          : grp.protocolUrl
-          ? `<a
-              class="btn-outline-sm defi-proto-extract-btn"
-              href="${escHtml(grp.protocolUrl)}"
-              target="_blank"
-              rel="noopener noreferrer"
-              style="text-decoration:none; display:inline-flex; align-items:center;"
-            >Manage on ${escHtml(grp.name)} ↗</a>`
-          : `<button
-              type="button"
-              class="btn-outline-sm defi-proto-extract-btn"
-              disabled
-            >Locked / Guarded</button>`;
-
-      return `
-        <div class="defi-protocol-group" data-protocol-group="${escHtml(grp.name)}">
-          <div class="defi-proto-head">
-            <div class="defi-proto-id">
-              <span class="defi-proto-logo-tile">
-                <img src="${escHtml(grp.logo)}" alt="" class="defi-proto-logo-img" />
-              </span>
-              <div class="defi-proto-meta">
-                <strong>${escHtml(grp.name)}</strong>
-                <span class="mono muted-xs">${grp.positions.length} ${grp.positions.length === 1 ? 'position' : 'positions'} · $${grp.totalUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-              </div>
-            </div>
-            ${headerActionHtml}
           </div>
-          <div class="defi-pos-list">${posRowsHtml}</div>
+        `;
+      })
+      .join('');
+
+    const headerActionHtml =
+      grp.readyCount > 0
+        ? `<button
+            type="button"
+            class="btn-outline-sm defi-proto-extract-btn"
+            data-extract-protocol="${escHtml(grp.name)}"
+          >Extract ${escHtml(grp.name)}</button>`
+        : grp.protocolUrl
+        ? `<a
+            class="btn-outline-sm defi-proto-extract-btn"
+            href="${escHtml(grp.protocolUrl)}"
+            target="_blank"
+            rel="noopener noreferrer"
+            style="text-decoration:none; display:inline-flex; align-items:center;"
+          >Manage on ${escHtml(grp.name)}</a>`
+        : `<button
+            type="button"
+            class="btn-outline-sm defi-proto-extract-btn"
+            disabled
+          >Unavailable</button>`;
+
+    return `
+      <div class="defi-protocol-group" data-protocol-group="${escHtml(grp.name)}">
+        <div class="defi-proto-head">
+          <div class="defi-proto-id">
+            <span class="defi-proto-logo-tile">
+              <img src="${escHtml(grp.logo)}" width="20" height="20" alt="" class="defi-proto-logo-img" />
+            </span>
+            <div class="defi-proto-meta">
+              <strong>${escHtml(grp.name)}</strong>
+              <span class="muted-xs tabular-nums">${grp.positions.length} ${grp.positions.length === 1 ? 'position' : 'positions'} · $${grp.totalUsd.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+            </div>
+          </div>
+          ${headerActionHtml}
         </div>
-      `;
-    })
-    .join('');
+        <div class="defi-pos-list">${posRowsHtml}</div>
+      </div>
+    `;
+  };
+
+  const readyHtml = readyGroups.map(renderGroupCard).join('');
+  const unavailableHtml = unavailableGroups.length
+    ? `<details class="defi-unavailable-details"${unavailablePositionsCount <= 2 ? ' open' : ''}>
+        <summary>
+          <span>Show ${unavailablePositionsCount} unavailable ${unavailablePositionsCount === 1 ? 'position' : 'positions'}</span>
+          <span class="muted-xs">${unavailableGroups.length} ${unavailableGroups.length === 1 ? 'protocol' : 'protocols'}</span>
+        </summary>
+        <div class="defi-unavailable-body">${unavailableGroups.map(renderGroupCard).join('')}</div>
+      </details>`
+    : '';
+
+  groupsHost.innerHTML = `${readyHtml}${unavailableHtml}`;
 
   groupsHost.querySelectorAll('.defi-proto-logo-img').forEach((img) => {
     img.addEventListener('error', () => {
@@ -2177,11 +2398,25 @@ function renderAssetList() {
   });
 
   if (!filtered.length) {
-    host.innerHTML = `<div style="text-align:center; padding:36px 16px; color:var(--ink-3); font-size:13px;">No assets in this filter.</div>`;
+    host.innerHTML = `<div style="text-align:center; padding:32px 16px; color:var(--ink-2); font-size:13px;">No assets in this filter.</div>`;
     return;
   }
 
-  host.innerHTML = filtered
+  // Sort actionable / selected / worth-it assets first, zero-value & blocked last
+  const sorted = [...filtered].sort((a, b) => {
+    const rank = (x) => {
+      if (selectedAssetIds.has(x.id)) return 0;
+      if (x.roiVerdict === 'worth_it') return 1;
+      if (x.action === 'BRIDGE_DIRECT_USDC' || x.action === 'SELL_AND_BRIDGE' || x.action === 'WITHDRAW_AND_BRIDGE') return 2;
+      if (x.grossUsd > 0 && x.action !== 'SKIP_HONEYPOT' && x.action !== 'SKIP_UNPRICED') return 3;
+      return 4;
+    };
+    const dr = rank(a) - rank(b);
+    if (dr !== 0) return dr;
+    return Number(b.grossUsd || 0) - Number(a.grossUsd || 0);
+  });
+
+  host.innerHTML = sorted
     .map((a) => {
       const checked = selectedAssetIds.has(a.id);
       const defiNorm = isDefiAsset(a) ? normalizeDefiPosition(a, outputAsset) : null;
@@ -2194,8 +2429,11 @@ function renderAssetList() {
       const protoLogo =
         localProtoLogo === '/logos/vault.svg' && remoteProtoLogo ? remoteProtoLogo : localProtoLogo;
       const chainLogo = getChainLogoPath(a.chain);
-      const mainLogo = protoLogo || (a.symbol === 'USDC' ? '/logos/usdc.svg' : chainLogo);
-      const showSubLogo = Boolean(protoLogo || a.symbol === 'USDC');
+      const tokenLogo = getTokenLogoPath(a.symbol, a.chain);
+      const mainLogo = protoLogo || tokenLogo;
+      const showSubLogo = Boolean(mainLogo !== chainLogo);
+      const mainLightCls = needsLightLogoBacking(mainLogo) ? ' logo-light-backing' : '';
+      const subLightCls = needsLightLogoBacking(a.chain) ? ' logo-light-backing' : '';
       const usdStr =
         a.action === 'BURN_ZERO_LIQUIDITY'
           ? '$0.00'
@@ -2208,11 +2446,11 @@ function renderAssetList() {
       const balStr = `${formatCompactBalance(a.uiBalance)} ${a.symbol}`;
       const debtBadge =
         defiNorm && defiNorm.category === 'debt_guard'
-          ? `<span class="micro-pill" style="background:var(--hold-bg);border-color:#fde68a;color:#92400e;">Debt Guard</span>`
+          ? `<span class="micro-pill is-warn">Debt Guard</span>`
           : defiNorm && defiNorm.category === 'cooldown'
-          ? `<span class="micro-pill" style="background:var(--hold-bg);border-color:#fde68a;color:#92400e;">Locked</span>`
+          ? `<span class="micro-pill is-warn">Locked</span>`
           : a.aaveDebtUsd > 0
-          ? `<span class="micro-pill" style="background:var(--block-bg);border-color:#fecaca;color:#991b1b;">Debt Guard</span>`
+          ? `<span class="micro-pill is-danger">Debt Guard</span>`
           : '';
       const walletTag =
         currentScan?.unifiedWallets?.length > 1 && a.sourceWalletLabel
@@ -2228,8 +2466,8 @@ function renderAssetList() {
           <input type="checkbox" class="asset-chk" data-asset-id="${escHtml(a.id)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''} aria-label="Select ${escHtml(a.symbol)} on ${escHtml(a.chainName)}" />
           <div class="asset-row-id">
             <span class="asset-logo-wrap">
-              <img src="${escHtml(mainLogo)}" alt="" class="asset-logo-main" />
-              ${showSubLogo ? `<img src="${escHtml(chainLogo)}" alt="" class="asset-logo-sub" />` : ''}
+              <img src="${escHtml(mainLogo)}" width="19" height="19" alt="" class="asset-logo-main${mainLightCls}" />
+              ${showSubLogo ? `<img src="${escHtml(chainLogo)}" width="14" height="14" alt="" class="asset-logo-sub${subLightCls}" />` : ''}
             </span>
             <div class="asset-row-name-col">
               <div class="asset-row-sym">
@@ -2356,19 +2594,20 @@ function renderPreSignProofCard(proof) {
   card.classList.toggle('is-safe', Boolean(proof.allChecksSafe && proof.hasEnoughNativeGas));
   card.classList.toggle('is-warn', !proof.allChecksSafe || !proof.hasEnoughNativeGas);
 
+  const gasIcon = proof.hasEnoughNativeGas ? uiIcon('check', 12) : uiIcon('alert-triangle', 12);
   const gasLabel = proof.hasEnoughNativeGas
-    ? `✓ ${proof.nativeBalanceUi} ${proof.nativeSymbol} (~$${safeNum(proof.nativeBalanceUsd).toFixed(2)})`
-    : `! Low gas (${proof.nativeBalanceUi} ${proof.nativeSymbol}) → Switch to Gasless 1-Sig`;
+    ? `${proof.nativeBalanceUi} ${proof.nativeSymbol} (~$${safeNum(proof.nativeBalanceUsd).toFixed(2)})`
+    : `Low gas (${proof.nativeBalanceUi} ${proof.nativeSymbol}) · Switch to Gasless 1-Sig`;
   const checkRows = (proof.checks || [])
     .slice(0, 6)
     .map((c) => {
-      const mark =
+      const markHtml =
         c.preflightStatus === 'verified'
-          ? '✓'
+          ? uiIcon('check', 12)
           : c.preflightStatus === 'reverted'
-          ? '✕'
-          : '•';
-      return `<div class="proof-check-row"><span>${mark} ${escapeHtml(c.assetSymbol)}: ${escapeHtml(c.summary)}</span><span class="mono muted-xs">${escapeHtml(c.preflightStatus)}</span></div>`;
+          ? uiIcon('x-circle', 12)
+          : uiIcon('circle', 10);
+      return `<div class="proof-check-row"><span class="proof-check-left">${markHtml}<span>${escapeHtml(c.assetSymbol)}: ${escapeHtml(c.summary)}</span></span><span class="mono muted-xs">${escapeHtml(c.preflightStatus)}</span></div>`;
     })
     .join('');
 
@@ -2378,21 +2617,22 @@ function renderPreSignProofCard(proof) {
   const feeEstStr = safeNum(proof.protocolFee?.estimatedFeeUsd).toFixed(2);
   const haircutCount = safeInt(proof.haircutDroppedAssets?.length);
 
+  const headerIcon = proof.allChecksSafe ? uiIcon('check-circle', 13) : uiIcon('alert-triangle', 13);
   const headerLabel = proof.allChecksSafe
-    ? '✓ Real-Time Pre-Sign Proof'
+    ? 'Real-Time Pre-Sign Proof'
     : proof.simulatedLive === false
-    ? '! Pre-Flight Only (Not Live-Simulated)'
-    : '! Simulation Warning';
+    ? 'Pre-Flight Only (Not Live-Simulated)'
+    : 'Simulation Warning';
 
   card.innerHTML = `
     <div class="proof-head">
-      <span>${headerLabel} (${escapeHtml(proof.chainName)} #${escapeHtml(blockStr)})</span>
+      <span class="proof-head-title">${headerIcon}<span>${headerLabel} (${escapeHtml(proof.chainName)} #${escapeHtml(blockStr)})</span></span>
       <span class="mono muted-xs">${escapeHtml(shortAddr(proof.proofDigestSha256))}</span>
     </div>
     ${proof.simulationNote ? `<div class="breakeven-banner mono">${escapeHtml(proof.simulationNote)}</div>` : ''}
     <div class="proof-kv"><span>Wallet Proven</span><strong class="mono">${escapeHtml(shortAddr(proof.userAddress))}</strong></div>
-    <div class="proof-kv"><span>Gas Check</span><span class="mono">${escapeHtml(gasLabel)}</span></div>
-    <div class="proof-kv"><span>Solana Recipient bytes32</span><span class="mono">${proof.mintRecipientVerified ? '✓ Matched bit-for-bit' : '✕ Mismatch'}</span></div>
+    <div class="proof-kv"><span>Gas Check</span><span class="proof-kv-val mono">${gasIcon}<span>${escapeHtml(gasLabel)}</span></span></div>
+    <div class="proof-kv"><span>Solana Recipient bytes32</span><span class="proof-kv-val mono">${proof.mintRecipientVerified ? `${uiIcon('check', 12)}<span>Matched bit-for-bit</span>` : `${uiIcon('x-circle', 12)}<span>Mismatch</span>`}</span></div>
     <div class="proof-kv"><span>Guaranteed Min Output</span><strong class="mono">≥ $${escapeHtml(minNetStr)} ${escapeHtml(proof.outputAsset)}</strong></div>
     <div class="proof-kv"><span>Protocol Fee (${escapeHtml(feePctStr)}%)</span><span class="mono">$${escapeHtml(feeEstStr)} (${escapeHtml(proof.protocolFee?.collectionMethod)})</span></div>
     ${
@@ -2497,12 +2737,12 @@ function setExecutionMode(mode) {
 }
 
 function legStatusBadge(status) {
-  if (status === 'landed' || status === 'attested') return { cls: 'tag-defi', icon: '✓' };
-  if (status === 'failed') return { cls: 'tag-burn', icon: '!' };
+  if (status === 'landed' || status === 'attested') return { cls: 'tag-defi', iconName: 'check' };
+  if (status === 'failed') return { cls: 'tag-burn', iconName: 'alert-triangle' };
   if (status === 'relaying' || status === 'confirming' || status === 'signing' || status === 'preparing') {
-    return { cls: 'tag-sell', icon: '◉' };
+    return { cls: 'tag-sell', iconName: 'activity-dot' };
   }
-  return { cls: 'tag-skip', icon: '○' };
+  return { cls: 'tag-skip', iconName: 'circle' };
 }
 
 function renderBackgroundAgentUI() {
@@ -2584,7 +2824,7 @@ function renderBackgroundAgentUI() {
           proveBtn.className = 'text-action pro-only';
           proveBtn.dataset.proveJobId = String(activeJob.jobId || '');
           proveBtn.dataset.proveChain = String(leg.chain || '');
-          proveBtn.textContent = 'Prove ✓';
+          proveBtn.innerHTML = `${uiIcon('check', 12)}<span>Prove</span>`;
           proveBtn.addEventListener('click', () => {
             proveLegOnchain(activeJob.jobId, leg.chain, proveBtn);
           });
@@ -2618,7 +2858,8 @@ function renderBackgroundAgentUI() {
 
         const badge = document.createElement('span');
         badge.className = `action-tag ${b.cls}`;
-        badge.textContent = `${b.icon} ${String(leg.status || '')}`;
+        badge.innerHTML = uiIcon(b.iconName, 11);
+        badge.appendChild(document.createTextNode(String(leg.status || '')));
 
         row.append(left, badge);
         feed.append(row);
@@ -2880,7 +3121,7 @@ async function proveLegOnchain(jobId, chain, btnEl = null) {
   } catch (err) {
     showToast(err.message);
   } finally {
-    if (btnEl) btnEl.textContent = 'Prove ✓';
+    if (btnEl) btnEl.innerHTML = `${uiIcon('check', 12)}<span>Prove</span>`;
   }
 }
 
@@ -4196,7 +4437,7 @@ function renderWalletModalContent() {
         {
           id: 'cosmostation',
           name: 'Cosmostation',
-          logo: '/logos/cosmos.svg',
+          logo: resolveLogo('/logos/cosmostation.svg', '/logos/cosmos.svg'),
           installUrl: 'https://www.cosmostation.io/wallet',
           sub: 'Cosmostation browser extension',
         },
@@ -4821,10 +5062,27 @@ function wireEvents() {
     const input = document.getElementById('heroWalletInput');
     const addr = input?.value.trim();
     if (addr) {
-      runScan({ address: addr, autoOpen: true });
+      const detected = detectAddressFamily(addr);
+      if (detected && detected !== activeFamily) {
+        activeFamily = detected;
+        updateFamilyChrome();
+      }
+      runScan({ address: addr, family: detected || activeFamily, autoOpen: true });
     } else {
       showToast('Enter a wallet address to scan.');
       input?.focus();
+    }
+  });
+
+  document.getElementById('appEvmInput')?.addEventListener('input', (e) => {
+    const val = String(e.target?.value || '').trim();
+    const detected = detectAddressFamily(val);
+    if (detected && detected !== activeFamily) {
+      activeFamily = detected;
+      document.querySelectorAll('.family-pill[data-family]').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.family === activeFamily);
+      });
+      updateWalletButtons();
     }
   });
 
@@ -4833,7 +5091,12 @@ function wireEvents() {
     const input = document.getElementById('appEvmInput');
     const addr = input?.value.trim();
     if (addr) {
-      runScan({ address: addr, family: activeFamily, autoOpen: false });
+      const detected = detectAddressFamily(addr);
+      if (detected && detected !== activeFamily) {
+        activeFamily = detected;
+        updateFamilyChrome();
+      }
+      runScan({ address: addr, family: detected || activeFamily, autoOpen: false });
     } else {
       showToast('Enter a wallet address to scan.');
       input?.focus();

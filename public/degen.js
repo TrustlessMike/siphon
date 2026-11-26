@@ -9,7 +9,7 @@ import {
   isUserRejectedError,
   isValidSolanaBase58,
   signAndSendSolanaVersionedTx,
-} from './wallets.js?v=7';
+} from './wallets.js?v=8';
 
 const DEFAULT_FALLBACK_GAME_MODES = [
   {
@@ -899,15 +899,34 @@ async function handleSignAndPlaceOrder() {
   }
 }
 
+function hasExtendedLogos() {
+  return Boolean(
+    typeof window !== 'undefined' &&
+      (typeof window.renderTurgaliumUiIcon === 'function' ||
+        typeof window.renderUiIcon === 'function')
+  );
+}
+
+function getJupiterLogoPath() {
+  return hasExtendedLogos() ? '/logos/jupiter.svg' : '/logos/solana.svg';
+}
+
 function attachThumbFallbacks(container) {
   if (!container) return;
+  const jupLogo = getJupiterLogoPath();
   container.querySelectorAll('img.degen-event-thumb').forEach((img) => {
     if (img.dataset.fallbackBound === '1') return;
     img.dataset.fallbackBound = '1';
     img.addEventListener('error', () => {
       const span = document.createElement('span');
       span.className = 'degen-event-thumb-fallback';
-      span.textContent = (img.dataset.initials || 'JP').slice(0, 2).toUpperCase();
+      const icon = document.createElement('img');
+      icon.src = jupLogo;
+      icon.width = 24;
+      icon.height = 24;
+      icon.alt = '';
+      icon.className = 'degen-thumb-jup-logo';
+      span.appendChild(icon);
       img.replaceWith(span);
     });
   });
@@ -956,19 +975,20 @@ function renderPocketBar() {
       <div class="degen-pocket-top">
         <div class="degen-pocket-headline">
           <div class="degen-eyebrow-row">
-            <span class="degen-eyebrow mono">PRESERVATION-FIRST SIDE-POCKET</span>
-            <span class="degen-pill-safe mono">${esc(pocket.preservedPct)}% Principal Guarded</span>
+            <span class="degen-eyebrow"><img src="${esc(getJupiterLogoPath())}" width="15" height="15" alt="" class="chain-logo-xs" />Principal protection</span>
+            <span class="degen-pill-safe">${esc(pocket.preservedPct)}% Principal Guarded</span>
             ${liveBadgeHtml}
           </div>
           <p class="degen-split-summary" id="degenSplitHeadline">${headlineHtml}</p>
-          <div class="degen-yield-meta mono" id="degenYieldProjectionLine">${esc(yieldSubline)}</div>
+          <div class="degen-yield-meta" id="degenYieldProjectionLine">${esc(yieldSubline)}</div>
         </div>
 
         <div class="degen-pocket-controls">
           <div class="degen-control-group">
             <label class="degen-control-label" for="degenBalanceInput">
+              <img src="/logos/usdc.svg" width="14" height="14" alt="" class="chain-logo-xs" />
               <span>Solana USDC</span>
-              <span class="mono muted-xs">${esc(state.balanceSource)}</span>
+              <span class="muted-xs">${esc(state.balanceSource)}</span>
             </label>
             <div class="degen-balance-input-wrap">
               <span class="mono muted-xs">$</span>
@@ -1322,8 +1342,8 @@ function renderGamesStrip() {
   host.innerHTML = `
     <div class="degen-games-section">
       <div class="degen-section-head">
-        <h2 class="degen-section-title">Jupiter Games &amp; Perps</h2>
-        <span class="mono muted-xs">Direct non-custodial Solana venues</span>
+        <h2 class="degen-section-title"><img src="${esc(getJupiterLogoPath())}" width="16" height="16" alt="" class="chain-logo-sm" />Jupiter Games &amp; Perps</h2>
+        <span class="muted-xs">Direct non-custodial Solana venues</span>
       </div>
       <div class="degen-games-grid">${cardsHtml}</div>
     </div>
@@ -1389,9 +1409,10 @@ function renderMarketsSection() {
           .slice(0, 2)
           .map((w) => w[0])
           .join('') || 'JP';
+        const jupLogo = getJupiterLogoPath();
         const thumbHtml = imgUrl
           ? `<img src="${esc(imgUrl)}" alt="" class="degen-event-thumb" loading="lazy" referrerpolicy="no-referrer" data-initials="${esc(initials)}" />`
-          : `<span class="degen-event-thumb-fallback">${esc(initials.toUpperCase())}</span>`;
+          : `<span class="degen-event-thumb-fallback"><img src="${esc(jupLogo)}" width="24" height="24" alt="" class="degen-thumb-jup-logo" /></span>`;
 
         const topMarkets = (ev.markets || []).slice(0, 3);
         const isEventSelected = state.selected && state.selected.eventId === ev.eventId;
