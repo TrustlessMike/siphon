@@ -805,7 +805,7 @@ export async function prepareCosmosDirectBatch(
       estimatedFeeUsd,
     },
     estimatedSeconds: maxSeconds,
-    gaslessAvailable: Boolean(process.env.SIPHON_COSMOS_RELAYER_KEY?.trim() || cfg.supportsTxFees),
+    gaslessAvailable: Boolean(process.env.TURGALIUM_COSMOS_RELAYER_KEY?.trim() || cfg.supportsTxFees),
     gaslessMechanism: cfg.supportsTxFees
       ? 'Osmosis x/txfees (pay gas in any IBC token) or x/feegrant'
       : 'Cosmos x/feegrant BasicAllowance',
@@ -1233,9 +1233,9 @@ export const cosmosAdapter: ChainFamilyAdapter = {
     // Canonical SPL USDC ATA PDA (fixes CRIT-03 for Noble CCTP Domain 4 -> Solana Domain 5!)
     const mintRecipientBytes32 = deriveNonEvmCctpRecipientBytes32(params.solanaDestination);
     const feeGranter =
-      process.env.SIPHON_COSMOS_FEE_GRANTER?.trim() || `${cfg.prefix}1siphonrelayerfeegranter000000000000`;
+      process.env.TURGALIUM_COSMOS_FEE_GRANTER?.trim() || `${cfg.prefix}1turgaliumrelayerfeegranter000000000`;
     const feeRecipientCosmos =
-      getNonEvmFeeRecipient('cosmos') || `${cfg.prefix}1siphontreasuryvault00000000000000`;
+      getNonEvmFeeRecipient('cosmos') || `${cfg.prefix}1turgaliumtreasuryvault00000000000`;
 
     const chainAssets = filterChainSweepableAssets(cfg.id, params.assets);
     const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
@@ -1339,7 +1339,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       chainId: cfg.chainId,
       txBody: {
         messages,
-        memo: `Siphon 1-Sig Cosmos→Solana (${feeCfg.feePercent}% fee · nonce ${nonce})`,
+        memo: `Turgalium 1-Sig Cosmos→Solana (${feeCfg.feePercent}% fee · nonce ${nonce})`,
         timeoutHeight: String(deadline),
       },
       authInfo: {
@@ -1372,8 +1372,8 @@ export const cosmosAdapter: ChainFamilyAdapter = {
       userGasCostUsd: 0,
       sponsoredGasEstUsd,
       gasSponsorshipMechanism: cfg.supportsTxFees
-        ? 'x/feegrant BasicAllowance (fee_granter = Siphon Relayer) + Osmosis txfees'
-        : 'x/feegrant BasicAllowance (fee_granter = Siphon Relayer)',
+        ? 'x/feegrant BasicAllowance (fee_granter = Turgalium Relayer) + Osmosis txfees'
+        : 'x/feegrant BasicAllowance (fee_granter = Turgalium Relayer)',
       protocolFeeBps: feeCfg.feeBps,
       protocolFeePercent: feeCfg.feePercent,
       protocolFeeUsd,
@@ -1388,7 +1388,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
         grossUsd: a.grossUsd,
       })),
       signPayload,
-      relayerConfigured: Boolean(process.env.SIPHON_COSMOS_RELAYER_KEY?.trim()),
+      relayerConfigured: Boolean(process.env.TURGALIUM_COSMOS_RELAYER_KEY?.trim()),
       sponsorEligible: breakEven.eligible,
       sponsorRejectionReason: breakEven.rejectionReason,
       intentDigestSha256,
@@ -1729,7 +1729,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
         throw new Error('Signed Cosmos gasless TxBody expired. Re-sign a fresh intent.');
       }
       const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.SIPHON_COSMOS_RELAYER_KEY?.trim());
+      const configured = Boolean(process.env.TURGALIUM_COSMOS_RELAYER_KEY?.trim());
       out.submitted = {
         accepted: true,
         mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
@@ -1738,7 +1738,7 @@ export const cosmosAdapter: ChainFamilyAdapter = {
         signatureFingerprint: fp,
         nextStep: configured
           ? `Cosmos x/feegrant relayer queued atomic TxBody ${params.intentId} (${fp}) on ${cfg.name}.`
-          : `Cosmos 1-Sig TxBody verified (${fp}). Use Direct Mode (Skip Go) to broadcast directly from Keplr/Leap today, or configure SIPHON_COSMOS_RELAYER_KEY.`,
+          : `Cosmos 1-Sig TxBody verified (${fp}). Use Direct Mode (Skip Go) to broadcast directly from Keplr/Leap today, or configure TURGALIUM_COSMOS_RELAYER_KEY.`,
       };
     }
 

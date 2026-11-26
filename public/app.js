@@ -1,5 +1,5 @@
-import { mountSiphonFunnelScene } from './siphon-3d.js?v=7';
-import { renderConvergenceSvg } from './siphon-svg.js?v=7';
+import { mountTurgaliumFunnelScene } from './turgalium-3d.js?v=7';
+import { renderConvergenceSvg } from './turgalium-svg.js?v=7';
 import {
   claimCctpOnSolana,
   connectCoinbaseSmartWallet,
@@ -76,8 +76,8 @@ const executingChains = new Set();
 let planSeq = 0;
 let solBalSeq = 0;
 
-const FEE_RECIPIENT_STORAGE_KEY = 'siphon_fee_recipient_evm';
-const UI_MODE_STORAGE_KEY = 'siphon_ui_mode';
+const FEE_RECIPIENT_STORAGE_KEY = 'turgalium_fee_recipient_evm';
+const UI_MODE_STORAGE_KEY = 'turgalium_ui_mode';
 const PRO_ONLY_FILTERS = new Set(['low_efficiency', 'burn', 'skipped']);
 const PRO_ONLY_VIEWS = new Set(['agents', 'contract']);
 // Neutral all-zero Solana System Program address used strictly for read-only /api/plan previews
@@ -559,12 +559,12 @@ window.openApp = openApp;
 window.switchView = switchView;
 window.setUiMode = setUiMode;
 
-function dispatchSiphonBalanceUpdated() {
+function dispatchTurgaliumBalanceUpdated() {
   if (typeof window === 'undefined' || typeof CustomEvent !== 'function') return;
   const solDest = document.getElementById('solanaDestInput')?.value.trim() || '';
   const connectedSol = getConnectedSolanaAddress();
   window.dispatchEvent(
-    new CustomEvent('siphon:balance-updated', {
+    new CustomEvent('turgalium:balance-updated', {
       detail: {
         solanaUsdc: safeNum(solanaBalances?.usdcBalance),
         solBalance: safeNum(solanaBalances?.solBalance),
@@ -586,13 +586,13 @@ async function refreshSolanaBalance() {
   if (!solDest) {
     solanaBalances = null;
     if (badge) badge.textContent = 'Connect a Solana wallet or enter a destination address';
-    dispatchSiphonBalanceUpdated();
+    dispatchTurgaliumBalanceUpdated();
     return;
   }
   if (!isValidSolanaBase58(solDest)) {
     solanaBalances = null;
     if (badge) badge.textContent = 'Invalid Solana address';
-    dispatchSiphonBalanceUpdated();
+    dispatchTurgaliumBalanceUpdated();
     return;
   }
 
@@ -603,7 +603,7 @@ async function refreshSolanaBalance() {
     if (badge) {
       badge.textContent = `${safeNum(solanaBalances.usdcBalance).toFixed(2)} USDC · ${safeNum(solanaBalances.solBalance).toFixed(3)} SOL on Solana`;
     }
-    dispatchSiphonBalanceUpdated();
+    dispatchTurgaliumBalanceUpdated();
   } catch (err) {
     if (seq !== solBalSeq) return;
     const isInvalid = String(err?.message || '').toLowerCase().includes('invalid');
@@ -612,7 +612,7 @@ async function refreshSolanaBalance() {
         ? 'Invalid Solana address'
         : 'Valid Solana destination (RPC busy)';
     }
-    dispatchSiphonBalanceUpdated();
+    dispatchTurgaliumBalanceUpdated();
   }
 }
 
@@ -699,7 +699,7 @@ function renderEmptyScanState() {
   if (svgHost) svgHost.innerHTML = '';
   renderPreSignProofCard(null);
   updateWalletButtons();
-  dispatchSiphonBalanceUpdated();
+  dispatchTurgaliumBalanceUpdated();
 }
 
 function updateFamilyChrome() {
@@ -1020,7 +1020,7 @@ function renderAll() {
         ? `${t.netSolanaSol.toFixed(2)} SOL`
         : `$${t.netSolanaUsdc.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
   }
-  dispatchSiphonBalanceUpdated();
+  dispatchTurgaliumBalanceUpdated();
   const subEl = document.getElementById('kpiNetSub');
   if (subEl) {
     const eta = !isProMode()
@@ -2199,7 +2199,7 @@ function renderPreSignProofCard(proof) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `siphon-proof-${proof.chain}-${proof.proofId}.json`;
+    a.download = `turgalium-proof-${proof.chain}-${proof.proofId}.json`;
     a.click();
     URL.revokeObjectURL(url);
     showToast('Downloaded cryptographic migration proof certificate.');
@@ -3762,7 +3762,7 @@ function renderActiveContract() {
   const chosen =
     list.find((c) => c.id === activeContractId) || {
       id: 'router',
-      filename: 'contracts/SiphonRouter.sol',
+      filename: 'contracts/TurgaliumRouter.sol',
       source: contractData.source || '',
     };
   const src = chosen.source || '';
@@ -3828,7 +3828,7 @@ function buildSolanaAccountChangedHandler() {
       // Never clobber a manually edited #solanaDestInput on wallet accountChanged/disconnect
       syncDestinationUiState();
       updateWalletButtons();
-      dispatchSiphonBalanceUpdated();
+      dispatchTurgaliumBalanceUpdated();
       showToast(
         nextAddr
           ? `${meta?.walletName || 'Solana wallet'} switched to ${shortAddr(nextAddr)} — kept your manual destination (${shortAddr(currentVal)}).`
@@ -4414,7 +4414,7 @@ function renderWalletModalContent() {
       } else {
         syncDestinationUiState();
       }
-      dispatchSiphonBalanceUpdated();
+      dispatchTurgaliumBalanceUpdated();
     }
     updateWalletButtons();
     renderWalletModalContent();
@@ -4778,7 +4778,7 @@ function wireEvents() {
           allowedActions: actions,
         }),
       });
-      showToast(`Granted SiphonAgentVault mandate (${created.mandateId})`);
+      showToast(`Granted TurgaliumAgentVault mandate (${created.mandateId})`);
       await loadAgentsAndPlugins();
     } catch (err) {
       showToast(err.message);
@@ -4888,7 +4888,7 @@ function wireEvents() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `siphon-burn-receipt-${Date.now()}.csv`;
+    a.download = `turgalium-burn-receipt-${Date.now()}.csv`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     showToast('Downloaded CSV burn receipt.');
@@ -4904,7 +4904,7 @@ function wireEvents() {
     const list = Array.isArray(contractData?.contracts) ? contractData.contracts : [];
     const chosen = list.find((c) => c.id === activeContractId);
     const src = chosen?.source || contractData?.source || '';
-    const title = chosen?.title || 'SiphonRouter.sol';
+    const title = chosen?.title || 'TurgaliumRouter.sol';
     await navigator.clipboard?.writeText(src).catch(() => {});
     showToast(`Copied ${title}.`);
   });
@@ -4941,8 +4941,8 @@ loadWalletConnectorConfig().then((cfg) => {
   syncBackgroundJobs();
   loadAgentsAndPlugins();
 });
-heroScene = mountSiphonFunnelScene(document.getElementById('siphonHeroCanvas'));
-window.__siphonHeroScene = heroScene;
+heroScene = mountTurgaliumFunnelScene(document.getElementById('turgaliumHeroCanvas'));
+window.__turgaliumHeroScene = heroScene;
 renderEmptyScanState();
 
 async function runUnifiedScan() {
@@ -5147,8 +5147,8 @@ async function loadAgentsAndPlugins() {
 function buildRenderedClaudeDesktopConfig() {
   if (!pluginSetupData?.claudeDesktopConfig) return null;
   const cloned = JSON.parse(JSON.stringify(pluginSetupData.claudeDesktopConfig));
-  if (lastIssuedTokens.claude_mcp && cloned?.mcpServers?.siphon?.env) {
-    cloned.mcpServers.siphon.env.SIPHON_API_TOKEN = lastIssuedTokens.claude_mcp;
+  if (lastIssuedTokens.claude_mcp && cloned?.mcpServers?.turgalium?.env) {
+    cloned.mcpServers.turgalium.env.TURGALIUM_API_TOKEN = lastIssuedTokens.claude_mcp;
   }
   return cloned;
 }
@@ -5156,7 +5156,7 @@ function buildRenderedClaudeDesktopConfig() {
 function buildRenderedClaudeCliCommand() {
   if (!pluginSetupData?.claudeCodeCommand) return '';
   if (lastIssuedTokens.claude_mcp) {
-    return pluginSetupData.claudeCodeCommand.replace('<SIPHON_API_TOKEN>', lastIssuedTokens.claude_mcp);
+    return pluginSetupData.claudeCodeCommand.replace('<TURGALIUM_API_TOKEN>', lastIssuedTokens.claude_mcp);
   }
   return pluginSetupData.claudeCodeCommand;
 }

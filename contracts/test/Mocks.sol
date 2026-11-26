@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import { IAaveV3Pool, IPermit2 } from "../SiphonRouter.sol";
+import { IAaveV3Pool, IPermit2 } from "../TurgaliumRouter.sol";
 
 contract MockERC20 {
     string public name;

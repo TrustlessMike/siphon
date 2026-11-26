@@ -2,12 +2,12 @@
 pragma solidity 0.8.24;
 
 /**
- * @title SiphonDelegateRegistry
- * @notice On-chain policy allowlist & kill-switch registry for SiphonSweepDelegate (EIP-7702)
- *         and Siphon execution infrastructure.
+ * @title TurgaliumDelegateRegistry
+ * @notice On-chain policy allowlist & kill-switch registry for TurgaliumSweepDelegate (EIP-7702)
+ *         and Turgalium execution infrastructure.
  *
  * Security properties:
- *   1. Implements ISiphonDelegateRegistry consumed by SiphonSweepDelegate.
+ *   1. Implements ITurgaliumDelegateRegistry consumed by TurgaliumSweepDelegate.
  *   2. Two-step ownership transfer (transferOwnership -> acceptOwnership).
  *   3. Global pausable kill-switch: when paused, every isAllowed* / isApproved* query returns false,
  *      immediately halting all registry-gated delegated sweeps without migrating user EOA delegations.
@@ -15,7 +15,7 @@ pragma solidity 0.8.24;
  *      from targeting DeFi protocols).
  *   5. Batch configuration helpers for deterministic multi-chain deployment scripts.
  */
-contract SiphonDelegateRegistry {
+contract TurgaliumDelegateRegistry {
     address public owner;
     address public pendingOwner;
     bool public paused;
@@ -198,7 +198,7 @@ contract SiphonDelegateRegistry {
     }
 
     // -------------------------------------------------------------------------
-    // ISiphonDelegateRegistry Views (Fail-Closed When Paused)
+    // ITurgaliumDelegateRegistry Views (Fail-Closed When Paused)
     // -------------------------------------------------------------------------
 
     function isAllowedFeeRecipient(address recipient) external view returns (bool) {

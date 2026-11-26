@@ -2,7 +2,7 @@
 pragma solidity 0.8.24;
 
 /**
- * @title SiphonSweepDelegate (EIP-7702 Gasless 1-Signature Atomic Sweeper)
+ * @title TurgaliumSweepDelegate (EIP-7702 Gasless 1-Signature Atomic Sweeper)
  * @notice Hardened EIP-7702 delegation target for standard EOAs (Rabby, MetaMask, Phantom, Ledger).
  *
  * Security invariants:
@@ -13,7 +13,7 @@ pragma solidity 0.8.24;
  *      plus `SWEEP_INTENT_V2_TYPEHASH` binding CCTP V2 Fast Transfer / Forwarding Hook options and `maxFeeUsdcCap`.
  *   4. Supports Circle CCTP V1 (4-arg) and CCTP V2 (7-arg Standard/Fast + 8-arg `depositForBurnWithHook`)
  *      targeting the user's canonical 32-byte Solana USDC ATA PDA.
- *   5. Supports on-chain `SiphonAgentVault.authorizeAgentAction(...)` mandate enforcement via `executeSponsoredSweepWithMandate`.
+ *   5. Supports on-chain `TurgaliumAgentVault.authorizeAgentAction(...)` mandate enforcement via `executeSponsoredSweepWithMandate`.
  *   6. Safe execution ordering: approval revokes FIRST -> DeFi exits -> swaps (incl. native ETH value) ->
  *      mandate check (if any) -> fee & CCTP bridge -> isolated capped-gas, 32-byte bounded burn calls LAST.
  *   7. Exact ERC-7201 namespaced storage slot and owner `cancelNonce(uint256)` invalidation.
@@ -57,7 +57,7 @@ interface ITokenMessengerV2Delegate {
     ) external;
 }
 
-interface ISiphonDelegateRegistry {
+interface ITurgaliumDelegateRegistry {
     function paused() external view returns (bool);
     function isAllowedFeeRecipient(address recipient) external view returns (bool);
     function isAllowedRelayer(address relayer) external view returns (bool);
@@ -66,7 +66,7 @@ interface ISiphonDelegateRegistry {
     function isAllowedAgentVault(address vault) external view returns (bool);
 }
 
-interface ISiphonAgentVaultDelegate {
+interface ITurgaliumAgentVaultDelegate {
     struct AgentMandate {
         address owner;
         address agentKey;
@@ -154,7 +154,7 @@ library SafeDelegateERC20 {
     }
 }
 
-contract SiphonSweepDelegate {
+contract TurgaliumSweepDelegate {
     using SafeDelegateERC20 for address;
 
     address public constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
@@ -263,9 +263,9 @@ contract SiphonSweepDelegate {
         ApprovalRevoke[] revokes;
     }
 
-    /// @dev Exact ERC-7201 storage slot: keccak256(abi.encode(uint256(keccak256("siphon.eip7702.sweep.delegate.v1")) - 1)) & ~bytes32(uint256(0xff))
-    bytes32 private constant STORAGE_SLOT =
-        0xa6b7741274d7a992e8f1ae1e71cebc66d0900a4cbdc50d80cc8162e664a93f00;
+    /// @dev Exact ERC-7201 storage slot: keccak256(abi.encode(uint256(keccak256("turgalium.eip7702.sweep.delegate.v1")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 public constant STORAGE_SLOT =
+        0xb28ad115b98ee0cdb6a6fb3a8270e2f7701b3c3aad8c58cbdf5f3e0ec909a500;
 
     struct DelegateStorage {
         mapping(uint256 => bool) usedNonces;
@@ -391,7 +391,7 @@ contract SiphonSweepDelegate {
         return keccak256(
             abi.encode(
                 EIP712_DOMAIN_TYPEHASH,
-                keccak256("SiphonSweepDelegate"),
+                keccak256("TurgaliumSweepDelegate"),
                 keccak256("1"),
                 block.chainid,
                 address(this)
@@ -580,7 +580,7 @@ contract SiphonSweepDelegate {
             if (ex.protocol == address(0) || ex.protocol.code.length == 0) {
                 revert TargetNotAllowed(ex.protocol);
             }
-            if (!ISiphonDelegateRegistry(policyRegistry).isAllowedDefiProtocol(ex.protocol)) {
+            if (!ITurgaliumDelegateRegistry(policyRegistry).isAllowedDefiProtocol(ex.protocol)) {
                 revert TargetNotAllowed(ex.protocol);
             }
             if (ex.kind == ExitKind.AAVE_V3) {
@@ -608,7 +608,7 @@ contract SiphonSweepDelegate {
             if (sw.router == address(0) || sw.router.code.length == 0 || sw.router == usdc) {
                 revert TargetNotAllowed(sw.router);
             }
-            if (!ISiphonDelegateRegistry(policyRegistry).isAllowedSwapRouter(sw.router)) {
+            if (!ITurgaliumDelegateRegistry(policyRegistry).isAllowedSwapRouter(sw.router)) {
                 revert TargetNotAllowed(sw.router);
             }
 
@@ -722,7 +722,7 @@ contract SiphonSweepDelegate {
         uint256 gasReimbursementUsdc
     ) private view {
         // Unconditional kill-switch: halts ALL delegated sweeps (direct USDC, revokes, burns, 0-gas) immediately on pause
-        if (ISiphonDelegateRegistry(policyRegistry).paused()) revert ProtocolPaused();
+        if (ITurgaliumDelegateRegistry(policyRegistry).paused()) revert ProtocolPaused();
         if (block.timestamp > intent.deadline) revert ExpiredIntent();
         if (intent.minNetUsdcOut == 0) revert ZeroMinNetOutput();
         if (ds.usedNonces[intent.nonce]) revert NonceAlreadyUsed(intent.nonce);
@@ -740,14 +740,14 @@ contract SiphonSweepDelegate {
 
         // Enforce protocol fee recipient invariant (eliminates 100% fee bypass via attacker-controlled feeRecipient)
         bool feeRecipientValid = intent.feeRecipient == protocolFeeRecipient ||
-            ISiphonDelegateRegistry(policyRegistry).isAllowedFeeRecipient(intent.feeRecipient);
+            ITurgaliumDelegateRegistry(policyRegistry).isAllowedFeeRecipient(intent.feeRecipient);
         if (!feeRecipientValid) {
             revert UnauthorizedFeeRecipient(intent.feeRecipient);
         }
 
         // Require allowlisted relayer for BOTH gas-reimbursed sweeps AND 0-bps fee tiers (blocks third-party 0-fee bypass)
         if (gasReimbursementUsdc > 0 || intent.feeBps == 0) {
-            if (!ISiphonDelegateRegistry(policyRegistry).isAllowedRelayer(msg.sender)) {
+            if (!ITurgaliumDelegateRegistry(policyRegistry).isAllowedRelayer(msg.sender)) {
                 revert UnauthorizedRelayer(msg.sender);
             }
         }
@@ -778,7 +778,7 @@ contract SiphonSweepDelegate {
     }
 
     /**
-     * @notice Executed by Siphon's Gas Sponsor Relayer on behalf of the delegated EOA (`address(this)`).
+     * @notice Executed by Turgalium's Gas Sponsor Relayer on behalf of the delegated EOA (`address(this)`).
      *         User pays $0 gas and signs 1 off-chain EIP-712 intent.
      */
     function executeSponsoredSweep(
@@ -914,10 +914,10 @@ contract SiphonSweepDelegate {
     }
 
     /**
-     * @notice Mandate-gated EIP-7702 sponsored sweep integrated with on-chain `SiphonAgentVault.authorizeAgentAction`.
+     * @notice Mandate-gated EIP-7702 sponsored sweep integrated with on-chain `TurgaliumAgentVault.authorizeAgentAction`.
      * @dev Accepts `MANDATE_SWEEP_INTENT_TYPEHASH` signatures from either the delegated EOA (`address(this)`) or the
      *      mandate's authorized `agentKey` (when `mandate.owner == address(this)`), then verifies actual post-exit USDC
-     *      deltas (after CCTP maxFee) against `SiphonAgentVault`. Autonomous agent signatures strictly forbid arbitrary
+     *      deltas (after CCTP maxFee) against `TurgaliumAgentVault`. Autonomous agent signatures strictly forbid arbitrary
      *      swap calldata, non-USDC DeFi exits, arbitrary burns, and CCTP destinationCaller/hookData overrides.
      */
     function executeSponsoredSweepWithMandate(
@@ -939,13 +939,13 @@ contract SiphonSweepDelegate {
         if (agentVault == address(0) || agentVault.code.length == 0) {
             revert TargetNotAllowed(agentVault);
         }
-        if (!ISiphonDelegateRegistry(policyRegistry).isAllowedAgentVault(agentVault)) {
+        if (!ITurgaliumDelegateRegistry(policyRegistry).isAllowedAgentVault(agentVault)) {
             revert TargetNotAllowed(agentVault);
         }
 
         _validateCommonIntent(ds, intent, gasReimbursementUsdc);
 
-        ISiphonAgentVaultDelegate.AgentMandate memory m = ISiphonAgentVaultDelegate(agentVault).getMandate(mandateId);
+        ITurgaliumAgentVaultDelegate.AgentMandate memory m = ITurgaliumAgentVaultDelegate(agentVault).getMandate(mandateId);
         if (m.owner != address(this)) revert InvalidSignature();
 
         bytes32 digest = hashMandateIntent(intent, maxFeeUsdcCap, cctpOpts, agentVault, mandateId, actionBit);
@@ -1006,8 +1006,8 @@ contract SiphonSweepDelegate {
             cctpOpts
         );
 
-        // Enforce on-chain SiphonAgentVault policy caps & locked Solana recipient BEFORE moving fees or bridging
-        ISiphonAgentVaultDelegate(agentVault).authorizeAgentAction(
+        // Enforce on-chain TurgaliumAgentVault policy caps & locked Solana recipient BEFORE moving fees or bridging
+        ITurgaliumAgentVaultDelegate(agentVault).authorizeAgentAction(
             mandateId,
             signer,
             actionBit,

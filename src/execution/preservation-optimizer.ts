@@ -1075,7 +1075,7 @@ export async function evaluatePreservationPlan(
     );
     const routeAuctionSavingsUsd = r2(perTokenManualBridgeOverhead + auctionDeltaVsWorstBridge);
 
-    // 4. Popup Count Math (Naive manual approve + withdraw + swap + bridge vs Siphon 1-click batch)
+    // 4. Popup Count Math (Naive manual approve + withdraw + swap + bridge vs Turgalium 1-click batch)
     let popupsNaive = 0;
     for (const a of sweepable) {
       const direct = isCanonicalDirectUsdc(a);

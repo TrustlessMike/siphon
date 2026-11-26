@@ -2,10 +2,10 @@
 pragma solidity 0.8.24;
 
 import { TestBase } from "./TestBase.sol";
-import { SiphonDelegateRegistry } from "../SiphonDelegateRegistry.sol";
+import { TurgaliumDelegateRegistry } from "../TurgaliumDelegateRegistry.sol";
 
-contract SiphonDelegateRegistryTest is TestBase {
-    SiphonDelegateRegistry internal registry;
+contract TurgaliumDelegateRegistryTest is TestBase {
+    TurgaliumDelegateRegistry internal registry;
     address internal owner = address(0xA11CE);
     address internal nextOwner = address(0xB0B);
     address internal attacker = address(0xBAD);
@@ -18,7 +18,7 @@ contract SiphonDelegateRegistryTest is TestBase {
     address internal agentVault = address(0x6001);
 
     function setUp() public {
-        registry = new SiphonDelegateRegistry(owner);
+        registry = new TurgaliumDelegateRegistry(owner);
         // Contract allowlist targets must have deployed bytecode (L-3)
         vm.etch(router1, hex"00");
         vm.etch(defi1, hex"00");
@@ -27,8 +27,8 @@ contract SiphonDelegateRegistryTest is TestBase {
     }
 
     function test_ConstructorRejectsZeroOwner() public {
-        vm.expectRevert(SiphonDelegateRegistry.InvalidAddress.selector);
-        new SiphonDelegateRegistry(address(0));
+        vm.expectRevert(TurgaliumDelegateRegistry.InvalidAddress.selector);
+        new TurgaliumDelegateRegistry(address(0));
     }
 
     function test_AllowlistSingleAndBatchConfiguration() public {
@@ -70,25 +70,25 @@ contract SiphonDelegateRegistryTest is TestBase {
         vm.startPrank(owner);
         registry.setAllowedSwapRouter(router1, true);
 
-        vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, router1));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumDelegateRegistry.DisjointAllowlistViolation.selector, router1));
         registry.setAllowedDefiProtocol(router1, true);
 
-        vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, router1));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumDelegateRegistry.DisjointAllowlistViolation.selector, router1));
         registry.setAllowedAgentVault(router1, true);
 
-        vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, router1));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumDelegateRegistry.DisjointAllowlistViolation.selector, router1));
         registry.setAllowedDelegateImplementation(router1, true);
 
         registry.setAllowedDefiProtocol(defi1, true);
-        vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, defi1));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumDelegateRegistry.DisjointAllowlistViolation.selector, defi1));
         registry.setAllowedSwapRouter(defi1, true);
 
         registry.setAllowedAgentVault(agentVault, true);
-        vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, agentVault));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumDelegateRegistry.DisjointAllowlistViolation.selector, agentVault));
         registry.setAllowedSwapRouter(agentVault, true);
 
         registry.setAllowedDelegateImplementation(delegateImpl, true);
-        vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, delegateImpl));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumDelegateRegistry.DisjointAllowlistViolation.selector, delegateImpl));
         registry.setAllowedSwapRouter(delegateImpl, true);
         vm.stopPrank();
     }
@@ -96,16 +96,16 @@ contract SiphonDelegateRegistryTest is TestBase {
     function test_ContractAllowlistSettersRejectEoAs() public {
         address eoaAddr = address(0x9999);
         vm.startPrank(owner);
-        vm.expectRevert(SiphonDelegateRegistry.InvalidAddress.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.InvalidAddress.selector);
         registry.setAllowedSwapRouter(eoaAddr, true);
 
-        vm.expectRevert(SiphonDelegateRegistry.InvalidAddress.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.InvalidAddress.selector);
         registry.setAllowedDefiProtocol(eoaAddr, true);
 
-        vm.expectRevert(SiphonDelegateRegistry.InvalidAddress.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.InvalidAddress.selector);
         registry.setAllowedDelegateImplementation(eoaAddr, true);
 
-        vm.expectRevert(SiphonDelegateRegistry.InvalidAddress.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.InvalidAddress.selector);
         registry.setAllowedAgentVault(eoaAddr, true);
         vm.stopPrank();
     }
@@ -134,7 +134,7 @@ contract SiphonDelegateRegistryTest is TestBase {
 
         // Double pause reverts
         vm.prank(owner);
-        vm.expectRevert(SiphonDelegateRegistry.AlreadyPaused.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.AlreadyPaused.selector);
         registry.pause();
 
         // Unpause restores all allowlist entries cleanly
@@ -150,11 +150,11 @@ contract SiphonDelegateRegistryTest is TestBase {
 
     function test_TwoStepOwnershipTransfer() public {
         vm.prank(attacker);
-        vm.expectRevert(SiphonDelegateRegistry.Unauthorized.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.Unauthorized.selector);
         registry.transferOwnership(attacker);
 
         vm.prank(owner);
-        vm.expectRevert(SiphonDelegateRegistry.InvalidAddress.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.InvalidAddress.selector);
         registry.transferOwnership(address(0));
 
         vm.prank(owner);
@@ -163,7 +163,7 @@ contract SiphonDelegateRegistryTest is TestBase {
         assertEq(registry.owner(), owner);
 
         vm.prank(attacker);
-        vm.expectRevert(SiphonDelegateRegistry.Unauthorized.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.Unauthorized.selector);
         registry.acceptOwnership();
 
         vm.prank(nextOwner);
@@ -173,7 +173,7 @@ contract SiphonDelegateRegistryTest is TestBase {
 
         // Previous owner is now locked out
         vm.prank(owner);
-        vm.expectRevert(SiphonDelegateRegistry.Unauthorized.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.Unauthorized.selector);
         registry.pause();
 
         // New owner has full control
@@ -184,19 +184,19 @@ contract SiphonDelegateRegistryTest is TestBase {
 
     function test_UnauthorizedCannotModifyAllowlists() public {
         vm.startPrank(attacker);
-        vm.expectRevert(SiphonDelegateRegistry.Unauthorized.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.Unauthorized.selector);
         registry.setAllowedRelayer(attacker, true);
 
-        vm.expectRevert(SiphonDelegateRegistry.Unauthorized.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.Unauthorized.selector);
         registry.setAllowedSwapRouter(attacker, true);
 
-        vm.expectRevert(SiphonDelegateRegistry.Unauthorized.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.Unauthorized.selector);
         registry.setAllowedDefiProtocol(attacker, true);
 
-        vm.expectRevert(SiphonDelegateRegistry.Unauthorized.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.Unauthorized.selector);
         registry.setAllowedFeeRecipient(attacker, true);
 
-        vm.expectRevert(SiphonDelegateRegistry.Unauthorized.selector);
+        vm.expectRevert(TurgaliumDelegateRegistry.Unauthorized.selector);
         registry.pause();
         vm.stopPrank();
     }

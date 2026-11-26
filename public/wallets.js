@@ -1,5 +1,5 @@
 /**
- * Real Browser Wallet Connectors for Siphon:
+ * Real Browser Wallet Connectors for Turgalium:
  *  - EVM: EIP-6963 multi-wallet discovery + window.ethereum (MetaMask, Rabby, Phantom EVM, Coinbase Wallet)
  *  - Solana: Phantom (window.phantom.solana), Backpack (window.backpack), Solflare (window.solflare), window.solana
  */
@@ -325,8 +325,8 @@ function dispatchWalletChangedEvent(detail) {
   try {
     const ev =
       typeof CustomEvent === 'function'
-        ? new CustomEvent('siphon:wallet-changed', { detail })
-        : Object.assign(new Event('siphon:wallet-changed'), { detail });
+        ? new CustomEvent('turgalium:wallet-changed', { detail })
+        : Object.assign(new Event('turgalium:wallet-changed'), { detail });
     window.dispatchEvent(ev);
   } catch {
     // ignore non-browser dispatch errors
@@ -449,7 +449,7 @@ let activeSolanaSession = null;
 let solanaSessionSeq = 0;
 const familyWalletCleanups = {};
 
-const WC_STORAGE_KEY = 'siphon_wc_project_id';
+const WC_STORAGE_KEY = 'turgalium_wc_project_id';
 
 export function getSavedWalletConnectProjectId() {
   try {
@@ -479,7 +479,7 @@ async function loadWalletSdkBundle({ initCoinbase = false } = {}) {
       try {
         const sdk = cachedSdkModule.createCoinbaseWalletSDK({
           appName: 'Turgalium',
-          appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
+          appLogoUrl: `${window.location.origin}/logos/turgalium.svg`,
           appChainIds: SUPPORTED_CHAIN_IDS,
           preference: { options: 'all' },
         });
@@ -506,7 +506,7 @@ async function loadWalletSdkBundle({ initCoinbase = false } = {}) {
     try {
       const sdk = mod.createCoinbaseWalletSDK({
         appName: 'Turgalium',
-        appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
+        appLogoUrl: `${window.location.origin}/logos/turgalium.svg`,
         appChainIds: SUPPORTED_CHAIN_IDS,
         preference: { options: 'all' },
       });
@@ -629,9 +629,9 @@ export function resolvePaymasterUrl(chainId, explicitUrl = null) {
   };
 
   if (typeof window !== 'undefined') {
-    const winPerChain = lookupMap(window.__SIPHON_PAYMASTER_URLS);
+    const winPerChain = lookupMap(window.__TURGALIUM_PAYMASTER_URLS);
     if (winPerChain) return winPerChain;
-    const winGlobal = normalizePaymasterUrl(window.__SIPHON_PAYMASTER_URL);
+    const winGlobal = normalizePaymasterUrl(window.__TURGALIUM_PAYMASTER_URL);
     if (winGlobal) return winGlobal;
   }
 
@@ -643,7 +643,7 @@ export function resolvePaymasterUrl(chainId, explicitUrl = null) {
 /**
  * Builds ERC-7677 `capabilities` object for EIP-5792 `wallet_sendCalls` ONLY when:
  *   1. The connected wallet advertises `paymasterService.supported === true` on `chainId`, AND
- *   2. A valid paymaster URL is configured (explicitly, via `window.__SIPHON_PAYMASTER_URL`, or server config).
+ *   2. A valid paymaster URL is configured (explicitly, via `window.__TURGALIUM_PAYMASTER_URL`, or server config).
  * Returns `undefined` when unavailable so callers cleanly fall back to self-funded batches.
  */
 export function buildEip5792Capabilities({
@@ -1238,7 +1238,7 @@ export async function connectCoinbaseSmartWallet(callbacks = {}) {
     } else {
       const sdk = createCoinbaseWalletSDK({
         appName: 'Turgalium',
-        appLogoUrl: `${window.location.origin}/logos/siphon.svg`,
+        appLogoUrl: `${window.location.origin}/logos/turgalium.svg`,
         appChainIds: SUPPORTED_CHAIN_IDS,
         preference: { options: 'all' },
       });
@@ -1291,7 +1291,7 @@ export async function connectWalletConnect(callbacks = {}) {
       name: 'Turgalium',
       description: 'Move fragmented EVM positions and tokens to Solana.',
       url: window.location.origin,
-      icons: [`${window.location.origin}/logos/siphon.svg`],
+      icons: [`${window.location.origin}/logos/turgalium.svg`],
     },
   });
   await provider.connect();
@@ -1778,16 +1778,16 @@ export function isMobileBrowser(userAgent) {
 
 function resolveDeepLinkTarget(targetUrl, refUrl) {
   const fallbackHref =
-    typeof window !== 'undefined' && window.location?.href ? window.location.href : 'https://siphon.app/';
+    typeof window !== 'undefined' && window.location?.href ? window.location.href : 'https://turgalium.app/';
   const candidate = typeof targetUrl === 'string' && targetUrl.trim() ? targetUrl.trim() : fallbackHref;
   let parsedTarget;
   try {
     parsedTarget = new URL(candidate);
     if (parsedTarget.protocol !== 'http:' && parsedTarget.protocol !== 'https:') {
-      parsedTarget = new URL('https://siphon.app/');
+      parsedTarget = new URL('https://turgalium.app/');
     }
   } catch {
-    parsedTarget = new URL('https://siphon.app/');
+    parsedTarget = new URL('https://turgalium.app/');
   }
 
   let cleanRef = parsedTarget.origin;
@@ -3677,7 +3677,7 @@ export async function connectFamilyWallet(family, opts = {}) {
   } else if (family === 'ton') {
     const prov = chosen.provider;
     if (chosen.kind === 'tonconnect2' || isTonConnect2Bridge(prov)) {
-      const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : 'https://siphon.app';
+      const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : 'https://turgalium.app';
       const manifestUrl = opts.manifestUrl || `${origin}/tonconnect-manifest.json`;
       let res;
       try {

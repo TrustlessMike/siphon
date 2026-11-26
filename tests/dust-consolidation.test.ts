@@ -7,7 +7,7 @@ import {
   type FollowUpQuoteFn,
 } from '../src/execution/tx-builder.js';
 import { buildGaslessSweepIntent } from '../src/relayer/sponsor.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 import type { ScannedAsset, ScanReport } from '../src/scanner/types.js';
 
 const USER_EVM = '0x1111111111111111111111111111111111111111';
@@ -457,7 +457,7 @@ test('buildGaslessSweepIntent surfaces instantSingleSigBreakdown and supports fi
 });
 
 test('HTTP /api/dust/plan exposes two-lane signature optimization metrics', async () => {
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   try {
     const addr = server.address();

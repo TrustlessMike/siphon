@@ -81,11 +81,11 @@ function createSoftShadowTexture() {
 }
 
 /**
- * Siphon Daylight 3D Convergence Sculpture:
+ * Turgalium Daylight 3D Convergence Sculpture:
  * Matte porcelain-ceramic flared funnel, 6 brushed silver-titanium vertical conduit ribs
  * (6 EVM chains), and a central frosted Kamino ice-cyan (#C6F4FF) glass triangular prism core.
  */
-export function mountSiphonFunnelScene(canvas) {
+export function mountTurgaliumFunnelScene(canvas) {
   if (!canvas) return { setActive() {}, setPaused() {}, isRunning() { return false; }, destroy() {} };
 
   const rect = canvas.getBoundingClientRect();

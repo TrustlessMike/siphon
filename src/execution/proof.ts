@@ -645,7 +645,7 @@ export async function buildPreSignSimulationProof(params: {
   };
 
   const proofPayload = {
-    schemaVersion: 'siphon-presign-proof-v1',
+    schemaVersion: 'turgalium-presign-proof-v1',
     proofId,
     chainId: cfg.chainId,
     blockNumber,
@@ -1042,7 +1042,7 @@ export async function verifyOnchainExecutionProof(params: {
   }
 
   const canonicalProofObject = {
-    schemaVersion: 'siphon-execution-proof-v1',
+    schemaVersion: 'turgalium-execution-proof-v1',
     chain: params.chain,
     chainId: cfg.chainId,
     txHash: cleanTxHash,

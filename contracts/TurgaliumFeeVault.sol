@@ -2,9 +2,9 @@
 pragma solidity 0.8.24;
 
 /**
- * @title SiphonFeeVault
+ * @title TurgaliumFeeVault
  * @notice Auditable protocol treasury vault receiving 0-10% tiered migration fees (with optional whale
- *         USDC caps) from SiphonRouter, SiphonSweepDelegate, Relay appFees, LI.FI integrator fees,
+ *         USDC caps) from TurgaliumRouter, TurgaliumSweepDelegate, Relay appFees, LI.FI integrator fees,
  *         and EIP-5792 atomic batch splits.
  *
  * Security properties:
@@ -53,7 +53,7 @@ library SafeVaultERC20 {
     }
 }
 
-contract SiphonFeeVault {
+contract TurgaliumFeeVault {
     using SafeVaultERC20 for address;
 
     struct Payee {

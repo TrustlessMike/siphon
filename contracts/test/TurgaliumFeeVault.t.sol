@@ -3,10 +3,10 @@ pragma solidity 0.8.24;
 
 import { TestBase } from "./TestBase.sol";
 import { MockERC20, RevertingReceiver } from "./Mocks.sol";
-import { SiphonFeeVault } from "../SiphonFeeVault.sol";
+import { TurgaliumFeeVault } from "../TurgaliumFeeVault.sol";
 
-contract SiphonFeeVaultTest is TestBase {
-    SiphonFeeVault internal vault;
+contract TurgaliumFeeVaultTest is TestBase {
+    TurgaliumFeeVault internal vault;
     MockERC20 internal usdc;
 
     address internal treasuryA = address(0x1111);
@@ -16,12 +16,12 @@ contract SiphonFeeVaultTest is TestBase {
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
-        vault = new SiphonFeeVault(treasuryA);
+        vault = new TurgaliumFeeVault(treasuryA);
     }
 
     function test_ConstructorAndZeroAddressGuards() public {
-        vm.expectRevert(SiphonFeeVault.InvalidAddress.selector);
-        new SiphonFeeVault(address(0));
+        vm.expectRevert(TurgaliumFeeVault.InvalidAddress.selector);
+        new TurgaliumFeeVault(address(0));
 
         assertEq(vault.payeeCount(), 1);
         (address acct, uint16 share) = vault.payees(0);
@@ -30,10 +30,10 @@ contract SiphonFeeVaultTest is TestBase {
     }
 
     function test_ERC20SplitAccountingAndDustRetention() public {
-        SiphonFeeVault.Payee[] memory payees = new SiphonFeeVault.Payee[](3);
-        payees[0] = SiphonFeeVault.Payee({ account: treasuryA, shareBps: 3333 });
-        payees[1] = SiphonFeeVault.Payee({ account: treasuryB, shareBps: 3333 });
-        payees[2] = SiphonFeeVault.Payee({ account: treasuryC, shareBps: 3334 });
+        TurgaliumFeeVault.Payee[] memory payees = new TurgaliumFeeVault.Payee[](3);
+        payees[0] = TurgaliumFeeVault.Payee({ account: treasuryA, shareBps: 3333 });
+        payees[1] = TurgaliumFeeVault.Payee({ account: treasuryB, shareBps: 3333 });
+        payees[2] = TurgaliumFeeVault.Payee({ account: treasuryC, shareBps: 3334 });
         vault.setPayees(payees);
 
         // 10_001 base units -> rounding dust stays cleanly inside vault (no last-payee dust bias)
@@ -50,9 +50,9 @@ contract SiphonFeeVaultTest is TestBase {
     function test_NativePushDoSImmunityAndClaim() public {
         RevertingReceiver blocked = new RevertingReceiver();
 
-        SiphonFeeVault.Payee[] memory payees = new SiphonFeeVault.Payee[](2);
-        payees[0] = SiphonFeeVault.Payee({ account: address(blocked), shareBps: 4000 });
-        payees[1] = SiphonFeeVault.Payee({ account: treasuryB, shareBps: 6000 });
+        TurgaliumFeeVault.Payee[] memory payees = new TurgaliumFeeVault.Payee[](2);
+        payees[0] = TurgaliumFeeVault.Payee({ account: address(blocked), shareBps: 4000 });
+        payees[1] = TurgaliumFeeVault.Payee({ account: treasuryB, shareBps: 6000 });
         vault.setPayees(payees);
 
         vm.deal(address(vault), 10 ether);
@@ -72,9 +72,9 @@ contract SiphonFeeVaultTest is TestBase {
     }
 
     function test_ERC20BlacklistIsolationAndClaim() public {
-        SiphonFeeVault.Payee[] memory payees = new SiphonFeeVault.Payee[](2);
-        payees[0] = SiphonFeeVault.Payee({ account: treasuryA, shareBps: 5000 });
-        payees[1] = SiphonFeeVault.Payee({ account: treasuryB, shareBps: 5000 });
+        TurgaliumFeeVault.Payee[] memory payees = new TurgaliumFeeVault.Payee[](2);
+        payees[0] = TurgaliumFeeVault.Payee({ account: treasuryA, shareBps: 5000 });
+        payees[1] = TurgaliumFeeVault.Payee({ account: treasuryB, shareBps: 5000 });
         vault.setPayees(payees);
 
         usdc.setBlacklisted(treasuryA, true);
@@ -97,21 +97,21 @@ contract SiphonFeeVaultTest is TestBase {
 
     function test_PayeeValidationAndOwnershipGuards() public {
         // Invalid sum
-        SiphonFeeVault.Payee[] memory badSum = new SiphonFeeVault.Payee[](1);
-        badSum[0] = SiphonFeeVault.Payee({ account: treasuryA, shareBps: 9999 });
-        vm.expectRevert(abi.encodeWithSelector(SiphonFeeVault.InvalidShares.selector, 9999));
+        TurgaliumFeeVault.Payee[] memory badSum = new TurgaliumFeeVault.Payee[](1);
+        badSum[0] = TurgaliumFeeVault.Payee({ account: treasuryA, shareBps: 9999 });
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumFeeVault.InvalidShares.selector, 9999));
         vault.setPayees(badSum);
 
         // Duplicate payee
-        SiphonFeeVault.Payee[] memory dup = new SiphonFeeVault.Payee[](2);
-        dup[0] = SiphonFeeVault.Payee({ account: treasuryA, shareBps: 5000 });
-        dup[1] = SiphonFeeVault.Payee({ account: treasuryA, shareBps: 5000 });
-        vm.expectRevert(abi.encodeWithSelector(SiphonFeeVault.DuplicatePayee.selector, treasuryA));
+        TurgaliumFeeVault.Payee[] memory dup = new TurgaliumFeeVault.Payee[](2);
+        dup[0] = TurgaliumFeeVault.Payee({ account: treasuryA, shareBps: 5000 });
+        dup[1] = TurgaliumFeeVault.Payee({ account: treasuryA, shareBps: 5000 });
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumFeeVault.DuplicatePayee.selector, treasuryA));
         vault.setPayees(dup);
 
         // Non-owner rejected
         vm.prank(attacker);
-        vm.expectRevert(SiphonFeeVault.Unauthorized.selector);
+        vm.expectRevert(TurgaliumFeeVault.Unauthorized.selector);
         vault.setPayees(badSum);
 
         // Two-step ownership
@@ -127,10 +127,10 @@ contract SiphonFeeVaultTest is TestBase {
         uint16 b = uint16(bound(uint256(shareB), 1, 9_999 - uint256(a)));
         uint16 c = 10_000 - a - b;
 
-        SiphonFeeVault.Payee[] memory payees = new SiphonFeeVault.Payee[](3);
-        payees[0] = SiphonFeeVault.Payee({ account: treasuryA, shareBps: a });
-        payees[1] = SiphonFeeVault.Payee({ account: treasuryB, shareBps: b });
-        payees[2] = SiphonFeeVault.Payee({ account: treasuryC, shareBps: c });
+        TurgaliumFeeVault.Payee[] memory payees = new TurgaliumFeeVault.Payee[](3);
+        payees[0] = TurgaliumFeeVault.Payee({ account: treasuryA, shareBps: a });
+        payees[1] = TurgaliumFeeVault.Payee({ account: treasuryB, shareBps: b });
+        payees[2] = TurgaliumFeeVault.Payee({ account: treasuryC, shareBps: c });
         vault.setPayees(payees);
 
         usdc.mint(address(vault), amount);

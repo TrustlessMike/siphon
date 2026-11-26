@@ -3,7 +3,7 @@ import { fetchCctpAttestationForTx } from '../bridge/cctp.js';
 import { checkLiveExecutionStatus } from '../execution/tx-builder.js';
 import { EVM_CHAINS } from '../scanner/chains.js';
 import type { AnyChainId, EvmChainId } from '../scanner/types.js';
-import type { SiphonStateStore } from '../storage/state-store.js';
+import type { TurgaliumStateStore } from '../storage/state-store.js';
 
 const NON_EVM_EXPLORERS: Record<string, string> = {
   cosmoshub: 'https://www.mintscan.io/cosmos',
@@ -117,7 +117,7 @@ export interface BackgroundJobStoreOptions {
   pollIntervalMs?: number;
   statusChecker?: typeof checkLiveExecutionStatus;
   attestationFetcher?: typeof fetchCctpAttestationForTx;
-  stateStore?: SiphonStateStore;
+  stateStore?: TurgaliumStateStore;
   resumePollersOnLoad?: boolean;
 }
 
@@ -189,7 +189,7 @@ export class BackgroundJobStore {
   private readonly pollIntervalMs: number;
   private readonly statusChecker: typeof checkLiveExecutionStatus;
   private readonly attestationFetcher: typeof fetchCctpAttestationForTx;
-  private readonly stateStore?: SiphonStateStore;
+  private readonly stateStore?: TurgaliumStateStore;
 
   constructor(opts: BackgroundJobStoreOptions = {}) {
     this.maxJobs = Math.max(1, Math.floor(opts.maxJobs ?? DEFAULT_MAX_JOBS));

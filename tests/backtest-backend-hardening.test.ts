@@ -66,7 +66,7 @@ import {
   resetRpcCircuitBreaker,
 } from '../src/scanner/rpc.js';
 import type { ScannedAsset, ScanReport } from '../src/scanner/types.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 import { parseServerPort } from '../src/server/index.js';
 import { extractRateLimitKey, SlidingWindowRateLimiter } from '../src/server/rate-limit.js';
 import {
@@ -225,13 +225,13 @@ test('Relayer rejects arbitrary/mismatched txCalldata, preserves intent on trans
   const relayer = makeTestEvmWallet(0x71);
   const user = makeTestEvmWallet(0x72);
   const router = '0x4444444444444444444444444444444444444444';
-  const prevKey = process.env.SIPHON_RELAYER_PRIVATE_KEY;
-  const prevRouter = process.env.SIPHON_ROUTER_BASE;
-  const prevFee = process.env.SIPHON_FEE_RECIPIENT_EVM;
+  const prevKey = process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
+  const prevRouter = process.env.TURGALIUM_ROUTER_BASE;
+  const prevFee = process.env.TURGALIUM_FEE_RECIPIENT_EVM;
 
-  process.env.SIPHON_RELAYER_PRIVATE_KEY = relayer.privKeyHex;
-  process.env.SIPHON_ROUTER_BASE = router;
-  process.env.SIPHON_FEE_RECIPIENT_EVM = '0x5555555555555555555555555555555555555555';
+  process.env.TURGALIUM_RELAYER_PRIVATE_KEY = relayer.privKeyHex;
+  process.env.TURGALIUM_ROUTER_BASE = router;
+  process.env.TURGALIUM_FEE_RECIPIENT_EVM = '0x5555555555555555555555555555555555555555';
   configureGaslessIntentStore(new MemoryStateStore());
   resetRelayerNonceTrackerForTest();
 
@@ -262,7 +262,7 @@ test('Relayer rejects arbitrary/mismatched txCalldata, preserves intent on trans
     assert.equal(isGaslessDigestConsumed(plan.eip712Digest), false);
 
     // 2. HTTP /api/relayer/submit returns 400 for arbitrary calldata and keeps intent reusable
-    const { server } = createSiphonServer({ rateLimit: { enabled: false } });
+    const { server } = createTurgaliumServer({ rateLimit: { enabled: false } });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     try {
@@ -360,12 +360,12 @@ test('Relayer rejects arbitrary/mismatched txCalldata, preserves intent on trans
     configureGaslessIntentStore(null);
     clearTrackedGaslessIntentsForTest();
     resetRelayerNonceTrackerForTest();
-    if (prevKey === undefined) delete process.env.SIPHON_RELAYER_PRIVATE_KEY;
-    else process.env.SIPHON_RELAYER_PRIVATE_KEY = prevKey;
-    if (prevRouter === undefined) delete process.env.SIPHON_ROUTER_BASE;
-    else process.env.SIPHON_ROUTER_BASE = prevRouter;
-    if (prevFee === undefined) delete process.env.SIPHON_FEE_RECIPIENT_EVM;
-    else process.env.SIPHON_FEE_RECIPIENT_EVM = prevFee;
+    if (prevKey === undefined) delete process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
+    else process.env.TURGALIUM_RELAYER_PRIVATE_KEY = prevKey;
+    if (prevRouter === undefined) delete process.env.TURGALIUM_ROUTER_BASE;
+    else process.env.TURGALIUM_ROUTER_BASE = prevRouter;
+    if (prevFee === undefined) delete process.env.TURGALIUM_FEE_RECIPIENT_EVM;
+    else process.env.TURGALIUM_FEE_RECIPIENT_EVM = prevFee;
   }
 });
 
@@ -517,7 +517,7 @@ test('Relayer broadcaster serializes concurrent nonces per (chain, relayer) and 
 
 test('POST /api/agents/approvals enforces admin session or agent:propose Bearer scope; MCP enforces per-tool scopes', async () => {
   const adminSecret = 'backtest-admin-secret-0123456789';
-  const { server, agentEngine } = createSiphonServer({
+  const { server, agentEngine } = createTurgaliumServer({
     adminSessionToken: adminSecret,
     rateLimit: { enabled: false },
   });
@@ -567,12 +567,12 @@ test('POST /api/agents/approvals enforces admin session or agent:propose Bearer 
     });
     assert.equal(wrongScopeRes.status, 403);
 
-    // Valid X-Siphon-Admin-Session succeeds
+    // Valid X-Turgalium-Admin-Session succeeds
     const adminOk = await fetch(`${base}/api/agents/approvals`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Siphon-Admin-Session': adminSecret,
+        'X-Turgalium-Admin-Session': adminSecret,
       },
       body: JSON.stringify(payload),
     });
@@ -594,7 +594,7 @@ test('POST /api/agents/approvals enforces admin session or agent:propose Bearer 
     });
     assert.equal(proposeOk.status, 200);
 
-    // MCP scope enforcement: read-only token allowed on siphon_list_agent_mandates, blocked (-32003) on siphon_request_sweep_permission & siphon_plan_dust_conversion
+    // MCP scope enforcement: read-only token allowed on turgalium_list_agent_mandates, blocked (-32003) on turgalium_request_sweep_permission & turgalium_plan_dust_conversion
     const mcpReadOk = await fetch(`${base}/mcp`, {
       method: 'POST',
       headers: {
@@ -605,7 +605,7 @@ test('POST /api/agents/approvals enforces admin session or agent:propose Bearer 
         jsonrpc: '2.0',
         id: 1,
         method: 'tools/call',
-        params: { name: 'siphon_list_agent_mandates', arguments: {} },
+        params: { name: 'turgalium_list_agent_mandates', arguments: {} },
       }),
     }).then((r) => r.json());
     assert.ok(mcpReadOk.result && !mcpReadOk.error);
@@ -621,7 +621,7 @@ test('POST /api/agents/approvals enforces admin session or agent:propose Bearer 
         id: 2,
         method: 'tools/call',
         params: {
-          name: 'siphon_request_sweep_permission',
+          name: 'turgalium_request_sweep_permission',
           arguments: {
             actionType: 'bridge_solana',
             summary: 'Should be blocked',
@@ -646,7 +646,7 @@ test('POST /api/agents/approvals enforces admin session or agent:propose Bearer 
         jsonrpc: '2.0',
         id: 3,
         method: 'tools/call',
-        params: { name: 'siphon_plan_dust_conversion', arguments: { scanId: 'scan_1' } },
+        params: { name: 'turgalium_plan_dust_conversion', arguments: { scanId: 'scan_1' } },
       }),
     }).then((r) => r.json());
     assert.equal(mcpDustDenied.error?.code, -32003);
@@ -662,7 +662,7 @@ test('POST /api/agents/approvals enforces admin session or agent:propose Bearer 
         jsonrpc: '2.0',
         id: 4,
         method: 'tools/call',
-        params: { name: 'siphon_list_agent_mandates', arguments: {} },
+        params: { name: 'turgalium_list_agent_mandates', arguments: {} },
       }),
     }).then((r) => r.json());
     assert.equal(mcpReadDenied.error?.code, -32003);
@@ -725,13 +725,13 @@ test('Rate limiter ignores unverified Bearer tokens, gates Fly-Client-IP on FLY_
   // Limiter picks up trustFlyClientIp from env.FLY_APP_NAME
   const limiterNoFly = new SlidingWindowRateLimiter({ trustProxy: true }, {});
   assert.equal(limiterNoFly.trustFlyClientIp, false);
-  const limiterWithFly = new SlidingWindowRateLimiter({}, { FLY_APP_NAME: 'siphon-prod' });
+  const limiterWithFly = new SlidingWindowRateLimiter({}, { FLY_APP_NAME: 'turgalium-prod' });
   assert.equal(limiterWithFly.trustFlyClientIp, true);
   assert.equal(limiterWithFly.trustProxy, true);
 });
 
 test('Served HTML documents include strict Content-Security-Policy header', async () => {
-  const { server } = createSiphonServer({ rateLimit: { enabled: false } });
+  const { server } = createTurgaliumServer({ rateLimit: { enabled: false } });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
@@ -777,7 +777,7 @@ test('decodeMulticall3Aggregate3 enforces strict hex, even length, offset, count
 });
 
 test('Approval routes validate multicallChunkSize (400) and scanStaleErc20Approvals guards NaN chunk/timeout', async () => {
-  const { server } = createSiphonServer({ rateLimit: { enabled: false } });
+  const { server } = createTurgaliumServer({ rateLimit: { enabled: false } });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
@@ -881,7 +881,7 @@ test('redactRpcUrl strips API keys, credentials, paths, and queries in metrics a
 // ============================================================================
 
 test('Non-string address fields return HTTP 400 (never 500) across routes and /api/defi/preflight emits CORS headers', async () => {
-  const { server } = createSiphonServer({ rateLimit: { enabled: false } });
+  const { server } = createTurgaliumServer({ rateLimit: { enabled: false } });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
@@ -1110,7 +1110,7 @@ test('degen-routes propagates 400/413/415 on claim/close and jupiter-markets ver
   assert.match(closeRes.reason ?? '', /feePayer mismatch/i);
 
   // HTTP degen-routes: malformed JSON -> 400, oversized >32 KiB -> 413, wrong Content-Type -> 415
-  const { server } = createSiphonServer({ degenClient: mockClient, rateLimit: { enabled: false } });
+  const { server } = createTurgaliumServer({ degenClient: mockClient, rateLimit: { enabled: false } });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
@@ -1167,7 +1167,7 @@ test('Preservation routes & fee math: validates protocolFeeBps (allowing 0, reje
   assert.equal(negCap.capApplied, true);
 
   // 3. HTTP POST /api/optimize/preservation validates protocolFeeBps strictly and preserves 0 bps
-  const { server } = createSiphonServer({ rateLimit: { enabled: false } });
+  const { server } = createTurgaliumServer({ rateLimit: { enabled: false } });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
@@ -1406,7 +1406,7 @@ test('FileStateStore quarantines corrupt JSON, PreservationAgentStore persists a
   }
 
   // 2. Corrupt JSON quarantine in FileStateStore.load()
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'siphon-hardening-'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'turgalium-hardening-'));
   const warnings: string[] = [];
   const origWarn = console.warn;
   console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(' '));

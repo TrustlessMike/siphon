@@ -15,7 +15,7 @@ import {
   type ApprovalRpcCallFn,
 } from '../src/scanner/approvals.js';
 import { decodeMulticall3Aggregate3, encodeMulticall3Aggregate3 } from '../src/scanner/rpc.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 
 interface WalletsUxModule {
   DUAL_VM_WALLET_FAMILIES: Set<string>;
@@ -87,7 +87,7 @@ interface WalletsUxModule {
 }
 
 class MockWindow extends EventTarget {
-  location = { origin: 'https://siphon.app', href: 'https://siphon.app/?tab=scanner' };
+  location = { origin: 'https://turgalium.app', href: 'https://turgalium.app/?tab=scanner' };
   localStorage = {
     getItem: () => null,
     setItem: () => {},
@@ -123,8 +123,8 @@ function resetMockGlobals() {
     'coinbaseSolana',
     'solana',
     'trustwallet',
-    '__SIPHON_PAYMASTER_URL',
-    '__SIPHON_PAYMASTER_URLS',
+    '__TURGALIUM_PAYMASTER_URL',
+    '__TURGALIUM_PAYMASTER_URLS',
   ]) {
     delete mockWindow[key];
   }
@@ -339,17 +339,17 @@ test('ERC-7677 Paymaster: attaches capabilities.paymasterService.url when wallet
   assert.equal(resNoPm.paymasterUrl, null);
   assert.equal('capabilities' in sentPayloads[0], false);
 
-  // Case B: window.__SIPHON_PAYMASTER_URL configured + Base supports paymaster -> attaches ERC-7677 capability
-  mockWindow.__SIPHON_PAYMASTER_URL = 'https://paymaster.siphon.example/v1/base';
+  // Case B: window.__TURGALIUM_PAYMASTER_URL configured + Base supports paymaster -> attaches ERC-7677 capability
+  mockWindow.__TURGALIUM_PAYMASTER_URL = 'https://paymaster.turgalium.example/v1/base';
   const resWithPm = await wallets.sendEip5792Batch({
     chainId: 8453,
     calls: [{ to: USDC_ETH, data: '0x', value: '0x0' }],
     expectedFrom: EVM_ADDR,
   });
   assert.equal(resWithPm.paymasterSponsored, true);
-  assert.equal(resWithPm.paymasterUrl, 'https://paymaster.siphon.example/v1/base');
+  assert.equal(resWithPm.paymasterUrl, 'https://paymaster.turgalium.example/v1/base');
   assert.deepEqual(sentPayloads[1].capabilities, {
-    paymasterService: { url: 'https://paymaster.siphon.example/v1/base' },
+    paymasterService: { url: 'https://paymaster.turgalium.example/v1/base' },
   });
 
   // Case C: Ethereum (chainId 1) advertises paymasterService.supported === false -> MUST NOT attach capabilities
@@ -486,23 +486,23 @@ test('Mobile Deep-Links: detects mobile UAs, builds exact Phantom/Solflare unive
   assert.equal(wallets.isMobileBrowser(androidUa), true);
   assert.equal(wallets.isMobileBrowser(desktopUa), false);
 
-  const appUrl = 'https://siphon.app/app?chain=base';
+  const appUrl = 'https://turgalium.app/app?chain=base';
   const phantomUrl = wallets.buildMobileWalletDeepLink('phantom', appUrl);
   const solflareUrl = wallets.buildMobileWalletDeepLink('solflare', appUrl);
 
   assert.equal(
     phantomUrl,
-    `https://phantom.app/ul/browse/${encodeURIComponent(appUrl)}?ref=${encodeURIComponent('https://siphon.app')}`
+    `https://phantom.app/ul/browse/${encodeURIComponent(appUrl)}?ref=${encodeURIComponent('https://turgalium.app')}`
   );
   assert.equal(
     solflareUrl,
-    `https://solflare.com/ul/v1/browse/${encodeURIComponent(appUrl)}?ref=${encodeURIComponent('https://siphon.app')}`
+    `https://solflare.com/ul/v1/browse/${encodeURIComponent(appUrl)}?ref=${encodeURIComponent('https://turgalium.app')}`
   );
   assert.equal(wallets.buildMobileWalletDeepLink('unknown', appUrl), null);
 
-  // Unsafe javascript: scheme must fall back safely to https://siphon.app/
+  // Unsafe javascript: scheme must fall back safely to https://turgalium.app/
   const safeFallback = wallets.buildMobileWalletDeepLink('phantom', 'javascript:alert(1)');
-  assert.ok(safeFallback?.startsWith('https://phantom.app/ul/browse/https%3A%2F%2Fsiphon.app%2F'));
+  assert.ok(safeFallback?.startsWith('https://phantom.app/ul/browse/https%3A%2F%2Fturgalium.app%2F'));
 
   // Mobile connect with no injected wallet throws structured MOBILE_DEEP_LINK_REQUIRED error
   type MobileDeepLinkErr = Error & {
@@ -678,7 +678,7 @@ test('Stale Approval Scanner: encodes allowance/revoke calldata, chunks Multical
 });
 
 test('HTTP API: GET /api/approvals/spenders and POST /api/approvals/scan validate inputs and return ready-to-sign revokes', async () => {
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   assert.ok(address && typeof address === 'object');

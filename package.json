@@ -1,11 +1,11 @@
 {
-  "name": "siphon-migrator",
+  "name": "turgalium-migrator",
   "version": "0.1.0",
   "license": "MIT",
   "description": "Open-source multi-chain DeFi & dust migrator to Solana with 1-click DeFi extraction, EIP-5792/7702 batching, signed Two-Level ROI guard, and Claude MCP / ChatGPT plugins",
   "repository": {
     "type": "git",
-    "url": "https://github.com/TrustlessMike/siphon.git"
+    "url": "https://github.com/TrustlessMike/turgalium.git"
   },
   "type": "module",
   "scripts": {

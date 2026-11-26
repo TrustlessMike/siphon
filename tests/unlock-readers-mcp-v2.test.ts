@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { keccak_256 } from '@noble/hashes/sha3';
-import { SiphonAgentEngine } from '../src/agent/mandate-engine.js';
+import { TurgaliumAgentEngine } from '../src/agent/mandate-engine.js';
 import {
   buildChatGptOpenApiSpec,
   buildOpenApiSpec,
@@ -36,7 +36,7 @@ import {
 import {
   handleMcpJsonRpc,
   handleMcpRequest,
-  SIPHON_MCP_TOOLS,
+  TURGALIUM_MCP_TOOLS,
   type McpToolContext,
 } from '../src/mcp/server.js';
 import { encodeBech32Strict, decodeBech32Strict } from '../src/scanner/address.js';
@@ -200,7 +200,7 @@ function makeScanReport(assets: ScannedAsset[], extra?: Partial<ScanReport>): Sc
 
 function makeMcpContext(overrides: Partial<McpToolContext> = {}): McpToolContext {
   return {
-    agentEngine: new SiphonAgentEngine(),
+    agentEngine: new TurgaliumAgentEngine(),
     scanCache: new BoundedTtlCache<string, ScanReport>({ maxEntries: 20, ttlMs: 60_000 }),
     nowMs: () => FIXED_NOW_MS,
     ...overrides,
@@ -705,7 +705,7 @@ test('evaluatePreservationPlan merges live Lido/Ethena/Cosmos unlocks with scan 
 // 6. MCP v2 TOOLS & CHATGPT OPENAPI 3.1 SCHEMA TESTS
 // ============================================================================
 
-test('MCP tools/list and ChatGPT OpenAPI 3.1 spec expose all 5 v2 read-only tools and block siphon_create_agent_mandate', async () => {
+test('MCP tools/list and ChatGPT OpenAPI 3.1 spec expose all 5 v2 read-only tools and block turgalium_create_agent_mandate', async () => {
   const ctx = makeMcpContext();
 
   // Verify handleMcpRequest alias matches handleMcpJsonRpc
@@ -719,11 +719,11 @@ test('MCP tools/list and ChatGPT OpenAPI 3.1 spec expose all 5 v2 read-only tool
 
   const toolNames = listResp.result.tools.map((t) => t.name);
   const requiredV2Tools = [
-    'siphon_preservation_audit',
-    'siphon_list_unlock_schedule',
-    'siphon_solana_rent_scan',
-    'siphon_solana_yield_preview',
-    'siphon_degen_markets',
+    'turgalium_preservation_audit',
+    'turgalium_list_unlock_schedule',
+    'turgalium_solana_rent_scan',
+    'turgalium_solana_yield_preview',
+    'turgalium_degen_markets',
   ];
 
   for (const name of requiredV2Tools) {
@@ -733,18 +733,18 @@ test('MCP tools/list and ChatGPT OpenAPI 3.1 spec expose all 5 v2 read-only tool
     assert.equal(tool?.annotations.destructiveHint, false, `${name} must be destructiveHint: false`);
   }
 
-  // Security invariant: siphon_create_agent_mandate MUST NEVER be exposed in tools/list
-  assert.equal(toolNames.includes('siphon_create_agent_mandate'), false);
-  assert.equal(SIPHON_MCP_TOOLS.some((t) => t.name === 'siphon_create_agent_mandate'), false);
+  // Security invariant: turgalium_create_agent_mandate MUST NEVER be exposed in tools/list
+  assert.equal(toolNames.includes('turgalium_create_agent_mandate'), false);
+  assert.equal(TURGALIUM_MCP_TOOLS.some((t) => t.name === 'turgalium_create_agent_mandate'), false);
 
-  // Direct call to siphon_create_agent_mandate MUST stay blocked with isError: true
+  // Direct call to turgalium_create_agent_mandate MUST stay blocked with isError: true
   const blockedResp = (await handleMcpRequest(
     {
       jsonrpc: '2.0',
       id: 2,
       method: 'tools/call',
       params: {
-        name: 'siphon_create_agent_mandate',
+        name: 'turgalium_create_agent_mandate',
         arguments: {
           ownerAddress: EVM_WALLET,
           lockedSolanaRecipient: SOL_WALLET,
@@ -758,7 +758,7 @@ test('MCP tools/list and ChatGPT OpenAPI 3.1 spec expose all 5 v2 read-only tool
   assert.match(blockedResp.result.content[0].text, /disabled via MCP/i);
 
   // Verify ChatGPT OpenAPI 3.1 spec exposes all 5 new v2 operations as non-consequential (read-only)
-  const spec = buildChatGptOpenApiSpec('https://siphon.example/');
+  const spec = buildChatGptOpenApiSpec('https://turgalium.example/');
   assert.equal(spec.openapi, '3.1.0');
   assert.equal(spec.info.version, '2.0.0');
 
@@ -921,14 +921,14 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
   });
   ctx.scanCache.set(scan.scanId, scan);
 
-  // 1. siphon_preservation_audit (by scanId AND by walletAddress)
+  // 1. turgalium_preservation_audit (by scanId AND by walletAddress)
   const auditResp = (await handleMcpRequest(
     {
       jsonrpc: '2.0',
       id: 101,
       method: 'tools/call',
       params: {
-        name: 'siphon_preservation_audit',
+        name: 'turgalium_preservation_audit',
         arguments: {
           scanId: scan.scanId,
           outputAsset: 'USDC',
@@ -960,7 +960,7 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
       id: 102,
       method: 'tools/call',
       params: {
-        name: 'siphon_preservation_audit',
+        name: 'turgalium_preservation_audit',
         arguments: { walletAddress: EVM_WALLET.toLowerCase() },
       },
     },
@@ -968,14 +968,14 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
   )) as { result: { structuredContent: { scanId: string } } };
   assert.equal(auditByWalletResp.result.structuredContent.scanId, scan.scanId);
 
-  // 2. siphon_list_unlock_schedule
+  // 2. turgalium_list_unlock_schedule
   const unlockResp = (await handleMcpRequest(
     {
       jsonrpc: '2.0',
       id: 103,
       method: 'tools/call',
       params: {
-        name: 'siphon_list_unlock_schedule',
+        name: 'turgalium_list_unlock_schedule',
         arguments: {
           evmAddress: EVM_WALLET,
           cosmosAddresses: [COSMOS_HUB_ADDR],
@@ -1010,14 +1010,14 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
     ['lido_withdrawal', 'cctp_claim', 'ethena_cooldown', 'cosmos_unbonding']
   );
 
-  // 3. siphon_solana_rent_scan
+  // 3. turgalium_solana_rent_scan
   const rentResp = (await handleMcpRequest(
     {
       jsonrpc: '2.0',
       id: 104,
       method: 'tools/call',
       params: {
-        name: 'siphon_solana_rent_scan',
+        name: 'turgalium_solana_rent_scan',
         arguments: { ownerAddress: SOL_WALLET, solPriceUsd: 160 },
       },
     },
@@ -1040,14 +1040,14 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
   assert.equal(rent.reclaimableSol, 0.0101964);
   assert.equal(rent.reclaimableUsd, 1.63);
 
-  // 4. siphon_solana_yield_preview (90% Preserved Yield + 10% Degen Side-Pocket)
+  // 4. turgalium_solana_yield_preview (90% Preserved Yield + 10% Degen Side-Pocket)
   const yieldResp = (await handleMcpRequest(
     {
       jsonrpc: '2.0',
       id: 105,
       method: 'tools/call',
       params: {
-        name: 'siphon_solana_yield_preview',
+        name: 'turgalium_solana_yield_preview',
         arguments: {
           ownerAddress: SOL_WALLET,
           totalUsdcAmount: 10_000,
@@ -1083,14 +1083,14 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
   );
   assert.ok(yieldData.projections.projectedAnnualYieldUsd > 0);
 
-  // 5. siphon_degen_markets (strictly read-only + sanitized)
+  // 5. turgalium_degen_markets (strictly read-only + sanitized)
   const degenResp = (await handleMcpRequest(
     {
       jsonrpc: '2.0',
       id: 106,
       method: 'tools/call',
       params: {
-        name: 'siphon_degen_markets',
+        name: 'turgalium_degen_markets',
         arguments: { category: 'crypto', filter: 'trending', limit: 5 },
       },
     },
@@ -1131,130 +1131,130 @@ test('All 5 new MCP v2 tools reject malformed addresses, out-of-range numbers, a
   const ctx = makeMcpContext();
 
   const invalidCalls: Array<{ label: string; name: string; args: Record<string, unknown> }> = [
-    // siphon_preservation_audit
-    { label: 'audit missing scanId and wallet', name: 'siphon_preservation_audit', args: {} },
+    // turgalium_preservation_audit
+    { label: 'audit missing scanId and wallet', name: 'turgalium_preservation_audit', args: {} },
     {
       label: 'audit malformed walletAddress',
-      name: 'siphon_preservation_audit',
+      name: 'turgalium_preservation_audit',
       args: { walletAddress: '0xNOT_A_VALID_WALLET<script>' },
     },
     {
       label: 'audit zero EVM walletAddress',
-      name: 'siphon_preservation_audit',
+      name: 'turgalium_preservation_audit',
       args: { walletAddress: '0x0000000000000000000000000000000000000000' },
     },
     {
       label: 'audit out-of-bounds protocolFeeBps',
-      name: 'siphon_preservation_audit',
+      name: 'turgalium_preservation_audit',
       args: { scanId: 'scan_1', protocolFeeBps: 1500 },
     },
     {
       label: 'audit invalid outputAsset',
-      name: 'siphon_preservation_audit',
+      name: 'turgalium_preservation_audit',
       args: { scanId: 'scan_1', outputAsset: 'ETH' },
     },
-    // siphon_list_unlock_schedule
-    { label: 'unlock missing all inputs', name: 'siphon_list_unlock_schedule', args: {} },
+    // turgalium_list_unlock_schedule
+    { label: 'unlock missing all inputs', name: 'turgalium_list_unlock_schedule', args: {} },
     {
       label: 'unlock malformed evmAddress',
-      name: 'siphon_list_unlock_schedule',
+      name: 'turgalium_list_unlock_schedule',
       args: { evmAddress: '0x1234' },
     },
     {
       label: 'unlock dead burn evmAddress',
-      name: 'siphon_list_unlock_schedule',
+      name: 'turgalium_list_unlock_schedule',
       args: { evmAddress: '0x000000000000000000000000000000000000dEaD' },
     },
     {
       label: 'unlock invalid Cosmos Bech32 checksum',
-      name: 'siphon_list_unlock_schedule',
+      name: 'turgalium_list_unlock_schedule',
       args: { cosmosAddresses: ['cosmos1fl48vsnmsdzcv85q5d2q4z5ajdha8yu34mf0ea'] },
     },
     {
       label: 'unlock unsupported Cosmos HRP',
-      name: 'siphon_list_unlock_schedule',
+      name: 'turgalium_list_unlock_schedule',
       args: { cosmosAddresses: [deriveValidCosmosAddressForHrp('juno')] },
     },
     {
       label: 'unlock negative CCTP amountUsdc',
-      name: 'siphon_list_unlock_schedule',
+      name: 'turgalium_list_unlock_schedule',
       args: {
         attestedCctpLegs: [
           { chain: 'ethereum', amountUsdc: -50, attestationStatus: 'complete' },
         ],
       },
     },
-    // siphon_solana_rent_scan
+    // turgalium_solana_rent_scan
     {
       label: 'rent scan malformed Solana pubkey',
-      name: 'siphon_solana_rent_scan',
+      name: 'turgalium_solana_rent_scan',
       args: { ownerAddress: 'not-a-solana-address' },
     },
     {
       label: 'rent scan EVM address passed to Solana tool',
-      name: 'siphon_solana_rent_scan',
+      name: 'turgalium_solana_rent_scan',
       args: { ownerAddress: EVM_WALLET },
     },
     {
       label: 'rent scan all-zero System Program pubkey',
-      name: 'siphon_solana_rent_scan',
+      name: 'turgalium_solana_rent_scan',
       args: { ownerAddress: '11111111111111111111111111111111' },
     },
     {
       label: 'rent scan boolean coerced solPriceUsd',
-      name: 'siphon_solana_rent_scan',
+      name: 'turgalium_solana_rent_scan',
       args: { ownerAddress: SOL_WALLET, solPriceUsd: true },
     },
-    // siphon_solana_yield_preview
+    // turgalium_solana_yield_preview
     {
       label: 'yield preview violates 50% preservation floor',
-      name: 'siphon_solana_yield_preview',
+      name: 'turgalium_solana_yield_preview',
       args: { totalUsdcAmount: 1000, preservePct: 40 },
     },
     {
       label: 'yield preview preservePct > 100',
-      name: 'siphon_solana_yield_preview',
+      name: 'turgalium_solana_yield_preview',
       args: { totalUsdcAmount: 1000, preservePct: 105 },
     },
     {
       label: 'yield preview negative totalUsdcAmount',
-      name: 'siphon_solana_yield_preview',
+      name: 'turgalium_solana_yield_preview',
       args: { totalUsdcAmount: -500 },
     },
     {
       label: 'yield preview boolean totalUsdcAmount',
-      name: 'siphon_solana_yield_preview',
+      name: 'turgalium_solana_yield_preview',
       args: { totalUsdcAmount: true },
     },
     {
       label: 'yield preview invalid strategy',
-      name: 'siphon_solana_yield_preview',
+      name: 'turgalium_solana_yield_preview',
       args: { totalUsdcAmount: 1000, strategy: '100x_leverage_rug' },
     },
     {
       label: 'yield preview malformed ownerAddress',
-      name: 'siphon_solana_yield_preview',
+      name: 'turgalium_solana_yield_preview',
       args: { totalUsdcAmount: 1000, ownerAddress: '0xbad_solana' },
     },
-    // siphon_degen_markets
+    // turgalium_degen_markets
     {
       label: 'degen markets invalid category',
-      name: 'siphon_degen_markets',
+      name: 'turgalium_degen_markets',
       args: { category: 'place_bet_now' },
     },
     {
       label: 'degen markets invalid filter',
-      name: 'siphon_degen_markets',
+      name: 'turgalium_degen_markets',
       args: { filter: 'execute_order' },
     },
     {
       label: 'degen markets limit out of bounds',
-      name: 'siphon_degen_markets',
+      name: 'turgalium_degen_markets',
       args: { limit: 100 },
     },
     {
       label: 'degen markets control char in query',
-      name: 'siphon_degen_markets',
+      name: 'turgalium_degen_markets',
       args: { query: 'SOL\u0000\u0007' },
     },
   ];

@@ -119,7 +119,7 @@ export interface SolanaPriorityFeeConfig {
 }
 
 export interface SolanaCctpClaimPlan {
-  planVersion: 'siphon-solana-cctp-claim-v1';
+  planVersion: 'turgalium-solana-cctp-claim-v1';
   transactionVersion: 0;
   cctpVersion: 1 | 2;
   messageHash: string;
@@ -860,7 +860,7 @@ export function buildSolanaCctpClaimInstructionPlan(
   ];
 
   return {
-    planVersion: 'siphon-solana-cctp-claim-v1',
+    planVersion: 'turgalium-solana-cctp-claim-v1',
     transactionVersion: 0,
     cctpVersion: decoded.cctpVersion,
     messageHash: decoded.messageHash,

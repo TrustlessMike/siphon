@@ -25,7 +25,7 @@ import {
 } from '../src/bridge/solana-claim.js';
 import { SOLANA_CCTP_DOMAIN } from '../src/scanner/chains.js';
 import type { ScannedAsset } from '../src/scanner/types.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 
 const SOL_USER_A = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
 const SOL_USER_B = '7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV';
@@ -1033,7 +1033,7 @@ test('Solana CCTP claim planner FAILS CLOSED on mismatched mintRecipient (raw ow
 });
 
 test('POST /api/cctp/solana-claim-tx serves serializable claim transaction plan and rejects mismatched mintRecipient fail-closed', async () => {
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');
@@ -1062,7 +1062,7 @@ test('POST /api/cctp/solana-claim-tx serves serializable claim transaction plan 
     });
     assert.equal(okRes.status, 200);
     const plan = (await okRes.json()) as Record<string, unknown>;
-    assert.equal(plan.planVersion, 'siphon-solana-cctp-claim-v1');
+    assert.equal(plan.planVersion, 'turgalium-solana-cctp-claim-v1');
     assert.equal(plan.mintRecipientVerified, true);
     assert.equal(plan.amountUsdc, 88);
     assert.equal(plan.recipientUsdcAta, deriveSolanaUsdcAta(SOL_USER_A).toBase58());

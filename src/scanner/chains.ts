@@ -277,7 +277,7 @@ export function isValidFeeRecipientEvm(addr?: string | null): addr is string {
   );
 }
 
-export const PROTOCOL_FEE_BPS = resolveProtocolFeeBps(process.env.SIPHON_FEE_BPS);
+export const PROTOCOL_FEE_BPS = resolveProtocolFeeBps(process.env.TURGALIUM_FEE_BPS);
 
 export interface ProtocolFeeConfig {
   feeBps: number;
@@ -294,15 +294,15 @@ export function getProtocolFeeConfig(overrides?: {
   feeBps?: number | string | null;
   feeRecipientEvm?: string | null;
 }): ProtocolFeeConfig {
-  const feeBps = resolveProtocolFeeBps(overrides?.feeBps ?? process.env.SIPHON_FEE_BPS);
+  const feeBps = resolveProtocolFeeBps(overrides?.feeBps ?? process.env.TURGALIUM_FEE_BPS);
   // HIGH-01: When server treasury is configured via environment, never allow client overrides to hijack fees.
-  const serverTreasury = process.env.SIPHON_FEE_RECIPIENT_EVM?.trim() || null;
+  const serverTreasury = process.env.TURGALIUM_FEE_RECIPIENT_EVM?.trim() || null;
   const candidateEvm = isValidFeeRecipientEvm(serverTreasury)
     ? serverTreasury
     : overrides?.feeRecipientEvm ?? null;
   const feeRecipientEvm = isValidFeeRecipientEvm(candidateEvm) ? candidateEvm.trim() : null;
-  const feeRecipientSol = process.env.SIPHON_FEE_RECIPIENT_SOL?.trim() || null;
-  const rawType = (process.env.SIPHON_FEE_DESTINATION_TYPE ?? 'contract').toLowerCase();
+  const feeRecipientSol = process.env.TURGALIUM_FEE_RECIPIENT_SOL?.trim() || null;
+  const rawType = (process.env.TURGALIUM_FEE_DESTINATION_TYPE ?? 'contract').toLowerCase();
   const feeDestinationType: 'contract' | 'wallet' = rawType === 'wallet' ? 'wallet' : 'contract';
 
   return {

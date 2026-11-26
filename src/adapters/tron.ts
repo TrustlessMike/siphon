@@ -552,7 +552,7 @@ export const tronAdapter: ChainFamilyAdapter = {
         estimatedFeeUsd,
       },
       estimatedSeconds: maxSeconds,
-      gaslessAvailable: Boolean(process.env.SIPHON_TRON_RELAYER_KEY?.trim()),
+      gaslessAvailable: Boolean(process.env.TURGALIUM_TRON_RELAYER_KEY?.trim()),
       gaslessMechanism: 'Relayer Dual ENERGY + BANDWIDTH Delegation (DelegateResourceContract) or GasFree USDT',
       notes,
     };
@@ -562,7 +562,7 @@ export const tronAdapter: ChainFamilyAdapter = {
     const feeCfg = getProtocolFeeConfig({ feeBps: params.protocolFeeBps });
     const mintRecipientBytes32 = solanaAddressToBytes32(params.solanaDestination);
     const tronRouter =
-      getNonEvmFeeRecipient('tron') || 'TSiphonTronRouterEnergyDelegator0000';
+      getNonEvmFeeRecipient('tron') || 'TTurgaliumTronRouterEnergyDelegat000';
     const chainAssets = filterChainSweepableAssets('tron', params.assets);
     const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
     const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
@@ -581,7 +581,7 @@ export const tronAdapter: ChainFamilyAdapter = {
 
     const signPayload = {
       standard: 'TIP-712',
-      domain: { name: 'SiphonTronRouter', version: '1', chainId: '0x2b6653dc', verifyingContract: tronRouter },
+      domain: { name: 'TurgaliumTronRouter', version: '1', chainId: '0x2b6653dc', verifyingContract: tronRouter },
       relayerPreStep: {
         contractType: 'DelegateResourceContract',
         resources: ['ENERGY', 'BANDWIDTH'],
@@ -639,7 +639,7 @@ export const tronAdapter: ChainFamilyAdapter = {
         grossUsd: a.grossUsd,
       })),
       signPayload,
-      relayerConfigured: Boolean(process.env.SIPHON_TRON_RELAYER_KEY?.trim()),
+      relayerConfigured: Boolean(process.env.TURGALIUM_TRON_RELAYER_KEY?.trim()),
       sponsorEligible: breakEven.eligible,
       sponsorRejectionReason: breakEven.rejectionReason,
       intentDigestSha256,
@@ -1011,7 +1011,7 @@ export const tronAdapter: ChainFamilyAdapter = {
         throw new Error('Signed Tron gasless intent expired. Re-sign a fresh intent.');
       }
       const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.SIPHON_TRON_RELAYER_KEY?.trim());
+      const configured = Boolean(process.env.TURGALIUM_TRON_RELAYER_KEY?.trim());
       out.submitted = {
         accepted: true,
         mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
@@ -1020,7 +1020,7 @@ export const tronAdapter: ChainFamilyAdapter = {
         signatureFingerprint: fp,
         nextStep: configured
           ? `Tron Energy+Bandwidth Delegator queued ${params.intentId} (${fp}).`
-          : `Tron intent verified (${fp}). Use Direct Mode (TronLink + Relay/LI.FI) to execute live TVM transactions today, or configure SIPHON_TRON_RELAYER_KEY.`,
+          : `Tron intent verified (${fp}). Use Direct Mode (TronLink + Relay/LI.FI) to execute live TVM transactions today, or configure TURGALIUM_TRON_RELAYER_KEY.`,
       };
     }
 

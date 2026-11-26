@@ -259,7 +259,7 @@ export async function prepareAptosDirectBatch(
           action: asset.action,
           provider: 'aptos_fa_transfer',
           label: `Protocol Fee (${feeCfg.feePercent}% USDC)`,
-          description: `Transfers ${feeCfg.feePercent}% Native FA USDC fee to Siphon treasury`,
+          description: `Transfers ${feeCfg.feePercent}% Native FA USDC fee to Turgalium treasury`,
           nativePayload: {
             type: 'entry_function_payload',
             function: '0x1::primary_fungible_store::transfer',
@@ -389,7 +389,7 @@ export async function prepareAptosDirectBatch(
         action: asset.action,
         provider: 'aptos_fa_transfer',
         label: `Protocol Fee (${feeCfg.feePercent}% USDC)`,
-        description: `Transfers ${feeCfg.feePercent}% Native FA USDC fee to Siphon treasury`,
+        description: `Transfers ${feeCfg.feePercent}% Native FA USDC fee to Turgalium treasury`,
         nativePayload: {
           type: 'entry_function_payload',
           function: '0x1::primary_fungible_store::transfer',
@@ -474,7 +474,7 @@ export async function prepareAptosDirectBatch(
       estimatedFeeUsd,
     },
     estimatedSeconds: maxSeconds,
-    gaslessAvailable: Boolean(process.env.SIPHON_APTOS_FEE_PAYER_KEY?.trim()),
+    gaslessAvailable: Boolean(process.env.TURGALIUM_APTOS_FEE_PAYER_KEY?.trim()),
     gaslessMechanism: 'Aptos Native FeePayerRawTransaction ($0 user APT)',
     notes,
   };
@@ -745,7 +745,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
       expiration_timestamp_secs: String(deadline),
       payload: {
         type: 'entry_function_payload',
-        function: `${feePayerAddress}::siphon_sweep_router::atomic_sweep_and_bridge`,
+        function: `${feePayerAddress}::turgalium_sweep_router::atomic_sweep_and_bridge`,
         type_arguments: [],
         arguments: [
           chainAssets.map((a) => a.address),
@@ -791,7 +791,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
         grossUsd: a.grossUsd,
       })),
       signPayload,
-      relayerConfigured: Boolean(process.env.SIPHON_APTOS_FEE_PAYER_KEY?.trim()),
+      relayerConfigured: Boolean(process.env.TURGALIUM_APTOS_FEE_PAYER_KEY?.trim()),
       sponsorEligible: breakEven.eligible,
       sponsorRejectionReason: breakEven.rejectionReason,
       intentDigestSha256,
@@ -1139,7 +1139,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
         throw new Error('Signed Aptos FeePayer intent expired. Re-sign a fresh intent.');
       }
       const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.SIPHON_APTOS_FEE_PAYER_KEY?.trim());
+      const configured = Boolean(process.env.TURGALIUM_APTOS_FEE_PAYER_KEY?.trim());
       out.submitted = {
         accepted: true,
         mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
@@ -1148,7 +1148,7 @@ export const aptosAdapter: ChainFamilyAdapter = {
         signatureFingerprint: fp,
         nextStep: configured
           ? `Aptos Fee Payer queued ${params.intentId} (${fp}).`
-          : `Aptos 1-Sig Move intent verified (${fp}). Use Direct Mode (Petra/Phantom) for immediate CCTP Domain 9 execution, or configure SIPHON_APTOS_FEE_PAYER_KEY.`,
+          : `Aptos 1-Sig Move intent verified (${fp}). Use Direct Mode (Petra/Phantom) for immediate CCTP Domain 9 execution, or configure TURGALIUM_APTOS_FEE_PAYER_KEY.`,
       };
     }
 

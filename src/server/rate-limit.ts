@@ -119,18 +119,18 @@ export class SlidingWindowRateLimiter {
   private blockedTotal = 0;
 
   constructor(opts: RateLimiterOptions = {}, env: NodeJS.ProcessEnv = process.env) {
-    const envDisabled = parseBoolEnv(env.SIPHON_RATE_LIMIT_DISABLED);
+    const envDisabled = parseBoolEnv(env.TURGALIUM_RATE_LIMIT_DISABLED);
     this.enabled = opts.enabled ?? (envDisabled === true ? false : true);
     this.maxRequests = Math.max(
       1,
-      Math.floor(opts.maxRequests ?? parsePositiveInt(env.SIPHON_RATE_LIMIT_MAX, DEFAULT_MAX_REQUESTS))
+      Math.floor(opts.maxRequests ?? parsePositiveInt(env.TURGALIUM_RATE_LIMIT_MAX, DEFAULT_MAX_REQUESTS))
     );
     this.windowMs = Math.max(
       100,
-      Math.floor(opts.windowMs ?? parsePositiveInt(env.SIPHON_RATE_LIMIT_WINDOW_MS, DEFAULT_WINDOW_MS))
+      Math.floor(opts.windowMs ?? parsePositiveInt(env.TURGALIUM_RATE_LIMIT_WINDOW_MS, DEFAULT_WINDOW_MS))
     );
     this.maxKeys = Math.max(100, Math.floor(opts.maxKeys ?? DEFAULT_MAX_KEYS));
-    const envTrustProxy = parseBoolEnv(env.SIPHON_TRUST_PROXY);
+    const envTrustProxy = parseBoolEnv(env.TURGALIUM_TRUST_PROXY);
     this.trustFlyClientIp = opts.trustFlyClientIp ?? Boolean(env.FLY_APP_NAME?.trim());
     this.trustProxy = opts.trustProxy ?? (envTrustProxy ?? this.trustFlyClientIp);
     this.nowMs = opts.nowMs ?? (() => Date.now());

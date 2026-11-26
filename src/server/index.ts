@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createSiphonServer } from './app.js';
+import { createTurgaliumServer } from './app.js';
 
 export interface StartupSecurityConfig {
   host: string;
@@ -23,7 +23,7 @@ export function isLoopbackBindHost(host: string): boolean {
 /**
  * Fail-closed production startup guard:
  * Refuses to bind a non-loopback network interface (e.g. `0.0.0.0`, `::`, LAN/public IP)
- * unless `SIPHON_ADMIN_SESSION_TOKEN` is explicitly configured.
+ * unless `TURGALIUM_ADMIN_SESSION_TOKEN` is explicitly configured.
  */
 export function assertSafeStartupConfig(config: StartupSecurityConfig): {
   loopback: boolean;
@@ -37,13 +37,13 @@ export function assertSafeStartupConfig(config: StartupSecurityConfig): {
     const token = config.adminSessionToken?.trim() ?? '';
     if (!token) {
       throw new Error(
-        `Fail-closed startup guard: refusing to bind non-loopback HOST="${host}" without SIPHON_ADMIN_SESSION_TOKEN set. ` +
-          `Configure SIPHON_ADMIN_SESSION_TOKEN (and SIPHON_ALLOWED_HOSTS / SIPHON_ALLOWED_ORIGIN) before exposing Siphon beyond localhost.`
+        `Fail-closed startup guard: refusing to bind non-loopback HOST="${host}" without TURGALIUM_ADMIN_SESSION_TOKEN set. ` +
+          `Configure TURGALIUM_ADMIN_SESSION_TOKEN (and TURGALIUM_ALLOWED_HOSTS / TURGALIUM_ALLOWED_ORIGIN) before exposing Turgalium beyond localhost.`
       );
     }
     if (token.length < 16) {
       warnings.push(
-        'SIPHON_ADMIN_SESSION_TOKEN is shorter than 16 characters; use a high-entropy random secret in production.'
+        'TURGALIUM_ADMIN_SESSION_TOKEN is shorter than 16 characters; use a high-entropy random secret in production.'
       );
     }
     if (
@@ -52,7 +52,7 @@ export function assertSafeStartupConfig(config: StartupSecurityConfig): {
       !config.publicBaseUrl?.trim()
     ) {
       warnings.push(
-        'Binding non-loopback host without SIPHON_ALLOWED_HOSTS, SIPHON_ALLOWED_ORIGIN, or SIPHON_PUBLIC_BASE_URL; non-loopback Host headers will be rejected by DNS-rebinding protection.'
+        'Binding non-loopback host without TURGALIUM_ALLOWED_HOSTS, TURGALIUM_ALLOWED_ORIGIN, or TURGALIUM_PUBLIC_BASE_URL; non-loopback Host headers will be rejected by DNS-rebinding protection.'
       );
     }
   }
@@ -68,7 +68,7 @@ export function logJson(
   const entry = JSON.stringify({
     ts: new Date().toISOString(),
     level,
-    service: 'siphon-migrator',
+    service: 'turgalium-migrator',
     event,
     ...meta,
   });
@@ -86,22 +86,22 @@ export function parseServerPort(raw?: string): number {
   return parsed;
 }
 
-export function startSiphonProcess(env: NodeJS.ProcessEnv = process.env) {
+export function startTurgaliumProcess(env: NodeJS.ProcessEnv = process.env) {
   const port = parseServerPort(env.PORT);
   const host = env.HOST?.trim() || '127.0.0.1';
 
   const check = assertSafeStartupConfig({
     host,
-    adminSessionToken: env.SIPHON_ADMIN_SESSION_TOKEN,
-    allowedHosts: env.SIPHON_ALLOWED_HOSTS,
-    allowedOrigin: env.SIPHON_ALLOWED_ORIGIN,
-    publicBaseUrl: env.SIPHON_PUBLIC_BASE_URL,
+    adminSessionToken: env.TURGALIUM_ADMIN_SESSION_TOKEN,
+    allowedHosts: env.TURGALIUM_ALLOWED_HOSTS,
+    allowedOrigin: env.TURGALIUM_ALLOWED_ORIGIN,
+    publicBaseUrl: env.TURGALIUM_PUBLIC_BASE_URL,
   });
   for (const warning of check.warnings) {
     logJson('warn', 'startup_warning', { host, warning });
   }
 
-  const instance = createSiphonServer();
+  const instance = createTurgaliumServer();
   const { server, jobStore, stateStore, rateLimiter } = instance;
 
   let shuttingDown = false;
@@ -153,7 +153,7 @@ const isEntrypoint =
 
 if (isEntrypoint) {
   try {
-    startSiphonProcess();
+    startTurgaliumProcess();
   } catch (err) {
     logJson('error', 'startup_blocked', {
       error: err instanceof Error ? err.message : String(err),

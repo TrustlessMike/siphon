@@ -1,5 +1,5 @@
 /* =====================================================================
-   SIPHON — KAMINO 2.0 + AAVE (BUCK) + 0.XYZ DAYLIGHT PROTOCOL SYSTEM
+   TURGALIUM — KAMINO 2.0 + AAVE (BUCK) + 0.XYZ DAYLIGHT PROTOCOL SYSTEM
    Paper white (#FCFCFC), stark black ink (#0A0A0A), 1px hairlines
    (#E4E6EB), and Kamino ice-cyan (#C6F4FF) active highlights.
    ===================================================================== */
@@ -416,7 +416,7 @@ select {
   color: var(--ink-2);
 }
 
-/* Inline Wallet Scan Pill matching the Siphon design comp */
+/* Inline Wallet Scan Pill matching the Turgalium design comp */
 .hero-scan-pill {
   display: flex;
   align-items: center;

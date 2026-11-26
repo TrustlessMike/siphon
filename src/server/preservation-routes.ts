@@ -1,5 +1,5 @@
 import type { IncomingMessage } from 'node:http';
-import type { SiphonAgentEngine } from '../agent/mandate-engine.js';
+import type { TurgaliumAgentEngine } from '../agent/mandate-engine.js';
 import {
   evaluateDustAutoHarvestEligibility,
   type GasWatchTrigger,
@@ -20,7 +20,7 @@ export interface PreservationRouteContext {
   readJsonBody: <T>(req: IncomingMessage, maxBytes?: number) => Promise<T>;
   reply: (status: number, payload: unknown) => void;
   scanCache: BoundedTtlCache<string, ScanReport>;
-  agentEngine: SiphonAgentEngine;
+  agentEngine: TurgaliumAgentEngine;
   preservationAgents: PreservationAgentStore;
   maxPrivilegedBodyBytes: number;
   nowMs?: () => number;
@@ -96,7 +96,7 @@ function isValidScanReportShape(val: unknown): val is ScanReport {
 }
 
 function buildMandateValidator(
-  agentEngine: SiphonAgentEngine,
+  agentEngine: TurgaliumAgentEngine,
   nowMs: () => number
 ): (mandateId: string, trigger: GasWatchTrigger) => boolean {
   return (mandateId: string, trigger: GasWatchTrigger): boolean => {
@@ -109,7 +109,7 @@ function buildMandateValidator(
 }
 
 /**
- * Handles Siphon Capital-Preservation & Watchdog Agent HTTP endpoints:
+ * Handles Turgalium Capital-Preservation & Watchdog Agent HTTP endpoints:
  *  - POST /api/optimize/preservation
  *  - GET  /api/agents/gas-watch
  *  - POST /api/agents/gas-watch

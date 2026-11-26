@@ -509,7 +509,7 @@ test('Preservation Fee Engine: preserves >= 99.5% on $10k and $100k (saving +$67
     assert.equal(res.netAfterFeeUsd, 0);
   }
 
-  // Backwards compatibility of legacy resolveProtocolFeeBps() (tests/siphon.test.ts invariants!)
+  // Backwards compatibility of legacy resolveProtocolFeeBps() (tests/turgalium.test.ts invariants!)
   assert.equal(resolveProtocolFeeBps(undefined), 700);
   assert.equal(resolveProtocolFeeBps(100), 500);
   assert.equal(resolveProtocolFeeBps(750), 750);

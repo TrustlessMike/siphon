@@ -78,7 +78,7 @@
 
           <div class="hero-visual-col">
             <canvas
-              id="siphonHeroCanvas"
+              id="turgaliumHeroCanvas"
               class="hero-3d-canvas"
               aria-label="3D porcelain, brushed titanium, and frosted ice-cyan Solana funnel sculpture"
             ></canvas>
@@ -456,7 +456,7 @@
                       id="feeRecipientInput"
                       class="field-input-xs mono"
                       maxlength="64"
-                      placeholder="0x… SiphonFeeVault or Treasury wallet"
+                      placeholder="0x… TurgaliumFeeVault or Treasury wallet"
                       aria-label="Protocol fee recipient EVM address"
                     />
                   </div>
@@ -765,7 +765,7 @@
                     <h2>Spending Rules (Mandates)</h2>
                     <p class="muted-xs" style="margin:2px 0 0;">Caps and allowed actions enforced before any AI-proposed sweep executes.</p>
                   </div>
-                  <span class="mono muted-xs contract-chip" title="Policy mirrors contracts/SiphonAgentVault.sol">SiphonAgentVault.sol</span>
+                  <span class="mono muted-xs contract-chip" title="Policy mirrors contracts/TurgaliumAgentVault.sol">TurgaliumAgentVault.sol</span>
                 </div>
 
                 <form class="mandate-form" id="createMandateForm">
@@ -933,10 +933,10 @@
             </div>
             <div class="btn-row">
               <div class="seg-output" role="tablist" aria-label="Smart contract selector">
-                <button type="button" class="seg-opt contract-tab active" data-contract-id="router">SiphonRouter.sol</button>
-                <button type="button" class="seg-opt contract-tab" data-contract-id="delegate">SiphonSweepDelegate.sol</button>
-                <button type="button" class="seg-opt contract-tab" data-contract-id="agent">SiphonAgentVault.sol</button>
-                <button type="button" class="seg-opt contract-tab" data-contract-id="vault">SiphonFeeVault.sol</button>
+                <button type="button" class="seg-opt contract-tab active" data-contract-id="router">TurgaliumRouter.sol</button>
+                <button type="button" class="seg-opt contract-tab" data-contract-id="delegate">TurgaliumSweepDelegate.sol</button>
+                <button type="button" class="seg-opt contract-tab" data-contract-id="agent">TurgaliumAgentVault.sol</button>
+                <button type="button" class="seg-opt contract-tab" data-contract-id="vault">TurgaliumFeeVault.sol</button>
               </div>
               <button type="button" class="btn-outline-sm" id="copyContractBtn">Copy Solidity Source</button>
             </div>
@@ -944,7 +944,7 @@
 
           <div class="card code-card">
             <div class="code-meta-bar mono">
-              <span id="contractFileLabel">contracts/SiphonRouter.sol</span>
+              <span id="contractFileLabel">contracts/TurgaliumRouter.sol</span>
               <span id="contractStats">Solidity 0.8.24 · 5–10% Fee · Domain 5 → Solana</span>
             </div>
             <pre class="code-viewer mono" id="contractCodeHost">Loading…</pre>

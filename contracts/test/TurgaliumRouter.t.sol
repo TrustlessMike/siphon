@@ -13,10 +13,10 @@ import {
     MockERC4626Vault,
     MockPermit2
 } from "./Mocks.sol";
-import { SiphonRouter, IPermit2 } from "../SiphonRouter.sol";
-import { SiphonAgentVault } from "../SiphonAgentVault.sol";
+import { TurgaliumRouter, IPermit2 } from "../TurgaliumRouter.sol";
+import { TurgaliumAgentVault } from "../TurgaliumAgentVault.sol";
 
-contract SiphonRouterTest is TestBase {
+contract TurgaliumRouterTest is TestBase {
     MockERC20 internal usdc;
     MockERC20 internal dustToken;
     MockERC20 internal aUsdc;
@@ -30,9 +30,9 @@ contract SiphonRouterTest is TestBase {
     MockCompoundV3Comet internal comet;
     MockERC4626Vault internal vault4626;
 
-    SiphonRouter internal routerV2;
-    SiphonRouter internal routerV1;
-    SiphonAgentVault internal agentVault;
+    TurgaliumRouter internal routerV2;
+    TurgaliumRouter internal routerV1;
+    TurgaliumAgentVault internal agentVault;
 
     address internal owner;
     address internal feeRecipient = address(0xFEE1);
@@ -68,8 +68,8 @@ contract SiphonRouterTest is TestBase {
         usdc.mint(address(aggregator), 10_000_000e6);
 
         // Deploy routers (V2 default 25 bps preservation tier; V1 700 bps legacy tier)
-        routerV2 = new SiphonRouter(address(usdc), address(cctpV2), 2, feeRecipient, 25);
-        routerV1 = new SiphonRouter(address(usdc), address(cctpV1), 1, feeRecipient, 700);
+        routerV2 = new TurgaliumRouter(address(usdc), address(cctpV2), 2, feeRecipient, 25);
+        routerV1 = new TurgaliumRouter(address(usdc), address(cctpV1), 1, feeRecipient, 700);
 
         // Configure allowlists on routerV2
         routerV2.setAllowedSwapAggregator(address(aggregator), true);
@@ -81,8 +81,8 @@ contract SiphonRouterTest is TestBase {
         // Configure allowlists on routerV1
         routerV1.setAllowedSwapAggregator(address(aggregator), true);
 
-        // Deploy real SiphonAgentVault linked to routerV2
-        agentVault = new SiphonAgentVault(address(routerV2));
+        // Deploy real TurgaliumAgentVault linked to routerV2
+        agentVault = new TurgaliumAgentVault(address(routerV2));
         routerV2.setAllowedAgentVault(address(agentVault), true);
 
         // Etch MockPermit2 at canonical Permit2 address
@@ -90,7 +90,7 @@ contract SiphonRouterTest is TestBase {
         vm.etch(address(routerV2.PERMIT2()), address(permit2Impl).code);
     }
 
-    function _emptyCctp() internal pure returns (SiphonRouter.CctpV2Options memory opts) {}
+    function _emptyCctp() internal pure returns (TurgaliumRouter.CctpV2Options memory opts) {}
 
     function test_EndToEndMultiProtocolSweepSwapsAndIsolatedHoneypotBurn() public {
         // Setup user positions:
@@ -110,31 +110,31 @@ contract SiphonRouterTest is TestBase {
         dustToken.approve(address(routerV2), 100e18);
         deadToken.approve(address(routerV2), 1000e18);
 
-        SiphonRouter.DefiExitStep[] memory exits = new SiphonRouter.DefiExitStep[](3);
-        exits[0] = SiphonRouter.DefiExitStep({
-            kind: SiphonRouter.DefiKind.AAVE_V3_WITHDRAW,
+        TurgaliumRouter.DefiExitStep[] memory exits = new TurgaliumRouter.DefiExitStep[](3);
+        exits[0] = TurgaliumRouter.DefiExitStep({
+            kind: TurgaliumRouter.DefiKind.AAVE_V3_WITHDRAW,
             protocol: address(aavePool),
             receiptToken: address(aUsdc),
             underlyingAsset: address(usdc),
             amount: 500e6
         });
-        exits[1] = SiphonRouter.DefiExitStep({
-            kind: SiphonRouter.DefiKind.COMPOUND_V3_WITHDRAW,
+        exits[1] = TurgaliumRouter.DefiExitStep({
+            kind: TurgaliumRouter.DefiKind.COMPOUND_V3_WITHDRAW,
             protocol: address(comet),
             receiptToken: address(0),
             underlyingAsset: address(usdc),
             amount: 300e6
         });
-        exits[2] = SiphonRouter.DefiExitStep({
-            kind: SiphonRouter.DefiKind.ERC4626_REDEEM,
+        exits[2] = TurgaliumRouter.DefiExitStep({
+            kind: TurgaliumRouter.DefiKind.ERC4626_REDEEM,
             protocol: address(vault4626),
             receiptToken: address(0),
             underlyingAsset: address(usdc),
             amount: 200e6
         });
 
-        SiphonRouter.SwapStep[] memory swaps = new SiphonRouter.SwapStep[](1);
-        swaps[0] = SiphonRouter.SwapStep({
+        TurgaliumRouter.SwapStep[] memory swaps = new TurgaliumRouter.SwapStep[](1);
+        swaps[0] = TurgaliumRouter.SwapStep({
             tokenIn: address(dustToken),
             amountIn: 100e18,
             pullFromUser: true,
@@ -147,11 +147,11 @@ contract SiphonRouterTest is TestBase {
             )
         });
 
-        SiphonRouter.BurnStep[] memory burns = new SiphonRouter.BurnStep[](2);
-        burns[0] = SiphonRouter.BurnStep({ token: address(deadToken), amount: 1000e18 });
-        burns[1] = SiphonRouter.BurnStep({ token: address(honeypotToken), amount: 12345 });
+        TurgaliumRouter.BurnStep[] memory burns = new TurgaliumRouter.BurnStep[](2);
+        burns[0] = TurgaliumRouter.BurnStep({ token: address(deadToken), amount: 1000e18 });
+        burns[1] = TurgaliumRouter.BurnStep({ token: address(honeypotToken), amount: 12345 });
 
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 0,
             minNetUsdcOut: 1490e6,
@@ -189,16 +189,16 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV2), 10_000e6);
 
-        SiphonRouter.SweepParams memory zeroFeeParams = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory zeroFeeParams = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 10_000e6,
             minNetUsdcOut: 10_000e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
         (uint256 bridged0, ) = routerV2.sweepAndBridgeToSolana(zeroFeeParams);
         vm.stopPrank();
@@ -214,16 +214,16 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV2), 100_000e6);
 
-        SiphonRouter.SweepParams memory whaleParams = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory whaleParams = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 100_000e6,
             minNetUsdcOut: 99_975e6,
             maxFeeUsdcCap: 25e6, // User-side ceiling agrees with $25 cap
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
         (uint256 bridgedWhale, ) = routerV2.sweepAndBridgeToSolana(whaleParams);
         vm.stopPrank();
@@ -236,7 +236,7 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV2), 100_000e6);
         whaleParams.maxFeeUsdcCap = 10e6; // User refuses to pay >$10 when protocol charges $25
-        vm.expectRevert(abi.encodeWithSelector(SiphonRouter.FeeCapExceeded.selector, 25e6, 10e6));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumRouter.FeeCapExceeded.selector, 25e6, 10e6));
         routerV2.sweepAndBridgeToSolana(whaleParams);
         vm.stopPrank();
     }
@@ -247,16 +247,16 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV1), 1_000e6);
 
-        SiphonRouter.SweepParams memory v1Params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory v1Params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 500e6,
             minNetUsdcOut: 400e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
         (uint256 bridgedV1, uint64 nonceV1) = routerV1.sweepAndBridgeToSolana(v1Params);
         assertEq(nonceV1, 1);
@@ -265,7 +265,7 @@ contract SiphonRouterTest is TestBase {
 
         // V1 rejects hookData
         v1Params.cctp.hookData = hex"deadbeef";
-        vm.expectRevert(SiphonRouter.CctpV2Required.selector);
+        vm.expectRevert(TurgaliumRouter.CctpV2Required.selector);
         routerV1.sweepAndBridgeToSolana(v1Params);
         vm.stopPrank();
 
@@ -274,21 +274,21 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV2), 2_000e6);
 
-        SiphonRouter.SweepParams memory fastParams = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory fastParams = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 1_000e6,
             minNetUsdcOut: 990e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
-            cctp: SiphonRouter.CctpV2Options({
+            cctp: TurgaliumRouter.CctpV2Options({
                 destinationCaller: bytes32(uint256(0xCAFE)),
                 maxFee: 1e6,
                 minFinalityThreshold: 1000,
                 hookData: ""
             }),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
         routerV2.sweepAndBridgeToSolana(fastParams);
         assertEq(cctpV2.lastMinFinalityThreshold(), 1000);
@@ -312,7 +312,7 @@ contract SiphonRouterTest is TestBase {
         vm.stopPrank();
     }
 
-    function test_SweepWithMandateEnforcesSiphonAgentVaultPolicy() public {
+    function test_SweepWithMandateEnforcesTurgaliumAgentVaultPolicy() public {
         // Owner grants mandate to `agent`:
         // - lockedSolanaRecipient = SOLANA_ATA
         // - maxPerTxUsd6 = 500e6 ($500)
@@ -341,16 +341,16 @@ contract SiphonRouterTest is TestBase {
         usdc.approve(address(routerV2), 3_000e6);
 
         uint256 startTs = block.timestamp;
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 450e6,
             minNetUsdcOut: 440e6,
             maxFeeUsdcCap: 0,
             deadline: startTs + 3600,
             cctp: _emptyCctp(),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         // 1. Happy path: agent executes $450 sweep (under $500 per-tx & $800 daily cap)
@@ -368,7 +368,7 @@ contract SiphonRouterTest is TestBase {
         // 2. Wrong Solana recipient -> REVERTS with RecipientMismatch!
         params.solanaRecipient = WRONG_SOLANA_ATA;
         vm.prank(agent);
-        vm.expectRevert(SiphonAgentVault.RecipientMismatch.selector);
+        vm.expectRevert(TurgaliumAgentVault.RecipientMismatch.selector);
         routerV2.sweepWithMandate(
             address(agentVault),
             mandateId,
@@ -379,7 +379,7 @@ contract SiphonRouterTest is TestBase {
 
         // 3. Second $450 sweep same day -> 450 + 450 = 900 > 800 dailyCap -> REVERTS with ExceedsDailyCap!
         vm.prank(agent);
-        vm.expectRevert(abi.encodeWithSelector(SiphonAgentVault.ExceedsDailyCap.selector, 900e6, 800e6));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumAgentVault.ExceedsDailyCap.selector, 900e6, 800e6));
         routerV2.sweepWithMandate(
             address(agentVault),
             mandateId,
@@ -392,7 +392,7 @@ contract SiphonRouterTest is TestBase {
         params.directUsdcAmount = 200e6;
         params.minNetUsdcOut = 190e6;
         vm.prank(agent);
-        vm.expectRevert(abi.encodeWithSelector(SiphonAgentVault.FeeAboveCap.selector, 100, 50));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumAgentVault.FeeAboveCap.selector, 100, 50));
         routerV2.sweepWithMandate(
             address(agentVault),
             mandateId,
@@ -402,9 +402,9 @@ contract SiphonRouterTest is TestBase {
         routerV2.setFeeParams(feeRecipient, 25);
 
         // 5. Sneaking unauthorized DeFi exit when ACTION_DEFI_WITHDRAW was NOT granted -> REVERTS!
-        SiphonRouter.DefiExitStep[] memory sneakyExit = new SiphonRouter.DefiExitStep[](1);
-        sneakyExit[0] = SiphonRouter.DefiExitStep({
-            kind: SiphonRouter.DefiKind.COMPOUND_V3_WITHDRAW,
+        TurgaliumRouter.DefiExitStep[] memory sneakyExit = new TurgaliumRouter.DefiExitStep[](1);
+        sneakyExit[0] = TurgaliumRouter.DefiExitStep({
+            kind: TurgaliumRouter.DefiKind.COMPOUND_V3_WITHDRAW,
             protocol: address(comet),
             receiptToken: address(0),
             underlyingAsset: address(usdc),
@@ -412,14 +412,14 @@ contract SiphonRouterTest is TestBase {
         });
         params.defiExits = sneakyExit;
         vm.prank(agent);
-        vm.expectRevert(abi.encodeWithSelector(SiphonRouter.MandateActionNotPermitted.selector, actionDefi));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumRouter.MandateActionNotPermitted.selector, actionDefi));
         routerV2.sweepWithMandate(
             address(agentVault),
             mandateId,
             actionBridge,
             params
         );
-        params.defiExits = new SiphonRouter.DefiExitStep[](0);
+        params.defiExits = new TurgaliumRouter.DefiExitStep[](0);
 
         // 6. Warp +24 hours -> daily cap resets cleanly and $450 sweep succeeds (monotonic nonce increments)!
         vm.warp(startTs + 1 days);
@@ -443,7 +443,7 @@ contract SiphonRouterTest is TestBase {
         params.directUsdcAmount = 100e6;
         params.minNetUsdcOut = 90e6;
         vm.prank(agent);
-        vm.expectRevert(SiphonAgentVault.MandateInactiveOrExpired.selector);
+        vm.expectRevert(TurgaliumAgentVault.MandateInactiveOrExpired.selector);
         routerV2.sweepWithMandate(
             address(agentVault),
             mandateId,
@@ -469,8 +469,8 @@ contract SiphonRouterTest is TestBase {
         });
 
         // Swap only 60 of 100 permitted DUST tokens -> 40 DUST MUST be refunded to user!
-        SiphonRouter.SwapStep[] memory swaps = new SiphonRouter.SwapStep[](1);
-        swaps[0] = SiphonRouter.SwapStep({
+        TurgaliumRouter.SwapStep[] memory swaps = new TurgaliumRouter.SwapStep[](1);
+        swaps[0] = TurgaliumRouter.SwapStep({
             tokenIn: address(dustToken),
             amountIn: 100e18,
             pullFromUser: false,
@@ -483,7 +483,7 @@ contract SiphonRouterTest is TestBase {
             )
         });
 
-        SiphonRouter.SiphonSweepWitness memory witness = SiphonRouter.SiphonSweepWitness({
+        TurgaliumRouter.TurgaliumSweepWitness memory witness = TurgaliumRouter.TurgaliumSweepWitness({
             solanaRecipient: SOLANA_ATA,
             minNetUsdcOut: 90e6,
             maxGasReimbursementUsdc: 2e6,
@@ -507,26 +507,42 @@ contract SiphonRouterTest is TestBase {
         // Tampering with swapsHash reverts
         witness.swapsHash = keccak256("tampered");
         vm.prank(relayer);
-        vm.expectRevert(SiphonRouter.InvalidSwapsHash.selector);
+        vm.expectRevert(TurgaliumRouter.InvalidSwapsHash.selector);
         routerV2.sweepWithPermit2Batch(user, permit, witness, dummySig, 1e6, swaps);
+
+        // Permit2 EIP-712 witness typestring strictly alphabetical (TokenPermissions before TurgaliumSweepWitness)
+        assertEq(
+            routerV2.TURGALIUM_WITNESS_TYPEHASH(),
+            keccak256(
+                "TurgaliumSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient,bytes32 swapsHash)"
+            )
+        );
+        assertEq(
+            keccak256(bytes(routerV2.TURGALIUM_WITNESS_TYPESTRING())),
+            keccak256(
+                bytes(
+                    "TurgaliumSweepWitness witness)TokenPermissions(address token,uint256 amount)TurgaliumSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient,bytes32 swapsHash)"
+                )
+            )
+        );
     }
 
     function test_DisjointAllowlistsAndFakeATokenRejected() public {
         // Cannot add existing aggregator as DeFi protocol
-        vm.expectRevert(abi.encodeWithSelector(SiphonRouter.DisjointAllowlistViolation.selector, address(aggregator)));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumRouter.DisjointAllowlistViolation.selector, address(aggregator)));
         routerV2.setAllowedDefiProtocol(address(aggregator), true);
 
         // Fake aToken rejected by Pool.getReserveData validation
-        SiphonRouter.DefiExitStep[] memory badAave = new SiphonRouter.DefiExitStep[](1);
-        badAave[0] = SiphonRouter.DefiExitStep({
-            kind: SiphonRouter.DefiKind.AAVE_V3_WITHDRAW,
+        TurgaliumRouter.DefiExitStep[] memory badAave = new TurgaliumRouter.DefiExitStep[](1);
+        badAave[0] = TurgaliumRouter.DefiExitStep({
+            kind: TurgaliumRouter.DefiKind.AAVE_V3_WITHDRAW,
             protocol: address(aavePool),
             receiptToken: address(dustToken), // WRONG receipt token!
             underlyingAsset: address(usdc),
             amount: 100e6
         });
 
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 0,
             minNetUsdcOut: 1,
@@ -534,12 +550,12 @@ contract SiphonRouterTest is TestBase {
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
             defiExits: badAave,
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         vm.prank(user);
-        vm.expectRevert(SiphonRouter.InvalidAddress.selector);
+        vm.expectRevert(TurgaliumRouter.InvalidAddress.selector);
         routerV2.sweepAndBridgeToSolana(params);
     }
 
@@ -568,8 +584,8 @@ contract SiphonRouterTest is TestBase {
         dustToken.approve(address(routerV2), 100e18);
 
         // 1. Rogue agent tries executing arbitrary swapCalldata -> REVERTS AgentArbitrarySwapsForbidden!
-        SiphonRouter.SwapStep[] memory rogueSwaps = new SiphonRouter.SwapStep[](1);
-        rogueSwaps[0] = SiphonRouter.SwapStep({
+        TurgaliumRouter.SwapStep[] memory rogueSwaps = new TurgaliumRouter.SwapStep[](1);
+        rogueSwaps[0] = TurgaliumRouter.SwapStep({
             tokenIn: address(dustToken),
             amountIn: 100e18,
             pullFromUser: true,
@@ -582,42 +598,42 @@ contract SiphonRouterTest is TestBase {
             )
         });
 
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 0,
             minNetUsdcOut: 1,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
             swaps: rogueSwaps,
-            burns: new SiphonRouter.BurnStep[](0)
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         vm.prank(agent);
-        vm.expectRevert(SiphonRouter.AgentArbitrarySwapsForbidden.selector);
+        vm.expectRevert(TurgaliumRouter.AgentArbitrarySwapsForbidden.selector);
         routerV2.sweepWithMandate(address(agentVault), mandateId, actionDust, params);
 
         // 2. Rogue agent tries non-USDC DeFi exit (underlyingAsset != usdc) -> REVERTS AgentNonUsdcDefiExitForbidden!
-        SiphonRouter.DefiExitStep[] memory nonUsdcExit = new SiphonRouter.DefiExitStep[](1);
-        nonUsdcExit[0] = SiphonRouter.DefiExitStep({
-            kind: SiphonRouter.DefiKind.COMPOUND_V3_WITHDRAW,
+        TurgaliumRouter.DefiExitStep[] memory nonUsdcExit = new TurgaliumRouter.DefiExitStep[](1);
+        nonUsdcExit[0] = TurgaliumRouter.DefiExitStep({
+            kind: TurgaliumRouter.DefiKind.COMPOUND_V3_WITHDRAW,
             protocol: address(comet),
             receiptToken: address(0),
             underlyingAsset: address(dustToken),
             amount: 10e18
         });
-        params.swaps = new SiphonRouter.SwapStep[](0);
+        params.swaps = new TurgaliumRouter.SwapStep[](0);
         params.defiExits = nonUsdcExit;
 
         vm.prank(agent);
         vm.expectRevert(
-            abi.encodeWithSelector(SiphonRouter.AgentNonUsdcDefiExitForbidden.selector, address(dustToken))
+            abi.encodeWithSelector(TurgaliumRouter.AgentNonUsdcDefiExitForbidden.selector, address(dustToken))
         );
         routerV2.sweepWithMandate(address(agentVault), mandateId, actionDefi, params);
 
         // 3. Capital owner themselves CAN still execute swaps via sweepWithMandate!
-        params.defiExits = new SiphonRouter.DefiExitStep[](0);
+        params.defiExits = new TurgaliumRouter.DefiExitStep[](0);
         params.swaps = rogueSwaps;
         params.minNetUsdcOut = 490e6;
         vm.prank(user);
@@ -644,16 +660,16 @@ contract SiphonRouterTest is TestBase {
         vm.prank(user);
         usdc.approve(address(routerV2), 400e6);
 
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 400e6,
             minNetUsdcOut: 398e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         vm.prank(agent);
@@ -686,29 +702,29 @@ contract SiphonRouterTest is TestBase {
         vm.stopPrank();
 
         // 1. Rogue agent tries burning tokens inside mandate sweep -> REVERTS AgentBurnsForbidden!
-        SiphonRouter.BurnStep[] memory burns = new SiphonRouter.BurnStep[](1);
-        burns[0] = SiphonRouter.BurnStep({ token: address(deadToken), amount: 100e18 });
+        TurgaliumRouter.BurnStep[] memory burns = new TurgaliumRouter.BurnStep[](1);
+        burns[0] = TurgaliumRouter.BurnStep({ token: address(deadToken), amount: 100e18 });
 
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 200e6,
             minNetUsdcOut: 190e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
             burns: burns
         });
 
         vm.prank(agent);
-        vm.expectRevert(SiphonRouter.AgentBurnsForbidden.selector);
+        vm.expectRevert(TurgaliumRouter.AgentBurnsForbidden.selector);
         routerV2.sweepWithMandate(address(agentVault), mandateId, actionBridge, params);
 
         // 2. Even direct owner sweep attempting to burn USDC -> REVERTS InvalidBurnToken(usdc)!
-        burns[0] = SiphonRouter.BurnStep({ token: address(usdc), amount: 100e6 });
+        burns[0] = TurgaliumRouter.BurnStep({ token: address(usdc), amount: 100e6 });
         vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(SiphonRouter.InvalidBurnToken.selector, address(usdc)));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumRouter.InvalidBurnToken.selector, address(usdc)));
         routerV2.sweepAndBridgeToSolana(params);
     }
 
@@ -732,32 +748,32 @@ contract SiphonRouterTest is TestBase {
 
         // 1. Direct sweep: 1000 USDC gross, 2.5 USDC protocol fee -> 997.5 bridged, but cctp.maxFee = 10 USDC
         //    -> minSolanaReceived = 987.5 < minNetUsdcOut (995) -> REVERTS SlippageExceeded(987.5e6, 995e6)!
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 1_000e6,
             minNetUsdcOut: 995e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
-            cctp: SiphonRouter.CctpV2Options({
+            cctp: TurgaliumRouter.CctpV2Options({
                 destinationCaller: bytes32(0),
                 maxFee: 10e6, // 1% CCTP fee
                 minFinalityThreshold: 1000,
                 hookData: ""
             }),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(SiphonRouter.SlippageExceeded.selector, 987_500_000, 995e6));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumRouter.SlippageExceeded.selector, 987_500_000, 995e6));
         routerV2.sweepAndBridgeToSolana(params);
 
         // 2. Mandate sweep: lower minNetUsdcOut to 900e6 so SlippageExceeded doesn't fire,
         //    but 25 bps protocol + 100 bps CCTP = 125 bps > mandate maxFeeBps (50) -> REVERTS FeeAboveCap(125, 50)!
         params.minNetUsdcOut = 900e6;
         vm.prank(agent);
-        vm.expectRevert(abi.encodeWithSelector(SiphonAgentVault.FeeAboveCap.selector, 125, 50));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumAgentVault.FeeAboveCap.selector, 125, 50));
         routerV2.sweepWithMandate(address(agentVault), mandateId, actionBridge, params);
 
         // 3. Mandate sweep with higher maxFeeBps (200) but cctp.maxFee pushing minSolanaReceived below minNetOutBps (9900)
@@ -774,7 +790,7 @@ contract SiphonRouterTest is TestBase {
             actionBridge
         );
         vm.prank(agent);
-        vm.expectRevert(abi.encodeWithSelector(SiphonAgentVault.NegativeOrLowRoiBlocked.selector, 987_500_000, 990e6));
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumAgentVault.NegativeOrLowRoiBlocked.selector, 987_500_000, 990e6));
         routerV2.sweepWithMandate(address(agentVault), strictRoiMandate, actionBridge, params);
     }
 
@@ -797,32 +813,32 @@ contract SiphonRouterTest is TestBase {
         usdc.approve(address(routerV2), 500e6);
 
         // 1. Rogue agent sets non-zero destinationCaller (ransom lock on Solana) -> REVERTS!
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 200e6,
             minNetUsdcOut: 190e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
-            cctp: SiphonRouter.CctpV2Options({
+            cctp: TurgaliumRouter.CctpV2Options({
                 destinationCaller: bytes32(uint256(0xBAD)),
                 maxFee: 0,
                 minFinalityThreshold: 1000,
                 hookData: ""
             }),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         vm.prank(agent);
-        vm.expectRevert(SiphonRouter.AgentCctpOverrideForbidden.selector);
+        vm.expectRevert(TurgaliumRouter.AgentCctpOverrideForbidden.selector);
         routerV2.sweepWithMandate(address(agentVault), mandateId, actionBridge, params);
 
         // 2. Rogue agent injects arbitrary hookData -> REVERTS!
         params.cctp.destinationCaller = bytes32(0);
         params.cctp.hookData = hex"deadbeef";
         vm.prank(agent);
-        vm.expectRevert(SiphonRouter.AgentCctpOverrideForbidden.selector);
+        vm.expectRevert(TurgaliumRouter.AgentCctpOverrideForbidden.selector);
         routerV2.sweepWithMandate(address(agentVault), mandateId, actionBridge, params);
     }
 
@@ -830,16 +846,16 @@ contract SiphonRouterTest is TestBase {
         // User has only 300 USDC supplied in Compound v3 Comet, requests withdrawing 1,000 USDC
         comet.creditUser(user, address(usdc), 300e6);
 
-        SiphonRouter.DefiExitStep[] memory exits = new SiphonRouter.DefiExitStep[](1);
-        exits[0] = SiphonRouter.DefiExitStep({
-            kind: SiphonRouter.DefiKind.COMPOUND_V3_WITHDRAW,
+        TurgaliumRouter.DefiExitStep[] memory exits = new TurgaliumRouter.DefiExitStep[](1);
+        exits[0] = TurgaliumRouter.DefiExitStep({
+            kind: TurgaliumRouter.DefiKind.COMPOUND_V3_WITHDRAW,
             protocol: address(comet),
             receiptToken: address(0),
             underlyingAsset: address(usdc),
             amount: 1_000e6 // Over-withdrawal attempt!
         });
 
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 0,
             minNetUsdcOut: 290e6,
@@ -847,8 +863,8 @@ contract SiphonRouterTest is TestBase {
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
             defiExits: exits,
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         vm.prank(user);
@@ -861,7 +877,7 @@ contract SiphonRouterTest is TestBase {
 
         // Second attempt when supplied == 0 -> REVERTS InsufficientSuppliedBalance!
         vm.prank(user);
-        vm.expectRevert(SiphonRouter.InsufficientSuppliedBalance.selector);
+        vm.expectRevert(TurgaliumRouter.InsufficientSuppliedBalance.selector);
         routerV2.sweepAndBridgeToSolana(params);
     }
 
@@ -871,8 +887,8 @@ contract SiphonRouterTest is TestBase {
         vm.prank(user);
         dustToken.approve(address(routerV2), 100e18);
 
-        SiphonRouter.SwapStep[] memory swaps = new SiphonRouter.SwapStep[](1);
-        swaps[0] = SiphonRouter.SwapStep({
+        TurgaliumRouter.SwapStep[] memory swaps = new TurgaliumRouter.SwapStep[](1);
+        swaps[0] = TurgaliumRouter.SwapStep({
             tokenIn: address(dustToken),
             amountIn: 100e18,
             pullFromUser: true,
@@ -885,16 +901,16 @@ contract SiphonRouterTest is TestBase {
             )
         });
 
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: 0,
             minNetUsdcOut: 295e6,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
             swaps: swaps,
-            burns: new SiphonRouter.BurnStep[](0)
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         vm.prank(user);
@@ -923,16 +939,16 @@ contract SiphonRouterTest is TestBase {
         vm.startPrank(user);
         usdc.approve(address(routerV2), gross);
 
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_ATA,
             directUsdcAmount: gross,
             minNetUsdcOut: 1,
             maxFeeUsdcCap: 0,
             deadline: block.timestamp + 600,
             cctp: _emptyCctp(),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         (uint256 bridged, ) = routerV2.sweepAndBridgeToSolana(params);

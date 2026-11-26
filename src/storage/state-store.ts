@@ -11,7 +11,7 @@ export type StateNamespace =
   | 'preservation_agents'
   | (string & {});
 
-export interface SiphonStateStore {
+export interface TurgaliumStateStore {
   readonly kind: 'memory' | 'file' | string;
   readonly persistent: boolean;
   load<T>(namespace: StateNamespace, fallback: T): T;
@@ -41,9 +41,9 @@ export function assertValidNamespace(namespace: string): string {
 
 /**
  * In-memory state store used by default in tests and ephemeral runs when
- * SIPHON_DATA_DIR is unset. Serializes through JSON to preserve persistence semantics.
+ * TURGALIUM_DATA_DIR is unset. Serializes through JSON to preserve persistence semantics.
  */
-export class MemoryStateStore implements SiphonStateStore {
+export class MemoryStateStore implements TurgaliumStateStore {
   readonly kind = 'memory' as const;
   readonly persistent = false;
   private readonly entries = new Map<string, string>();
@@ -98,7 +98,7 @@ export interface FileStateStoreOptions {
  * Writes each namespace to a unique temp file in `dataDir` with restrictive permissions
  * and atomically swaps it into place via `fs.renameSync`.
  */
-export class FileStateStore implements SiphonStateStore {
+export class FileStateStore implements TurgaliumStateStore {
   readonly kind = 'file' as const;
   readonly persistent = true;
   readonly dataDir: string;
@@ -164,7 +164,7 @@ export class FileStateStore implements SiphonStateStore {
         JSON.stringify({
           ts: new Date(ts).toISOString(),
           level: 'warn',
-          service: 'siphon-migrator',
+          service: 'turgalium-migrator',
           event: 'state_store_corrupt_file_quarantined',
           namespace,
           file: path.basename(filePath),
@@ -228,25 +228,25 @@ export class FileStateStore implements SiphonStateStore {
 }
 
 export interface CreateStateStoreOptions {
-  stateStore?: SiphonStateStore;
+  stateStore?: TurgaliumStateStore;
   dataDir?: string | null;
   env?: NodeJS.ProcessEnv;
 }
 
 /**
- * Resolves the active SiphonStateStore:
+ * Resolves the active TurgaliumStateStore:
  *   1. Explicit `stateStore` instance (allows custom DB/Redis/File adapters)
- *   2. Explicit `dataDir` option or `SIPHON_DATA_DIR` environment variable -> `FileStateStore`
+ *   2. Explicit `dataDir` option or `TURGALIUM_DATA_DIR` environment variable -> `FileStateStore`
  *   3. Default -> `MemoryStateStore` (safe, zero-disk-footprint default for tests)
  */
-export function createStateStore(opts: CreateStateStoreOptions = {}): SiphonStateStore {
+export function createStateStore(opts: CreateStateStoreOptions = {}): TurgaliumStateStore {
   if (opts.stateStore) return opts.stateStore;
 
   const env = opts.env ?? process.env;
   const resolvedDir =
     opts.dataDir !== undefined
       ? opts.dataDir?.trim() || null
-      : env.SIPHON_DATA_DIR?.trim() || null;
+      : env.TURGALIUM_DATA_DIR?.trim() || null;
 
   if (resolvedDir) {
     return new FileStateStore(resolvedDir);

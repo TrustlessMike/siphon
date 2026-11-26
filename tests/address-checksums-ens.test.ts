@@ -39,7 +39,7 @@ import {
 } from '../src/scanner/address.js';
 import { EVM_CHAINS } from '../src/scanner/chains.js';
 import { scanPresetWallet } from '../src/scanner/classifier.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 
 function makeTonFriendlyAddress(params: {
   tag: number;
@@ -520,9 +520,9 @@ test('HIGH-03 ENS: EIP-137 namehash vectors, multi-label subdomain detection, an
   assert.equal(calls[1].data, `0x${ENS_ADDR_SELECTOR}${vitalikNode}`);
 
   // Unresolved ENS (zero resolver) -> null / EnsResolutionError('UNRESOLVED')
-  assert.equal(await resolveEnsName('unregistered-siphon.eth', { rpcCall: mockRpcCall }), null);
+  assert.equal(await resolveEnsName('unregistered-turgalium.eth', { rpcCall: mockRpcCall }), null);
   await assert.rejects(
-    () => resolveEnsNameOrThrow('unregistered-siphon.eth', { rpcCall: mockRpcCall }),
+    () => resolveEnsNameOrThrow('unregistered-turgalium.eth', { rpcCall: mockRpcCall }),
     (err: unknown) => err instanceof EnsResolutionError && err.code === 'UNRESOLVED'
   );
 
@@ -557,7 +557,7 @@ test('HIGH-03 HTTP /api/scan, /api/plan & evmAdapter.scanWallet(): ENS resolutio
   const vitalikNode = ensNamehash('vitalik.eth').slice(2);
   const subNode = ensNamehash('sub.name.eth').slice(2);
 
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');
@@ -651,7 +651,7 @@ test('HIGH-03 HTTP /api/scan, /api/plan & evmAdapter.scanWallet(): ENS resolutio
     const unresolvedRes = await fetch(`${base}/api/scan`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address: 'does-not-exist-siphon-xyz.eth' }),
+      body: JSON.stringify({ address: 'does-not-exist-turgalium-xyz.eth' }),
     });
     assert.equal(unresolvedRes.status, 400);
     const unresolvedBody = (await unresolvedRes.json()) as { error: string };
@@ -695,7 +695,7 @@ test('HIGH-03 HTTP /api/scan, /api/plan & evmAdapter.scanWallet(): ENS resolutio
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        scan: { ...preset, walletAddress: 'does-not-exist-siphon-xyz.eth' },
+        scan: { ...preset, walletAddress: 'does-not-exist-turgalium-xyz.eth' },
         solanaDestination: '',
       }),
     });

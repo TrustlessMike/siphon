@@ -30,23 +30,23 @@ Turgalium is an open-source, preservation-first multi-ecosystem portfolio migrat
 - **Smart Exit Router & Live Unlock Readers**: Routes liquid yield receipts (`sUSDe`, `wstETH`, `rETH`, `cbETH`, `weETH`, `sDAI`, `sUSDS`) through direct swap to bypass cooldowns, and reads live on-chain **Lido Withdrawal Queue**, **Ethena `sUSDe` cooldowns**, and **Cosmos unbonding delegations**.
 
 ### 4. Hardened Solidity v2 Contracts & Foundry Mainnet-Fork Verification (`contracts/`)
-- **`SiphonRouter.sol`**: Disjoint swap-aggregator vs DeFi-protocol allowlists, Permit2 witness sweeps, explicit `directUsdcAmount`, `MIN_FEE_BPS = 0` + whale `maxFeeUsdcCap`, CCTP V2 Fast Transfer & hooks, and `SiphonAgentVault` mandate linkage.
-- **`SiphonSweepDelegate.sol`**: EIP-7702 EOA delegation target with immutable canonical `usdc`/`cctpMessenger`, mandatory `policyRegistry` kill-switch, domain-separated `MANDATE_SWEEP_INTENT_TYPEHASH`, and approval revocations.
-- **`SiphonAgentVault.sol`**: Policy-bounded agent mandates with immutable locked Solana recipient, per-tx & 24h USD caps, single-bit action bitmask, and global router revocation.
-- **`SiphonDelegateRegistry.sol` & `SiphonFeeVault.sol`**: Two-step governed allowlist & emergency pause kill-switch; push-DoS & blacklist-isolated multi-payee fee vault.
+- **`TurgaliumRouter.sol`**: Disjoint swap-aggregator vs DeFi-protocol allowlists, Permit2 witness sweeps, explicit `directUsdcAmount`, `MIN_FEE_BPS = 0` + whale `maxFeeUsdcCap`, CCTP V2 Fast Transfer & hooks, and `TurgaliumAgentVault` mandate linkage.
+- **`TurgaliumSweepDelegate.sol`**: EIP-7702 EOA delegation target with immutable canonical `usdc`/`cctpMessenger`, mandatory `policyRegistry` kill-switch, domain-separated `MANDATE_SWEEP_INTENT_TYPEHASH`, and approval revocations.
+- **`TurgaliumAgentVault.sol`**: Policy-bounded agent mandates with immutable locked Solana recipient, per-tx & 24h USD caps, single-bit action bitmask, and global router revocation.
+- **`TurgaliumDelegateRegistry.sol` & `TurgaliumFeeVault.sol`**: Two-step governed allowlist & emergency pause kill-switch; push-DoS & blacklist-isolated multi-payee fee vault.
 - Verified with **37 Foundry unit/fuzz/exploit-proof tests** + **3 live Ethereum Mainnet-fork tests**.
 
 ### 5. Permissioned AI Agents: Claude MCP & ChatGPT Actions (`src/agent/`, `src/mcp/`)
-- **Claude MCP (`POST /mcp` & `npm run mcp`)**: Exposes 10 scoped tools (`scan:read`, `dust:plan`, `agent:propose`) including `siphon_preservation_audit`, `siphon_list_unlock_schedule`, `siphon_solana_rent_scan`, `siphon_solana_yield_preview`, and read-only `siphon_degen_markets`.
-- **Production Hardening**: Atomic file-backed persistence (`SIPHON_DATA_DIR`) with corrupt-file quarantine, sliding-window rate limiter, RPC circuit breaker with URL redaction, fail-closed non-loopback admin auth, strict HTML `Content-Security-Policy`, `Dockerfile`, and `fly.toml`.
+- **Claude MCP (`POST /mcp` & `npm run mcp`)**: Exposes 10 scoped tools (`scan:read`, `dust:plan`, `agent:propose`) including `turgalium_preservation_audit`, `turgalium_list_unlock_schedule`, `turgalium_solana_rent_scan`, `turgalium_solana_yield_preview`, and read-only `turgalium_degen_markets`.
+- **Production Hardening**: Atomic file-backed persistence (`TURGALIUM_DATA_DIR`) with corrupt-file quarantine, sliding-window rate limiter, RPC circuit breaker with URL redaction, fail-closed non-loopback admin auth, strict HTML `Content-Security-Policy`, `Dockerfile`, and `fly.toml`.
 
 ---
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/TrustlessMike/siphon.git
-cd siphon
+git clone https://github.com/TrustlessMike/turgalium.git
+cd turgalium
 npm install
 npm run typecheck && npm run build && npm test
 npm run start
@@ -57,10 +57,10 @@ npm run start
 
 ```bash
 # Solidity unit + 256-run fuzz + adversarial proofs
-forge build --sizes && forge test --no-match-contract SiphonMainnetFork -vv
+forge build --sizes && forge test --no-match-contract TurgaliumMainnetFork -vv
 
 # Optional live Ethereum Mainnet fork test
-MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test --match-contract SiphonMainnetFork -vv
+MAINNET_RPC_URL=https://ethereum-rpc.publicnode.com forge test --match-contract TurgaliumMainnetFork -vv
 
 # 8-suite Playwright E2E (desktop 1440px, tablet 900px, mobile 390px)
 pip install playwright && playwright install chromium
@@ -74,14 +74,14 @@ python3 tests/e2e-playwright.py
 claude mcp add --transport http turgalium http://127.0.0.1:4420/mcp
 
 # Or stdio MCP proxy pointing to the running Turgalium server
-SIPHON_API_URL=http://127.0.0.1:4420 npm run mcp
+TURGALIUM_API_URL=http://127.0.0.1:4420 npm run mcp
 ```
 
 ---
 
 ## Configuration
 
-See [`.env.example`](.env.example) for all optional production environment variables (server/auth `SIPHON_ADMIN_SESSION_TOKEN`, persistence `SIPHON_DATA_DIR`, RPC URLs, indexers, `JUPITER_API_KEY`, `ENSO_API_KEY`, `SIPHON_PAYMASTER_URL`, and treasury recipients). Internal `SIPHON_*` environment variable names and contract identifiers are preserved for full backward compatibility.
+See [`.env.example`](.env.example) for all optional production environment variables (server/auth `TURGALIUM_ADMIN_SESSION_TOKEN`, persistence `TURGALIUM_DATA_DIR`, RPC URLs, indexers, `JUPITER_API_KEY`, `ENSO_API_KEY`, `TURGALIUM_PAYMASTER_URL`, and treasury recipients).
 
 ---
 

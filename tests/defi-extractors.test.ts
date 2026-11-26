@@ -27,7 +27,7 @@ import {
   type PreparedExecution,
 } from '../src/execution/tx-builder.js';
 import type { ScannedAsset } from '../src/scanner/types.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 
 const USER = '0x71C7656EC7ab88b098defB751B7401B5f6d8976F';
 const SAMPLE_SOLANA_WALLET = 'AK9CKqppArTVRrmd4rQKzvjcmNUHnx5LBFx1HXoYaz2n';
@@ -692,7 +692,7 @@ test('Plain-English revert translator & HTTP API (/api/defi/preflight, /api/scan
   assert.ok(msgAave.toLowerCase().includes('health factor'));
 
   // HTTP integration test
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');

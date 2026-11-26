@@ -282,7 +282,7 @@ export interface RelayerBroadcastResult {
 }
 
 /**
- * Signs and broadcasts a real EIP-1559 transaction from Siphon's configured relayer key
+ * Signs and broadcasts a real EIP-1559 transaction from Turgalium's configured relayer key
  * via `eth_sendRawTransaction` (or a custom broadcaster hook such as Flashbots Protect).
  *
  * Fail-closed guarantees:
@@ -302,12 +302,12 @@ export async function broadcastSignedRelayerTx(
     };
   }
 
-  const rawKey = (req.privateKeyHex ?? process.env.SIPHON_RELAYER_PRIVATE_KEY ?? '').trim();
+  const rawKey = (req.privateKeyHex ?? process.env.TURGALIUM_RELAYER_PRIVATE_KEY ?? '').trim();
   if (!rawKey) {
     return {
       broadcasted: false,
       reasonCode: 'relayer_key_missing',
-      diagnostic: `SIPHON_RELAYER_PRIVATE_KEY is not configured for ${cfg.name}; refusing to broadcast or fabricate a transaction hash.`,
+      diagnostic: `TURGALIUM_RELAYER_PRIVATE_KEY is not configured for ${cfg.name}; refusing to broadcast or fabricate a transaction hash.`,
     };
   }
 
@@ -315,7 +315,7 @@ export async function broadcastSignedRelayerTx(
     return {
       broadcasted: false,
       reasonCode: 'relayer_key_invalid',
-      diagnostic: 'SIPHON_RELAYER_PRIVATE_KEY is malformed (expected 32-byte 0x hex secp256k1 private key).',
+      diagnostic: 'TURGALIUM_RELAYER_PRIVATE_KEY is malformed (expected 32-byte 0x hex secp256k1 private key).',
     };
   }
 
@@ -324,7 +324,7 @@ export async function broadcastSignedRelayerTx(
     return {
       broadcasted: false,
       reasonCode: 'router_unconfigured',
-      diagnostic: `Router/delegate address is unconfigured or placeholder for ${cfg.name}; configure SIPHON_ROUTER_${req.chain.toUpperCase()} before broadcasting.`,
+      diagnostic: `Router/delegate address is unconfigured or placeholder for ${cfg.name}; configure TURGALIUM_ROUTER_${req.chain.toUpperCase()} before broadcasting.`,
     };
   }
 

@@ -1543,7 +1543,7 @@ test('Wave 8C [C-1]: signAndSendSolanaVersionedTx deserializes fail-closed, veri
   wallets.disconnectSolanaWallet();
 });
 
-test('Wave 8C [L-3, M-4, L-4, H-2]: sendEvmRevokeCalls rejects zero spender & mixed chainId, verifies EIP-5792 status, tracks partial sequential failures, and dispatches siphon:wallet-changed', async () => {
+test('Wave 8C [L-3, M-4, L-4, H-2]: sendEvmRevokeCalls rejects zero spender & mixed chainId, verifies EIP-5792 status, tracks partial sequential failures, and dispatches turgalium:wallet-changed', async () => {
   resetMockWalletGlobals();
   wallets.disconnectEvmWallet();
 
@@ -1559,7 +1559,7 @@ test('Wave 8C [L-3, M-4, L-4, H-2]: sendEvmRevokeCalls rejects zero spender & mi
   const onWalletChanged = (ev: Event) => {
     walletEvents.push(((ev as CustomEvent).detail || {}) as Record<string, unknown>);
   };
-  mockWindow.addEventListener('siphon:wallet-changed', onWalletChanged);
+  mockWindow.addEventListener('turgalium:wallet-changed', onWalletChanged);
 
   let sendTxCount = 0;
   let rejectSecondSequential = false;
@@ -1593,7 +1593,7 @@ test('Wave 8C [L-3, M-4, L-4, H-2]: sendEvmRevokeCalls rejects zero spender & mi
     await wallets.connectEvmWallet();
     assert.ok(
       walletEvents.some((d) => d.family === 'evm' && d.action === 'connect' && d.address === EVM_USER),
-      'Expected siphon:wallet-changed connect event for EVM'
+      'Expected turgalium:wallet-changed connect event for EVM'
     );
 
     // 1. Reject zero spender (L-3)
@@ -1651,13 +1651,13 @@ test('Wave 8C [L-3, M-4, L-4, H-2]: sendEvmRevokeCalls rejects zero spender & mi
     // 5. normalizePaymasterUrl rejects credentials and rejects http://127.0.0.1 on non-local browser origin (L-4)
     assert.equal(wallets.normalizePaymasterUrl('https://user:pass@paymaster.example.com/v1'), null);
     const prevLocation = mockWindow.location;
-    mockWindow.location = { origin: 'https://siphon.app', hostname: 'siphon.app' } as typeof mockWindow.location;
+    mockWindow.location = { origin: 'https://turgalium.app', hostname: 'turgalium.app' } as typeof mockWindow.location;
     try {
       assert.equal(wallets.normalizePaymasterUrl('http://127.0.0.1:4337/pm'), null);
       assert.equal(wallets.normalizePaymasterUrl('http://localhost:4337/pm'), null);
       assert.equal(
-        wallets.normalizePaymasterUrl('https://paymaster.siphon.app/v1'),
-        'https://paymaster.siphon.app/v1'
+        wallets.normalizePaymasterUrl('https://paymaster.turgalium.app/v1'),
+        'https://paymaster.turgalium.app/v1'
       );
     } finally {
       mockWindow.location = prevLocation;
@@ -1666,10 +1666,10 @@ test('Wave 8C [L-3, M-4, L-4, H-2]: sendEvmRevokeCalls rejects zero spender & mi
     wallets.disconnectEvmWallet();
     assert.ok(
       walletEvents.some((d) => d.family === 'evm' && d.action === 'disconnect' && d.address === null),
-      'Expected siphon:wallet-changed disconnect event for EVM'
+      'Expected turgalium:wallet-changed disconnect event for EVM'
     );
   } finally {
-    mockWindow.removeEventListener('siphon:wallet-changed', onWalletChanged);
+    mockWindow.removeEventListener('turgalium:wallet-changed', onWalletChanged);
     delete mockWindow.ethereum;
     wallets.disconnectEvmWallet();
   }

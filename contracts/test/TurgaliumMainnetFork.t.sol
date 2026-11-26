@@ -2,16 +2,16 @@
 pragma solidity 0.8.24;
 
 import { TestBase } from "./TestBase.sol";
-import { SiphonRouter, IERC20, IAaveV3Pool } from "../SiphonRouter.sol";
-import { SiphonAgentVault } from "../SiphonAgentVault.sol";
+import { TurgaliumRouter, IERC20, IAaveV3Pool } from "../TurgaliumRouter.sol";
+import { TurgaliumAgentVault } from "../TurgaliumAgentVault.sol";
 
 interface IAaveV3SupplyPool is IAaveV3Pool {
     function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
 }
 
 /**
- * @title SiphonMainnetForkTest
- * @notice Verifies SiphonRouter + SiphonAgentVault against live forked Ethereum Mainnet bytecode & state:
+ * @title TurgaliumMainnetForkTest
+ * @notice Verifies TurgaliumRouter + TurgaliumAgentVault against live forked Ethereum Mainnet bytecode & state:
  *         - Circle TokenMessengerV2 (`0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d`)
  *         - Native Ethereum USDC    (`0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48`)
  *         - Uniswap Permit2         (`0x000000000022D473030F116dDEE9F6B43aC78BA3`)
@@ -20,7 +20,7 @@ interface IAaveV3SupplyPool is IAaveV3Pool {
  *
  * Skips cleanly when `MAINNET_RPC_URL` is unset (offline CI); runs full forked execution when provided.
  */
-contract SiphonMainnetForkTest is TestBase {
+contract TurgaliumMainnetForkTest is TestBase {
     address internal constant MAINNET_USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     address internal constant MAINNET_CCTP_V2 = 0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d;
     address internal constant MAINNET_PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
@@ -32,8 +32,8 @@ contract SiphonMainnetForkTest is TestBase {
         0x4c9e8b5f2a1d3e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7;
 
     bool internal forkActive;
-    SiphonRouter internal router;
-    SiphonAgentVault internal agentVault;
+    TurgaliumRouter internal router;
+    TurgaliumAgentVault internal agentVault;
 
     address internal user = address(0x51F01);
     address internal agent = address(0x51F02);
@@ -48,11 +48,11 @@ contract SiphonMainnetForkTest is TestBase {
         vm.createSelectFork(rpcUrl);
         forkActive = true;
 
-        router = new SiphonRouter(MAINNET_USDC, MAINNET_CCTP_V2, 2, treasury, 25);
+        router = new TurgaliumRouter(MAINNET_USDC, MAINNET_CCTP_V2, 2, treasury, 25);
         router.setAllowedDefiProtocol(MAINNET_AAVE_V3_POOL, true);
         router.setMaxFeeUsdcCap(15e6); // $15 whale fee cap
 
-        agentVault = new SiphonAgentVault(address(router));
+        agentVault = new TurgaliumAgentVault(address(router));
         router.setAllowedAgentVault(address(agentVault), true);
     }
 
@@ -89,21 +89,21 @@ contract SiphonMainnetForkTest is TestBase {
         vm.startPrank(user);
         require(IERC20(MAINNET_USDC).approve(address(router), sweepAmount), "APPROVE_FAILED");
 
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_USDC_ATA,
             directUsdcAmount: sweepAmount,
             minNetUsdcOut: 19_985e6,
             maxFeeUsdcCap: 15e6,
             deadline: block.timestamp + 600,
-            cctp: SiphonRouter.CctpV2Options({
+            cctp: TurgaliumRouter.CctpV2Options({
                 destinationCaller: bytes32(0),
                 maxFee: 0,
                 minFinalityThreshold: 2000, // Standard finality
                 hookData: ""
             }),
-            defiExits: new SiphonRouter.DefiExitStep[](0),
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            defiExits: new TurgaliumRouter.DefiExitStep[](0),
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         (uint256 bridgedUsdc, ) = router.sweepAndBridgeToSolana(params);
@@ -132,7 +132,7 @@ contract SiphonMainnetForkTest is TestBase {
         uint256 aBal = IERC20(MAINNET_AETH_USDC).balanceOf(user);
         assertGe(aBal, supplyAmount - 10, "aEthUSDC mint too low");
 
-        // 2. Grant SiphonAgentVault mandate for autonomous agent DeFi unwind + Solana bridge
+        // 2. Grant TurgaliumAgentVault mandate for autonomous agent DeFi unwind + Solana bridge
         bytes32 mandateId = agentVault.grantMandate(
             agent,
             SOLANA_USDC_ATA,
@@ -144,35 +144,35 @@ contract SiphonMainnetForkTest is TestBase {
             agentVault.ACTION_DEFI_WITHDRAW() | agentVault.ACTION_BRIDGE_SOLANA()
         );
 
-        // Approve SiphonRouter to pull user's aEthUSDC
+        // Approve TurgaliumRouter to pull user's aEthUSDC
         require(IERC20(MAINNET_AETH_USDC).approve(address(router), aBal), "AUSDC_APPROVE_FAILED");
         vm.stopPrank();
 
         // 3. Autonomous agent executes Aave v3 withdraw -> Circle CCTP V2 Fast Transfer (minFinalityThreshold = 1000)
-        SiphonRouter.DefiExitStep[] memory exits = new SiphonRouter.DefiExitStep[](1);
-        exits[0] = SiphonRouter.DefiExitStep({
-            kind: SiphonRouter.DefiKind.AAVE_V3_WITHDRAW,
+        TurgaliumRouter.DefiExitStep[] memory exits = new TurgaliumRouter.DefiExitStep[](1);
+        exits[0] = TurgaliumRouter.DefiExitStep({
+            kind: TurgaliumRouter.DefiKind.AAVE_V3_WITHDRAW,
             protocol: MAINNET_AAVE_V3_POOL,
             receiptToken: MAINNET_AETH_USDC,
             underlyingAsset: MAINNET_USDC,
             amount: 4_000e6
         });
 
-        SiphonRouter.SweepParams memory params = SiphonRouter.SweepParams({
+        TurgaliumRouter.SweepParams memory params = TurgaliumRouter.SweepParams({
             solanaRecipient: SOLANA_USDC_ATA,
             directUsdcAmount: 0,
             minNetUsdcOut: 3_980e6,
             maxFeeUsdcCap: 15e6,
             deadline: block.timestamp + 600,
-            cctp: SiphonRouter.CctpV2Options({
+            cctp: TurgaliumRouter.CctpV2Options({
                 destinationCaller: bytes32(0),
                 maxFee: 5e6, // 0.125% fast fee ceiling (total 25 bps protocol + 12.5 bps CCTP = 38 bps <= 50 bps mandate cap)
                 minFinalityThreshold: 1000, // CCTP V2 Fast Transfer
                 hookData: ""
             }),
             defiExits: exits,
-            swaps: new SiphonRouter.SwapStep[](0),
-            burns: new SiphonRouter.BurnStep[](0)
+            swaps: new TurgaliumRouter.SwapStep[](0),
+            burns: new TurgaliumRouter.BurnStep[](0)
         });
 
         uint8 actionDefi = agentVault.ACTION_DEFI_WITHDRAW();

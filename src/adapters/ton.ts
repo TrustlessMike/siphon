@@ -546,7 +546,7 @@ export const tonAdapter: ChainFamilyAdapter = {
     const relayerTonAddr =
       getNonEvmFeeRecipient('ton') ||
       gaslessCfg?.relayAddress ||
-      'EQCsiphonRelayerW5GaslessBattery0000000000000000';
+      'EQCturgaliumRelayerW5GaslessBattery0000000000000';
     const chainAssets = filterChainSweepableAssets('ton', params.assets);
     const grossUsd = Number(chainAssets.reduce((s, a) => s + a.grossUsd, 0).toFixed(2));
     const protocolFeeUsd = Number(((grossUsd * feeCfg.feeBps) / 10_000).toFixed(2));
@@ -626,7 +626,7 @@ export const tonAdapter: ChainFamilyAdapter = {
         grossUsd: a.grossUsd,
       })),
       signPayload,
-      relayerConfigured: Boolean(process.env.SIPHON_TON_RELAYER_KEY?.trim() || gaslessCfg?.relayAddress),
+      relayerConfigured: Boolean(process.env.TURGALIUM_TON_RELAYER_KEY?.trim() || gaslessCfg?.relayAddress),
       sponsorEligible: breakEven.eligible,
       sponsorRejectionReason: breakEven.rejectionReason,
       intentDigestSha256,
@@ -955,7 +955,7 @@ export const tonAdapter: ChainFamilyAdapter = {
         throw new Error('Signed TON W5 batch intent expired. Re-sign a fresh intent.');
       }
       const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.SIPHON_TON_RELAYER_KEY?.trim());
+      const configured = Boolean(process.env.TURGALIUM_TON_RELAYER_KEY?.trim());
       out.submitted = {
         accepted: true,
         mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',

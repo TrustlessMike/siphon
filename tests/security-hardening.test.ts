@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { cosmosAdapter } from '../src/adapters/cosmos.js';
-import { SiphonAgentEngine } from '../src/agent/mandate-engine.js';
+import { TurgaliumAgentEngine } from '../src/agent/mandate-engine.js';
 import { buildMigrationPlan } from '../src/bridge/cctp.js';
-import { createStdioMcpDispatcher, SIPHON_MCP_TOOLS } from '../src/mcp/server.js';
+import { createStdioMcpDispatcher, TURGALIUM_MCP_TOOLS } from '../src/mcp/server.js';
 import { planDustConversion } from '../src/scanner/dust.js';
 import { applyTwoLevelRoiToReport, evaluatePortfolioRoi } from '../src/scanner/roi.js';
 import type { ScannedAsset, ScanReport } from '../src/scanner/types.js';
@@ -15,7 +15,7 @@ import {
   normalizeWalletDedupKey,
   scanUnifiedWallets,
 } from '../src/scanner/unify.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 import { BoundedTtlCache } from '../src/server/cache.js';
 import { BackgroundJobStore } from '../src/server/jobs.js';
 
@@ -114,8 +114,8 @@ function makeReport(assets: ScannedAsset[], overrides: Partial<ScanReport> = {})
 }
 
 test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden localhost API', async () => {
-  const { server } = createSiphonServer({
-    allowedOrigins: ['https://trusted.siphon.example'],
+  const { server } = createTurgaliumServer({
+    allowedOrigins: ['https://trusted.turgalium.example'],
     adminSessionToken: 'admin_secret_xyz_789',
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -130,7 +130,7 @@ test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden loca
     assert.equal(mandatesUnauth.headers.get('access-control-allow-origin'), null);
 
     const mandatesNoOrigin = await fetch(`${base}/api/agents/mandates`, {
-      headers: { 'X-Siphon-Admin-Session': 'admin_secret_xyz_789' },
+      headers: { 'X-Turgalium-Admin-Session': 'admin_secret_xyz_789' },
     });
     assert.equal(mandatesNoOrigin.status, 200);
     assert.equal(mandatesNoOrigin.headers.get('access-control-allow-origin'), null);
@@ -148,7 +148,7 @@ test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden loca
       headers: {
         Origin: 'https://evil.attacker.com',
         'Content-Type': 'application/json',
-        'X-Siphon-Admin-Session': 'admin_secret_xyz_789',
+        'X-Turgalium-Admin-Session': 'admin_secret_xyz_789',
       },
       body: JSON.stringify({ label: 'Evil', client: 'claude_mcp' }),
     });
@@ -161,7 +161,7 @@ test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden loca
       headers: {
         Origin: 'http://localhost.evil.com',
         'Content-Type': 'application/json',
-        'X-Siphon-Admin-Session': 'admin_secret_xyz_789',
+        'X-Turgalium-Admin-Session': 'admin_secret_xyz_789',
       },
       body: JSON.stringify({ ownerAddress: SAMPLE_EVM_WALLET_A, lockedSolanaRecipient: SAMPLE_SOLANA_WALLET }),
     });
@@ -173,7 +173,7 @@ test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden loca
       headers: {
         'Sec-Fetch-Site': 'cross-site',
         'Content-Type': 'application/json',
-        'X-Siphon-Admin-Session': 'admin_secret_xyz_789',
+        'X-Turgalium-Admin-Session': 'admin_secret_xyz_789',
       },
       body: JSON.stringify({ label: 'CSRF', client: 'claude_mcp' }),
     });
@@ -185,17 +185,17 @@ test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden loca
       headers: {
         Origin: base,
         'Content-Type': 'text/plain',
-        'X-Siphon-Admin-Session': 'admin_secret_xyz_789',
+        'X-Turgalium-Admin-Session': 'admin_secret_xyz_789',
       },
       body: JSON.stringify({ label: 'Plain', client: 'claude_mcp' }),
     });
     assert.equal(textPlainCsrf.status, 415);
 
-    // 3. Explicit loopback and configured SIPHON_ALLOWED_ORIGIN are reflected properly
+    // 3. Explicit loopback and configured TURGALIUM_ALLOWED_ORIGIN are reflected properly
     const loopbackAllowed = await fetch(`${base}/api/agents/mandates`, {
       headers: {
         Origin: 'http://localhost:5173',
-        'X-Siphon-Admin-Session': 'admin_secret_xyz_789',
+        'X-Turgalium-Admin-Session': 'admin_secret_xyz_789',
       },
     });
     assert.equal(loopbackAllowed.status, 200);
@@ -204,14 +204,14 @@ test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden loca
 
     const configuredAllowed = await fetch(`${base}/api/agents/mandates`, {
       headers: {
-        Origin: 'https://trusted.siphon.example',
-        'X-Siphon-Admin-Session': 'admin_secret_xyz_789',
+        Origin: 'https://trusted.turgalium.example',
+        'X-Turgalium-Admin-Session': 'admin_secret_xyz_789',
       },
     });
     assert.equal(configuredAllowed.status, 200);
     assert.equal(
       configuredAllowed.headers.get('access-control-allow-origin'),
-      'https://trusted.siphon.example'
+      'https://trusted.turgalium.example'
     );
 
     // 4. Admin session header required when configured
@@ -224,7 +224,7 @@ test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden loca
 
     const wrongAdmin = await fetch(`${base}/api/plugin/tokens`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Siphon-Admin-Session': 'wrong_token' },
+      headers: { 'Content-Type': 'application/json', 'X-Turgalium-Admin-Session': 'wrong_token' },
       body: JSON.stringify({ label: 'Wrong Admin', client: 'claude_mcp' }),
     });
     assert.equal(wrongAdmin.status, 401);
@@ -232,12 +232,12 @@ test('CORS, CSRF, Admin Session, Bearer Auth, and strict body limits harden loca
     // Valid admin session mints a Claude MCP token
     const issuedRes = await fetch(`${base}/api/plugin/tokens`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Siphon-Admin-Session': 'admin_secret_xyz_789' },
+      headers: { 'Content-Type': 'application/json', 'X-Turgalium-Admin-Session': 'admin_secret_xyz_789' },
       body: JSON.stringify({ label: 'Claude Desktop', client: 'claude_mcp' }),
     });
     assert.equal(issuedRes.status, 200);
     const issued = await issuedRes.json();
-    assert.ok(issued.token.startsWith('siphon_mcp_'));
+    assert.ok(issued.token.startsWith('turgalium_mcp_'));
 
     // 5. Missing Bearer token on /mcp is REJECTED with 401
     const noAuthMcp = await fetch(`${base}/mcp`, {
@@ -348,15 +348,15 @@ test('BoundedTtlCache and BackgroundJobStore enforce LRU capacity and TTL evicti
   jobs.dispose();
 });
 
-test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running HTTP server (no split-brain)', async () => {
-  // 1. Tool list MUST NOT expose siphon_create_agent_mandate
+test('MCP disables turgalium_create_agent_mandate and stdio MCP proxies to running HTTP server (no split-brain)', async () => {
+  // 1. Tool list MUST NOT expose turgalium_create_agent_mandate
   assert.equal(
-    SIPHON_MCP_TOOLS.some((t) => t.name === 'siphon_create_agent_mandate'),
+    TURGALIUM_MCP_TOOLS.some((t) => t.name === 'turgalium_create_agent_mandate'),
     false,
-    'siphon_create_agent_mandate must be removed from SIPHON_MCP_TOOLS'
+    'turgalium_create_agent_mandate must be removed from TURGALIUM_MCP_TOOLS'
   );
 
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');
@@ -383,7 +383,7 @@ test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running 
       body: JSON.stringify({ label: 'Claude Stdio Proxy', client: 'claude_mcp' }),
     }).then((r) => r.json());
 
-    // 2. Direct attempt to call siphon_create_agent_mandate over /mcp returns isError: true
+    // 2. Direct attempt to call turgalium_create_agent_mandate over /mcp returns isError: true
     const mintAttempt = await fetch(`${base}/mcp`, {
       method: 'POST',
       headers: {
@@ -395,7 +395,7 @@ test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running 
         id: 10,
         method: 'tools/call',
         params: {
-          name: 'siphon_create_agent_mandate',
+          name: 'turgalium_create_agent_mandate',
           arguments: {
             ownerAddress: SAMPLE_EVM_WALLET_A,
             lockedSolanaRecipient: SAMPLE_SOLANA_WALLET,
@@ -407,7 +407,7 @@ test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running 
     assert.equal(mintAttempt.result.isError, true);
     assert.match(mintAttempt.result.content[0].text, /disabled via MCP/i);
 
-    // 3. Stdio MCP dispatcher with SIPHON_API_URL proxies cleanly to HTTP server
+    // 3. Stdio MCP dispatcher with TURGALIUM_API_URL proxies cleanly to HTTP server
     const stdioDispatch = createStdioMcpDispatcher({
       apiUrl: base,
       apiToken: tok.token,
@@ -417,7 +417,7 @@ test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running 
       jsonrpc: '2.0',
       id: 1,
       method: 'tools/call',
-      params: { name: 'siphon_list_agent_mandates', arguments: {} },
+      params: { name: 'turgalium_list_agent_mandates', arguments: {} },
     })) as { result: { structuredContent: { mandates: Array<{ mandateId: string }> } } };
     assert.ok(
       listResp.result.structuredContent.mandates.some((m) => m.mandateId === mandate.mandateId),
@@ -429,7 +429,7 @@ test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running 
       id: 2,
       method: 'tools/call',
       params: {
-        name: 'siphon_request_sweep_permission',
+        name: 'turgalium_request_sweep_permission',
         arguments: {
           actionType: 'bridge_solana',
           summary: 'Stdio proxy sweep request',
@@ -458,7 +458,7 @@ test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running 
       id: 20,
       method: 'tools/call',
       params: {
-        name: 'siphon_scan_wallets',
+        name: 'turgalium_scan_wallets',
         arguments: { wallets: [{ presetId: 'veteran_defi', label: 'Vault' }] },
       },
     })) as {
@@ -476,7 +476,7 @@ test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running 
       id: 21,
       method: 'tools/call',
       params: {
-        name: 'siphon_request_sweep_permission',
+        name: 'turgalium_request_sweep_permission',
         arguments: {
           mandateId: mandate.mandateId,
           actionType: 'bridge_solana',
@@ -513,12 +513,12 @@ test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running 
     })) as { error?: { code: number } };
     assert.equal(unauthResp.error?.code, -32001);
 
-    // 5. Real child-process stdio integration check with SIPHON_API_URL & SIPHON_API_TOKEN
+    // 5. Real child-process stdio integration check with TURGALIUM_API_URL & TURGALIUM_API_TOKEN
     const tsxBin = path.resolve(process.cwd(), 'node_modules/.bin/tsx');
     const mcpEntry = path.resolve(process.cwd(), 'src/mcp/server.ts');
     const childResp = await new Promise<Record<string, unknown>>((resolve, reject) => {
       const child = spawn(tsxBin, [mcpEntry], {
-        env: { ...process.env, SIPHON_API_URL: base, SIPHON_API_TOKEN: tok.token },
+        env: { ...process.env, TURGALIUM_API_URL: base, TURGALIUM_API_TOKEN: tok.token },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       let out = '';
@@ -549,7 +549,7 @@ test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running 
           jsonrpc: '2.0',
           id: 99,
           method: 'tools/call',
-          params: { name: 'siphon_list_agent_mandates', arguments: {} },
+          params: { name: 'turgalium_list_agent_mandates', arguments: {} },
         }) + '\n'
       );
     });
@@ -565,7 +565,7 @@ test('MCP disables siphon_create_agent_mandate and stdio MCP proxies to running 
 
 test('Mandate engine resets spentTodayUsd after rolling 24h window and rejects spoofed grossUsd/estimatedNetUsdc', () => {
   let now = Date.parse('2026-11-25T00:00:00.000Z');
-  const engine = new SiphonAgentEngine({ nowMs: () => now });
+  const engine = new TurgaliumAgentEngine({ nowMs: () => now });
 
   const mandate = engine.createMandate({
     name: 'Rolling Cap Test',
@@ -622,7 +622,7 @@ test('Mandate engine resets spentTodayUsd after rolling 24h window and rejects s
   });
   assert.equal(r3.status, 'rejected');
 
-  // Advance past 24h window -> spentTodayUsd resets cleanly matching SiphonAgentVault.sol!
+  // Advance past 24h window -> spentTodayUsd resets cleanly matching TurgaliumAgentVault.sol!
   now += 12 * 3600 * 1000 + 1000;
   const refreshed = engine.getMandate(mandate.mandateId);
   assert.equal(refreshed?.spentTodayUsd, 0);
@@ -949,14 +949,14 @@ test('Case-sensitive address deduplication, per-(wallet, chain) dust/ROI batchin
   }
 });
 
-test('SiphonAgentVault.sol enforces single-bit actionBit validation and authorizedRouter guard', () => {
-  const vaultPath = path.resolve(process.cwd(), 'contracts/SiphonAgentVault.sol');
+test('TurgaliumAgentVault.sol enforces single-bit actionBit validation and authorizedRouter guard', () => {
+  const vaultPath = path.resolve(process.cwd(), 'contracts/TurgaliumAgentVault.sol');
   const sol = fs.readFileSync(vaultPath, 'utf8');
 
   // Single-bit actionBit check
   assert.ok(
     sol.includes('actionBit == 0 || (actionBit & (actionBit - 1)) != 0'),
-    'SiphonAgentVault must enforce single-bit actionBit validation'
+    'TurgaliumAgentVault must enforce single-bit actionBit validation'
   );
   assert.ok(sol.includes('error InvalidActionBit(uint8 actionBit);'));
 

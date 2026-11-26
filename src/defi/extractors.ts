@@ -257,7 +257,7 @@ export function validateTrustedProtocolTarget(params: {
   if (protocolId === 'external_protocol') {
     return {
       trusted: false,
-      reason: `External protocol position must be managed on its protocol app — Siphon only executes verified native protocol extractors.`,
+      reason: `External protocol position must be managed on its protocol app — Turgalium only executes verified native protocol extractors.`,
     };
   }
 
@@ -2072,7 +2072,7 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
           unlockDateStr
             ? `Wait until ${unlockDateStr} and unlock ${asset.uiBalance} ${uSym} on ${protocolName}`
             : `Unlock ${asset.uiBalance} ${uSym} directly on ${protocolName}`,
-          `Return to Siphon to sweep unlocked ${uSym} to Solana ${outputAsset}`,
+          `Return to Turgalium to sweep unlocked ${uSym} to Solana ${outputAsset}`,
         ],
         cooldownDetected: true,
         underlyingSymbol: uSym,
@@ -2108,7 +2108,7 @@ export function resolveDefiExitPlan(input: ResolveDefiExitPlanInput): DefiExitPl
           `Active borrow on ${protocolName} (${debtDetail}${hfPart} · Net $${netUsd.toFixed(2)}). Repay debt or manage collateral directly on ${protocolName}.`,
         plainEnglishSteps: [
           `Open ${protocolName} to repay ${debtDetail} or adjust collateral (Net $${netUsd.toFixed(2)})`,
-          `Return to Siphon once unlocked to sweep ${uSym} to Solana ${outputAsset}`,
+          `Return to Turgalium once unlocked to sweep ${uSym} to Solana ${outputAsset}`,
         ],
         underlyingSymbol: uSym,
         underlyingAddress: asset.underlyingAddress,

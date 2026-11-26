@@ -20,7 +20,7 @@ export interface DegenRouteContext {
 }
 
 /**
- * Modular HTTP routes for the Siphon Degen tab (live Jupiter Prediction Markets +
+ * Modular HTTP routes for the Turgalium Degen tab (live Jupiter Prediction Markets +
  * Preservation-First Side-Pocket cap + Order Preview + Live Positions/Claims/Early Exit).
  */
 export async function handleDegenRoutes(ctx: DegenRouteContext): Promise<boolean> {

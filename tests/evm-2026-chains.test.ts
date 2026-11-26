@@ -384,7 +384,7 @@ test('Wave 7B: Dynamic gas reserve math, ROI fee tiers, and route auction adapte
 
 test('Wave 7B: Frontend SVG logos and chain theme mappings exist for all 19 EVM chains', () => {
   const appJs = fs.readFileSync(path.join(REPO_ROOT, 'public/app.js'), 'utf8');
-  const svgJs = fs.readFileSync(path.join(REPO_ROOT, 'public/siphon-svg.js'), 'utf8');
+  const svgJs = fs.readFileSync(path.join(REPO_ROOT, 'public/turgalium-svg.js'), 'utf8');
 
   for (const chain of CHAIN_LIST) {
     const logoPath = path.join(REPO_ROOT, 'public/logos', `${chain.id}.svg`);
@@ -392,6 +392,6 @@ test('Wave 7B: Frontend SVG logos and chain theme mappings exist for all 19 EVM 
     const svgContent = fs.readFileSync(logoPath, 'utf8');
     assert.ok(svgContent.includes('<svg') && svgContent.includes('</svg>'), `Invalid SVG content for ${chain.id}`);
     assert.ok(appJs.includes(`'${chain.id}'`), `public/app.js missing chain slug '${chain.id}'`);
-    assert.ok(svgJs.includes(`'${chain.id}'`), `public/siphon-svg.js missing chain slug '${chain.id}'`);
+    assert.ok(svgJs.includes(`'${chain.id}'`), `public/turgalium-svg.js missing chain slug '${chain.id}'`);
   }
 });

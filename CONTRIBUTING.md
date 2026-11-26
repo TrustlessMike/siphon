@@ -1,6 +1,6 @@
-# Contributing to Siphon
+# Contributing to Turgalium
 
-Contributions are welcome! Siphon is MIT-licensed and built around strict fund-safety invariants and reproducible tests.
+Contributions are welcome! Turgalium is MIT-licensed and built around strict fund-safety invariants and reproducible tests.
 
 ## Development Workflow
 

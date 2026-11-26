@@ -46,7 +46,7 @@ export interface ApprovalSpenderInput {
 }
 
 /**
- * Matches Solidity `SiphonSweepDelegate.ApprovalRevoke { address token; address spender; }`
+ * Matches Solidity `TurgaliumSweepDelegate.ApprovalRevoke { address token; address spender; }`
  * while also carrying ready-to-sign ERC-20 `approve(spender, 0)` transaction calldata.
  */
 export interface ApprovalRevoke {

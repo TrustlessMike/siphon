@@ -313,7 +313,7 @@ export function renderConvergenceSvg(plan, scan) {
     : 'Fee Vault';
 
   return `
-    <svg id="siphonFlowSvg" role="img" aria-label="Multi-chain convergence topology to Solana" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" style="width:100%; min-width:720px; height:auto; display:block;">
+    <svg id="turgaliumFlowSvg" role="img" aria-label="Multi-chain convergence topology to Solana" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" style="width:100%; min-width:720px; height:auto; display:block;">
       <defs>
         <pattern id="siphGrid" width="20" height="20" patternUnits="userSpaceOnUse">
           <circle cx="1" cy="1" r="1" fill="#E2E5EC" />
@@ -361,7 +361,7 @@ export function renderConvergenceSvg(plan, scan) {
       <!-- Stage 4B: Protocol Treasury Fee Vault (5-10%) -->
       <g transform="translate(${col4X}, ${feeY})">
         <rect width="${col4W}" height="52" rx="8" fill="#FFFFFF" stroke="#D4D8E0" />
-        <image href="/logos/siphon.svg" x="12" y="16" width="18" height="18" />
+        <image href="/logos/turgalium.svg" x="12" y="16" width="18" height="18" />
         <text x="36" y="22" font-family="Inter, sans-serif" font-size="11.5" font-weight="600" fill="#0A0A0A">Fee (${escapeXml(feePct)}%) · ${escapeXml(feeDestShort)}</text>
         <text x="36" y="39" font-family="JetBrains Mono, monospace" font-size="10.2" fill="#52525B">$${escapeXml(feeUsd)} → Treasury</text>
       </g>

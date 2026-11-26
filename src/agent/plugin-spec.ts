@@ -5,11 +5,11 @@ export function buildAiPluginManifest(baseUrl: string) {
   return {
     schema_version: 'v1',
     name_for_human: 'Turgalium Multi-Chain Sweep & Preservation Agent',
-    name_for_model: 'siphon_migrator',
+    name_for_model: 'turgalium_migrator',
     description_for_human:
       'Scan unified wallets across 30 chains, run capital-preservation route audits, track live Lido/Ethena/Cosmos unlocks, reclaim Solana empty-ATA rent, preview 90/10 Solana yield splits, research Jupiter Prediction Markets, and propose permission-gated sweeps to Solana.',
     description_for_model:
-      'Use Turgalium to inspect unified multi-chain wallets across 30 chains, run capital-preservation audits, inspect live Lido/Ethena/Cosmos unlock queues and CCTP claims, scan Solana empty-ATA rent recovery, preview 90% yield + 10% Degen side-pocket splits, research trending Jupiter Prediction Markets (read-only), and submit permission-gated sweep requests. NEVER assume funds move or bets are placed without explicit user approval or an active SiphonAgentVault mandate.',
+      'Use Turgalium to inspect unified multi-chain wallets across 30 chains, run capital-preservation audits, inspect live Lido/Ethena/Cosmos unlock queues and CCTP claims, scan Solana empty-ATA rent recovery, preview 90% yield + 10% Degen side-pocket splits, research trending Jupiter Prediction Markets (read-only), and submit permission-gated sweep requests. NEVER assume funds move or bets are placed without explicit user approval or an active TurgaliumAgentVault mandate.',
     auth: {
       type: 'user_http',
       authorization_type: 'bearer',
@@ -20,7 +20,7 @@ export function buildAiPluginManifest(baseUrl: string) {
       is_user_authenticated: true,
     },
     logo_url: `${cleanBase}/logos/solana.svg`,
-    contact_email: 'security@siphon.local',
+    contact_email: 'security@turgalium.local',
     legal_info_url: `${cleanBase}/`,
   };
 }
@@ -109,7 +109,7 @@ export function buildOpenApiSpec(baseUrl: string) {
       },
       '/api/optimize/preservation': {
         post: {
-          operationId: 'siphon_preservation_audit',
+          operationId: 'turgalium_preservation_audit',
           'x-openai-isConsequential': false,
           summary:
             'Run Capital-Preservation Route Auction for a cached scanId or walletAddress: exact dollars saved, best route per chain, and Ethereum L1 gas-timing advice',
@@ -146,7 +146,7 @@ export function buildOpenApiSpec(baseUrl: string) {
       },
       '/api/optimize/unlock-schedule': {
         post: {
-          operationId: 'siphon_list_unlock_schedule',
+          operationId: 'turgalium_list_unlock_schedule',
           'x-openai-isConsequential': false,
           summary:
             'List live pending Lido stETH withdrawal NFTs, Ethena sUSDe cooldowns, Cosmos unbonding delegations, scan-indexed DeFi locks, and attested CCTP claims sorted soonest-first',
@@ -201,7 +201,7 @@ export function buildOpenApiSpec(baseUrl: string) {
       },
       '/api/solana/rent-scan': {
         post: {
-          operationId: 'siphon_solana_rent_scan',
+          operationId: 'turgalium_solana_rent_scan',
           'x-openai-isConsequential': false,
           summary:
             'Scan a Solana wallet for zero-balance empty SPL/Token-2022 Associated Token Accounts eligible for free SOL rent recovery (0.00203928 SOL per empty account)',
@@ -235,7 +235,7 @@ export function buildOpenApiSpec(baseUrl: string) {
       },
       '/api/solana/yield-park': {
         post: {
-          operationId: 'siphon_solana_yield_preview',
+          operationId: 'turgalium_solana_yield_preview',
           'x-openai-isConsequential': false,
           summary:
             'Preview the 90% Preserved Yield (JupSOL, Jupiter Lend jlUSDC, or Kamino USDC) + 10% Degen Side-Pocket split with exact micro-USDC accounting and projected APY (read-only)',
@@ -275,7 +275,7 @@ export function buildOpenApiSpec(baseUrl: string) {
       },
       '/api/degen/markets': {
         get: {
-          operationId: 'siphon_degen_markets',
+          operationId: 'turgalium_degen_markets',
           'x-openai-isConsequential': false,
           summary:
             'List live trending Jupiter Prediction Markets & implied odds for AI-assisted market research (strictly read-only; never places bets autonomously)',
@@ -325,7 +325,7 @@ export function buildOpenApiSpec(baseUrl: string) {
         get: {
           operationId: 'listAgentMandates',
           'x-openai-isConsequential': false,
-          summary: 'List policy-bounded SiphonAgentVault mandates and remaining daily caps',
+          summary: 'List policy-bounded TurgaliumAgentVault mandates and remaining daily caps',
           responses: { '200': { description: 'Object { mandates: AgentMandateRecord[] }' } },
         },
       },
@@ -340,7 +340,7 @@ export function buildOpenApiSpec(baseUrl: string) {
           operationId: 'requestSweepPermission',
           'x-openai-isConsequential': true,
           summary:
-            'Propose a dust conversion, DeFi withdrawal, or Solana sweep — enforces explicit human permission or active SiphonAgentVault mandate caps',
+            'Propose a dust conversion, DeFi withdrawal, or Solana sweep — enforces explicit human permission or active TurgaliumAgentVault mandate caps',
           security: [{ BearerAuth: [] }],
           requestBody: {
             required: true,
@@ -392,21 +392,21 @@ export function buildPluginSetupGuide(params: { baseUrl: string; rootDir: string
   return {
     claudeDesktopConfig: {
       mcpServers: {
-        siphon: {
+        turgalium: {
           command: 'node',
           args: [mcpEntrypoint],
           env: {
-            SIPHON_API_URL: cleanBase,
-            SIPHON_API_TOKEN: '<paste-scoped-claude-mcp-bearer-token>',
+            TURGALIUM_API_URL: cleanBase,
+            TURGALIUM_API_TOKEN: '<paste-scoped-claude-mcp-bearer-token>',
           },
         },
       },
     },
-    claudeCodeCommand: `claude mcp add --transport http --header "Authorization: Bearer <SIPHON_API_TOKEN>" siphon ${cleanBase}/mcp`,
+    claudeCodeCommand: `claude mcp add --transport http --header "Authorization: Bearer <TURGALIUM_API_TOKEN>" turgalium ${cleanBase}/mcp`,
     mcpHttpEndpoint: `${cleanBase}/mcp`,
     chatgptPluginManifestUrl: `${cleanBase}/.well-known/ai-plugin.json`,
     chatgptOpenApiUrl: `${cleanBase}/openapi.json`,
     chatgptCustomGptInstructions:
-      'You are Turgalium Assistant. Scan wallets via scanUnifiedWallets, audit exact capital savings via siphon_preservation_audit, inspect live Lido/Ethena/Cosmos unlocks via siphon_list_unlock_schedule, check free Solana rent recovery via siphon_solana_rent_scan, preview 90/10 yield splits via siphon_solana_yield_preview, and research Jupiter Prediction Markets read-only via siphon_degen_markets. Always submit value-moving sweeps via requestSweepPermission (with authentic scanned assetIds) and NEVER place bets or move funds autonomously without explicit user approval or an active owner-created SiphonAgentVault mandate.',
+      'You are Turgalium Assistant. Scan wallets via scanUnifiedWallets, audit exact capital savings via turgalium_preservation_audit, inspect live Lido/Ethena/Cosmos unlocks via turgalium_list_unlock_schedule, check free Solana rent recovery via turgalium_solana_rent_scan, preview 90/10 yield splits via turgalium_solana_yield_preview, and research Jupiter Prediction Markets read-only via turgalium_degen_markets. Always submit value-moving sweeps via requestSweepPermission (with authentic scanned assetIds) and NEVER place bets or move funds autonomously without explicit user approval or an active owner-created TurgaliumAgentVault mandate.',
   };
 }

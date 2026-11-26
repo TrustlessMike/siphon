@@ -186,7 +186,7 @@ export interface RpcCircuitBreakerMetrics {
 }
 
 function getEnvDefaultCooldownMs(): number {
-  const raw = process.env.SIPHON_RPC_COOLDOWN_MS?.trim();
+  const raw = process.env.TURGALIUM_RPC_COOLDOWN_MS?.trim();
   if (!raw) return DEFAULT_RPC_CIRCUIT_BREAKER_COOLDOWN_MS;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_RPC_CIRCUIT_BREAKER_COOLDOWN_MS;

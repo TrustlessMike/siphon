@@ -44,7 +44,7 @@ import {
   SOLANA_USDC_MINT,
 } from '../src/solana/yield-park.js';
 import { SOLANA_CCTP_DOMAIN } from '../src/scanner/chains.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 
 const SOL_USER_A = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
 const SOL_USER_B = '7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV';
@@ -922,7 +922,7 @@ test('buildSolanaYieldParkPlan quotes JupSOL via Jupiter Swap API, builds verifi
 // ============================================================================
 
 test('HTTP routes POST /api/solana/rent-scan, POST /api/solana/yield-park, and GET /api/solana/yield-strategies work end-to-end and reject bad inputs fail-closed', async () => {
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');

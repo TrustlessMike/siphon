@@ -1,5 +1,5 @@
 // =====================================================================
-// SIPHON DEGEN TAB — LIVE JUPITER PREDICTION MARKETS, INLINE SIGNING,
+// TURGALIUM DEGEN TAB — LIVE JUPITER PREDICTION MARKETS, INLINE SIGNING,
 // LIVE POSITIONS / CLAIMS & PRESERVATION-FIRST YIELD SPLIT UI
 // Modular, XSS-safe, zero-overflow controller bound to #view-degen.
 // =====================================================================
@@ -92,7 +92,7 @@ const state = {
   availableUsdc: 250,
   balanceSource: 'Model balance',
   userEditedBalance: false,
-  siphonBalanceDetail: null, // populated by clean `siphon:balance-updated` CustomEvent
+  turgaliumBalanceDetail: null, // populated by clean `turgalium:balance-updated` CustomEvent
   sidePocketMode: 'percent', // 'percent' | 'yield_funded'
   riskPct: 10,
   yieldApyPct: DEFAULT_YIELD_APY_PCT,
@@ -297,9 +297,9 @@ function computeLocalSidePocket(
   };
 }
 
-function detectSiphonBalance() {
-  // 1. Prefer clean structured balance detail emitted by `siphon:balance-updated`
-  const detail = state.siphonBalanceDetail;
+function detectTurgaliumBalance() {
+  // 1. Prefer clean structured balance detail emitted by `turgalium:balance-updated`
+  const detail = state.turgaliumBalanceDetail;
   if (detail && typeof detail === 'object') {
     const liveSolUsdc = Number(detail.solanaUsdc) || 0;
     const sweptUsdc = Number(detail.projectedSweepUsdc) || 0;
@@ -335,9 +335,9 @@ function detectSiphonBalance() {
   return null;
 }
 
-function syncBalanceFromSiphon(force = false) {
+function syncBalanceFromTurgalium(force = false) {
   if (state.userEditedBalance && !force) return;
-  const detected = detectSiphonBalance();
+  const detected = detectTurgaliumBalance();
   if (detected && detected.amount > 0) {
     state.availableUsdc = detected.amount;
     state.balanceSource = detected.source;
@@ -350,7 +350,7 @@ function syncBalanceFromSiphon(force = false) {
 function getSelectedSolanaWallet() {
   const connected = getConnectedSolanaAddress();
   if (connected && isValidSolanaBase58(connected)) return connected;
-  const fromEvent = state.siphonBalanceDetail?.solanaWallet;
+  const fromEvent = state.turgaliumBalanceDetail?.solanaWallet;
   if (fromEvent && isValidSolanaBase58(fromEvent)) return fromEvent;
   const raw = document.getElementById('solanaDestInput')?.value?.trim() || '';
   return isValidSolanaBase58(raw) ? raw : '';
@@ -918,7 +918,7 @@ function renderPocketBar() {
   if (!host) return;
 
   const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
-  const detected = detectSiphonBalance();
+  const detected = detectTurgaliumBalance();
 
   const is9010Active = pocket.mode === 'percent' && Math.abs(pocket.effectiveRiskPct - 10) < 0.01 && !pocket.wasClamped;
   const isYieldFundedActive = pocket.mode === 'yield_funded';
@@ -1117,7 +1117,7 @@ function renderPocketBar() {
   }
 
   document.getElementById('degenSyncBalanceBtn')?.addEventListener('click', () => {
-    syncBalanceFromSiphon(true);
+    syncBalanceFromTurgalium(true);
     clearOrderSigningState();
     renderPocketBar();
     renderMarketsSection();
@@ -1803,13 +1803,13 @@ function mountShell() {
     </div>
   `;
 
-  syncBalanceFromSiphon(false);
+  syncBalanceFromTurgalium(false);
   renderAll();
 }
 
 function onDegenTabActivated() {
   mountShell();
-  syncBalanceFromSiphon(false);
+  syncBalanceFromTurgalium(false);
   renderPocketBar();
   renderPositionsStrip();
   renderSlip();
@@ -1843,7 +1843,7 @@ function initDegenModule() {
   });
 
   // Strict state isolation on Solana wallet connect / account switch / disconnect
-  window.addEventListener('siphon:wallet-changed', (event) => {
+  window.addEventListener('turgalium:wallet-changed', (event) => {
     const detail = event?.detail;
     if (!detail || detail.family !== 'solana') return;
     clearOrderSigningState({ clearPositionFeedback: true });
@@ -1864,13 +1864,13 @@ function initDegenModule() {
   });
 
   // Clean event-driven balance & Solana wallet sync dispatched by app.js
-  window.addEventListener('siphon:balance-updated', (event) => {
+  window.addEventListener('turgalium:balance-updated', (event) => {
     const detail = event?.detail && typeof event.detail === 'object' ? event.detail : null;
     if (!detail) return;
-    state.siphonBalanceDetail = detail;
+    state.turgaliumBalanceDetail = detail;
 
     if (!state.userEditedBalance) {
-      syncBalanceFromSiphon(false);
+      syncBalanceFromTurgalium(false);
     }
 
     const nextWallet = getSelectedSolanaWallet();

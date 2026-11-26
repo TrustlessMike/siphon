@@ -144,7 +144,7 @@ export interface BuildSolanaYieldParkParams {
 }
 
 export interface SolanaYieldParkPlan {
-  planVersion: 'siphon-solana-yield-park-v1';
+  planVersion: 'turgalium-solana-yield-park-v1';
   ownerAddress: string;
   strategy: SolanaYieldStrategyMeta;
   split: YieldPreservationSplit;
@@ -170,7 +170,7 @@ export function listSolanaYieldStrategies(): SolanaYieldStrategyMeta[] {
 
 /**
  * Computes exact integer micro-USDC preservation split so `yieldUsdcRaw + degenSidePocketRaw === totalUsdcRaw`
- * with zero floating-point drift. Enforces Siphon's preservation-first guard: `50 <= preservePct <= 100`.
+ * with zero floating-point drift. Enforces Turgalium's preservation-first guard: `50 <= preservePct <= 100`.
  */
 export function calculateYieldPreservationSplit(
   totalUsdcAmount: number,
@@ -568,7 +568,7 @@ export async function buildSolanaYieldParkPlan(
   const projectedDailyYieldUsd = Number((projectedAnnualYieldUsd / 365).toFixed(4));
 
   return {
-    planVersion: 'siphon-solana-yield-park-v1',
+    planVersion: 'turgalium-solana-yield-park-v1',
     ownerAddress: ownerClean,
     strategy,
     split,
