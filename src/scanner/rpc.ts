@@ -103,6 +103,197 @@ const TRANSIENT_RPC_ERROR_CODES = new Set<number>([
 const TRANSIENT_RPC_ERROR_RE =
   /429|limit exceeded|rate[\s_-]?limit|too many requests|timeout|timed out|compute units|quota|throttl|over capacity|service unavailable|bad gateway|internal error|temporarily unavailable|try again/i;
 
+const RATE_LIMIT_RPC_ERROR_CODES = new Set<number>([-32005, -32016, -32007, -32097, 429]);
+const RATE_LIMIT_RPC_ERROR_RE =
+  /429|limit exceeded|rate[\s_-]?limit|too many requests|compute units|quota|throttl/i;
+
+export const DEFAULT_RPC_CIRCUIT_BREAKER_COOLDOWN_MS = 60_000;
+export const DEFAULT_RPC_RATE_LIMIT_THRESHOLD = 2;
+
+export interface RpcCircuitBreakerConfig {
+  circuitBreakerCooldownMs?: number;
+  rateLimitErrorThreshold?: number;
+  nowMs?: () => number;
+}
+
+interface RpcEndpointCircuitState {
+  url: string;
+  consecutiveRateLimitErrors: number;
+  cooldownUntilMs: number;
+  tripCount: number;
+  lastError?: string;
+}
+
+export interface RpcCircuitBreakerMetrics {
+  circuitBreakerCooldownMs: number;
+  rateLimitErrorThreshold: number;
+  openEndpoints: Array<{
+    url: string;
+    cooldownRemainingMs: number;
+    tripCount: number;
+    lastError?: string;
+  }>;
+  totalCalls: number;
+  totalBatchCalls: number;
+  totalFailovers: number;
+  circuitBreakerTrips: number;
+  circuitBreakerSkips: number;
+}
+
+function getEnvDefaultCooldownMs(): number {
+  const raw = process.env.SIPHON_RPC_COOLDOWN_MS?.trim();
+  if (!raw) return DEFAULT_RPC_CIRCUIT_BREAKER_COOLDOWN_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_RPC_CIRCUIT_BREAKER_COOLDOWN_MS;
+}
+
+const rpcCircuitStates = new Map<string, RpcEndpointCircuitState>();
+let circuitBreakerCooldownMs = getEnvDefaultCooldownMs();
+let circuitBreakerThreshold = DEFAULT_RPC_RATE_LIMIT_THRESHOLD;
+let circuitBreakerNowMs: () => number = () => Date.now();
+let rpcTotalCalls = 0;
+let rpcTotalBatchCalls = 0;
+let rpcTotalFailovers = 0;
+let rpcCircuitBreakerTrips = 0;
+let rpcCircuitBreakerSkips = 0;
+
+export function configureRpcCircuitBreaker(config: RpcCircuitBreakerConfig): void {
+  if (config.circuitBreakerCooldownMs !== undefined) {
+    circuitBreakerCooldownMs = Math.max(0, Math.floor(config.circuitBreakerCooldownMs));
+  }
+  if (config.rateLimitErrorThreshold !== undefined) {
+    circuitBreakerThreshold = Math.max(1, Math.floor(config.rateLimitErrorThreshold));
+  }
+  if (config.nowMs !== undefined) {
+    circuitBreakerNowMs = config.nowMs;
+  }
+}
+
+export function resetRpcCircuitBreaker(): void {
+  rpcCircuitStates.clear();
+  circuitBreakerCooldownMs = getEnvDefaultCooldownMs();
+  circuitBreakerThreshold = DEFAULT_RPC_RATE_LIMIT_THRESHOLD;
+  circuitBreakerNowMs = () => Date.now();
+  rpcTotalCalls = 0;
+  rpcTotalBatchCalls = 0;
+  rpcTotalFailovers = 0;
+  rpcCircuitBreakerTrips = 0;
+  rpcCircuitBreakerSkips = 0;
+}
+
+export function isRateLimitRpcError(error?: JsonRpcErrorLike): boolean {
+  if (!error) return false;
+  if (typeof error.code === 'number' && RATE_LIMIT_RPC_ERROR_CODES.has(error.code)) {
+    return true;
+  }
+  return RATE_LIMIT_RPC_ERROR_RE.test(error.message ?? '');
+}
+
+export function isRpcEndpointInCooldown(
+  rpcUrl: string,
+  now = circuitBreakerNowMs()
+): boolean {
+  const state = rpcCircuitStates.get(rpcUrl);
+  if (!state) return false;
+  if (state.cooldownUntilMs > now) return true;
+  if (state.cooldownUntilMs > 0) {
+    state.cooldownUntilMs = 0;
+    state.consecutiveRateLimitErrors = 0;
+  }
+  return false;
+}
+
+function recordRpcSuccess(rpcUrl: string): void {
+  const state = rpcCircuitStates.get(rpcUrl);
+  if (state) {
+    state.consecutiveRateLimitErrors = 0;
+    state.cooldownUntilMs = 0;
+  }
+}
+
+function recordRpcRateLimitFailure(
+  rpcUrl: string,
+  reason: string,
+  immediateTrip: boolean,
+  opts?: RpcCircuitBreakerConfig
+): void {
+  const now = (opts?.nowMs ?? circuitBreakerNowMs)();
+  const cooldownMs = opts?.circuitBreakerCooldownMs ?? circuitBreakerCooldownMs;
+  const threshold = opts?.rateLimitErrorThreshold ?? circuitBreakerThreshold;
+
+  let state = rpcCircuitStates.get(rpcUrl);
+  if (!state) {
+    state = {
+      url: rpcUrl,
+      consecutiveRateLimitErrors: 0,
+      cooldownUntilMs: 0,
+      tripCount: 0,
+    };
+    rpcCircuitStates.set(rpcUrl, state);
+  }
+
+  state.consecutiveRateLimitErrors += 1;
+  state.lastError = reason;
+
+  if ((immediateTrip || state.consecutiveRateLimitErrors >= threshold) && cooldownMs > 0) {
+    state.cooldownUntilMs = now + cooldownMs;
+    state.tripCount += 1;
+    rpcCircuitBreakerTrips += 1;
+  }
+}
+
+function selectRpcCandidates(
+  rpcUrls: string[],
+  opts?: RpcCircuitBreakerConfig
+): string[] {
+  const now = (opts?.nowMs ?? circuitBreakerNowMs)();
+  const healthy: string[] = [];
+  const cooled: Array<{ url: string; cooldownUntilMs: number }> = [];
+
+  for (const url of rpcUrls) {
+    if (isRpcEndpointInCooldown(url, now)) {
+      const st = rpcCircuitStates.get(url);
+      cooled.push({ url, cooldownUntilMs: st?.cooldownUntilMs ?? now });
+    } else {
+      healthy.push(url);
+    }
+  }
+
+  if (healthy.length > 0) {
+    if (cooled.length > 0) {
+      rpcCircuitBreakerSkips += cooled.length;
+    }
+    return healthy;
+  }
+
+  // If every endpoint is currently in cooldown, degrade gracefully by trying soonest-expiring first.
+  return cooled.sort((a, b) => a.cooldownUntilMs - b.cooldownUntilMs).map((c) => c.url);
+}
+
+export function getRpcCircuitBreakerMetrics(now = circuitBreakerNowMs()): RpcCircuitBreakerMetrics {
+  const openEndpoints: RpcCircuitBreakerMetrics['openEndpoints'] = [];
+  for (const st of rpcCircuitStates.values()) {
+    if (st.cooldownUntilMs > now) {
+      openEndpoints.push({
+        url: st.url,
+        cooldownRemainingMs: st.cooldownUntilMs - now,
+        tripCount: st.tripCount,
+        lastError: st.lastError,
+      });
+    }
+  }
+  return {
+    circuitBreakerCooldownMs,
+    rateLimitErrorThreshold: circuitBreakerThreshold,
+    openEndpoints,
+    totalCalls: rpcTotalCalls,
+    totalBatchCalls: rpcTotalBatchCalls,
+    totalFailovers: rpcTotalFailovers,
+    circuitBreakerTrips: rpcCircuitBreakerTrips,
+    circuitBreakerSkips: rpcCircuitBreakerSkips,
+  };
+}
+
 export interface JsonRpcErrorLike {
   message?: string;
   code?: number;
@@ -151,7 +342,7 @@ function isCriticalBatchRequest(req: { method: string; params: unknown[] }): boo
 function validateBatchResponses(
   requests: Array<{ id: number; method: string; params: unknown[] }>,
   responses: Array<{ id: number; result?: string; error?: { message: string; code?: number } }>
-): { ok: true } | { ok: false; reason: string } {
+): { ok: true } | { ok: false; reason: string; rateLimited?: boolean; http429?: boolean } {
   if (!responses.length) {
     return { ok: false, reason: 'Empty batch response' };
   }
@@ -164,6 +355,8 @@ function validateBatchResponses(
       return {
         ok: false,
         reason: `RPC ${req.method} failed (${resp.error.code ?? 'err'}: ${resp.error.message ?? 'node error'})`,
+        rateLimited: isRateLimitRpcError(resp.error),
+        http429: resp.error.code === 429,
       };
     }
 
@@ -178,6 +371,8 @@ function validateBatchResponses(
           return {
             ok: false,
             reason: `Critical RPC ${req.method} error (${resp.error.code ?? 'err'}: ${resp.error.message ?? 'failed'})`,
+            rateLimited: isRateLimitRpcError(resp.error),
+            http429: resp.error.code === 429,
           };
         }
       } else if (resp.result === undefined) {
@@ -193,6 +388,8 @@ function validateBatchResponses(
     return {
       ok: false,
       reason: firstErr?.message ?? 'Batch response contained no results',
+      rateLimited: isRateLimitRpcError(firstErr),
+      http429: firstErr?.code === 429,
     };
   }
 
@@ -202,10 +399,15 @@ function validateBatchResponses(
 export async function evmJsonRpcBatch(
   rpcUrls: string[],
   requests: Array<{ id: number; method: string; params: unknown[] }>,
-  timeoutMs = 4500
+  timeoutMs = 4500,
+  circuitOpts?: RpcCircuitBreakerConfig
 ): Promise<Array<{ id: number; result?: string; error?: { message: string; code?: number } }>> {
+  rpcTotalBatchCalls += 1;
+  const candidates = selectRpcCandidates(rpcUrls, circuitOpts);
   let lastErr: unknown;
-  for (const rpcUrl of rpcUrls) {
+  for (let i = 0; i < candidates.length; i++) {
+    const rpcUrl = candidates[i];
+    if (i > 0) rpcTotalFailovers += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -217,7 +419,11 @@ export async function evmJsonRpcBatch(
       });
       clearTimeout(timer);
       if (!res.ok) {
-        lastErr = new Error(`RPC HTTP ${res.status} (${rpcUrl})`);
+        const msg = `RPC HTTP ${res.status} (${rpcUrl})`;
+        if (res.status === 429) {
+          recordRpcRateLimitFailure(rpcUrl, msg, true, circuitOpts);
+        }
+        lastErr = new Error(msg);
         continue;
       }
       const parsed = await res.json();
@@ -229,6 +435,7 @@ export async function evmJsonRpcBatch(
 
       const batchCheck = validateBatchResponses(requests, arr);
       if (batchCheck.ok) {
+        recordRpcSuccess(rpcUrl);
         return arr;
       }
 
@@ -271,7 +478,11 @@ export async function evmJsonRpcBatch(
           );
           const singleCheck = validateBatchResponses(requests, singles);
           if (singleCheck.ok) {
+            recordRpcSuccess(rpcUrl);
             return singles;
+          }
+          if (singleCheck.http429 || singleCheck.rateLimited) {
+            recordRpcRateLimitFailure(rpcUrl, singleCheck.reason, Boolean(singleCheck.http429), circuitOpts);
           }
           lastErr = new Error(`${singleCheck.reason} (${rpcUrl})`);
           continue;
@@ -281,6 +492,9 @@ export async function evmJsonRpcBatch(
         }
       }
 
+      if (batchCheck.http429 || batchCheck.rateLimited) {
+        recordRpcRateLimitFailure(rpcUrl, batchCheck.reason, Boolean(batchCheck.http429), circuitOpts);
+      }
       lastErr = new Error(`${batchCheck.reason} (${rpcUrl})`);
       continue;
     } catch (err) {
@@ -295,10 +509,15 @@ export async function evmJsonRpcCall<T = string>(
   rpcUrls: string[],
   method: string,
   params: unknown[],
-  timeoutMs = 3800
+  timeoutMs = 3800,
+  circuitOpts?: RpcCircuitBreakerConfig
 ): Promise<{ result?: T; error?: { message?: string; code?: number } }> {
+  rpcTotalCalls += 1;
+  const candidates = selectRpcCandidates(rpcUrls, circuitOpts);
   let lastErr: unknown;
-  for (const rpcUrl of rpcUrls) {
+  for (let i = 0; i < candidates.length; i++) {
+    const rpcUrl = candidates[i];
+    if (i > 0) rpcTotalFailovers += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -310,20 +529,30 @@ export async function evmJsonRpcCall<T = string>(
       });
       clearTimeout(timer);
       if (!res.ok) {
-        lastErr = new Error(`RPC HTTP ${res.status} (${rpcUrl})`);
+        const msg = `RPC HTTP ${res.status} (${rpcUrl})`;
+        if (res.status === 429) {
+          recordRpcRateLimitFailure(rpcUrl, msg, true, circuitOpts);
+        }
+        lastErr = new Error(msg);
         continue;
       }
       const json = (await res.json()) as { result?: T; error?: { message?: string; code?: number } };
       if (json.result !== undefined) {
+        recordRpcSuccess(rpcUrl);
         return json;
       }
       if (json.error !== undefined) {
         // Short-circuit ONLY on genuine EVM execution reverts (code === 3 or /execution reverted|revert/i).
         // Infrastructure, rate-limit, and node errors MUST fail over to the next configured RPC URL.
         if (isEvmExecutionRevertError(json.error)) {
+          recordRpcSuccess(rpcUrl);
           return json;
         }
-        lastErr = new Error(json.error.message ?? `RPC error ${json.error.code ?? ''}`);
+        const msg = json.error.message ?? `RPC error ${json.error.code ?? ''}`;
+        if (isRateLimitRpcError(json.error)) {
+          recordRpcRateLimitFailure(rpcUrl, msg, json.error.code === 429, circuitOpts);
+        }
+        lastErr = new Error(msg);
         continue;
       }
       lastErr = new Error('Empty JSON-RPC response');

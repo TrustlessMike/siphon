@@ -3,6 +3,7 @@ import { fetchCctpAttestationForTx } from '../bridge/cctp.js';
 import { checkLiveExecutionStatus } from '../execution/tx-builder.js';
 import { EVM_CHAINS } from '../scanner/chains.js';
 import type { AnyChainId, EvmChainId } from '../scanner/types.js';
+import type { SiphonStateStore } from '../storage/state-store.js';
 
 const NON_EVM_EXPLORERS: Record<string, string> = {
   cosmoshub: 'https://www.mintscan.io/cosmos',
@@ -116,6 +117,8 @@ export interface BackgroundJobStoreOptions {
   pollIntervalMs?: number;
   statusChecker?: typeof checkLiveExecutionStatus;
   attestationFetcher?: typeof fetchCctpAttestationForTx;
+  stateStore?: SiphonStateStore;
+  resumePollersOnLoad?: boolean;
 }
 
 const DEFAULT_MAX_JOBS = 30;
@@ -186,6 +189,7 @@ export class BackgroundJobStore {
   private readonly pollIntervalMs: number;
   private readonly statusChecker: typeof checkLiveExecutionStatus;
   private readonly attestationFetcher: typeof fetchCctpAttestationForTx;
+  private readonly stateStore?: SiphonStateStore;
 
   constructor(opts: BackgroundJobStoreOptions = {}) {
     this.maxJobs = Math.max(1, Math.floor(opts.maxJobs ?? DEFAULT_MAX_JOBS));
@@ -194,6 +198,63 @@ export class BackgroundJobStore {
     this.pollIntervalMs = Math.max(10, opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
     this.statusChecker = opts.statusChecker ?? checkLiveExecutionStatus;
     this.attestationFetcher = opts.attestationFetcher ?? fetchCctpAttestationForTx;
+    this.stateStore = opts.stateStore;
+    if (this.stateStore) {
+      this.hydrateFromStore(Boolean(opts.resumePollersOnLoad));
+    }
+  }
+
+  private hydrateFromStore(resumePollers: boolean): void {
+    if (!this.stateStore) return;
+    const saved = this.stateStore.load<Array<{ job: BackgroundJob; expiresAt: number }>>('jobs', []);
+    if (!Array.isArray(saved)) return;
+    const now = this.nowMs();
+    for (const entry of saved) {
+      if (
+        !entry ||
+        typeof entry !== 'object' ||
+        !entry.job ||
+        typeof entry.job.jobId !== 'string' ||
+        typeof entry.expiresAt !== 'number' ||
+        !Number.isFinite(entry.expiresAt) ||
+        now >= entry.expiresAt
+      ) {
+        continue;
+      }
+      this.jobs.set(entry.job.jobId, { job: entry.job, expiresAt: entry.expiresAt });
+    }
+    this.pruneInactiveJobs();
+    if (resumePollers) {
+      this.resumeActivePollers();
+    }
+  }
+
+  private persist(): void {
+    if (!this.stateStore) return;
+    const entries = Array.from(this.jobs.values());
+    this.stateStore.save('jobs', entries);
+  }
+
+  /**
+   * Resumes background settlement pollers for any persisted in-flight EVM legs after restart.
+   */
+  resumeActivePollers(): number {
+    const now = this.nowMs();
+    let resumed = 0;
+    for (const [jobId, entry] of this.jobs.entries()) {
+      if (now >= entry.expiresAt || entry.job.status !== 'active') continue;
+      for (const leg of entry.job.legs) {
+        if (
+          isEvmChainId(leg.chain) &&
+          (leg.status === 'confirming' || leg.status === 'relaying') &&
+          (leg.evmTxHash || leg.requestId)
+        ) {
+          this.ensureBackgroundPoller(jobId, leg.legId, leg.chain);
+          resumed += 1;
+        }
+      }
+    }
+    return resumed;
   }
 
   pruneExpired(now = this.nowMs()): number {
@@ -204,6 +265,9 @@ export class BackgroundJobStore {
         this.jobs.delete(jobId);
         removed += 1;
       }
+    }
+    if (removed > 0) {
+      this.persist();
     }
     return removed;
   }
@@ -304,6 +368,7 @@ export class BackgroundJobStore {
 
     this.jobs.set(jobId, { job, expiresAt: nowMs + this.ttlMs });
     this.pruneInactiveJobs(jobId);
+    this.persist();
     return job;
   }
 
@@ -340,6 +405,7 @@ export class BackgroundJobStore {
     if (this.nowMs() >= entry.expiresAt) {
       this.clearPollersForJob(jobId);
       this.jobs.delete(jobId);
+      this.persist();
       return null;
     }
     // Refresh LRU order on read
@@ -414,6 +480,7 @@ export class BackgroundJobStore {
     // Refresh LRU position and extend TTL on active update
     this.jobs.delete(jobId);
     this.jobs.set(jobId, { job, expiresAt: nowMs + this.ttlMs });
+    this.persist();
 
     const pollerKey = `${jobId}:${leg.legId}`;
 
@@ -446,6 +513,7 @@ export class BackgroundJobStore {
     if (job.legs.length === 0) {
       job.status = 'completed';
       this.pruneInactiveJobs(job.jobId);
+      this.persist();
       return;
     }
 
@@ -453,6 +521,7 @@ export class BackgroundJobStore {
     const allTerminal = job.legs.every((l) => TERMINAL_JOB_LEG_STATUSES.has(l.status));
     if (!allTerminal) {
       job.status = 'active';
+      this.persist();
       return;
     }
 
@@ -466,6 +535,7 @@ export class BackgroundJobStore {
     else job.status = 'failed';
 
     this.pruneInactiveJobs(job.jobId);
+    this.persist();
   }
 
   private ensureBackgroundPoller(jobId: string, legId: string, chain: EvmChainId): void {

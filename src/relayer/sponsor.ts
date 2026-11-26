@@ -6,6 +6,13 @@ import { EVM_CHAINS, getProtocolFeeConfig } from '../scanner/chains.js';
 import { isEip2612Token } from '../scanner/discovery.js';
 import { computeRelayerBreakEven, RELAYER_BREAK_EVEN_MULTIPLIER } from '../scanner/roi.js';
 import type { EvmChainId, ScannedAsset } from '../scanner/types.js';
+import type { SiphonStateStore } from '../storage/state-store.js';
+import {
+  broadcastSignedRelayerTx,
+  type RelayerBroadcastResult,
+  type RelayerCustomBroadcasterContext,
+} from './broadcaster.js';
+import type { evmJsonRpcCall } from '../scanner/rpc.js';
 
 export const CANONICAL_PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
 
@@ -30,6 +37,7 @@ export const SWEEP_INTENT_TYPE_STRING =
   'SweepIntent(bytes32 solanaRecipient,address usdc,address cctpMessenger,address feeRecipient,uint16 feeBps,uint256 directUsdcAmount,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint256 nonce,uint256 deadline,bytes32 callsHash)';
 
 const MAX_ISSUED_INTENTS = 2000;
+const MAX_CONSUMED_DIGESTS = 10_000;
 
 interface TrackedGaslessIntent {
   intentId: string;
@@ -37,6 +45,7 @@ interface TrackedGaslessIntent {
   chain: EvmChainId;
   chainId: number;
   userAddress: string;
+  routerAddress: string | null;
   deadline: number;
   eligible: boolean;
   rejectionReason?: string;
@@ -45,9 +54,74 @@ interface TrackedGaslessIntent {
   eip712Digest: string | null;
   consumed: boolean;
   createdAt: number;
+  txHash?: string;
+}
+
+interface ConsumedDigestRecord {
+  digest: string;
+  intentId: string;
+  chain: EvmChainId;
+  consumedAt: number;
+  deadline: number;
+}
+
+interface PersistedGaslessIntentState {
+  intents: TrackedGaslessIntent[];
+  consumedDigests: ConsumedDigestRecord[];
 }
 
 const issuedIntents = new Map<string, TrackedGaslessIntent>();
+const consumedDigests = new Map<string, ConsumedDigestRecord>();
+let activeIntentStateStore: SiphonStateStore | null = null;
+
+function hydrateGaslessIntentsFromStore(store: SiphonStateStore): void {
+  const saved = store.load<PersistedGaslessIntentState>('gasless_intents', {
+    intents: [],
+    consumedDigests: [],
+  });
+  issuedIntents.clear();
+  consumedDigests.clear();
+  if (saved && Array.isArray(saved.intents)) {
+    for (const item of saved.intents) {
+      if (item && typeof item.intentId === 'string') {
+        issuedIntents.set(item.intentId, item);
+      }
+    }
+  }
+  if (saved && Array.isArray(saved.consumedDigests)) {
+    for (const rec of saved.consumedDigests) {
+      if (rec && typeof rec.digest === 'string') {
+        consumedDigests.set(rec.digest.toLowerCase(), rec);
+      }
+    }
+  }
+}
+
+function persistGaslessIntents(store: SiphonStateStore | null = activeIntentStateStore): void {
+  if (!store) return;
+  store.save<PersistedGaslessIntentState>('gasless_intents', {
+    intents: Array.from(issuedIntents.values()),
+    consumedDigests: Array.from(consumedDigests.values()),
+  });
+}
+
+/**
+ * Configures a pluggable `SiphonStateStore` for gasless intent tracking and
+ * replay-protected consumed EIP-712 digests, immediately hydrating persisted state.
+ */
+export function configureGaslessIntentStore(store: SiphonStateStore | null): void {
+  activeIntentStateStore = store;
+  if (store) {
+    hydrateGaslessIntentsFromStore(store);
+  }
+}
+
+/**
+ * Returns true if the given 32-byte EIP-712 digest has already been consumed.
+ */
+export function isGaslessDigestConsumed(digest: string): boolean {
+  return consumedDigests.has(digest.trim().toLowerCase());
+}
 
 function keccakHex(bytes: Uint8Array): string {
   return '0x' + Buffer.from(keccak_256(bytes)).toString('hex');
@@ -308,6 +382,8 @@ export interface SignedIntentReceipt {
   signatureValid: boolean;
   signatureFingerprint: string;
   txHash?: string;
+  relayerAddress?: string;
+  diagnostic?: string;
   nextStep: string;
 }
 
@@ -348,10 +424,11 @@ export function isSponsorRelayerConfigured(chain?: EvmChainId): boolean {
 }
 
 /**
- * Clears in-memory tracked intents (for deterministic testing).
+ * Clears in-memory tracked intents and consumed digests (for deterministic testing).
  */
 export function clearTrackedGaslessIntentsForTest(): void {
   issuedIntents.clear();
+  consumedDigests.clear();
 }
 
 /**
@@ -676,6 +753,7 @@ export function buildGaslessSweepIntent(params: {
     chain: params.chain,
     chainId: cfg.chainId,
     userAddress: params.userAddress.toLowerCase(),
+    routerAddress,
     deadline,
     eligible: sponsorEligible,
     rejectionReason: sponsorRejectionReason,
@@ -689,6 +767,7 @@ export function buildGaslessSweepIntent(params: {
     const oldest = issuedIntents.keys().next().value;
     if (oldest) issuedIntents.delete(oldest);
   }
+  persistGaslessIntents();
 
   return {
     intentId,
@@ -791,6 +870,12 @@ export function submitSignedGaslessIntent(params: {
       `Cannot submit preview-only intent on ${cfg.name}: deploy SiphonRouter/SiphonSweepDelegate and set SIPHON_ROUTER_${params.chain.toUpperCase()} + SIPHON_FEE_RECIPIENT_EVM.`
     );
   }
+  const normalizedDigest = tracked.eip712Digest.toLowerCase();
+  if (consumedDigests.has(normalizedDigest)) {
+    throw new Error(
+      `Gasless sweep intent digest ${normalizedDigest} has already been consumed (replay rejected).`
+    );
+  }
   if (tracked.chain !== params.chain) {
     throw new Error(`Chain mismatch for intent ${params.intentId}: expected ${tracked.chain}, got ${params.chain}.`);
   }
@@ -812,8 +897,21 @@ export function submitSignedGaslessIntent(params: {
     );
   }
 
-  // Single-use replay protection: mark consumed immediately after cryptographic verification
+  // Single-use replay protection: mark consumed immediately after cryptographic verification & persist
   tracked.consumed = true;
+  consumedDigests.set(normalizedDigest, {
+    digest: normalizedDigest,
+    intentId: params.intentId,
+    chain: params.chain,
+    consumedAt: Date.now(),
+    deadline: tracked.deadline,
+  });
+  while (consumedDigests.size > MAX_CONSUMED_DIGESTS) {
+    const oldestDigest = consumedDigests.keys().next().value;
+    if (!oldestDigest) break;
+    consumedDigests.delete(oldestDigest);
+  }
+  persistGaslessIntents();
 
   const signatureFingerprint =
     '0x' + crypto.createHash('sha256').update(sig).digest('hex').slice(0, 16);
@@ -833,8 +931,105 @@ export function submitSignedGaslessIntent(params: {
     recoveredSigner,
     signatureValid: true,
     signatureFingerprint,
+    diagnostic: configured
+      ? 'Verified EIP-712 intent queued; call submitAndBroadcastSignedGaslessIntent or broadcastSignedRelayerTx to broadcast.'
+      : `Relayer key SIPHON_RELAYER_PRIVATE_KEY is unconfigured for ${cfg.name}.`,
     nextStep: configured
       ? `EIP-712 signature cryptographically verified for ${recoveredSigner}. Intent ${params.intentId} queued for sponsored broadcast on ${cfg.name} (not yet attested onchain).`
       : `EIP-712 signature verified (${signatureFingerprint}) for ${recoveredSigner}, NOT broadcast or attested. Configure SIPHON_RELAYER_PRIVATE_KEY to broadcast sponsored sweeps on ${cfg.name}.`,
+  };
+}
+
+/**
+ * Verifies a user-signed EIP-712 gasless sweep intent AND attempts real onchain broadcast
+ * via `broadcastSignedRelayerTx()` when `SIPHON_RELAYER_PRIVATE_KEY`, router, and execution
+ * calldata (`txCalldata`) are available.
+ *
+ * Always fails closed honestly (`broadcasted: false`, never fabricates tx hashes) if the
+ * relayer key, router, calldata, or upstream RPC is unavailable.
+ */
+export async function submitAndBroadcastSignedGaslessIntent(params: {
+  intentId: string;
+  chain: EvmChainId;
+  userAddress: string;
+  signature: string;
+  deadline: number;
+  txCalldata?: string;
+  gasLimit?: bigint;
+  maxFeePerGasWei?: bigint;
+  maxPriorityFeePerGasWei?: bigint;
+  nonce?: number;
+  rpcUrls?: string[];
+  sendRawTransaction?: (ctx: RelayerCustomBroadcasterContext) => Promise<string>;
+  rpcCall?: typeof evmJsonRpcCall;
+}): Promise<SignedIntentReceipt & { broadcastResult?: RelayerBroadcastResult }> {
+  // Cryptographic EIP-712 verification + fail-closed single-use replay persistence
+  const receipt = submitSignedGaslessIntent({
+    intentId: params.intentId,
+    chain: params.chain,
+    userAddress: params.userAddress,
+    signature: params.signature,
+    deadline: params.deadline,
+  });
+
+  if (!receipt.accepted) {
+    return receipt;
+  }
+
+  const tracked = issuedIntents.get(params.intentId);
+  const targetContract =
+    tracked?.mode === 'eip7702_delegate'
+      ? params.userAddress
+      : tracked?.routerAddress ?? getChainRouterAddress(params.chain);
+
+  if (!params.txCalldata?.trim()) {
+    return {
+      ...receipt,
+      broadcasted: false,
+      settlementStatus: 'queued_pending_broadcast',
+      diagnostic:
+        'Relayer key and router are configured, but encoded router/delegate execution calldata (txCalldata) was not supplied; refusing to fabricate a transaction hash.',
+    };
+  }
+
+  const broadcastResult = await broadcastSignedRelayerTx({
+    chain: params.chain,
+    to: targetContract,
+    data: params.txCalldata,
+    gasLimit: params.gasLimit,
+    maxFeePerGasWei: params.maxFeePerGasWei,
+    maxPriorityFeePerGasWei: params.maxPriorityFeePerGasWei,
+    nonce: params.nonce,
+    rpcUrls: params.rpcUrls,
+    sendRawTransaction: params.sendRawTransaction,
+    rpcCall: params.rpcCall,
+  });
+
+  if (!broadcastResult.broadcasted || !broadcastResult.txHash) {
+    return {
+      ...receipt,
+      broadcasted: false,
+      settlementStatus: 'queued_pending_broadcast',
+      relayerAddress: broadcastResult.relayerAddress,
+      diagnostic: broadcastResult.diagnostic,
+      nextStep: `EIP-712 signature verified, but relayer broadcast did not complete: ${broadcastResult.diagnostic}`,
+      broadcastResult,
+    };
+  }
+
+  if (tracked) {
+    tracked.txHash = broadcastResult.txHash;
+    persistGaslessIntents();
+  }
+
+  return {
+    ...receipt,
+    broadcasted: true,
+    settlementStatus: 'broadcast',
+    txHash: broadcastResult.txHash,
+    relayerAddress: broadcastResult.relayerAddress,
+    diagnostic: broadcastResult.diagnostic,
+    nextStep: `Sponsored EIP-1559 transaction broadcast on ${receipt.chainName}: ${broadcastResult.txHash}.`,
+    broadcastResult,
   };
 }

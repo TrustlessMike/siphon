@@ -1,0 +1,46 @@
+# Fly.io deployment manifest for Siphon Migrator
+# Before first deploy:
+#   1. fly volumes create siphon_data --region iad --size 1
+#   2. fly secrets set SIPHON_ADMIN_SESSION_TOKEN="$(openssl rand -hex 32)"
+#   3. fly secrets set SIPHON_ALLOWED_HOSTS="siphon-migrator.fly.dev" SIPHON_ALLOWED_ORIGIN="https://siphon-migrator.fly.dev" SIPHON_PUBLIC_BASE_URL="https://siphon-migrator.fly.dev"
+
+app = "siphon-migrator"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  HOST = "0.0.0.0"
+  PORT = "4420"
+  SIPHON_DATA_DIR = "/data"
+  SIPHON_TRUST_PROXY = "true"
+  SIPHON_REQUIRE_PLUGIN_AUTH = "true"
+  SIPHON_RATE_LIMIT_MAX = "240"
+  SIPHON_RATE_LIMIT_WINDOW_MS = "60000"
+  SIPHON_RPC_COOLDOWN_MS = "60000"
+
+[[mounts]]
+  source = "siphon_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 4420
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/api/health"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

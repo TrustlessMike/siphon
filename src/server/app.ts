@@ -27,9 +27,17 @@ import {
 } from '../execution/tx-builder.js';
 import {
   buildGaslessSweepIntent,
+  configureGaslessIntentStore,
   isSponsorRelayerConfigured,
-  submitSignedGaslessIntent,
+  submitAndBroadcastSignedGaslessIntent,
 } from '../relayer/sponsor.js';
+import { getRpcCircuitBreakerMetrics } from '../scanner/rpc.js';
+import { createStateStore, type SiphonStateStore } from '../storage/state-store.js';
+import {
+  buildRateLimitHeaders,
+  SlidingWindowRateLimiter,
+  type RateLimiterOptions,
+} from './rate-limit.js';
 import {
   detectAddress,
   EnsResolutionError,
@@ -116,6 +124,10 @@ export interface SiphonServerOptions {
   degenClient?: JupiterMarketsClient;
   nowMs?: () => number;
   liveGasFetcher?: (chain: EvmChainId) => Promise<number | null>;
+  stateStore?: SiphonStateStore;
+  dataDir?: string | null;
+  rateLimit?: RateLimiterOptions;
+  trustProxy?: boolean;
 }
 
 const VALID_JOB_LEG_STATUSES = new Set<JobLegStatus>([
@@ -572,6 +584,30 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
   const adminSessionToken =
     opts.adminSessionToken?.trim() || process.env.SIPHON_ADMIN_SESSION_TOKEN?.trim() || null;
 
+  const stateStore = createStateStore({
+    stateStore: opts.stateStore,
+    dataDir: opts.dataDir,
+  });
+  if (stateStore.persistent) {
+    configureGaslessIntentStore(stateStore);
+  }
+  const rateLimiter = new SlidingWindowRateLimiter({
+    ...opts.rateLimit,
+    trustProxy: opts.rateLimit?.trustProxy ?? opts.trustProxy,
+    nowMs: opts.rateLimit?.nowMs ?? opts.nowMs,
+  });
+
+  const startedAtMs = (opts.nowMs ?? (() => Date.now()))();
+  const runtimeMetrics = {
+    requestsTotal: 0,
+    apiRequestsTotal: 0,
+    mcpRequestsTotal: 0,
+    status2xx: 0,
+    status4xx: 0,
+    status429: 0,
+    status5xx: 0,
+  };
+
   const scanCache = new BoundedTtlCache<string, ScanReport>({
     maxEntries: opts.scanCacheMaxEntries ?? DEFAULT_SCAN_CACHE_MAX,
     ttlMs: opts.scanCacheTtlMs ?? DEFAULT_SCAN_CACHE_TTL_MS,
@@ -581,12 +617,24 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
     maxJobs: opts.jobStoreMaxJobs,
     ttlMs: opts.jobStoreTtlMs,
     nowMs: opts.nowMs,
+    stateStore,
+    resumePollersOnLoad: stateStore.persistent,
   });
-  const agentEngine = new SiphonAgentEngine({ nowMs: opts.nowMs });
+  const agentEngine = new SiphonAgentEngine({ nowMs: opts.nowMs, stateStore });
   const degenClient = opts.degenClient ?? new JupiterMarketsClient({ nowMs: opts.nowMs });
   const preservationAgents = new PreservationAgentStore({ nowMs: opts.nowMs });
 
   const server = http.createServer(async (req, res) => {
+    runtimeMetrics.requestsTotal += 1;
+    res.on('finish', () => {
+      const code = res.statusCode;
+      if (code >= 200 && code < 300) runtimeMetrics.status2xx += 1;
+      else if (code === 429) {
+        runtimeMetrics.status4xx += 1;
+        runtimeMetrics.status429 += 1;
+      } else if (code >= 400 && code < 500) runtimeMetrics.status4xx += 1;
+      else if (code >= 500) runtimeMetrics.status5xx += 1;
+    });
     try {
       const method = (req.method ?? 'GET').toUpperCase();
       const rawUrl = req.url ?? '/';
@@ -705,6 +753,28 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         return;
       }
 
+      if (pathname.startsWith('/api/')) runtimeMetrics.apiRequestsTotal += 1;
+      else if (pathname === '/mcp') runtimeMetrics.mcpRequestsTotal += 1;
+
+      if (
+        rateLimiter.enabled &&
+        ((pathname.startsWith('/api/') && pathname !== '/api/health') || pathname === '/mcp')
+      ) {
+        const rl = rateLimiter.consumeRequest(req);
+        const rlHeaders = buildRateLimitHeaders(rl);
+        if (!rl.allowed) {
+          return sendJson(
+            res,
+            429,
+            {
+              error: 'Rate limit exceeded. Please retry later.',
+              retryAfterSec: rl.retryAfterSec,
+            },
+            { ...corsHeaders, ...rlHeaders }
+          );
+        }
+      }
+
       if (isPrivilegedCrossOriginProtectedRoute(pathname, method)) {
         const originCheck = checkCrossOriginAndCsrf(method === 'POST');
         if (!originCheck.ok) {
@@ -739,6 +809,35 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           protocolFeeBps: protocolFee.feeBps,
           protocolFee,
           l2IndexerProvider: getL2IndexerProvider(),
+        });
+      }
+
+      if (method === 'GET' && pathname === '/api/metrics') {
+        if (adminSessionToken && !hasValidAdminSession()) {
+          return reply(401, { error: 'Missing or invalid X-Siphon-Admin-Session header.' });
+        }
+        const now = (opts.nowMs ?? (() => Date.now()))();
+        const jobs = jobStore.listJobs();
+        return reply(200, {
+          service: 'siphon-migrator',
+          timestamp: new Date(now).toISOString(),
+          uptimeSec: Math.max(0, Math.floor((now - startedAtMs) / 1000)),
+          requests: { ...runtimeMetrics },
+          rateLimit: rateLimiter.getStats(),
+          rpc: getRpcCircuitBreakerMetrics(now),
+          persistence: {
+            kind: stateStore.kind,
+            persistent: stateStore.persistent,
+            namespaces: stateStore.listNamespaces(),
+          },
+          stores: {
+            jobsTotal: jobs.length,
+            activeJobs: jobs.filter((j) => j.status === 'active').length,
+            mandatesTotal: agentEngine.listMandates().length,
+            approvalsTotal: agentEngine.listApprovals().length,
+            pluginTokensTotal: agentEngine.listPluginTokens().length,
+            scanCacheEntries: scanCache.size,
+          },
         });
       }
 
@@ -1705,6 +1804,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           signature?: string;
           deadline?: number;
           solanaDestination?: string;
+          txCalldata?: string;
         }>(req);
 
         if (!body.intentId || !body.chain || !body.userAddress || !body.signature || !body.deadline) {
@@ -1715,12 +1815,13 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
 
         try {
           if (isEvmChain(body.chain)) {
-            const receipt = submitSignedGaslessIntent({
+            const receipt = await submitAndBroadcastSignedGaslessIntent({
               intentId: body.intentId,
               chain: body.chain,
               userAddress: body.userAddress,
               signature: body.signature,
               deadline: body.deadline,
+              txCalldata: body.txCalldata,
             });
             return reply(200, receipt);
           }
@@ -1993,5 +2094,5 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
     jobStore.dispose();
   });
 
-  return { server, scanCache, jobStore, agentEngine, preservationAgents };
+  return { server, scanCache, jobStore, agentEngine, preservationAgents, stateStore, rateLimiter };
 }
