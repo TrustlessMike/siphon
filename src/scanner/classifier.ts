@@ -201,7 +201,7 @@ function classifyAndBuildReport(params: {
 
     const chainItemCount = Math.max(1, countsPerChain.get(item.chain) ?? 1);
     const estimatedGasUsd = round4(singleGasUnits * gasPriceEth * meta.nativePriceUsd);
-    // Batching via SiphonRouter saves ~42% gas (eliminates repeated 21k base tx + repeated approvals + shared CCTP burn)
+    // Batching via TurgaliumRouter saves ~42% gas (eliminates repeated 21k base tx + repeated approvals + shared CCTP burn)
     const batchedGasUsd = round4(
       estimatedGasUsd * (chainItemCount > 1 ? 0.54 : 0.85)
     );

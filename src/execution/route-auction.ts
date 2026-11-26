@@ -304,7 +304,7 @@ function buildProtocolFeeTx(params: {
   if (!feeConfig.feeRecipientEvm || feeRaw <= 0n) return null;
   const cfg = EVM_CHAINS[chain];
   const recipient = feeConfig.feeRecipientEvm;
-  const destLabel = feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'SiphonFeeVault';
+  const destLabel = feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'TurgaliumFeeVault';
 
   if (asset.address === 'native') {
     return {

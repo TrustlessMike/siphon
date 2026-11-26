@@ -1,10 +1,10 @@
-# Fly.io deployment manifest for Siphon Migrator
+# Fly.io deployment manifest for Turgalium Migrator
 # Before first deploy:
-#   1. fly volumes create siphon_data --region iad --size 1
-#   2. fly secrets set SIPHON_ADMIN_SESSION_TOKEN="$(openssl rand -hex 32)"
-#   3. fly secrets set SIPHON_ALLOWED_HOSTS="siphon-migrator.fly.dev" SIPHON_ALLOWED_ORIGIN="https://siphon-migrator.fly.dev" SIPHON_PUBLIC_BASE_URL="https://siphon-migrator.fly.dev"
+#   1. fly volumes create turgalium_data --region iad --size 1
+#   2. fly secrets set TURGALIUM_ADMIN_SESSION_TOKEN="$(openssl rand -hex 32)"
+#   3. fly secrets set TURGALIUM_ALLOWED_HOSTS="turgalium-migrator.fly.dev" TURGALIUM_ALLOWED_ORIGIN="https://turgalium-migrator.fly.dev" TURGALIUM_PUBLIC_BASE_URL="https://turgalium-migrator.fly.dev"
 
-app = "siphon-migrator"
+app = "turgalium-migrator"
 primary_region = "iad"
 
 [build]
@@ -14,15 +14,15 @@ primary_region = "iad"
   NODE_ENV = "production"
   HOST = "0.0.0.0"
   PORT = "4420"
-  SIPHON_DATA_DIR = "/data"
-  SIPHON_TRUST_PROXY = "true"
-  SIPHON_REQUIRE_PLUGIN_AUTH = "true"
-  SIPHON_RATE_LIMIT_MAX = "240"
-  SIPHON_RATE_LIMIT_WINDOW_MS = "60000"
-  SIPHON_RPC_COOLDOWN_MS = "60000"
+  TURGALIUM_DATA_DIR = "/data"
+  TURGALIUM_TRUST_PROXY = "true"
+  TURGALIUM_REQUIRE_PLUGIN_AUTH = "true"
+  TURGALIUM_RATE_LIMIT_MAX = "240"
+  TURGALIUM_RATE_LIMIT_WINDOW_MS = "60000"
+  TURGALIUM_RPC_COOLDOWN_MS = "60000"
 
 [[mounts]]
-  source = "siphon_data"
+  source = "turgalium_data"
   destination = "/data"
 
 [http_service]

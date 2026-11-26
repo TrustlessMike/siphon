@@ -27,7 +27,7 @@ import {
   quotePanoraAptosSwap,
 } from '../src/execution/non-evm-converter.js';
 import type { ScannedAsset } from '../src/scanner/types.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 
 const SAMPLE_SOLANA_WALLET = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
 
@@ -185,7 +185,7 @@ test('Bitcoin Ordinals/Runes guard, P2WSH vBytes, TON address validation, and Tr
 });
 
 test('Unified POST /api/tx/prepare-chain-batch executes real non-EVM direct conversion routing across all 6 families', async () => {
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');

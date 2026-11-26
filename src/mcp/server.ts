@@ -1,6 +1,6 @@
 import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
-import { SiphonAgentEngine, type AgentActionType } from '../agent/mandate-engine.js';
+import { TurgaliumAgentEngine, type AgentActionType } from '../agent/mandate-engine.js';
 import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import {
   scanReclaimableSolanaRent,
@@ -54,7 +54,7 @@ export interface ScanCacheLike {
 }
 
 export interface McpToolContext {
-  agentEngine: SiphonAgentEngine;
+  agentEngine: TurgaliumAgentEngine;
   scanCache: ScanCacheLike;
   /** Optional verified Bearer token scopes; when provided, enforces per-tool scope checks */
   tokenScopes?: string[];
@@ -68,16 +68,16 @@ export interface McpToolContext {
 }
 
 const MCP_TOOL_REQUIRED_SCOPE: Record<string, string> = {
-  siphon_request_sweep_permission: 'agent:propose',
-  siphon_plan_dust_conversion: 'dust:plan',
-  siphon_scan_wallets: 'scan:read',
-  siphon_list_agent_mandates: 'scan:read',
-  siphon_list_pending_approvals: 'scan:read',
-  siphon_preservation_audit: 'scan:read',
-  siphon_list_unlock_schedule: 'scan:read',
-  siphon_solana_rent_scan: 'scan:read',
-  siphon_solana_yield_preview: 'scan:read',
-  siphon_degen_markets: 'scan:read',
+  turgalium_request_sweep_permission: 'agent:propose',
+  turgalium_plan_dust_conversion: 'dust:plan',
+  turgalium_scan_wallets: 'scan:read',
+  turgalium_list_agent_mandates: 'scan:read',
+  turgalium_list_pending_approvals: 'scan:read',
+  turgalium_preservation_audit: 'scan:read',
+  turgalium_list_unlock_schedule: 'scan:read',
+  turgalium_solana_rent_scan: 'scan:read',
+  turgalium_solana_yield_preview: 'scan:read',
+  turgalium_degen_markets: 'scan:read',
 };
 
 export interface JsonRpcRequest {
@@ -100,9 +100,9 @@ const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F-\u009F]/;
 
 const defaultMcpJupiterClient = new JupiterMarketsClient();
 
-export const SIPHON_MCP_TOOLS = [
+export const TURGALIUM_MCP_TOOLS = [
   {
-    name: 'siphon_scan_wallets',
+    name: 'turgalium_scan_wallets',
     description:
       'Scan and unify one or more wallets across 30 chains (19 EVMs, 6 Cosmos/IBC, Sui, Aptos, TON, Tron, Bitcoin) with live DeFi detection and signed Two-Level ROI verdicts. Returned token symbols/names are sanitized untrusted on-chain data.',
     annotations: {
@@ -140,7 +140,7 @@ export const SIPHON_MCP_TOOLS = [
     },
   },
   {
-    name: 'siphon_plan_dust_conversion',
+    name: 'turgalium_plan_dust_conversion',
     description:
       'Analyze small/dust token balances across all scanned chains and compute exact per-(wallet, chain) batch-rescue ROI savings vs individual swaps.',
     annotations: {
@@ -161,9 +161,9 @@ export const SIPHON_MCP_TOOLS = [
     },
   },
   {
-    name: 'siphon_list_agent_mandates',
+    name: 'turgalium_list_agent_mandates',
     description:
-      'Inspect active SiphonAgentVault policy-bounded smart-contract agent mandates, locked Solana destinations, and remaining daily USD caps. Mandates are owner-created only in the Turgalium UI or on-chain.',
+      'Inspect active TurgaliumAgentVault policy-bounded smart-contract agent mandates, locked Solana destinations, and remaining daily USD caps. Mandates are owner-created only in the Turgalium UI or on-chain.',
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -177,9 +177,9 @@ export const SIPHON_MCP_TOOLS = [
     },
   },
   {
-    name: 'siphon_request_sweep_permission',
+    name: 'turgalium_request_sweep_permission',
     description:
-      'Propose a dust conversion, DeFi withdrawal, or multi-chain sweep to Solana. Enforces human-in-the-loop permission approval (or active SiphonAgentVault mandate auto-approval under cap) and verifies assetIds against scanCache.',
+      'Propose a dust conversion, DeFi withdrawal, or multi-chain sweep to Solana. Enforces human-in-the-loop permission approval (or active TurgaliumAgentVault mandate auto-approval under cap) and verifies assetIds against scanCache.',
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
@@ -217,7 +217,7 @@ export const SIPHON_MCP_TOOLS = [
     },
   },
   {
-    name: 'siphon_list_pending_approvals',
+    name: 'turgalium_list_pending_approvals',
     description: 'Check pending, approved, or rejected AI permission requests in the Turgalium Permission Gate.',
     annotations: {
       readOnlyHint: true,
@@ -232,7 +232,7 @@ export const SIPHON_MCP_TOOLS = [
     },
   },
   {
-    name: 'siphon_preservation_audit',
+    name: 'turgalium_preservation_audit',
     description:
       'Run Turgalium Capital-Preservation Route Auction (evaluatePreservationPlan) for a cached scanId or walletAddress, returning exact dollars saved (gas batching, Permit2/EIP-2612 approvals, negative-ROI pruning, route auction), best bridge route per chain, and Ethereum L1 gas-timing advice. Read-only.',
     annotations: {
@@ -262,7 +262,7 @@ export const SIPHON_MCP_TOOLS = [
     },
   },
   {
-    name: 'siphon_list_unlock_schedule',
+    name: 'turgalium_list_unlock_schedule',
     description:
       'Return live pending on-chain unlocks across Ethereum Lido Withdrawal Queue (stETH NFTs), Ethena sUSDe cooldowns, Cosmos staking unbonding delegations, scan-indexed DeFi locks, and attested Circle CCTP claims, deduplicated and sorted soonest-first. Read-only.',
     annotations: {
@@ -315,7 +315,7 @@ export const SIPHON_MCP_TOOLS = [
     },
   },
   {
-    name: 'siphon_solana_rent_scan',
+    name: 'turgalium_solana_rent_scan',
     description:
       'Scan a Solana wallet across SPL Token and Token-2022 programs for zero-balance non-frozen empty Associated Token Accounts (ATAs) eligible for free SOL rent recovery (0.00203928 SOL per empty account). Read-only; never signs or submits transactions.',
     annotations: {
@@ -341,7 +341,7 @@ export const SIPHON_MCP_TOOLS = [
     },
   },
   {
-    name: 'siphon_solana_yield_preview',
+    name: 'turgalium_solana_yield_preview',
     description:
       'Compute Turgalium Preservation-First Solana post-arrival split: default 90% Preserved Yield (JupSOL, Jupiter Lend jlUSDC, or Kamino USDC) + 10% Degen Side-Pocket with exact micro-USDC accounting and projected APY. Read-only preview; never signs or swaps autonomously.',
     annotations: {
@@ -382,7 +382,7 @@ export const SIPHON_MCP_TOOLS = [
     },
   },
   {
-    name: 'siphon_degen_markets',
+    name: 'turgalium_degen_markets',
     description:
       'List live trending Jupiter Prediction Markets & implied odds for AI-assisted market research. Strictly read-only: NEVER places bets, builds signed orders, or moves funds autonomously without explicit user approval in Turgalium.',
     annotations: {
@@ -536,7 +536,7 @@ export async function handleMcpJsonRpc(
         protocolVersion: negotiated,
         capabilities: { tools: {} },
         serverInfo: {
-          name: 'siphon-migrator-mcp',
+          name: 'turgalium-migrator-mcp',
           version: '2.0.0',
         },
       },
@@ -551,7 +551,7 @@ export async function handleMcpJsonRpc(
     return {
       jsonrpc: '2.0',
       id,
-      result: { tools: SIPHON_MCP_TOOLS },
+      result: { tools: TURGALIUM_MCP_TOOLS },
     };
   }
 
@@ -566,7 +566,7 @@ export async function handleMcpJsonRpc(
     }
     const args = rawArgs as Record<string, unknown>;
 
-    if (toolName === 'siphon_create_agent_mandate') {
+    if (toolName === 'turgalium_create_agent_mandate') {
       return {
         jsonrpc: '2.0',
         id,
@@ -575,14 +575,14 @@ export async function handleMcpJsonRpc(
           content: [
             {
               type: 'text',
-              text: 'siphon_create_agent_mandate is disabled via MCP for security: mandates must be created by the wallet owner in the Siphon UI or on-chain in SiphonAgentVault.',
+              text: 'turgalium_create_agent_mandate is disabled via MCP for security: mandates must be created by the wallet owner in the Turgalium UI or on-chain in TurgaliumAgentVault.',
             },
           ],
         },
       };
     }
 
-    const knownTool = SIPHON_MCP_TOOLS.some((t) => t.name === toolName);
+    const knownTool = TURGALIUM_MCP_TOOLS.some((t) => t.name === toolName);
     if (!knownTool) {
       return jsonRpcError(id, -32602, `Unknown MCP tool: ${toolName}`);
     }
@@ -602,7 +602,7 @@ export async function handleMcpJsonRpc(
       let result: unknown;
       const nowMs = (ctx.nowMs ?? (() => Date.now()))();
 
-      if (toolName === 'siphon_scan_wallets') {
+      if (toolName === 'turgalium_scan_wallets') {
         if (!Array.isArray(args.wallets) || args.wallets.length === 0 || args.wallets.length > 20) {
           return jsonRpcError(id, -32602, 'Invalid params: wallets must be an array of 1 to 20 wallet descriptors.');
         }
@@ -655,7 +655,7 @@ export async function handleMcpJsonRpc(
             action: a.action,
           })),
         };
-      } else if (toolName === 'siphon_plan_dust_conversion') {
+      } else if (toolName === 'turgalium_plan_dust_conversion') {
         if (typeof args.scanId !== 'string' || !args.scanId.trim() || args.scanId.length > 128) {
           return jsonRpcError(id, -32602, 'Invalid params: scanId must be a non-empty string <= 128 chars.');
         }
@@ -669,15 +669,15 @@ export async function handleMcpJsonRpc(
           return jsonRpcError(id, -32602, 'Invalid params: protocolFeeBps must be a finite number in [500, 1000].');
         }
         const scan = ctx.scanCache.get(args.scanId.trim());
-        if (!scan) throw new Error('scanId not found — call siphon_scan_wallets first.');
+        if (!scan) throw new Error('scanId not found — call turgalium_scan_wallets first.');
         result = planDustConversion({
           scan,
           maxDustThresholdUsd: maxDust,
           protocolFeeBps: feeBps,
         });
-      } else if (toolName === 'siphon_list_agent_mandates') {
+      } else if (toolName === 'turgalium_list_agent_mandates') {
         result = { mandates: ctx.agentEngine.listMandates() };
-      } else if (toolName === 'siphon_request_sweep_permission') {
+      } else if (toolName === 'turgalium_request_sweep_permission') {
         if (typeof args.actionType !== 'string' || !VALID_ACTIONS.has(args.actionType)) {
           return jsonRpcError(id, -32602, `Invalid params: actionType must be one of ${Array.from(VALID_ACTIONS).join(', ')}.`);
         }
@@ -724,9 +724,9 @@ export async function handleMcpJsonRpc(
           assetIds: Array.isArray(args.assetIds) ? args.assetIds.map(String) : [],
           scanCache: ctx.scanCache.values(),
         });
-      } else if (toolName === 'siphon_list_pending_approvals') {
+      } else if (toolName === 'turgalium_list_pending_approvals') {
         result = { approvals: ctx.agentEngine.listApprovals() };
-      } else if (toolName === 'siphon_preservation_audit') {
+      } else if (toolName === 'turgalium_preservation_audit') {
         const hasScanId = args.scanId !== undefined;
         const hasWallet = args.walletAddress !== undefined;
         if (!hasScanId && !hasWallet) {
@@ -807,7 +807,7 @@ export async function handleMcpJsonRpc(
           (scanIdClean ? ctx.scanCache.get(scanIdClean) : undefined) ??
           (walletClean ? findCachedScanByWallet(ctx.scanCache, walletClean) : undefined);
         if (!scan) {
-          throw new Error('Cached scan not found — call siphon_scan_wallets first.');
+          throw new Error('Cached scan not found — call turgalium_scan_wallets first.');
         }
 
         const plan = await evaluatePreservationPlan(scan, {
@@ -857,7 +857,7 @@ export async function handleMcpJsonRpc(
           unlockScheduleCount: plan.unlockSchedule.length,
           unlockSchedule: plan.unlockSchedule,
         };
-      } else if (toolName === 'siphon_list_unlock_schedule') {
+      } else if (toolName === 'turgalium_list_unlock_schedule') {
         const hasScanId = args.scanId !== undefined;
         const hasEvm = args.evmAddress !== undefined;
         const hasCosmos = args.cosmosAddresses !== undefined;
@@ -883,7 +883,7 @@ export async function handleMcpJsonRpc(
           }
           scan = ctx.scanCache.get(args.scanId.trim());
           if (!scan) {
-            throw new Error('scanId not found — call siphon_scan_wallets first.');
+            throw new Error('scanId not found — call turgalium_scan_wallets first.');
           }
         }
 
@@ -1044,7 +1044,7 @@ export async function handleMcpJsonRpc(
           unlockSchedule: merged,
           warnings,
         };
-      } else if (toolName === 'siphon_solana_rent_scan') {
+      } else if (toolName === 'turgalium_solana_rent_scan') {
         const ownerCheck = assertValidSolanaAddressStrict(args.ownerAddress, 'ownerAddress');
         if (!ownerCheck.ok) {
           return jsonRpcError(id, -32602, ownerCheck.error);
@@ -1093,7 +1093,7 @@ export async function handleMcpJsonRpc(
           batchesRequired: scanRes.batchesRequired,
           reclaimableAccounts: scanRes.reclaimableAccounts.slice(0, 50),
         };
-      } else if (toolName === 'siphon_solana_yield_preview') {
+      } else if (toolName === 'turgalium_solana_yield_preview') {
         const totalUsdcAmount = parseStrictFiniteNumber(args.totalUsdcAmount);
         if (totalUsdcAmount === null || totalUsdcAmount <= 0 || totalUsdcAmount > MAX_TOTAL_USDC_AMOUNT) {
           return jsonRpcError(
@@ -1167,7 +1167,7 @@ export async function handleMcpJsonRpc(
           result = {
             readOnly: true,
             autonomousExecutionAllowed: false,
-            planVersion: 'siphon-solana-yield-park-v1',
+            planVersion: 'turgalium-solana-yield-park-v1',
             ownerAddress: ownerAddress ?? null,
             strategy,
             split,
@@ -1187,7 +1187,7 @@ export async function handleMcpJsonRpc(
             warnings: [],
           };
         }
-      } else if (toolName === 'siphon_degen_markets') {
+      } else if (toolName === 'turgalium_degen_markets') {
         let category: JupiterCategory = 'all';
         if (args.category !== undefined) {
           if (typeof args.category !== 'string' || !VALID_JUPITER_CATEGORIES.has(args.category.trim().toLowerCase())) {
@@ -1311,9 +1311,9 @@ export async function handleMcpJsonRpc(
 export const handleMcpRequest = handleMcpJsonRpc;
 
 /**
- * Proxies stdio MCP JSON-RPC requests to a running Siphon HTTP server (`POST /mcp`)
+ * Proxies stdio MCP JSON-RPC requests to a running Turgalium HTTP server (`POST /mcp`)
  * so Claude Desktop / Claude Code stdio sessions share the exact same mandates,
- * pending approvals, and scanCache as the Siphon web UI (preventing split-brain).
+ * pending approvals, and scanCache as the Turgalium web UI (preventing split-brain).
  */
 export async function proxyMcpJsonRpcToHttp(
   body: JsonRpcRequest,
@@ -1328,10 +1328,10 @@ export async function proxyMcpJsonRpcToHttp(
   try {
     parsed = new URL(opts.apiUrl.trim());
   } catch {
-    return jsonRpcError(id, -32000, `Invalid SIPHON_API_URL: ${opts.apiUrl}`);
+    return jsonRpcError(id, -32000, `Invalid TURGALIUM_API_URL: ${opts.apiUrl}`);
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return jsonRpcError(id, -32000, `Unsupported SIPHON_API_URL protocol: ${parsed.protocol}`);
+    return jsonRpcError(id, -32000, `Unsupported TURGALIUM_API_URL protocol: ${parsed.protocol}`);
   }
 
   const endpoint = parsed.pathname.endsWith('/mcp')
@@ -1371,16 +1371,16 @@ export async function proxyMcpJsonRpcToHttp(
     if (!res.ok) {
       const msg =
         (json && typeof json.error === 'string' && json.error) ||
-        `Siphon HTTP MCP proxy error (HTTP ${res.status})`;
+        `Turgalium HTTP MCP proxy error (HTTP ${res.status})`;
       return jsonRpcError(id, res.status === 401 || res.status === 403 ? -32001 : -32000, msg);
     }
 
-    return jsonRpcError(id, -32603, 'Invalid JSON-RPC response from Siphon HTTP server.');
+    return jsonRpcError(id, -32603, 'Invalid JSON-RPC response from Turgalium HTTP server.');
   } catch (err) {
     return jsonRpcError(
       id,
       -32000,
-      `Failed to reach Siphon HTTP server at ${endpoint}: ${err instanceof Error ? err.message : String(err)}`
+      `Failed to reach Turgalium HTTP server at ${endpoint}: ${err instanceof Error ? err.message : String(err)}`
     );
   }
 }
@@ -1391,8 +1391,8 @@ export function createStdioMcpDispatcher(opts?: {
   ctx?: McpToolContext;
   fetchImpl?: typeof fetch;
 }): (req: JsonRpcRequest) => Promise<Record<string, unknown>> {
-  const apiUrl = (opts?.apiUrl ?? process.env.SIPHON_API_URL ?? '').trim();
-  const apiToken = (opts?.apiToken ?? process.env.SIPHON_API_TOKEN ?? '').trim();
+  const apiUrl = (opts?.apiUrl ?? process.env.TURGALIUM_API_URL ?? '').trim();
+  const apiToken = (opts?.apiToken ?? process.env.TURGALIUM_API_TOKEN ?? '').trim();
 
   if (apiUrl) {
     return (req: JsonRpcRequest) =>
@@ -1404,7 +1404,7 @@ export function createStdioMcpDispatcher(opts?: {
   }
 
   const localCtx: McpToolContext = opts?.ctx ?? {
-    agentEngine: new SiphonAgentEngine(),
+    agentEngine: new TurgaliumAgentEngine(),
     scanCache: new BoundedTtlCache<string, ScanReport>({
       maxEntries: 40,
       ttlMs: 30 * 60 * 1000,

@@ -359,7 +359,7 @@ function buildProtocolFeeTransferTx(params: {
   const evmChain = asEvmChain(asset.chain);
   const cfg = EVM_CHAINS[evmChain];
   const recipient = feeConfig.feeRecipientEvm;
-  const destLabel = feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'SiphonFeeVault';
+  const destLabel = feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'TurgaliumFeeVault';
 
   if (asset.address === 'native') {
     return {
@@ -925,7 +925,7 @@ async function tryRelayBridgeQuote(params: {
           `Live Relay cross-chain route: swaps & fills directly into ${solanaDestination.slice(0, 6)}…${solanaDestination.slice(-4)} on Solana with zero manual claim.`,
           feeConfig.feeRecipientEvm
             ? `Protocol fee ${feeConfig.feePercent}% routed via ${collectionMethod === 'relay_app_fee' ? 'Relay native appFee' : 'onchain EIP-5792 split'} to ${feeConfig.feeRecipientEvm}.`
-            : `Protocol fee ${feeConfig.feePercent}% modeled (set SIPHON_FEE_RECIPIENT_EVM or enter a treasury address to route onchain).`,
+            : `Protocol fee ${feeConfig.feePercent}% modeled (set TURGALIUM_FEE_RECIPIENT_EVM or enter a treasury address to route onchain).`,
         ],
       };
     } catch (err) {
@@ -986,7 +986,7 @@ async function tryLifiBridgeQuote(params: {
     url.searchParams.set('fromAmount', bridgeRaw.toString());
     url.searchParams.set('fromAddress', userAddress);
     url.searchParams.set('toAddress', solanaDestination);
-    url.searchParams.set('integrator', 'siphon');
+    url.searchParams.set('integrator', 'turgalium');
 
     const res = await fetchQuote(
       url.toString(),
@@ -2385,7 +2385,7 @@ export async function prepareChainBatchExecution(params: {
                 assetSymbol: asset.symbol,
                 action: asset.action,
                 provider: 'circle_cctp',
-                label: `Protocol Fee (${feeConfig.feePercent}% USDC → ${feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'SiphonFeeVault'})`,
+                label: `Protocol Fee (${feeConfig.feePercent}% USDC → ${feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'TurgaliumFeeVault'})`,
                 description: `Routes ${(Number(feeRaw) / 10 ** unlocked.decimals).toFixed(2)} USDC (${feeConfig.feeBps} bps) to ${feeConfig.feeRecipientEvm}`,
                 to: cfg.usdcAddress,
                 data: encodeErc20Transfer(feeConfig.feeRecipientEvm, feeRaw),

@@ -27,7 +27,7 @@ import {
   SOLANA_USDC_MINT,
   summarizeDegenPositions,
 } from '../src/degen/jupiter-markets.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 
 const VALID_SOLANA_WALLET = '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
 const VALID_MOCK_BLOCKHASH = '11111111111111111111111111111111';
@@ -387,7 +387,7 @@ test('HTTP endpoints GET /api/degen/markets, GET /api/degen/search, and POST /ap
     },
   });
 
-  const { server } = createSiphonServer({ degenClient });
+  const { server } = createTurgaliumServer({ degenClient });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address() as AddressInfo;
   const base = `http://127.0.0.1:${port}`;
@@ -821,7 +821,7 @@ test('positions normalization, P&L calculation, XSS sanitization, and /positions
     },
   });
 
-  const { server } = createSiphonServer({ degenClient });
+  const { server } = createTurgaliumServer({ degenClient });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address() as AddressInfo;
   const base = `http://127.0.0.1:${port}`;

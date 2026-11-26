@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deterministic end-to-end headless Chromium regression & safety backtest suite for Siphon.
+Deterministic end-to-end headless Chromium regression & safety backtest suite for Turgalium.
 Verifies Desktop (1440x900), Tablet (900x800), and Mobile (390x844) across all 5 views:
   1. Zero-default Solana destination guard & disconnect clearing (C-2)
   2. Stored DOM XSS & injection immunity on leg.assetCount, symbols, protocols (C-1)
@@ -8,7 +8,7 @@ Verifies Desktop (1440x900), Tablet (900x800), and Mobile (390x844) across all 5
      ton_rawSign removal, ensureEvmChain eth_chainId verification, and client pre-sign assertions (C-3, C-4, H-3)
   4. DeFi quick-unwind panel, guided 2-stage auto-bridge, Dust Converter CTA sync,
      mobile 390px visible Honeypot/ROI safety badges, connected 390px/900px 0px overflow,
-     constrained mobile toast rect, non-EVM modal footer copy, and siphon-3d.js rAF pause when hidden.
+     constrained mobile toast rect, non-EVM modal footer copy, and turgalium-3d.js rAF pause when hidden.
 """
 import json
 import os
@@ -17,9 +17,9 @@ import time
 import urllib.request
 from playwright.sync_api import sync_playwright
 
-PORT = int(os.environ.get("SIPHON_E2E_PORT", "4439"))
+PORT = int(os.environ.get("TURGALIUM_E2E_PORT", "4439"))
 BASE = f"http://127.0.0.1:{PORT}"
-SHOT_DIR = os.environ.get("SIPHON_E2E_SCREENSHOT_DIR", "")
+SHOT_DIR = os.environ.get("TURGALIUM_E2E_SCREENSHOT_DIR", "")
 VITALIK = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 VET_ADDR = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"
 SOL_PUBKEY = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
@@ -34,7 +34,7 @@ def wait_ready():
                     return
         except Exception:
             time.sleep(0.15)
-    raise RuntimeError(f"Siphon server failed to start on {BASE}")
+    raise RuntimeError(f"Turgalium server failed to start on {BASE}")
 
 
 def fetch_veteran_scan():
@@ -61,8 +61,8 @@ def main():
         env={
             **os.environ,
             "PORT": str(PORT),
-            "SIPHON_ROUTER_OPTIMISM": "0x2222222222222222222222222222222222222222",
-            "SIPHON_FEE_RECIPIENT_EVM": "0x1111111111111111111111111111111111111111",
+            "TURGALIUM_ROUTER_OPTIMISM": "0x2222222222222222222222222222222222222222",
+            "TURGALIUM_FEE_RECIPIENT_EVM": "0x1111111111111111111111111111111111111111",
         },
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -314,9 +314,9 @@ def main():
             sdk_gfx = pgD.evaluate("""async () => {
               const headRes = await fetch('/', { method: 'HEAD' });
               const mod = await import('/vendor/wallet-sdks.js');
-              const sdk = mod.createCoinbaseWalletSDK({ appName: 'Siphon', appChainIds: [1, 8453] });
+              const sdk = mod.createCoinbaseWalletSDK({ appName: 'Turgalium', appChainIds: [1, 8453] });
               const prov = sdk.getProvider();
-              const canvas = document.getElementById('siphonHeroCanvas');
+              const canvas = document.getElementById('turgaliumHeroCanvas');
               return {
                 headStatus: headRes.status,
                 coop: headRes.headers.get('cross-origin-opener-policy'),
@@ -359,12 +359,12 @@ def main():
             pgD.wait_for_function("() => document.querySelector('#connectEvmBtn')?.textContent?.includes('Rabby')", timeout=15000)
             pgD.wait_for_function("() => document.querySelector('#tabLegCount')?.textContent !== '0'", timeout=15000)
 
-            # 1D. Verify siphon-3d.js pauses rAF completely while #siteShell is hidden!
+            # 1D. Verify turgalium-3d.js pauses rAF completely while #siteShell is hidden!
             pgD.wait_for_timeout(120)
             raf_before = pgD.evaluate("() => window.__rafCount")
             pgD.wait_for_timeout(320)
             raf_after = pgD.evaluate("() => window.__rafCount")
-            scene_running = pgD.evaluate("() => Boolean(window.__siphonHeroScene?.isRunning?.())")
+            scene_running = pgD.evaluate("() => Boolean(window.__turgaliumHeroScene?.isRunning?.())")
             assert raf_after == raf_before and not scene_running, f"3D rAF leaked while hidden: {raf_before}->{raf_after}, running={scene_running}"
 
             # 1D-bis. Verify Lite mode default hides EIP / routing / fee / program details,
@@ -424,7 +424,7 @@ def main():
               };
               return {
                 mode: document.documentElement.dataset.uiMode,
-                stored: localStorage.getItem('siphon_ui_mode'),
+                stored: localStorage.getItem('turgalium_ui_mode'),
                 liteCostVisible: isVis('#summaryLiteCostText'),
                 bridgeRouteVisible: isVis('#bridgePrefSelect'),
                 feeDrawerBtnVisible: isVis('#toggleFeeDrawerBtn'),
@@ -583,13 +583,13 @@ def main():
                 pgD.wait_for_timeout(200)
                 overflowD[view] = pgD.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
                 if view == "agents":
-                    pgD.wait_for_function("() => (document.querySelector('#claudeMcpConfigHost')?.innerText || '').includes('siphon')", timeout=5000)
+                    pgD.wait_for_function("() => (document.querySelector('#claudeMcpConfigHost')?.innerText || '').includes('turgalium')", timeout=5000)
                     # Queue a real permission request via POST /api/agents/approvals (replaces removed demo button)
                     queued_ok = pgD.evaluate("""async () => {
                       const dest = document.getElementById('solanaDestInput')?.value?.trim();
                       const res = await fetch('/api/agents/approvals', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-Siphon-Requested-With': 'siphon-ui' },
+                        headers: { 'Content-Type': 'application/json', 'X-Turgalium-Requested-With': 'turgalium-ui' },
                         body: JSON.stringify({
                           client: 'claude_mcp',
                           actionType: 'dust_convert',
@@ -619,7 +619,7 @@ def main():
                     pgD.unroute("**/api/agents/mandates/*/revoke")
                     expect_simulated_500["active"] = False
                 elif view == "contract":
-                    pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract SiphonRouter')", timeout=5000)
+                    pgD.wait_for_function("() => (document.querySelector('#contractCodeHost')?.innerText || '').includes('contract TurgaliumRouter')", timeout=5000)
 
             # Switching back to Lite from Contracts view must gracefully return to Sweep view
             pgD.click(".ui-mode-btn[data-ui-mode='lite']")
@@ -1417,7 +1417,7 @@ def main():
                 pgM.wait_for_timeout(200)
                 overflowM[view] = pgM.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
                 if view == "activity":
-                    svg_w = pgM.evaluate("() => document.getElementById('siphonFlowSvg')?.getBoundingClientRect()?.width || 0")
+                    svg_w = pgM.evaluate("() => document.getElementById('turgaliumFlowSvg')?.getBoundingClientRect()?.width || 0")
                     assert svg_w >= 700, f"Expected horizontally scrollable readable SVG (>=700px) on mobile, got {svg_w}px"
                 shot_name = "burns" if view == "activity" else view
                 maybe_shot(pgM, f"goal_mobile_{shot_name}_390.png", full_page=True)
@@ -1667,7 +1667,7 @@ def main():
             with pgE.expect_download(timeout=10000) as dl_info:
                 pgE.click("#downloadBurnCsvBtn")
             download = dl_info.value
-            assert download.suggested_filename.startswith("siphon-burn-receipt-") and download.suggested_filename.endswith(".csv"), download.suggested_filename
+            assert download.suggested_filename.startswith("turgalium-burn-receipt-") and download.suggested_filename.endswith(".csv"), download.suggested_filename
             csv_path = download.path()
             with open(csv_path, "r", encoding="utf-8") as fh:
                 csv_text = fh.read()
@@ -1921,7 +1921,7 @@ def main():
                     status=200,
                     content_type="application/json",
                     body=json.dumps({
-                        "planVersion": "siphon-solana-yield-park-v1",
+                        "planVersion": "turgalium-solana-yield-park-v1",
                         "ownerAddress": body.get("ownerAddress", SOL_PUBKEY),
                         "strategy": {
                             "id": "jupsol",
@@ -2265,7 +2265,7 @@ def main():
             pgP.wait_for_timeout(150)
             post_disconnect = pgP.evaluate("""() => ({
               stripHidden: Boolean(document.getElementById('preservationStripHost')?.classList.contains('hidden')),
-              approvalScanNull: window.__siphonPreservationTools?.getState?.().approvalScan === null,
+              approvalScanNull: window.__turgaliumPreservationTools?.getState?.().approvalScan === null,
             })""")
             assert post_disconnect["stripHidden"] and post_disconnect["approvalScanNull"], post_disconnect
 

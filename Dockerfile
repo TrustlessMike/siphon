@@ -20,28 +20,28 @@ FROM node:22-slim AS runner
 
 WORKDIR /app
 
-RUN groupadd --system --gid 1001 siphon \
-  && useradd --system --uid 1001 --gid siphon --create-home siphon \
+RUN groupadd --system --gid 1001 turgalium \
+  && useradd --system --uid 1001 --gid turgalium --create-home turgalium \
   && mkdir -p /data \
-  && chown -R siphon:siphon /app /data
+  && chown -R turgalium:turgalium /app /data
 
-COPY --from=builder --chown=siphon:siphon /app/package.json ./package.json
-COPY --from=builder --chown=siphon:siphon /app/node_modules ./node_modules
-COPY --from=builder --chown=siphon:siphon /app/dist ./dist
-COPY --from=builder --chown=siphon:siphon /app/public ./public
-COPY --from=builder --chown=siphon:siphon /app/contracts ./contracts
+COPY --from=builder --chown=turgalium:turgalium /app/package.json ./package.json
+COPY --from=builder --chown=turgalium:turgalium /app/node_modules ./node_modules
+COPY --from=builder --chown=turgalium:turgalium /app/dist ./dist
+COPY --from=builder --chown=turgalium:turgalium /app/public ./public
+COPY --from=builder --chown=turgalium:turgalium /app/contracts ./contracts
 
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=4420 \
-    SIPHON_DATA_DIR=/data \
-    SIPHON_TRUST_PROXY=true
+    TURGALIUM_DATA_DIR=/data \
+    TURGALIUM_TRUST_PROXY=true
 
 EXPOSE 4420
 
 VOLUME ["/data"]
 
-USER siphon
+USER turgalium
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 4420) + '/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"

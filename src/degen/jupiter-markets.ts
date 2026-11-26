@@ -674,12 +674,12 @@ export function computeDegenSidePocket(input: DegenSidePocketInput): DegenSidePo
   let highRiskWarning: string | null = null;
   if (wasClamped) {
     highRiskWarning =
-      `Requested ${roundTo(requestedRiskPct, 1)}% exceeds Siphon's 50% preservation hard cap and was clamped to 50%. ` +
+      `Requested ${roundTo(requestedRiskPct, 1)}% exceeds Turgalium's 50% preservation hard cap and was clamped to 50%. ` +
       'Binary prediction contracts can settle to $0 — keep at least half of your migrated USDC preserved.';
   } else if (effectiveRiskPct > HIGH_RISK_WARNING_THRESHOLD_PCT) {
     highRiskWarning =
       `High-risk side-pocket (${effectiveRiskPct}%): binary prediction markets can expire worthless ($0). ` +
-      'Siphon recommends keeping 75%–95% of your Solana USDC preserved.';
+      'Turgalium recommends keeping 75%–95% of your Solana USDC preserved.';
   }
 
   return {

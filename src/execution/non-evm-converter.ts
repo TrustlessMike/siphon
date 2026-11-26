@@ -192,17 +192,17 @@ export function normalizeMoveCoinType(raw: string): string {
 export function getNonEvmFeeRecipient(family: Exclude<ChainFamily, 'evm'>, chainPrefix?: string): string | null {
   switch (family) {
     case 'cosmos':
-      return process.env.SIPHON_FEE_RECIPIENT_COSMOS?.trim() || process.env.SIPHON_COSMOS_FEE_RECIPIENT?.trim() || null;
+      return process.env.TURGALIUM_FEE_RECIPIENT_COSMOS?.trim() || process.env.TURGALIUM_COSMOS_FEE_RECIPIENT?.trim() || null;
     case 'sui':
-      return process.env.SIPHON_FEE_RECIPIENT_SUI?.trim() || process.env.SIPHON_SUI_SPONSOR_ADDRESS?.trim() || null;
+      return process.env.TURGALIUM_FEE_RECIPIENT_SUI?.trim() || process.env.TURGALIUM_SUI_SPONSOR_ADDRESS?.trim() || null;
     case 'aptos':
-      return process.env.SIPHON_FEE_RECIPIENT_APTOS?.trim() || process.env.SIPHON_APTOS_FEE_PAYER?.trim() || null;
+      return process.env.TURGALIUM_FEE_RECIPIENT_APTOS?.trim() || process.env.TURGALIUM_APTOS_FEE_PAYER?.trim() || null;
     case 'ton':
-      return process.env.SIPHON_FEE_RECIPIENT_TON?.trim() || process.env.SIPHON_TON_RELAYER_ADDRESS?.trim() || null;
+      return process.env.TURGALIUM_FEE_RECIPIENT_TON?.trim() || process.env.TURGALIUM_TON_RELAYER_ADDRESS?.trim() || null;
     case 'tron':
-      return process.env.SIPHON_FEE_RECIPIENT_TRON?.trim() || process.env.SIPHON_TRON_ROUTER?.trim() || null;
+      return process.env.TURGALIUM_FEE_RECIPIENT_TRON?.trim() || process.env.TURGALIUM_TRON_ROUTER?.trim() || null;
     case 'btc':
-      return process.env.SIPHON_THORNAME_AFFILIATE?.trim() || (chainPrefix ? `${chainPrefix}:siphon` : 'siphon');
+      return process.env.TURGALIUM_THORNAME_AFFILIATE?.trim() || (chainPrefix ? `${chainPrefix}:turgalium` : 'turgalium');
     default:
       return null;
   }
@@ -323,7 +323,7 @@ export async function quoteRelayNonEvm(params: {
   };
 
   // Relay supports appFees when recipient matches destination or origin format (Solana base58 recipient works across all origin VMs!)
-  const solFeeRecipient = process.env.SIPHON_FEE_RECIPIENT_SOLANA?.trim();
+  const solFeeRecipient = process.env.TURGALIUM_FEE_RECIPIENT_SOLANA?.trim();
   const feeBps = getProtocolFeeConfig({ feeBps: params.protocolFeeBps }).feeBps;
   if (solFeeRecipient && feeBps > 0) {
     body.appFees = [{ recipient: solFeeRecipient, fee: String(feeBps) }];

@@ -2,15 +2,15 @@
 pragma solidity ^0.8.24;
 
 /**
- * @title SiphonAgentVault
- * @notice Policy-bounded Smart-Contract Agent & AI Plugin Session Vault for Siphon.
+ * @title TurgaliumAgentVault
+ * @notice Policy-bounded Smart-Contract Agent & AI Plugin Session Vault for Turgalium.
  *
  * Security invariants:
  *   1. An owner grants a scoped AgentMandate to an autonomous agent key (or AI assistant relayer)
  *      with an IMMUTABLE `lockedSolanaRecipient` bytes32 destination — the agent can NEVER
  *      redirect funds to any other address.
  *   2. Mandate budget can ONLY be consumed by an owner-approved execution router/delegate
- *      (`authorizedRouter`, e.g. SiphonRouter or SiphonSweepDelegate) AFTER the router measures
+ *      (`authorizedRouter`, e.g. TurgaliumRouter or TurgaliumSweepDelegate) AFTER the router measures
  *      actual on-chain token transfer amounts and post-swap USDC balance deltas. Untrusted EOAs
  *      or agents CANNOT call `authorizeAgentAction` directly with self-reported `grossUsd6`/`netOutUsd6`.
  *   3. Every execution enforces:
@@ -22,7 +22,7 @@ pragma solidity ^0.8.24;
  *        - Minimum net output guard (`minNetOutBps`, preventing negative-ROI / high-haircut dust drains)
  *        - Mandate expiry (`expiresAt`) and instant owner `revokeMandate()`.
  */
-contract SiphonAgentVault {
+contract TurgaliumAgentVault {
     uint8 public constant ACTION_DUST_CONVERT = 1 << 0;
     uint8 public constant ACTION_DEFI_WITHDRAW = 1 << 1;
     uint8 public constant ACTION_BRIDGE_SOLANA = 1 << 2;
@@ -31,15 +31,15 @@ contract SiphonAgentVault {
         ACTION_DUST_CONVERT | ACTION_DEFI_WITHDRAW | ACTION_BRIDGE_SOLANA | ACTION_BURN_ZERO_LIQ;
     uint16 public constant HARD_MAX_FEE_BPS = 1000; // 10.00%
 
-    /// @notice Vault administrator authorized to configure the default Siphon execution router.
+    /// @notice Vault administrator authorized to configure the default Turgalium execution router.
     address public vaultAdmin;
     address public pendingVaultAdmin;
 
-    /// @notice Default approved execution router/delegate (SiphonRouter / SiphonSweepDelegate)
+    /// @notice Default approved execution router/delegate (TurgaliumRouter / TurgaliumSweepDelegate)
     ///         permitted to consume mandate budgets after verifying actual on-chain transfer amounts.
     address public authorizedRouter;
 
-    /// @notice Allowlist of approved execution routers/delegates (supports both SiphonRouter & SiphonSweepDelegate).
+    /// @notice Allowlist of approved execution routers/delegates (supports both TurgaliumRouter & TurgaliumSweepDelegate).
     mapping(address => bool) public authorizedRouters;
 
     struct AgentMandate {
@@ -118,7 +118,7 @@ contract SiphonAgentVault {
         _;
     }
 
-    /// @notice Updates the default approved SiphonRouter / SiphonSweepDelegate contract.
+    /// @notice Updates the default approved TurgaliumRouter / TurgaliumSweepDelegate contract.
     function setRouter(address newRouter) external onlyVaultAdmin {
         if (newRouter == address(0)) revert RouterNotConfigured();
         address prev = authorizedRouter;

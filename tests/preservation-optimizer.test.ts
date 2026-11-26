@@ -9,7 +9,7 @@ import { evaluatePreservationPlan } from '../src/execution/preservation-optimize
 import { EVM_CHAINS } from '../src/scanner/chains.js';
 import { scanPresetWallet } from '../src/scanner/classifier.js';
 import type { ScannedAsset, ScanReport } from '../src/scanner/types.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 
 const EVM_WALLET = '0x71C7656EC7ab88b098defB751B7401B5f6d8976F';
 const SOL_DEST = '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
@@ -653,7 +653,7 @@ test('Dust Auto-Harvest Evaluator blocks tiny $1 dust and approves efficient bat
 
 test('HTTP endpoints /api/optimize/preservation and /api/agents/gas-watch work end-to-end with validation & CSRF guards', async () => {
   let mockEthGwei = 28;
-  const { server } = createSiphonServer({
+  const { server } = createTurgaliumServer({
     liveGasFetcher: async () => mockEthGwei,
   });
 

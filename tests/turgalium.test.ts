@@ -40,7 +40,7 @@ import {
   formatUnits,
 } from '../src/scanner/rpc.js';
 import type { ScannedAsset } from '../src/scanner/types.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 
 const SAMPLE_SOLANA_WALLET = 'AK9CKqppArTVRrmd4rQKzvjcmNUHnx5LBFx1HXoYaz2n';
 
@@ -125,8 +125,8 @@ test('Preset multi-chain scan reconciles DeFi withdrawals, liquid dust, zero-liq
   assert.equal(plan.totals.netSolanaUsdc, legSum);
 });
 
-test('Siphon HTTP API serves health, chains, scan, plan, simulate, contract, and vendor Three.js', async () => {
-  const { server } = createSiphonServer();
+test('Turgalium HTTP API serves health, chains, scan, plan, simulate, contract, and vendor Three.js', async () => {
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');
@@ -168,7 +168,7 @@ test('Siphon HTTP API serves health, chains, scan, plan, simulate, contract, and
     assert.ok(sim.plan.totals.netSolanaUsdc > 0);
 
     const contract = await fetch(`${base}/api/contract`).then((r) => r.json());
-    assert.ok(contract.source.includes('contract SiphonRouter'));
+    assert.ok(contract.source.includes('contract TurgaliumRouter'));
     assert.ok(contract.source.includes('depositForBurn'));
 
     const threeRes = await fetch(`${base}/vendor/three.module.js`);
@@ -313,7 +313,7 @@ test('Siphon HTTP API serves health, chains, scan, plan, simulate, contract, and
     });
     assert.equal(badAtt.status, 400);
 
-    // SiphonRouter.sol security invariants
+    // TurgaliumRouter.sol security invariants
     assert.ok(contract.source.includes('library SafeERC20Lite'));
     assert.ok(contract.source.includes('exitStep.receiptToken.safeTransferFrom'));
     assert.ok(contract.source.includes('function acceptOwnership()'));
@@ -371,7 +371,7 @@ test('Aave v3 debt safety guard decodes getUserAccountData and blocks MAX withdr
 });
 
 test('Circle CCTP MessageSent log ABI extractor produces valid message bytes and keccak256 hash', () => {
-  const payload = Buffer.from('siphon-cctp-domain5-test-message', 'utf8');
+  const payload = Buffer.from('turgalium-cctp-domain5-test-message', 'utf8');
   const word = (n: number) => n.toString(16).padStart(64, '0');
   const paddedPayload = payload.toString('hex').padEnd(Math.ceil(payload.length / 32) * 64, '0');
   const encodedData = '0x' + word(0x20) + word(payload.length) + paddedPayload;
@@ -385,7 +385,7 @@ test('Circle CCTP MessageSent log ABI extractor produces valid message bytes and
   assert.match(extracted.messageHash, /^0x[0-9a-f]{64}$/);
 });
 
-test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain transfers, and exposes SiphonFeeVault.sol', async () => {
+test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain transfers, and exposes TurgaliumFeeVault.sol', async () => {
   // Clamping: below 5% -> 500 bps, above 10% -> 1000 bps, default -> 700 bps (7%)
   assert.equal(resolveProtocolFeeBps(undefined), 700);
   assert.equal(resolveProtocolFeeBps(100), 500);
@@ -452,8 +452,8 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
   assert.ok(polyBatch.calls.some((c) => c.stepId === 'protocol_fee_transfer_after_defi'));
   assert.equal(polyBatch.calls.length, 4); // Aave withdraw + 7% fee transfer + approve + CCTP burn
 
-  // HTTP /api/contract serves both SiphonRouter.sol (500-1000 bps) & SiphonFeeVault.sol
-  const { server } = createSiphonServer();
+  // HTTP /api/contract serves both TurgaliumRouter.sol (500-1000 bps) & TurgaliumFeeVault.sol
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');
@@ -462,18 +462,18 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
     assert.ok(c.source.includes('MIN_FEE_BPS = 0'));
     assert.ok(c.source.includes('MAX_FEE_BPS = 1000'));
     assert.ok(c.source.includes('permitWitnessTransferFrom'));
-    assert.ok(c.feeVaultSource.includes('contract SiphonFeeVault'));
-    assert.ok(c.delegateSource.includes('contract SiphonSweepDelegate'));
+    assert.ok(c.feeVaultSource.includes('contract TurgaliumFeeVault'));
+    assert.ok(c.delegateSource.includes('contract TurgaliumSweepDelegate'));
     assert.ok(c.delegateSource.includes('struct ApprovalRevoke'));
-    assert.ok(c.agentVaultSource.includes('contract SiphonAgentVault'));
+    assert.ok(c.agentVaultSource.includes('contract TurgaliumAgentVault'));
     assert.equal(c.contracts.length, 4);
 
     // Witness-bound Gasless 1-Signature Permit2 / EIP-7702 intent preparation & cryptographic signature verification
     const opAssets = report.assets.filter((a) => a.chain === 'optimism');
-    const prevOpRouter = process.env.SIPHON_ROUTER_OPTIMISM;
-    const prevFeeRecip = process.env.SIPHON_FEE_RECIPIENT_EVM;
-    process.env.SIPHON_ROUTER_OPTIMISM = '0x2222222222222222222222222222222222222222';
-    process.env.SIPHON_FEE_RECIPIENT_EVM = treasury;
+    const prevOpRouter = process.env.TURGALIUM_ROUTER_OPTIMISM;
+    const prevFeeRecip = process.env.TURGALIUM_FEE_RECIPIENT_EVM;
+    process.env.TURGALIUM_ROUTER_OPTIMISM = '0x2222222222222222222222222222222222222222';
+    process.env.TURGALIUM_FEE_RECIPIENT_EVM = treasury;
     const testPrivKey = Buffer.from('11'.repeat(32), 'hex');
     const testPub = secp256k1.getPublicKey(testPrivKey, false).slice(1);
     const testUserAddress = '0x' + Buffer.from(keccak_256(testPub).slice(-20)).toString('hex');
@@ -524,10 +524,10 @@ test('Protocol fee (5-10%) clamps cleanly, reconciles plan, splits onchain trans
       assert.equal(sigReceipt.broadcasted, false);
       assert.notEqual(sigReceipt.settlementStatus, 'attested');
     } finally {
-      if (prevOpRouter === undefined) delete process.env.SIPHON_ROUTER_OPTIMISM;
-      else process.env.SIPHON_ROUTER_OPTIMISM = prevOpRouter;
-      if (prevFeeRecip === undefined) delete process.env.SIPHON_FEE_RECIPIENT_EVM;
-      else process.env.SIPHON_FEE_RECIPIENT_EVM = prevFeeRecip;
+      if (prevOpRouter === undefined) delete process.env.TURGALIUM_ROUTER_OPTIMISM;
+      else process.env.TURGALIUM_ROUTER_OPTIMISM = prevOpRouter;
+      if (prevFeeRecip === undefined) delete process.env.TURGALIUM_FEE_RECIPIENT_EVM;
+      else process.env.TURGALIUM_FEE_RECIPIENT_EVM = prevFeeRecip;
     }
 
     // Real-time Pre-Sign Simulation Proof (POST /api/tx/simulate-proof)
@@ -710,7 +710,7 @@ test('Wave 1-3 adapters build 1-sig gasless intents, pre-sign proofs, and Bitcoi
   assert.ok(cosmosMsgs.some((m) => m.typeUrl.includes('MsgSend')));
   assert.ok(cosmosMsgs.some((m) => m.typeUrl.includes('MsgDepositForBurn')));
 
-  // 2. Sui: 1-sig Sponsored PTB (gasData.owner = Siphon Relayer) + Circle CCTP Domain 8 -> 5
+  // 2. Sui: 1-sig Sponsored PTB (gasData.owner = Turgalium Relayer) + Circle CCTP Domain 8 -> 5
   const suiIntent = await suiAdapter.buildGaslessIntent({
     chain: 'sui',
     assets: [mkAsset({ chain: 'sui', chainName: 'Sui', symbol: 'SUI', address: '0x2::sui::SUI' })],
@@ -804,10 +804,10 @@ test('Wave 1-3 adapters build 1-sig gasless intents, pre-sign proofs, and Bitcoi
   const outputs = btcIntent.signPayload.outputs as Array<{ type: string; memo?: string }>;
   const memoOut = outputs.find((o) => o.type === 'op_return_memo');
   assert.ok(memoOut?.memo?.includes(SAMPLE_SOLANA_WALLET));
-  assert.ok(memoOut?.memo?.includes(':siphon:750'));
+  assert.ok(memoOut?.memo?.includes(':turgalium:750'));
 
   // HTTP /api/families & non-EVM /api/relayer/prepare-intent + /api/tx/simulate-proof
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');
@@ -1112,7 +1112,7 @@ test('Two-Level Negative-ROI Guard: L1 dust, 10 L2 tokens batch rescue, ATA rent
   );
 
   // HTTP /api/relayer/prepare-intent returns 400 with sponsorRejectionReason, and contracts enforce RelayerBreakEvenNotMet
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');
@@ -1247,7 +1247,7 @@ test('Smart-contract DeFi withdrawals (Aave non-USDC, Compound cWETHv3, ERC-4626
 });
 
 test('Unified multi-wallet scan, Dust Conversion engine, Smart-Contract Agent Mandates, Claude MCP & ChatGPT Plugin', async () => {
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');
@@ -1279,7 +1279,7 @@ test('Unified multi-wallet scan, Dust Conversion engine, Smart-Contract Agent Ma
     assert.ok(dustPlan.totalDustAssetsFound >= 1);
     assert.equal(dustPlan.maxDustThresholdUsd, 25);
 
-    // 3. Smart-Contract Agent Mandate (SiphonAgentVault) + Auto-Approve vs Pending Human Approval
+    // 3. Smart-Contract Agent Mandate (TurgaliumAgentVault) + Auto-Approve vs Pending Human Approval
     const mandate = await fetch(`${base}/api/agents/mandates`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1316,7 +1316,7 @@ test('Unified multi-wallet scan, Dust Conversion engine, Smart-Contract Agent Ma
 
     // 4. ChatGPT Plugin Manifest + OpenAPI 3.1 + Scoped Bearer Token Auth
     const manifest = await fetch(`${base}/.well-known/ai-plugin.json`).then((r) => r.json());
-    assert.equal(manifest.name_for_model, 'siphon_migrator');
+    assert.equal(manifest.name_for_model, 'turgalium_migrator');
     const openapi = await fetch(`${base}/openapi.json`).then((r) => r.json());
     assert.equal(openapi.openapi, '3.1.0');
     assert.ok(openapi.paths['/api/scan/unified']);
@@ -1327,7 +1327,7 @@ test('Unified multi-wallet scan, Dust Conversion engine, Smart-Contract Agent Ma
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'ChatGPT Test', client: 'chatgpt_action' }),
     }).then((r) => r.json());
-    assert.ok(tok.token.startsWith('siphon_gpt_'));
+    assert.ok(tok.token.startsWith('turgalium_gpt_'));
 
     // Unauthenticated chatgpt_action approval call is rejected with 401
     const unauthApproval = await fetch(`${base}/api/agents/approvals`, {
@@ -1380,21 +1380,21 @@ test('Unified multi-wallet scan, Dust Conversion engine, Smart-Contract Agent Ma
     });
     assert.equal(unauth.status, 401);
 
-    // 5. Claude MCP JSON-RPC 2.0 (initialize, tools/list, tools/call siphon_request_sweep_permission)
+    // 5. Claude MCP JSON-RPC 2.0 (initialize, tools/list, tools/call turgalium_request_sweep_permission)
     const mcpInit = await fetch(`${base}/mcp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok.token}` },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize' }),
     }).then((r) => r.json());
-    assert.equal(mcpInit.result.serverInfo.name, 'siphon-migrator-mcp');
+    assert.equal(mcpInit.result.serverInfo.name, 'turgalium-migrator-mcp');
 
     const mcpTools = await fetch(`${base}/mcp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok.token}` },
       body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
     }).then((r) => r.json());
-    assert.ok(mcpTools.result.tools.some((t: { name: string }) => t.name === 'siphon_scan_wallets'));
-    assert.ok(mcpTools.result.tools.some((t: { name: string }) => t.name === 'siphon_request_sweep_permission'));
+    assert.ok(mcpTools.result.tools.some((t: { name: string }) => t.name === 'turgalium_scan_wallets'));
+    assert.ok(mcpTools.result.tools.some((t: { name: string }) => t.name === 'turgalium_request_sweep_permission'));
 
     const mcpReq = await fetch(`${base}/mcp`, {
       method: 'POST',
@@ -1404,7 +1404,7 @@ test('Unified multi-wallet scan, Dust Conversion engine, Smart-Contract Agent Ma
         id: 3,
         method: 'tools/call',
         params: {
-          name: 'siphon_request_sweep_permission',
+          name: 'turgalium_request_sweep_permission',
           arguments: {
             actionType: 'defi_withdraw',
             summary: 'Claude requested Aave withdrawal',

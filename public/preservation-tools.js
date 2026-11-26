@@ -1,5 +1,5 @@
 /**
- * Siphon Capital-Preservation & Post-Arrival Solana Tools Module:
+ * Turgalium Capital-Preservation & Post-Arrival Solana Tools Module:
  *  1. 1-Click Reclaim Free SOL (Empty-ATA Rent Vacuum) -> POST /api/solana/rent-scan
  *  2. 1-Click Post-Arrival Solana Yield Park (90% Safe Compound) -> GET /api/solana/yield-strategies + POST /api/solana/yield-park
  *  3. 1-Click Stale ERC-20 Approval Revoker -> POST /api/approvals/scan + EIP-5792 / sequential revoke
@@ -1212,7 +1212,7 @@ function bindEvents() {
   });
 
   // Strict wallet-switch / disconnect state isolation
-  window.addEventListener('siphon:wallet-changed', (ev) => {
+  window.addEventListener('turgalium:wallet-changed', (ev) => {
     const detail = ev?.detail;
     if (!detail) return;
     if (detail.family === 'evm') {
@@ -1248,8 +1248,8 @@ function bindEvents() {
     }
   });
 
-  // Sync with Siphon app balance / wallet updates
-  window.addEventListener('siphon:balance-updated', (ev) => {
+  // Sync with Turgalium app balance / wallet updates
+  window.addEventListener('turgalium:balance-updated', (ev) => {
     const detail = ev?.detail || {};
     state.balanceDetail = detail;
     if (!state.userEditedYieldAmount) {
@@ -1267,7 +1267,7 @@ function bindEvents() {
     updateSectionSummaryBadges();
   });
 
-  window.addEventListener('siphon:scan-updated', (ev) => {
+  window.addEventListener('turgalium:scan-updated', (ev) => {
     const scanReport = ev?.detail?.scanReport;
     if (!scanReport) return;
     state.latestScanReport = scanReport;
@@ -1292,7 +1292,7 @@ if (document.readyState === 'loading') {
   bindEvents();
 }
 
-window.__siphonPreservationTools = {
+window.__turgaliumPreservationTools = {
   getState: () => ({
     rentScan: state.rentScan,
     yieldPlan: state.yieldPlan,

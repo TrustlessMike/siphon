@@ -15,7 +15,7 @@ import {
   RELAYER_BREAK_EVEN_MULTIPLIER,
 } from '../src/scanner/roi.js';
 import type { AnyChainId, ChainScanSummary, ScannedAsset, ScanReport } from '../src/scanner/types.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 import {
   BackgroundJobStore,
   computePollerMaxAttempts,
@@ -309,7 +309,7 @@ test('CRIT-01: Relayer break-even solvency across reimbursed & unreimbursed mode
     'rejectionReason must match breakEvenGrossUsd'
   );
 
-  // 3. Reimbursed mode enforces protocolFeeUsd >= 0.5 * G (exact match to SiphonRouter.sol)
+  // 3. Reimbursed mode enforces protocolFeeUsd >= 0.5 * G (exact match to TurgaliumRouter.sol)
   const reimbLow = computeRelayerBreakEven({
     sponsoredGasUsd: 1.0,
     fixedRelayerOverheadUsd: 0,
@@ -745,7 +745,7 @@ test('HIGH-02 & HIGH-04: applyTwoLevelRoiToReport synchronizes totals, avoids re
 // ---------------------------------------------------------------------------
 
 test('CRIT-06 & CRIT-07 (HTTP): partial /api/jobs/:id/leg preserves fields, rejects malicious assetCount with 400, and isolates multi-wallet same-chain legs', async () => {
-  const { server } = createSiphonServer();
+  const { server } = createTurgaliumServer();
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const addr = server.address();
   assert.ok(addr && typeof addr !== 'string');

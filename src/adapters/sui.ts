@@ -128,7 +128,7 @@ export const SUI_FAMILY_META: ChainFamilyMeta = {
   shortLabel: 'Sui',
   chains: [{ id: 'sui', name: 'Sui', nativeSymbol: 'SUI', logo: '/logos/sui.svg', cctpDomain: SUI_CCTP_DOMAIN }],
   signingMechanism: '1-Sig Programmable Transaction Block (PTB) — Direct Wallet Standard or Sponsored Gas',
-  gasSponsorshipMechanism: 'Direct PTB or Sui Native Sponsored Transaction (gasData.owner = Siphon Relayer, $0 user SUI)',
+  gasSponsorshipMechanism: 'Direct PTB or Sui Native Sponsored Transaction (gasData.owner = Turgalium Relayer, $0 user SUI)',
   preSignProofMechanism: 'Sui GraphQL / gRPC state + dryRunTransactionBlock + Circle CCTP ATA bytes32 + Solana snapshot',
   bridgeProviders: ['LI.FI (Sui MVM)', 'Circle CCTP (Domain 8 → 5)', 'Cetus / Mayan'],
   wallets: [
@@ -673,8 +673,8 @@ export async function prepareSuiDirectBatch(
       estimatedFeeUsd,
     },
     estimatedSeconds: maxSeconds,
-    gaslessAvailable: Boolean(process.env.SIPHON_SUI_SPONSOR_PRIVATE_KEY?.trim()),
-    gaslessMechanism: 'Sui Native Sponsored PTB (gasData.owner = Siphon Sponsor)',
+    gaslessAvailable: Boolean(process.env.TURGALIUM_SUI_SPONSOR_PRIVATE_KEY?.trim()),
+    gaslessMechanism: 'Sui Native Sponsored PTB (gasData.owner = Turgalium Sponsor)',
     notes,
     ...(routeAuction ? { routeAuction } : {}),
   };
@@ -1041,7 +1041,7 @@ export const suiAdapter: ChainFamilyAdapter = {
       deadline,
       userGasCostUsd: 0,
       sponsoredGasEstUsd,
-      gasSponsorshipMechanism: 'Sui Native Sponsored Transaction (gasData.owner = Siphon Relayer)',
+      gasSponsorshipMechanism: 'Sui Native Sponsored Transaction (gasData.owner = Turgalium Relayer)',
       protocolFeeBps: feeCfg.feeBps,
       protocolFeePercent: feeCfg.feePercent,
       protocolFeeUsd,
@@ -1056,11 +1056,11 @@ export const suiAdapter: ChainFamilyAdapter = {
         grossUsd: a.grossUsd,
       })),
       signPayload,
-      relayerConfigured: Boolean(process.env.SIPHON_SUI_SPONSOR_PRIVATE_KEY?.trim()),
+      relayerConfigured: Boolean(process.env.TURGALIUM_SUI_SPONSOR_PRIVATE_KEY?.trim()),
       sponsorEligible: breakEven.eligible,
       sponsorRejectionReason: breakEven.rejectionReason,
       intentDigestSha256,
-      explanation: `1 Slush/Phantom signature authorizes an atomic ${commands.length}-command Sui PTB with gasData.owner = Siphon Relayer ($0 user SUI) → Circle CCTP Domain 8 → Solana USDC ATA PDA.`,
+      explanation: `1 Slush/Phantom signature authorizes an atomic ${commands.length}-command Sui PTB with gasData.owner = Turgalium Relayer ($0 user SUI) → Circle CCTP Domain 8 → Solana USDC ATA PDA.`,
     };
   },
 
@@ -1236,7 +1236,7 @@ export const suiAdapter: ChainFamilyAdapter = {
       warnings.push(insufficientBalanceDetail);
     }
     if (!hasEnoughNativeGas) {
-      warnings.push(`Low SUI balance (${nativeBalanceUi} SUI). Native Sponsored PTB sets gasData.owner = Siphon Relayer ($0 user gas).`);
+      warnings.push(`Low SUI balance (${nativeBalanceUi} SUI). Native Sponsored PTB sets gasData.owner = Turgalium Relayer ($0 user gas).`);
     }
     if (!rpcReachable) {
       warnings.push('Sui Mainnet GraphQL/RPC checkpoint could not be reached for live verification.');
@@ -1409,7 +1409,7 @@ export const suiAdapter: ChainFamilyAdapter = {
         throw new Error('Signed Sui gasless PTB intent expired. Re-sign a fresh intent.');
       }
       const fp = '0x' + crypto.createHash('sha256').update(params.signature).digest('hex').slice(0, 16);
-      const configured = Boolean(process.env.SIPHON_SUI_SPONSOR_PRIVATE_KEY?.trim());
+      const configured = Boolean(process.env.TURGALIUM_SUI_SPONSOR_PRIVATE_KEY?.trim());
       out.submitted = {
         accepted: true,
         mode: configured ? 'relayer_queued' : 'intent_verified_awaiting_deployment',
@@ -1418,7 +1418,7 @@ export const suiAdapter: ChainFamilyAdapter = {
         signatureFingerprint: fp,
         nextStep: configured
           ? `Sui gas sponsor queued PTB ${params.intentId} (${fp}) for co-signing.`
-          : `Sui 1-Sig PTB verified (${fp}). Switch to Direct Mode to execute immediately with your Slush/Phantom wallet, or configure SIPHON_SUI_SPONSOR_PRIVATE_KEY for $0 gas.`,
+          : `Sui 1-Sig PTB verified (${fp}). Switch to Direct Mode to execute immediately with your Slush/Phantom wallet, or configure TURGALIUM_SUI_SPONSOR_PRIVATE_KEY for $0 gas.`,
       };
     }
 

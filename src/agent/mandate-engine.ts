@@ -3,7 +3,7 @@ import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { resolveProtocolFeeBps } from '../scanner/chains.js';
 import { sanitizeFreeText } from '../scanner/sanitize.js';
 import type { AnyChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
-import type { SiphonStateStore } from '../storage/state-store.js';
+import type { TurgaliumStateStore } from '../storage/state-store.js';
 
 export type AgentActionType =
   | 'dust_convert'
@@ -33,7 +33,7 @@ export interface AgentMandateRecord {
   expiresAt: string;
   createdAt: string;
   active: boolean;
-  onchainContract: 'SiphonAgentVault.sol';
+  onchainContract: 'TurgaliumAgentVault.sol';
   lastRunAt?: string;
   executionsCount: number;
 }
@@ -71,14 +71,14 @@ export interface PluginApiTokenRecord {
   revoked: boolean;
 }
 
-export interface SiphonAgentEngineOptions {
+export interface TurgaliumAgentEngineOptions {
   nowMs?: () => number;
   maxMandates?: number;
   maxApprovals?: number;
   maxTokens?: number;
   approvalTtlMs?: number;
   tokenTtlMs?: number;
-  stateStore?: SiphonStateStore;
+  stateStore?: TurgaliumStateStore;
 }
 
 const DAY_MS = 86_400_000;
@@ -152,12 +152,12 @@ export function resolveAssetsFromScans(
 
 /**
  * Policy-bounded Smart-Contract Agent Mandate & AI Plugin Permission Gate engine.
- * Mirrors `contracts/SiphonAgentVault.sol` invariants off-chain and guarantees that
+ * Mirrors `contracts/TurgaliumAgentVault.sol` invariants off-chain and guarantees that
  * ChatGPT, Claude MCP, and autonomous dust/DeFi agents can NEVER bypass owner caps,
  * spoof scan valuations, brick quotas via Infinity/NaN, or redirect funds away from
  * the locked Solana destination.
  */
-export class SiphonAgentEngine {
+export class TurgaliumAgentEngine {
   private mandates = new Map<string, AgentMandateRecord>();
   private approvals = new Map<string, PermissionRequestRecord>();
   private tokens = new Map<string, { record: PluginApiTokenRecord; secretHash: Buffer }>();
@@ -167,9 +167,9 @@ export class SiphonAgentEngine {
   private readonly maxTokens: number;
   private readonly approvalTtlMs: number;
   private readonly tokenTtlMs: number;
-  private readonly stateStore?: SiphonStateStore;
+  private readonly stateStore?: TurgaliumStateStore;
 
-  constructor(opts: SiphonAgentEngineOptions = {}) {
+  constructor(opts: TurgaliumAgentEngineOptions = {}) {
     this.nowMs = opts.nowMs ?? (() => Date.now());
     this.maxMandates = Math.max(10, Math.floor(opts.maxMandates ?? DEFAULT_MAX_MANDATES));
     this.maxApprovals = Math.max(10, Math.floor(opts.maxApprovals ?? DEFAULT_MAX_APPROVALS));
@@ -244,7 +244,7 @@ export class SiphonAgentEngine {
   }
 
   /**
-   * Matches `SiphonAgentVault.sol` rolling 24h window semantics:
+   * Matches `TurgaliumAgentVault.sol` rolling 24h window semantics:
    * `if (block.timestamp >= dayWindowStart + 1 days) { dayWindowStart = block.timestamp; spentTodayUsd6 = 0; }`
    */
   private refreshRollingDayWindow(mandate: AgentMandateRecord, nowMs = this.nowMs()): boolean {
@@ -366,7 +366,7 @@ export class SiphonAgentEngine {
       expiresAt,
       createdAt: nowIso,
       active: true,
-      onchainContract: 'SiphonAgentVault.sol',
+      onchainContract: 'TurgaliumAgentVault.sol',
       executionsCount: 0,
     };
 
@@ -422,12 +422,12 @@ export class SiphonAgentEngine {
 
   /**
    * Proposes a value-moving action from Claude MCP, ChatGPT Action, or a Smart-Contract Agent.
-   * Evaluates every SiphonAgentVault policy check and either:
+   * Evaluates every TurgaliumAgentVault policy check and either:
    *   - Throws on invalid inputs (non-finite NaN/Infinity amounts, grossUsd <= 0, invalid actionType, unknown mandateId);
    *   - Rejects immediately on Negative ROI, spoofed scanCache valuation, or ANY hard mandate invariant violation;
    *   - Marks `auto_approved_by_mandate` ONLY when a valid active mandate passes EVERY check AND
    *     `autoApproveUnderUsd > 0 && grossUsd <= autoApproveUnderUsd`;
-   *   - Otherwise marks `pending_approval` so the owner explicitly clicks Approve / Reject in Siphon.
+   *   - Otherwise marks `pending_approval` so the owner explicitly clicks Approve / Reject in Turgalium.
    */
   requestPermission(input: {
     client: PluginClientKind;
@@ -698,7 +698,7 @@ export class SiphonAgentEngine {
       policyChecks.push({
         check: 'Human Permission Gate',
         passed: true,
-        detail: 'No auto-approve mandate supplied — queued for explicit owner confirmation in Siphon UI.',
+        detail: 'No auto-approve mandate supplied — queued for explicit owner confirmation in Turgalium UI.',
       });
     }
 
@@ -732,8 +732,8 @@ export class SiphonAgentEngine {
         : hardMandateViolation
         ? hardMandateViolation
         : canAutoApprove
-        ? `Auto-approved within SiphonAgentVault mandate ${mandate?.mandateId} (<= $${mandate?.autoApproveUnderUsd}).`
-        : 'Awaiting explicit user permission approval in Siphon.',
+        ? `Auto-approved within TurgaliumAgentVault mandate ${mandate?.mandateId} (<= $${mandate?.autoApproveUnderUsd}).`
+        : 'Awaiting explicit user permission approval in Turgalium.',
       createdAt: nowIso,
       expiresAt,
       decidedAt: autoRejected || canAutoApprove ? nowIso : undefined,
@@ -846,7 +846,7 @@ export class SiphonAgentEngine {
     scopes?: string[];
   }): { token: string; record: PluginApiTokenRecord } {
     const tokenId = `tok_${crypto.randomBytes(16).toString('hex')}`;
-    const rawSecret = `siphon_${params.client === 'chatgpt_action' ? 'gpt' : 'mcp'}_${crypto.randomBytes(18).toString('hex')}`;
+    const rawSecret = `turgalium_${params.client === 'chatgpt_action' ? 'gpt' : 'mcp'}_${crypto.randomBytes(18).toString('hex')}`;
     const secretHash = crypto.createHash('sha256').update(rawSecret).digest();
     const scopes =
       Array.isArray(params.scopes) && params.scopes.length

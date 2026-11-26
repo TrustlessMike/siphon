@@ -4,7 +4,7 @@ import { DEAD_BURN_ADDRESS, EVM_CHAINS } from '../scanner/chains.js';
 import { planDustConversion } from '../scanner/dust.js';
 import { sanitizeFreeText } from '../scanner/sanitize.js';
 import type { AnyChainId, EvmChainId, ScanReport } from '../scanner/types.js';
-import type { SiphonStateStore } from '../storage/state-store.js';
+import type { TurgaliumStateStore } from '../storage/state-store.js';
 
 export type GasWatchStatus = 'watching' | 'ready' | 'cancelled' | 'expired';
 
@@ -50,7 +50,7 @@ export interface PreservationAgentStoreOptions {
   maxTriggers?: number;
   defaultTtlMs?: number;
   nowMs?: () => number;
-  stateStore?: SiphonStateStore;
+  stateStore?: TurgaliumStateStore;
 }
 
 export interface DustAutoHarvestOptions {
@@ -124,7 +124,7 @@ function assertValidEvmChain(raw: unknown): EvmChainId {
 }
 
 /**
- * Bounded LRU store & fail-closed evaluator for Siphon Gas-Window Watchdog triggers.
+ * Bounded LRU store & fail-closed evaluator for Turgalium Gas-Window Watchdog triggers.
  *
  * Security invariants:
  *  - Hard LRU capacity cap (`maxTriggers = 50` by default) prevents memory DoS.
@@ -136,7 +136,7 @@ export class PreservationAgentStore {
   private readonly maxTriggers: number;
   private readonly defaultTtlMs: number;
   private readonly nowMs: () => number;
-  private readonly stateStore?: SiphonStateStore;
+  private readonly stateStore?: TurgaliumStateStore;
 
   constructor(opts: PreservationAgentStoreOptions = {}) {
     this.maxTriggers = Math.max(1, Math.floor(opts.maxTriggers ?? DEFAULT_MAX_TRIGGERS));
@@ -243,7 +243,7 @@ export class PreservationAgentStore {
       autoExecuteAllowed: false,
       safetyNote: mandateId
         ? `Linked to mandate ${mandateId} — auto-execution stays blocked until gas target is met and mandate is verified active.`
-        : 'Notify-only trigger — fail-closed without a signed SiphonAgentVault mandate.',
+        : 'Notify-only trigger — fail-closed without a signed TurgaliumAgentVault mandate.',
     };
 
     this.triggers.set(id, trigger);

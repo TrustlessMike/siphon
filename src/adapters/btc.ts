@@ -438,7 +438,7 @@ export async function prepareBtcDirectBatch(
     feeBreakdown: {
       feeBps: feeCfg.feeBps,
       feePercent: feeCfg.feePercent,
-      feeRecipient: `siphon:${feeCfg.feeBps}bps`,
+      feeRecipient: `turgalium:${feeCfg.feeBps}bps`,
       collectionMethod: 'relay_psbt_or_affiliate_bps',
       estimatedFeeUsd,
     },
@@ -677,11 +677,11 @@ export const btcAdapter: ChainFamilyAdapter = {
     const minNetUsdcOut = BigInt(Math.round(estimatedNetUsd * 0.98 * 1_000_000)).toString();
     // Include non-zero slippage limit and enforce <= 80-byte OP_RETURN relay standardness
     const limBaseUnits = minNetUsdcOut;
-    const candidateMemo = `=:${outputCode}:${params.solanaDestination}:${limBaseUnits}:siphon:${feeCfg.feeBps}`;
+    const candidateMemo = `=:${outputCode}:${params.solanaDestination}:${limBaseUnits}:turgalium:${feeCfg.feeBps}`;
     const affiliateMemo =
       Buffer.byteLength(candidateMemo, 'utf8') <= 80
         ? candidateMemo
-        : `=:${outputCode}:${params.solanaDestination}::siphon:${feeCfg.feeBps}`;
+        : `=:${outputCode}:${params.solanaDestination}::turgalium:${feeCfg.feeBps}`;
     const deadline = Math.floor(Date.now() / 1000) + 1800;
     const nonce = BigInt('0x' + crypto.randomBytes(8).toString('hex')).toString();
 
@@ -742,7 +742,7 @@ export const btcAdapter: ChainFamilyAdapter = {
       protocolFeeBps: feeCfg.feeBps,
       protocolFeePercent: feeCfg.feePercent,
       protocolFeeUsd,
-      feeRecipient: `siphon:${feeCfg.feeBps}bps`,
+      feeRecipient: `turgalium:${feeCfg.feeBps}bps`,
       minNetUsdcOut,
       estimatedNetUsd,
       coveredAssets: spendableAssets.map((a) => ({
@@ -825,7 +825,7 @@ export const btcAdapter: ChainFamilyAdapter = {
     const guaranteedMinNetUsd = Number((estimatedNetUsd * 0.98).toFixed(2));
     const outputAsset = params.outputAsset ?? 'USDC';
     const outputCode = outputAsset === 'SOL' ? 'SOL.SOL' : 'SOL.USDC';
-    const expectedMemo = `=:${outputCode}:${params.solanaDestination}::siphon:${feeCfg.feeBps}`;
+    const expectedMemo = `=:${outputCode}:${params.solanaDestination}::turgalium:${feeCfg.feeBps}`;
     const memoBytes = Buffer.byteLength(expectedMemo, 'utf8');
     const memoWithinLimit = memoBytes <= 80;
     const mempoolReachable = blockNumber > 0;
@@ -1048,7 +1048,7 @@ export const btcAdapter: ChainFamilyAdapter = {
             : !memoWithinLimit
             ? `Memo length ${memoBytes}B exceeds Bitcoin Core 80B standardness limit`
             : simulatedLive
-            ? 'Exact Solana address & Siphon affiliate bps verified with live PSBT'
+            ? 'Exact Solana address & Turgalium affiliate bps verified with live PSBT'
             : 'Solana address & memo format checked (tx execution not simulated live)',
         },
       ],

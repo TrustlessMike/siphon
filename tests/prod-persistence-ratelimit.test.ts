@@ -6,7 +6,7 @@ import test from 'node:test';
 import { keccak_256 } from '@noble/hashes/sha3';
 import { secp256k1 } from '@noble/curves/secp256k1';
 import { Keypair } from '@solana/web3.js';
-import { SiphonAgentEngine } from '../src/agent/mandate-engine.js';
+import { TurgaliumAgentEngine } from '../src/agent/mandate-engine.js';
 import {
   broadcastSignedRelayerTx,
   deriveEvmAddressFromPrivateKey,
@@ -32,7 +32,7 @@ import {
   resetRpcCircuitBreaker,
 } from '../src/scanner/rpc.js';
 import type { ScannedAsset } from '../src/scanner/types.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 import { assertSafeStartupConfig, isLoopbackBindHost } from '../src/server/index.js';
 import { BackgroundJobStore } from '../src/server/jobs.js';
 import { SlidingWindowRateLimiter } from '../src/server/rate-limit.js';
@@ -42,7 +42,7 @@ import {
   MemoryStateStore,
 } from '../src/storage/state-store.js';
 
-function makeTempDir(prefix = 'siphon-test-'): string {
+function makeTempDir(prefix = 'turgalium-test-'): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
@@ -110,9 +110,9 @@ async function withMockedFetch<T>(
 }
 
 test('FileStateStore: atomic writes, namespace validation, and createStateStore defaults', () => {
-  // Default with no SIPHON_DATA_DIR -> in-memory store
-  const prevDataDir = process.env.SIPHON_DATA_DIR;
-  delete process.env.SIPHON_DATA_DIR;
+  // Default with no TURGALIUM_DATA_DIR -> in-memory store
+  const prevDataDir = process.env.TURGALIUM_DATA_DIR;
+  delete process.env.TURGALIUM_DATA_DIR;
   try {
     const mem = createStateStore();
     assert.equal(mem.kind, 'memory');
@@ -120,7 +120,7 @@ test('FileStateStore: atomic writes, namespace validation, and createStateStore 
     mem.save('jobs', [{ id: 1 }]);
     assert.deepEqual(mem.load('jobs', []), [{ id: 1 }]);
   } finally {
-    if (prevDataDir !== undefined) process.env.SIPHON_DATA_DIR = prevDataDir;
+    if (prevDataDir !== undefined) process.env.TURGALIUM_DATA_DIR = prevDataDir;
   }
 
   const tmpDir = makeTempDir();
@@ -149,7 +149,7 @@ test('FileStateStore: atomic writes, namespace validation, and createStateStore 
   }
 });
 
-test('Persistence across restart: SiphonAgentEngine preserves mandates, 24h rolling spentTodayUsd, approvals, and plugin tokens', () => {
+test('Persistence across restart: TurgaliumAgentEngine preserves mandates, 24h rolling spentTodayUsd, approvals, and plugin tokens', () => {
   const tmpDir = makeTempDir();
   const solDest = Keypair.generate().publicKey.toBase58();
   const owner = '0x1111111111111111111111111111111111111111';
@@ -158,7 +158,7 @@ test('Persistence across restart: SiphonAgentEngine preserves mandates, 24h roll
   try {
     // --- Boot 1 ---
     const store1 = new FileStateStore(tmpDir);
-    const engine1 = new SiphonAgentEngine({ stateStore: store1, nowMs: () => now });
+    const engine1 = new TurgaliumAgentEngine({ stateStore: store1, nowMs: () => now });
 
     const mandate = engine1.createMandate({
       name: 'Daily Cap Guard Agent',
@@ -220,7 +220,7 @@ test('Persistence across restart: SiphonAgentEngine preserves mandates, 24h roll
     // --- Simulate process restart 2 hours later (still inside same 24h rolling window) ---
     now += 2 * 60 * 60 * 1000;
     const store2 = new FileStateStore(tmpDir);
-    const engine2 = new SiphonAgentEngine({ stateStore: store2, nowMs: () => now });
+    const engine2 = new TurgaliumAgentEngine({ stateStore: store2, nowMs: () => now });
 
     const reloadedMandate = engine2.getMandate(mandate.mandateId);
     assert.ok(reloadedMandate, 'Mandate must survive restart');
@@ -272,7 +272,7 @@ test('Persistence across restart: SiphonAgentEngine preserves mandates, 24h roll
 
     // --- Advance clock 25 hours from initial dayWindowStart -> rolling 24h window resets cleanly ---
     now += 23 * 60 * 60 * 1000;
-    const engine3 = new SiphonAgentEngine({ stateStore: new FileStateStore(tmpDir), nowMs: () => now });
+    const engine3 = new TurgaliumAgentEngine({ stateStore: new FileStateStore(tmpDir), nowMs: () => now });
     const resetMandate = engine3.getMandate(mandate.mandateId);
     assert.equal(resetMandate?.spentTodayUsd, 0);
     assert.equal(resetMandate?.remainingDailyUsd, 120);
@@ -342,14 +342,14 @@ test('Persistence across restart: gasless intent consumed EIP-712 digests remain
   const tmpDir = makeTempDir();
   const wallet = makeTestEvmWallet(0x19);
   const solDest = Keypair.generate().publicKey.toBase58();
-  const prevRouter = process.env.SIPHON_ROUTER_BASE;
-  const prevFee = process.env.SIPHON_FEE_RECIPIENT_EVM;
-  const prevKey = process.env.SIPHON_RELAYER_PRIVATE_KEY;
+  const prevRouter = process.env.TURGALIUM_ROUTER_BASE;
+  const prevFee = process.env.TURGALIUM_FEE_RECIPIENT_EVM;
+  const prevKey = process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
 
   try {
-    process.env.SIPHON_ROUTER_BASE = '0x4444444444444444444444444444444444444444';
-    process.env.SIPHON_FEE_RECIPIENT_EVM = '0x5555555555555555555555555555555555555555';
-    delete process.env.SIPHON_RELAYER_PRIVATE_KEY;
+    process.env.TURGALIUM_ROUTER_BASE = '0x4444444444444444444444444444444444444444';
+    process.env.TURGALIUM_FEE_RECIPIENT_EVM = '0x5555555555555555555555555555555555555555';
+    delete process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
 
     configureGaslessIntentStore(new FileStateStore(tmpDir));
 
@@ -394,12 +394,12 @@ test('Persistence across restart: gasless intent consumed EIP-712 digests remain
   } finally {
     configureGaslessIntentStore(null);
     clearTrackedGaslessIntentsForTest();
-    if (prevRouter === undefined) delete process.env.SIPHON_ROUTER_BASE;
-    else process.env.SIPHON_ROUTER_BASE = prevRouter;
-    if (prevFee === undefined) delete process.env.SIPHON_FEE_RECIPIENT_EVM;
-    else process.env.SIPHON_FEE_RECIPIENT_EVM = prevFee;
-    if (prevKey === undefined) delete process.env.SIPHON_RELAYER_PRIVATE_KEY;
-    else process.env.SIPHON_RELAYER_PRIVATE_KEY = prevKey;
+    if (prevRouter === undefined) delete process.env.TURGALIUM_ROUTER_BASE;
+    else process.env.TURGALIUM_ROUTER_BASE = prevRouter;
+    if (prevFee === undefined) delete process.env.TURGALIUM_FEE_RECIPIENT_EVM;
+    else process.env.TURGALIUM_FEE_RECIPIENT_EVM = prevFee;
+    if (prevKey === undefined) delete process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
+    else process.env.TURGALIUM_RELAYER_PRIVATE_KEY = prevKey;
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
@@ -433,10 +433,10 @@ test('Relayer Broadcaster: real EIP-1559 signing, custom & RPC broadcast, and ho
   assert.equal(signed.txHash, expectedHash);
 
   // 2. Fail closed when key is missing (NEVER fabricates txHash)
-  const prevKey = process.env.SIPHON_RELAYER_PRIVATE_KEY;
-  const prevRouter = process.env.SIPHON_ROUTER_BASE;
-  const prevFee = process.env.SIPHON_FEE_RECIPIENT_EVM;
-  delete process.env.SIPHON_RELAYER_PRIVATE_KEY;
+  const prevKey = process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
+  const prevRouter = process.env.TURGALIUM_ROUTER_BASE;
+  const prevFee = process.env.TURGALIUM_FEE_RECIPIENT_EVM;
+  delete process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
   try {
     const missingKey = await broadcastSignedRelayerTx({ chain: 'base', to: router, data: calldata });
     assert.equal(missingKey.broadcasted, false);
@@ -509,9 +509,9 @@ test('Relayer Broadcaster: real EIP-1559 signing, custom & RPC broadcast, and ho
     assert.equal(badHashResult.reasonCode, 'invalid_tx_hash');
 
     // 5. End-to-end submitAndBroadcastSignedGaslessIntent with configured env + custom broadcaster hook
-    process.env.SIPHON_RELAYER_PRIVATE_KEY = relayer.privKeyHex;
-    process.env.SIPHON_ROUTER_BASE = router;
-    process.env.SIPHON_FEE_RECIPIENT_EVM = '0x5555555555555555555555555555555555555555';
+    process.env.TURGALIUM_RELAYER_PRIVATE_KEY = relayer.privKeyHex;
+    process.env.TURGALIUM_ROUTER_BASE = router;
+    process.env.TURGALIUM_FEE_RECIPIENT_EVM = '0x5555555555555555555555555555555555555555';
     configureGaslessIntentStore(new MemoryStateStore());
 
     const intent = buildGaslessSweepIntent({
@@ -578,12 +578,12 @@ test('Relayer Broadcaster: real EIP-1559 signing, custom & RPC broadcast, and ho
   } finally {
     configureGaslessIntentStore(null);
     clearTrackedGaslessIntentsForTest();
-    if (prevKey === undefined) delete process.env.SIPHON_RELAYER_PRIVATE_KEY;
-    else process.env.SIPHON_RELAYER_PRIVATE_KEY = prevKey;
-    if (prevRouter === undefined) delete process.env.SIPHON_ROUTER_BASE;
-    else process.env.SIPHON_ROUTER_BASE = prevRouter;
-    if (prevFee === undefined) delete process.env.SIPHON_FEE_RECIPIENT_EVM;
-    else process.env.SIPHON_FEE_RECIPIENT_EVM = prevFee;
+    if (prevKey === undefined) delete process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
+    else process.env.TURGALIUM_RELAYER_PRIVATE_KEY = prevKey;
+    if (prevRouter === undefined) delete process.env.TURGALIUM_ROUTER_BASE;
+    else process.env.TURGALIUM_ROUTER_BASE = prevRouter;
+    if (prevFee === undefined) delete process.env.TURGALIUM_FEE_RECIPIENT_EVM;
+    else process.env.TURGALIUM_FEE_RECIPIENT_EVM = prevFee;
   }
 });
 
@@ -614,7 +614,7 @@ test('Rate limiter: sliding-window unit checks & HTTP 429 with Retry-After heade
   assert.equal(limiter.consume('ip:1.2.3.4').allowed, true);
 
   // 2. Live HTTP server returns 429 + Retry-After when limit exceeded, while /api/health remains exempt
-  const { server, agentEngine } = createSiphonServer({
+  const { server, agentEngine } = createTurgaliumServer({
     rateLimit: { maxRequests: 3, windowMs: 30_000 },
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -644,7 +644,7 @@ test('Rate limiter: sliding-window unit checks & HTTP 429 with Retry-After heade
 
     // Unverified random Bearer token CANNOT bypass IP rate limit!
     const fakeTokenRes = await fetch(`${baseUrl}/api/config`, {
-      headers: { Authorization: 'Bearer siphon_mcp_unverified_random_token' },
+      headers: { Authorization: 'Bearer turgalium_mcp_unverified_random_token' },
     });
     assert.equal(fakeTokenRes.status, 429);
 
@@ -768,7 +768,7 @@ test('RPC Circuit Breaker: skips 429 primary RPC for 60s cooldown and resumes af
   }
 });
 
-test('Non-loopback startup guard fails closed without SIPHON_ADMIN_SESSION_TOKEN', () => {
+test('Non-loopback startup guard fails closed without TURGALIUM_ADMIN_SESSION_TOKEN', () => {
   // Loopback hosts allowed without admin token
   for (const host of ['127.0.0.1', 'localhost', '::1', '[::1]']) {
     assert.equal(isLoopbackBindHost(host), true);
@@ -776,16 +776,16 @@ test('Non-loopback startup guard fails closed without SIPHON_ADMIN_SESSION_TOKEN
     assert.equal(res.loopback, true);
   }
 
-  // Non-loopback hosts MUST throw fail-closed without SIPHON_ADMIN_SESSION_TOKEN
-  for (const host of ['0.0.0.0', '::', '192.168.1.50', '10.0.0.8', 'siphon.example.com']) {
+  // Non-loopback hosts MUST throw fail-closed without TURGALIUM_ADMIN_SESSION_TOKEN
+  for (const host of ['0.0.0.0', '::', '192.168.1.50', '10.0.0.8', 'turgalium.example.com']) {
     assert.equal(isLoopbackBindHost(host), false);
     assert.throws(
       () => assertSafeStartupConfig({ host, adminSessionToken: '' }),
-      /SIPHON_ADMIN_SESSION_TOKEN/i
+      /TURGALIUM_ADMIN_SESSION_TOKEN/i
     );
     assert.throws(
       () => assertSafeStartupConfig({ host, adminSessionToken: '   ' }),
-      /SIPHON_ADMIN_SESSION_TOKEN/i
+      /TURGALIUM_ADMIN_SESSION_TOKEN/i
     );
   }
 
@@ -793,7 +793,7 @@ test('Non-loopback startup guard fails closed without SIPHON_ADMIN_SESSION_TOKEN
   const safe = assertSafeStartupConfig({
     host: '0.0.0.0',
     adminSessionToken: 'a'.repeat(32),
-    allowedHosts: 'siphon.example.com',
+    allowedHosts: 'turgalium.example.com',
   });
   assert.equal(safe.loopback, false);
   assert.equal(safe.warnings.length, 0);
@@ -806,7 +806,7 @@ test('GET /api/metrics returns structured runtime counters and full HTTP server 
 
   try {
     // --- Server Instance 1 backed by FileStateStore ---
-    const s1 = createSiphonServer({
+    const s1 = createTurgaliumServer({
       dataDir: tmpDir,
       adminSessionToken: adminToken,
       rateLimit: { maxRequests: 100, windowMs: 60_000 },
@@ -825,7 +825,7 @@ test('GET /api/metrics returns structured runtime counters and full HTTP server 
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Siphon-Admin-Session': adminToken,
+        'X-Turgalium-Admin-Session': adminToken,
       },
       body: JSON.stringify({
         name: 'HTTP Restart Mandate',
@@ -843,7 +843,7 @@ test('GET /api/metrics returns structured runtime counters and full HTTP server 
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Siphon-Admin-Session': adminToken,
+        'X-Turgalium-Admin-Session': adminToken,
       },
       body: JSON.stringify({ label: 'Persist Test MCP', client: 'claude_mcp' }),
     });
@@ -876,7 +876,7 @@ test('GET /api/metrics returns structured runtime counters and full HTTP server 
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Siphon-Admin-Session': adminToken,
+        'X-Turgalium-Admin-Session': adminToken,
       },
       body: JSON.stringify({
         sourceWallet: '0x1111111111111111111111111111111111111111',
@@ -891,7 +891,7 @@ test('GET /api/metrics returns structured runtime counters and full HTTP server 
 
     // Verify GET /api/metrics structure on instance 1
     const metricsRes = await fetch(`${url1}/api/metrics`, {
-      headers: { 'X-Siphon-Admin-Session': adminToken },
+      headers: { 'X-Turgalium-Admin-Session': adminToken },
     });
     assert.equal(metricsRes.status, 200);
     const metrics = (await metricsRes.json()) as {
@@ -903,7 +903,7 @@ test('GET /api/metrics returns structured runtime counters and full HTTP server 
       persistence: { kind: string; persistent: boolean; namespaces: string[] };
       stores: { jobsTotal: number; activeJobs: number; mandatesTotal: number; pluginTokensTotal: number };
     };
-    assert.equal(metrics.service, 'siphon-migrator');
+    assert.equal(metrics.service, 'turgalium-migrator');
     assert.equal(typeof metrics.uptimeSec, 'number');
     assert.ok(metrics.requests.requestsTotal >= 5);
     assert.ok(metrics.requests.apiRequestsTotal >= 5);
@@ -920,7 +920,7 @@ test('GET /api/metrics returns structured runtime counters and full HTTP server 
     await new Promise<void>((resolve) => s1.server.close(() => resolve()));
 
     // --- Server Instance 2 (Simulated Restart) against same dataDir ---
-    const s2 = createSiphonServer({
+    const s2 = createTurgaliumServer({
       dataDir: tmpDir,
       adminSessionToken: adminToken,
       rateLimit: { enabled: false },
@@ -946,7 +946,7 @@ test('GET /api/metrics returns structured runtime counters and full HTTP server 
 
       // Active job survived restart
       const reloadedJobRes = await fetch(`${url2}/api/jobs/${createdJob.jobId}`, {
-        headers: { 'X-Siphon-Admin-Session': adminToken },
+        headers: { 'X-Turgalium-Admin-Session': adminToken },
       });
       assert.equal(reloadedJobRes.status, 200);
       const reloadedJob = (await reloadedJobRes.json()) as { jobId: string; status: string };
@@ -972,23 +972,23 @@ test('Production deployment artifacts (Dockerfile, fly.toml, .env.example) are h
   assert.match(dockerfile, /FROM node:22-slim AS runner/);
   assert.match(dockerfile, /npm ci/);
   assert.match(dockerfile, /npm run build/);
-  assert.match(dockerfile, /USER siphon/);
+  assert.match(dockerfile, /USER turgalium/);
   assert.match(dockerfile, /HEALTHCHECK/);
-  assert.match(dockerfile, /SIPHON_DATA_DIR=\/data/);
+  assert.match(dockerfile, /TURGALIUM_DATA_DIR=\/data/);
 
   assert.match(flyToml, /\[\[mounts\]\]/);
   assert.match(flyToml, /destination = "\/data"/);
-  assert.match(flyToml, /SIPHON_DATA_DIR = "\/data"/);
+  assert.match(flyToml, /TURGALIUM_DATA_DIR = "\/data"/);
   assert.match(flyToml, /path = "\/api\/health"/);
 
   for (const key of [
-    'SIPHON_DATA_DIR=',
-    'SIPHON_ADMIN_SESSION_TOKEN=',
-    'SIPHON_RELAYER_PRIVATE_KEY=',
-    'SIPHON_RATE_LIMIT_MAX=',
-    'SIPHON_RPC_COOLDOWN_MS=',
-    'SIPHON_ALLOWED_HOSTS=',
-    'SIPHON_ALLOWED_ORIGIN=',
+    'TURGALIUM_DATA_DIR=',
+    'TURGALIUM_ADMIN_SESSION_TOKEN=',
+    'TURGALIUM_RELAYER_PRIVATE_KEY=',
+    'TURGALIUM_RATE_LIMIT_MAX=',
+    'TURGALIUM_RPC_COOLDOWN_MS=',
+    'TURGALIUM_ALLOWED_HOSTS=',
+    'TURGALIUM_ALLOWED_ORIGIN=',
     'ETH_RPC_URL=',
     'SOLANA_RPC_URL=',
   ]) {

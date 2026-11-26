@@ -2,7 +2,7 @@
 pragma solidity 0.8.24;
 
 /**
- * @title SiphonRouter
+ * @title TurgaliumRouter
  * @notice Single-signature EVM-to-Solana migrator router.
  *
  * Security-hardened execution flow:
@@ -14,7 +14,7 @@ pragma solidity 0.8.24;
  *      to the user's 32-byte Solana USDC ATA PDA (NEVER pass a raw Solana wallet owner pubkey!)
  *   6. Executes isolated zero-liquidity token burns LAST with capped gas & 32-byte bounded return copy (return-bomb safe)
  *   7. Two-step ownership transfer, hard-bounded tiered preservation protocol fee (0 - 1000 bps + optional USDC cap),
- *      on-chain SiphonAgentVault mandate enforcement (`sweepWithMandate`), and safe ETH/ERC-20 rescue
+ *      on-chain TurgaliumAgentVault mandate enforcement (`sweepWithMandate`), and safe ETH/ERC-20 rescue
  */
 
 interface IERC20 {
@@ -57,7 +57,7 @@ interface ITokenMessengerCCTPV2 {
     ) external;
 }
 
-interface ISiphonAgentVault {
+interface ITurgaliumAgentVault {
     struct AgentMandate {
         address owner;
         address agentKey;
@@ -203,7 +203,7 @@ library SafeERC20Lite {
     }
 }
 
-contract SiphonRouter {
+contract TurgaliumRouter {
     using SafeERC20Lite for address;
 
     /// @notice Canonical burn sink for verifiable zero-liquidity token disposal.
@@ -222,19 +222,19 @@ contract SiphonRouter {
     /// @notice Hard upper bound on Circle CCTP V2 fast-transfer fee as a share of bridged principal (5.00% = 500 bps).
     uint16 public constant MAX_CCTP_FEE_BPS = 500;
 
-    /// @notice SiphonAgentVault action bitmap flags (must mirror SiphonAgentVault.sol).
+    /// @notice TurgaliumAgentVault action bitmap flags (must mirror TurgaliumAgentVault.sol).
     uint8 public constant ACTION_DUST_CONVERT = 1 << 0;
     uint8 public constant ACTION_DEFI_WITHDRAW = 1 << 1;
     uint8 public constant ACTION_BRIDGE_SOLANA = 1 << 2;
     uint8 public constant ACTION_BURN_ZERO_LIQ = 1 << 3;
 
-    bytes32 public constant SIPHON_WITNESS_TYPEHASH = keccak256(
-        "SiphonSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient,bytes32 swapsHash)"
+    bytes32 public constant TURGALIUM_WITNESS_TYPEHASH = keccak256(
+        "TurgaliumSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient,bytes32 swapsHash)"
     );
-    string public constant SIPHON_WITNESS_TYPESTRING =
-        "SiphonSweepWitness witness)SiphonSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient,bytes32 swapsHash)TokenPermissions(address token,uint256 amount)";
+    string public constant TURGALIUM_WITNESS_TYPESTRING =
+        "TurgaliumSweepWitness witness)TokenPermissions(address token,uint256 amount)TurgaliumSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient,bytes32 swapsHash)";
 
-    struct SiphonSweepWitness {
+    struct TurgaliumSweepWitness {
         /// @dev Canonical 32-byte Solana USDC Associated Token Account (ATA) PDA — NEVER a raw wallet pubkey.
         bytes32 solanaRecipient;
         uint256 minNetUsdcOut;
@@ -286,7 +286,7 @@ contract SiphonRouter {
     /// @notice Owner-configured sponsor relayer allowlist (prevents MEV frontrunning of gasReimbursementUsdc).
     mapping(address => bool) public allowedRelayers;
 
-    /// @notice Owner-configured SiphonAgentVault allowlist permitted for `sweepWithMandate`.
+    /// @notice Owner-configured TurgaliumAgentVault allowlist permitted for `sweepWithMandate`.
     mapping(address => bool) public allowedAgentVaults;
 
     enum DefiKind {
@@ -331,7 +331,7 @@ contract SiphonRouter {
         BurnStep[] burns;
     }
 
-    event SiphonMigrated(
+    event TurgaliumMigrated(
         address indexed user,
         bytes32 indexed solanaRecipient,
         uint256 grossUsdc,
@@ -881,7 +881,7 @@ contract SiphonRouter {
         // 4. Execute isolated zero-liquidity burns LAST (after CCTP settlement) with capped gas & 32-byte bounded return copy
         (uint256 burnedCount, uint256 skippedBurns) = _executeTrailingBurns(msg.sender, params.burns);
 
-        emit SiphonMigrated(
+        emit TurgaliumMigrated(
             msg.sender,
             params.solanaRecipient,
             grossUsdc,
@@ -894,8 +894,8 @@ contract SiphonRouter {
     }
 
     /**
-     * @notice Executes a policy-bounded autonomous agent sweep gated by on-chain `SiphonAgentVault.authorizeAgentAction`.
-     * @dev Measures actual on-chain post-exit/post-swap USDC deltas before invoking `SiphonAgentVault.authorizeAgentAction`,
+     * @notice Executes a policy-bounded autonomous agent sweep gated by on-chain `TurgaliumAgentVault.authorizeAgentAction`.
+     * @dev Measures actual on-chain post-exit/post-swap USDC deltas before invoking `TurgaliumAgentVault.authorizeAgentAction`,
      *      guaranteeing locked Solana recipient, per-tx USD cap, rolling 24h cap, maxFeeBps, minNetOutBps, and action mask.
      *      When executed by an autonomous agent key (`msg.sender != m.owner`), strictly forbids arbitrary swapCalldata,
      *      non-USDC DeFi exits, arbitrary burns, and CCTP destinationCaller/hookData overrides.
@@ -913,7 +913,7 @@ contract SiphonRouter {
             revert TargetNotAllowed(agentVault);
         }
 
-        ISiphonAgentVault.AgentMandate memory m = ISiphonAgentVault(agentVault).getMandate(mandateId);
+        ITurgaliumAgentVault.AgentMandate memory m = ITurgaliumAgentVault(agentVault).getMandate(mandateId);
         if (m.owner == address(0)) revert Unauthorized();
         if (msg.sender != m.agentKey && msg.sender != m.owner) revert Unauthorized();
 
@@ -967,7 +967,7 @@ contract SiphonRouter {
         uint256 totalDeductions = grossUsdc - minSolanaReceived;
         uint16 totalEffectiveFeeBps = uint16((totalDeductions * 10_000 + grossUsdc - 1) / grossUsdc);
 
-        // Enforce on-chain SiphonAgentVault policy caps & locked Solana recipient BEFORE moving fees or bridging
+        // Enforce on-chain TurgaliumAgentVault policy caps & locked Solana recipient BEFORE moving fees or bridging
         uint256 execNonce = ++mandateExecutionNonce;
         bytes32 intentDigest = keccak256(
             abi.encode(
@@ -981,7 +981,7 @@ contract SiphonRouter {
                 block.chainid
             )
         );
-        ISiphonAgentVault(agentVault).authorizeAgentAction(
+        ITurgaliumAgentVault(agentVault).authorizeAgentAction(
             mandateId,
             msg.sender,
             actionBit,
@@ -1001,7 +1001,7 @@ contract SiphonRouter {
         (uint256 burnedCount, uint256 skippedBurns) = _executeTrailingBurns(m.owner, params.burns);
 
         emit MandateSweepExecuted(mandateId, agentVault, m.owner, msg.sender, grossUsdc, bridgedUsdc);
-        emit SiphonMigrated(
+        emit TurgaliumMigrated(
             m.owner,
             params.solanaRecipient,
             grossUsdc,
@@ -1016,7 +1016,7 @@ contract SiphonRouter {
     function _pullPermit2AndSnapshot(
         address user,
         IPermit2.PermitBatchTransferFrom calldata permit,
-        SiphonSweepWitness calldata witness,
+        TurgaliumSweepWitness calldata witness,
         bytes calldata permitSignature
     )
         private
@@ -1055,7 +1055,7 @@ contract SiphonRouter {
 
         bytes32 witnessHash = keccak256(
             abi.encode(
-                SIPHON_WITNESS_TYPEHASH,
+                TURGALIUM_WITNESS_TYPEHASH,
                 witness.solanaRecipient,
                 witness.minNetUsdcOut,
                 witness.maxGasReimbursementUsdc,
@@ -1069,7 +1069,7 @@ contract SiphonRouter {
             details,
             user,
             witnessHash,
-            SIPHON_WITNESS_TYPESTRING,
+            TURGALIUM_WITNESS_TYPESTRING,
             permitSignature
         );
 
@@ -1132,7 +1132,7 @@ contract SiphonRouter {
     function sweepWithPermit2Batch(
         address user,
         IPermit2.PermitBatchTransferFrom calldata permit,
-        SiphonSweepWitness calldata witness,
+        TurgaliumSweepWitness calldata witness,
         bytes calldata permitSignature,
         uint256 gasReimbursementUsdc,
         SwapStep[] calldata swaps
@@ -1200,7 +1200,7 @@ contract SiphonRouter {
 
         cctpNonce = _bridgeUsdcViaCctp(bridgedUsdc, witness.solanaRecipient);
 
-        emit SiphonMigrated(
+        emit TurgaliumMigrated(
             user,
             witness.solanaRecipient,
             grossUsdc,

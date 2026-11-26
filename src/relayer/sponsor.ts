@@ -6,7 +6,7 @@ import { EVM_CHAINS, getProtocolFeeConfig } from '../scanner/chains.js';
 import { isEip2612Token } from '../scanner/discovery.js';
 import { computeRelayerBreakEven, RELAYER_BREAK_EVEN_MULTIPLIER } from '../scanner/roi.js';
 import type { EvmChainId, ScannedAsset } from '../scanner/types.js';
-import type { SiphonStateStore } from '../storage/state-store.js';
+import type { TurgaliumStateStore } from '../storage/state-store.js';
 import {
   broadcastSignedRelayerTx,
   type RelayerBroadcastResult,
@@ -16,23 +16,23 @@ import type { evmJsonRpcCall } from '../scanner/rpc.js';
 
 export const CANONICAL_PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
 
-// EIP-2 secp256k1 half-order (matches SiphonSweepDelegate.SECP256K1N_HALF)
+// EIP-2 secp256k1 half-order (matches TurgaliumSweepDelegate.SECP256K1N_HALF)
 const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
 const SECP256K1_HALF_N =
   0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
 
-// Exact EIP-712 type strings matching contracts/SiphonRouter.sol and contracts/SiphonSweepDelegate.sol
+// Exact EIP-712 type strings matching contracts/TurgaliumRouter.sol and contracts/TurgaliumSweepDelegate.sol
 export const PERMIT2_DOMAIN_TYPE_STRING =
   'EIP712Domain(string name,uint256 chainId,address verifyingContract)';
 export const DELEGATE_DOMAIN_TYPE_STRING =
   'EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)';
 export const TOKEN_PERMISSIONS_TYPE_STRING = 'TokenPermissions(address token,uint256 amount)';
-export const SIPHON_WITNESS_TYPE_STRING =
-  'SiphonSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient,bytes32 swapsHash)';
+export const TURGALIUM_WITNESS_TYPE_STRING =
+  'TurgaliumSweepWitness(bytes32 solanaRecipient,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint16 feeBps,address feeRecipient,bytes32 swapsHash)';
 export const PERMIT_BATCH_WITNESS_TYPE_STRING =
-  'PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,SiphonSweepWitness witness)' +
-  SIPHON_WITNESS_TYPE_STRING +
-  TOKEN_PERMISSIONS_TYPE_STRING;
+  'PermitBatchWitnessTransferFrom(TokenPermissions[] permitted,address spender,uint256 nonce,uint256 deadline,TurgaliumSweepWitness witness)' +
+  TOKEN_PERMISSIONS_TYPE_STRING +
+  TURGALIUM_WITNESS_TYPE_STRING;
 export const SWEEP_INTENT_TYPE_STRING =
   'SweepIntent(bytes32 solanaRecipient,address usdc,address cctpMessenger,address feeRecipient,uint16 feeBps,uint256 directUsdcAmount,uint256 minNetUsdcOut,uint256 maxGasReimbursementUsdc,uint256 nonce,uint256 deadline,bytes32 callsHash)';
 
@@ -84,9 +84,9 @@ interface PersistedGaslessIntentState {
 const issuedIntents = new Map<string, TrackedGaslessIntent>();
 const consumedDigests = new Map<string, ConsumedDigestRecord>();
 const broadcastingIntentIds = new Set<string>();
-let activeIntentStateStore: SiphonStateStore | null = null;
+let activeIntentStateStore: TurgaliumStateStore | null = null;
 
-function hydrateGaslessIntentsFromStore(store: SiphonStateStore): void {
+function hydrateGaslessIntentsFromStore(store: TurgaliumStateStore): void {
   const saved = store.load<PersistedGaslessIntentState>('gasless_intents', {
     intents: [],
     consumedDigests: [],
@@ -109,7 +109,7 @@ function hydrateGaslessIntentsFromStore(store: SiphonStateStore): void {
   }
 }
 
-function persistGaslessIntents(store: SiphonStateStore | null = activeIntentStateStore): void {
+function persistGaslessIntents(store: TurgaliumStateStore | null = activeIntentStateStore): void {
   if (!store) return;
   store.save<PersistedGaslessIntentState>('gasless_intents', {
     intents: Array.from(issuedIntents.values()),
@@ -118,10 +118,10 @@ function persistGaslessIntents(store: SiphonStateStore | null = activeIntentStat
 }
 
 /**
- * Configures a pluggable `SiphonStateStore` for gasless intent tracking and
+ * Configures a pluggable `TurgaliumStateStore` for gasless intent tracking and
  * replay-protected consumed EIP-712 digests, immediately hydrating persisted state.
  */
-export function configureGaslessIntentStore(store: SiphonStateStore | null): void {
+export function configureGaslessIntentStore(store: TurgaliumStateStore | null): void {
   activeIntentStateStore = store;
   if (store) {
     hydrateGaslessIntentsFromStore(store);
@@ -154,7 +154,7 @@ function selectorFromSignature(sig: string): string {
   return '0x' + Buffer.from(keccakUtf8(sig).slice(0, 4)).toString('hex');
 }
 
-// Exact Solidity ABI 4-byte selectors for SiphonRouter & SiphonSweepDelegate sponsored entrypoints
+// Exact Solidity ABI 4-byte selectors for TurgaliumRouter & TurgaliumSweepDelegate sponsored entrypoints
 export const RELAYER_ALLOWED_SELECTORS = {
   sweepWithPermit2Batch: selectorFromSignature(
     'sweepWithPermit2Batch(address,((address,uint256)[],uint256,uint256),(bytes32,uint256,uint256,uint16,address,bytes32),bytes,uint256,(address,uint256,bool,address,bytes)[])'
@@ -238,13 +238,13 @@ export function verifyRelayerCalldataMatchesIntent(
     if (selector !== RELAYER_ALLOWED_SELECTORS.sweepWithPermit2Batch) {
       return {
         ok: false,
-        reason: `Calldata selector ${selector} does not match expected SiphonRouter.sweepWithPermit2Batch (${RELAYER_ALLOWED_SELECTORS.sweepWithPermit2Batch}).`,
+        reason: `Calldata selector ${selector} does not match expected TurgaliumRouter.sweepWithPermit2Batch (${RELAYER_ALLOWED_SELECTORS.sweepWithPermit2Batch}).`,
       };
     }
     // Head layout (11 words = 352 bytes):
     // 0: address user
     // 1: offset -> permit (PermitBatchTransferFrom)
-    // 2..7: inline static SiphonSweepWitness (solanaRecipient, minNetUsdcOut, maxGasReimbursementUsdc, feeBps, feeRecipient, swapsHash)
+    // 2..7: inline static TurgaliumSweepWitness (solanaRecipient, minNetUsdcOut, maxGasReimbursementUsdc, feeBps, feeRecipient, swapsHash)
     // 8: offset -> bytes permitSignature
     // 9: uint256 gasReimbursementUsdc
     // 10: offset -> SwapStep[] swaps
@@ -328,7 +328,7 @@ export function verifyRelayerCalldataMatchesIntent(
   if (!isV1 && !isV2) {
     return {
       ok: false,
-      reason: `Calldata selector ${selector} does not match expected SiphonSweepDelegate.executeSponsoredSweep or executeSponsoredSweepV2.`,
+      reason: `Calldata selector ${selector} does not match expected TurgaliumSweepDelegate.executeSponsoredSweep or executeSponsoredSweepV2.`,
     };
   }
 
@@ -406,7 +406,7 @@ export function verifyRelayerCalldataMatchesIntent(
 }
 
 /**
- * Encodes valid `SiphonRouter.sweepWithPermit2Batch(...)` calldata bound to a prepared
+ * Encodes valid `TurgaliumRouter.sweepWithPermit2Batch(...)` calldata bound to a prepared
  * `GaslessSweepIntentPlan` and verified user EIP-712 signature (with empty swaps array by default).
  */
 export function encodePermit2SweepCalldata(params: {
@@ -497,7 +497,7 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
 
 /**
  * Computes Solidity-identical `keccak256(abi.encode(defiExits, swaps, burns, revokes))`
- * matching `SiphonSweepDelegate.computeCallsHash` for empty call arrays (or custom pre-encoded calls).
+ * matching `TurgaliumSweepDelegate.computeCallsHash` for empty call arrays (or custom pre-encoded calls).
  */
 export function computeEmptySweepCallsHash(): string {
   // abi.encode(empty[], empty[], empty[], empty[]):
@@ -517,7 +517,7 @@ export function computeEmptySweepCallsHash(): string {
 
 /**
  * Computes Solidity-identical `keccak256(abi.encode(swaps))` for an empty `SwapStep[]` array,
- * matching `SiphonRouter.sweepWithPermit2Batch` witness `swapsHash`.
+ * matching `TurgaliumRouter.sweepWithPermit2Batch` witness `swapsHash`.
  */
 export function computeEmptySwapsHash(): string {
   // abi.encode(empty[]): head offset 0x20 + zero length 0
@@ -527,7 +527,7 @@ export function computeEmptySwapsHash(): string {
 
 /**
  * Computes the exact EIP-712 signing digest (`\x19\x01 || domainSeparator || structHash`)
- * for Siphon's `PermitBatchWitnessTransferFrom` or `SweepIntent` typed data.
+ * for Turgalium's `PermitBatchWitnessTransferFrom` or `SweepIntent` typed data.
  */
 export function computeGaslessIntentEip712Digest(typedData: Record<string, unknown>): string {
   const primaryType = typedData.primaryType as string;
@@ -553,7 +553,7 @@ export function computeGaslessIntentEip712Digest(typedData: Record<string, unkno
     const permittedHash = keccak_256(concatBytes(permHashes));
 
     const witness = message.witness as Record<string, unknown>;
-    const witnessTypeHash = keccakUtf8(SIPHON_WITNESS_TYPE_STRING);
+    const witnessTypeHash = keccakUtf8(TURGALIUM_WITNESS_TYPE_STRING);
     const witnessHash = keccak_256(
       concatBytes([
         witnessTypeHash,
@@ -674,7 +674,7 @@ export interface GaslessSweepIntentPlan {
   minNetUsdcOut: string; // 6 decimals raw string
   directUsdcAmount?: string; // 6 decimals raw string (EIP-7702 SweepIntent)
   callsHash?: string; // bytes32 (EIP-7702 SweepIntent)
-  swapsHash?: string; // bytes32 (Permit2 SiphonSweepWitness)
+  swapsHash?: string; // bytes32 (Permit2 TurgaliumSweepWitness)
   estimatedNetUsd: number;
   sponsorEligible: boolean;
   sponsorRejectionReason?: string;
@@ -719,7 +719,7 @@ export interface SignedIntentReceipt {
 }
 
 function getChainRouterAddress(chain: EvmChainId): string | null {
-  const envKey = `SIPHON_ROUTER_${chain.toUpperCase()}`;
+  const envKey = `TURGALIUM_ROUTER_${chain.toUpperCase()}`;
   const val = process.env[envKey]?.trim();
   if (!val || !/^0x[0-9a-fA-F]{40}$/.test(val)) return null;
   const lower = val.toLowerCase();
@@ -733,7 +733,7 @@ function getChainRouterAddress(chain: EvmChainId): string | null {
 }
 
 function getChainDelegateAddress(chain: EvmChainId): string | null {
-  const envKey = `SIPHON_DELEGATE_${chain.toUpperCase()}`;
+  const envKey = `TURGALIUM_DELEGATE_${chain.toUpperCase()}`;
   const val = process.env[envKey]?.trim();
   if (val && /^0x[0-9a-fA-F]{40}$/.test(val)) {
     const lower = val.toLowerCase();
@@ -748,7 +748,7 @@ function getChainDelegateAddress(chain: EvmChainId): string | null {
 }
 
 export function isSponsorRelayerConfigured(chain?: EvmChainId): boolean {
-  const hasKey = Boolean(process.env.SIPHON_RELAYER_PRIVATE_KEY?.trim());
+  const hasKey = Boolean(process.env.TURGALIUM_RELAYER_PRIVATE_KEY?.trim());
   if (!hasKey) return false;
   if (!chain) return true;
   return Boolean(getChainRouterAddress(chain));
@@ -766,7 +766,7 @@ export function clearTrackedGaslessIntentsForTest(): void {
 /**
  * Builds a single off-chain EIP-712 gasless signature payload solving BOTH:
  *   1. Zero per-tx popups (1 eth_signTypedData_v4 covers ALL tokens on the chain)
- *   2. Zero native gas needed by the user (Siphon Relayer sponsors gas, reimbursed from 5-10% fee/proceeds)
+ *   2. Zero native gas needed by the user (Turgalium Relayer sponsors gas, reimbursed from 5-10% fee/proceeds)
  *
  * Security hardening:
  *   - Uses canonical 32-byte Solana USDC ATA PDA (`solanaOwnerToUsdcAtaBytes32`) for CCTP `mintRecipient`
@@ -974,13 +974,13 @@ export function buildGaslessSweepIntent(params: {
                 { name: 'spender', type: 'address' },
                 { name: 'nonce', type: 'uint256' },
                 { name: 'deadline', type: 'uint256' },
-                { name: 'witness', type: 'SiphonSweepWitness' },
+                { name: 'witness', type: 'TurgaliumSweepWitness' },
               ],
               TokenPermissions: [
                 { name: 'token', type: 'address' },
                 { name: 'amount', type: 'uint256' },
               ],
-              SiphonSweepWitness: [
+              TurgaliumSweepWitness: [
                 { name: 'solanaRecipient', type: 'bytes32' },
                 { name: 'minNetUsdcOut', type: 'uint256' },
                 { name: 'maxGasReimbursementUsdc', type: 'uint256' },
@@ -1037,7 +1037,7 @@ export function buildGaslessSweepIntent(params: {
             },
             primaryType: 'SweepIntent',
             domain: {
-              name: 'SiphonSweepDelegate',
+              name: 'TurgaliumSweepDelegate',
               version: '1',
               chainId: cfg.chainId,
               verifyingContract: params.userAddress,
@@ -1173,9 +1173,9 @@ export function buildGaslessSweepIntent(params: {
     eip712Digest,
     intentDigestSha256,
     explanation: previewOnly
-      ? `Preview mode only on ${cfg.name}: deploy SiphonRouter/SiphonSweepDelegate and configure SIPHON_ROUTER_${params.chain.toUpperCase()} + SIPHON_FEE_RECIPIENT_EVM before signing live EIP-712 payloads.`
+      ? `Preview mode only on ${cfg.name}: deploy TurgaliumRouter/TurgaliumSweepDelegate and configure TURGALIUM_ROUTER_${params.chain.toUpperCase()} + TURGALIUM_FEE_RECIPIENT_EVM before signing live EIP-712 payloads.`
       : mode === 'permit2_batch'
-      ? `1 gasless Permit2 signature covers ${permit2Erc20Assets.length} liquid ERC-20 token(s) on ${cfg.name}. User pays $0.00 gas; Siphon Relayer sponsors gas & deducts ${feeConfig.feePercent}% fee onchain.`
+      ? `1 gasless Permit2 signature covers ${permit2Erc20Assets.length} liquid ERC-20 token(s) on ${cfg.name}. User pays $0.00 gas; Turgalium Relayer sponsors gas & deducts ${feeConfig.feePercent}% fee onchain.`
       : `1 gasless EIP-7702 SweepIntent covers ${coveredForEconomics.length} position(s) on ${cfg.name} with $0.00 user gas, explicit directUsdcAmount, and onchain minNetUsdcOut floor.`,
   };
 }
@@ -1224,7 +1224,7 @@ function validateSignedGaslessIntentPreConsume(params: {
   }
   if (tracked.previewOnly || !tracked.routerConfigured || !tracked.eip712Digest) {
     throw new Error(
-      `Cannot submit preview-only intent on ${cfg.name}: deploy SiphonRouter/SiphonSweepDelegate and set SIPHON_ROUTER_${params.chain.toUpperCase()} + SIPHON_FEE_RECIPIENT_EVM.`
+      `Cannot submit preview-only intent on ${cfg.name}: deploy TurgaliumRouter/TurgaliumSweepDelegate and set TURGALIUM_ROUTER_${params.chain.toUpperCase()} + TURGALIUM_FEE_RECIPIENT_EVM.`
     );
   }
   const normalizedDigest = tracked.eip712Digest.toLowerCase();
@@ -1309,10 +1309,10 @@ function buildBaseSignedIntentReceipt(
     signatureFingerprint,
     diagnostic: configured
       ? 'Verified EIP-712 intent queued; call submitAndBroadcastSignedGaslessIntent or broadcastSignedRelayerTx to broadcast.'
-      : `Relayer key SIPHON_RELAYER_PRIVATE_KEY is unconfigured for ${cfg.name}.`,
+      : `Relayer key TURGALIUM_RELAYER_PRIVATE_KEY is unconfigured for ${cfg.name}.`,
     nextStep: configured
       ? `EIP-712 signature cryptographically verified for ${recoveredSigner}. Intent ${params.intentId} queued for sponsored broadcast on ${cfg.name} (not yet attested onchain).`
-      : `EIP-712 signature verified (${signatureFingerprint}) for ${recoveredSigner}, NOT broadcast or attested. Configure SIPHON_RELAYER_PRIVATE_KEY to broadcast sponsored sweeps on ${cfg.name}.`,
+      : `EIP-712 signature verified (${signatureFingerprint}) for ${recoveredSigner}, NOT broadcast or attested. Configure TURGALIUM_RELAYER_PRIVATE_KEY to broadcast sponsored sweeps on ${cfg.name}.`,
   };
 }
 
@@ -1331,7 +1331,7 @@ export function submitSignedGaslessIntent(params: {
 
 /**
  * Verifies a user-signed EIP-712 gasless sweep intent AND attempts real onchain broadcast
- * via `broadcastSignedRelayerTx()` when `SIPHON_RELAYER_PRIVATE_KEY`, router, and execution
+ * via `broadcastSignedRelayerTx()` when `TURGALIUM_RELAYER_PRIVATE_KEY`, router, and execution
  * calldata (`txCalldata`) are available.
  *
  * Security & reliability guarantees:

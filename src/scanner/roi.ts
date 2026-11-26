@@ -728,7 +728,7 @@ export function evaluateAssetRoi(
 
 /**
  * Exact Relayer Break-Even Math:
- * Unifies off-chain eligibility with on-chain `SiphonRouter` / `SiphonSweepDelegate` solvency:
+ * Unifies off-chain eligibility with on-chain `TurgaliumRouter` / `TurgaliumSweepDelegate` solvency:
  *   - Total relayer outlay `G = sponsoredGasUsd + l1DataFeeUsd + fixedRelayerOverheadUsd`
  *   - Required coverage = `1.5 * G`
  *   - When gas is reimbursed from proceeds (`maxGasReimbursementUsd !== undefined`),

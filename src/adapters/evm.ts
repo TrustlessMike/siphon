@@ -30,7 +30,7 @@ export const EVM_FAMILY_META: ChainFamilyMeta = {
     cctpDomain: c.cctpDomain,
   })),
   signingMechanism: '1-Signature Witness-Bound Permit2 / EIP-7702 Delegate or EIP-5792 Batch',
-  gasSponsorshipMechanism: 'Siphon Relayer sponsors $0 user gas (reimbursed from 5–10% protocol fee)',
+  gasSponsorshipMechanism: 'Turgalium Relayer sponsors $0 user gas (reimbursed from 5–10% protocol fee)',
   preSignProofMechanism: 'Live EVM RPC eth_call preflight + Circle CCTP bytes32 match + Solana snapshot',
   bridgeProviders: ['Relay', 'LI.FI', 'Circle CCTP'],
   wallets: [
@@ -120,8 +120,8 @@ export const evmAdapter: ChainFamilyAdapter = {
       sponsoredGasEstUsd: intent.sponsoredGasEstUsd,
       gasSponsorshipMechanism:
         intent.mode === 'permit2_batch'
-          ? 'Permit2 PermitBatchWitnessTransferFrom + Siphon Relayer ($0 user gas)'
-          : 'EIP-7702 SiphonSweepDelegate + Siphon Relayer ($0 user gas)',
+          ? 'Permit2 PermitBatchWitnessTransferFrom + Turgalium Relayer ($0 user gas)'
+          : 'EIP-7702 TurgaliumSweepDelegate + Turgalium Relayer ($0 user gas)',
       protocolFeeBps: intent.protocolFeeBps,
       protocolFeePercent: intent.protocolFeePercent,
       protocolFeeUsd: intent.protocolFeeUsd,

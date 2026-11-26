@@ -980,12 +980,12 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     }
     if (feeUsdc > 0) {
       const destLabel = feeConfig.feeRecipientEvm
-        ? `${feeConfig.feeRecipientEvm.slice(0, 6)}…${feeConfig.feeRecipientEvm.slice(-4)} (${feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'SiphonFeeVault'})`
-        : 'SiphonFeeVault / Treasury (set recipient)';
+        ? `${feeConfig.feeRecipientEvm.slice(0, 6)}…${feeConfig.feeRecipientEvm.slice(-4)} (${feeConfig.feeDestinationType === 'wallet' ? 'Treasury Wallet' : 'TurgaliumFeeVault'})`
+        : 'TurgaliumFeeVault / Treasury (set recipient)';
       steps.push({
         step: `Protocol Fee (${feeConfig.feePercent}%)`,
         detail: `Routes $${feeUsdc.toFixed(2)} (${feeConfig.feeBps} bps) atomically to ${destLabel}`,
-        target: feeConfig.feeRecipientEvm ?? 'SiphonFeeVault',
+        target: feeConfig.feeRecipientEvm ?? 'TurgaliumFeeVault',
       });
     }
     if (bridgedUsdc > 0 && (effectiveChainPref === 'cctp' || directUsdcItems.length > 0 || swapItems.length === 0)) {

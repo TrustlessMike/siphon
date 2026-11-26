@@ -32,7 +32,7 @@ import {
   submitAndBroadcastSignedGaslessIntent,
 } from '../relayer/sponsor.js';
 import { getRpcCircuitBreakerMetrics } from '../scanner/rpc.js';
-import { createStateStore, type SiphonStateStore } from '../storage/state-store.js';
+import { createStateStore, type TurgaliumStateStore } from '../storage/state-store.js';
 import {
   buildRateLimitHeaders,
   SlidingWindowRateLimiter,
@@ -54,7 +54,7 @@ import {
 import { scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
 import { fetchSolanaWalletBalances, getL2IndexerProvider } from '../scanner/discovery.js';
 import {
-  SiphonAgentEngine,
+  TurgaliumAgentEngine,
   type AgentActionType,
   type PluginClientKind,
 } from '../agent/mandate-engine.js';
@@ -111,7 +111,7 @@ const DEFAULT_SCAN_CACHE_MAX = 40;
 const DEFAULT_SCAN_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_JOB_LEGS = 50;
 
-export interface SiphonServerOptions {
+export interface TurgaliumServerOptions {
   allowedOrigins?: string[];
   allowedHosts?: string[];
   publicBaseUrl?: string;
@@ -124,7 +124,7 @@ export interface SiphonServerOptions {
   degenClient?: JupiterMarketsClient;
   nowMs?: () => number;
   liveGasFetcher?: (chain: EvmChainId) => Promise<number | null>;
-  stateStore?: SiphonStateStore;
+  stateStore?: TurgaliumStateStore;
   dataDir?: string | null;
   rateLimit?: RateLimiterOptions;
   trustProxy?: boolean;
@@ -149,8 +149,8 @@ function isLoopbackHostname(hostname: string): boolean {
 
 function parseConfiguredAllowedHosts(explicit?: string[], extraOrigins?: Set<string>, publicBaseUrl?: string): Set<string> {
   const set = new Set<string>(['127.0.0.1', 'localhost', '[::1]', '::1']);
-  const envHosts = process.env.SIPHON_ALLOWED_HOSTS
-    ? process.env.SIPHON_ALLOWED_HOSTS.split(',')
+  const envHosts = process.env.TURGALIUM_ALLOWED_HOSTS
+    ? process.env.TURGALIUM_ALLOWED_HOSTS.split(',')
     : [];
   for (const h of [...(explicit ?? []), ...envHosts]) {
     const clean = h.trim().toLowerCase().replace(/:\d+$/, '');
@@ -204,7 +204,7 @@ function validateHostHeader(
     return {
       ok: false,
       status: 403,
-      error: 'Disallowed Host header blocked by Siphon DNS-rebinding protection.',
+      error: 'Disallowed Host header blocked by Turgalium DNS-rebinding protection.',
     };
   }
   return { ok: true, host: parsed.host, hostname };
@@ -212,14 +212,14 @@ function validateHostHeader(
 
 /**
  * Rejects client-supplied `feeRecipientEvm` overrides (`HIGH-7`).
- * Protocol fee treasury must be configured exclusively on the server via `SIPHON_FEE_RECIPIENT_EVM`.
+ * Protocol fee treasury must be configured exclusively on the server via `TURGALIUM_FEE_RECIPIENT_EVM`.
  */
 function assertNoFeeRecipientOverride(supplied?: string | null): void {
   if (supplied === undefined || supplied === null || supplied === '') return;
   if (typeof supplied !== 'string') {
     throw new HttpError(400, 'Invalid feeRecipientEvm value.');
   }
-  const serverRecipient = process.env.SIPHON_FEE_RECIPIENT_EVM?.trim();
+  const serverRecipient = process.env.TURGALIUM_FEE_RECIPIENT_EVM?.trim();
   if (!serverRecipient || supplied.trim().toLowerCase() !== serverRecipient.toLowerCase()) {
     throw new HttpError(
       400,
@@ -307,8 +307,8 @@ function isLoopbackOrigin(origin: string): boolean {
 function parseConfiguredAllowedOrigins(explicit?: string[]): Set<string> {
   const rawList =
     explicit ??
-    (process.env.SIPHON_ALLOWED_ORIGIN
-      ? process.env.SIPHON_ALLOWED_ORIGIN.split(',')
+    (process.env.TURGALIUM_ALLOWED_ORIGIN
+      ? process.env.TURGALIUM_ALLOWED_ORIGIN.split(',')
       : []);
   const set = new Set<string>();
   for (const item of rawList) {
@@ -418,7 +418,7 @@ function buildCorsHeaders(params: {
   isAllowedOrigin: (origin: string) => boolean;
 }): Record<string, string> {
   const headers: Record<string, string> = {
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Siphon-Admin-Session, Mcp-Session-Id, MCP-Protocol-Version',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Turgalium-Admin-Session, Mcp-Session-Id, MCP-Protocol-Version',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   };
   if (!params.restricted) {
@@ -556,10 +556,10 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
   return true;
 }
 
-export function createSiphonServer(opts: SiphonServerOptions = {}) {
+export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
   const configuredAllowedOrigins = parseConfiguredAllowedOrigins(opts.allowedOrigins);
   const configuredPublicBaseUrl =
-    opts.publicBaseUrl?.trim() || process.env.SIPHON_PUBLIC_BASE_URL?.trim() || null;
+    opts.publicBaseUrl?.trim() || process.env.TURGALIUM_PUBLIC_BASE_URL?.trim() || null;
   const normalizedPublicBaseUrl = configuredPublicBaseUrl
     ? normalizeOrigin(configuredPublicBaseUrl)
     : null;
@@ -571,7 +571,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
   const isAllowedOrigin = (origin: string): boolean =>
     isLoopbackOrigin(origin) || configuredAllowedOrigins.has(origin);
 
-  const envRequirePluginAuthRaw = process.env.SIPHON_REQUIRE_PLUGIN_AUTH?.trim().toLowerCase();
+  const envRequirePluginAuthRaw = process.env.TURGALIUM_REQUIRE_PLUGIN_AUTH?.trim().toLowerCase();
   const forcePluginAuth =
     opts.requirePluginAuth === true ||
     envRequirePluginAuthRaw === 'true' ||
@@ -584,7 +584,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
       : true);
 
   const adminSessionToken =
-    opts.adminSessionToken?.trim() || process.env.SIPHON_ADMIN_SESSION_TOKEN?.trim() || null;
+    opts.adminSessionToken?.trim() || process.env.TURGALIUM_ADMIN_SESSION_TOKEN?.trim() || null;
 
   const stateStore = createStateStore({
     stateStore: opts.stateStore,
@@ -622,7 +622,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
     stateStore,
     resumePollersOnLoad: stateStore.persistent,
   });
-  const agentEngine = new SiphonAgentEngine({ nowMs: opts.nowMs, stateStore });
+  const agentEngine = new TurgaliumAgentEngine({ nowMs: opts.nowMs, stateStore });
   const degenClient = opts.degenClient ?? new JupiterMarketsClient({ nowMs: opts.nowMs });
   const preservationAgents = new PreservationAgentStore({ nowMs: opts.nowMs, stateStore });
 
@@ -696,19 +696,19 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
 
       const checkCrossOriginAndCsrf = (requireJsonForBrowser: boolean): { ok: true } | { ok: false; status: number; error: string } => {
         if (originHeader && !originAllowed) {
-          return { ok: false, status: 403, error: 'Cross-origin request blocked by Siphon CORS policy.' };
+          return { ok: false, status: 403, error: 'Cross-origin request blocked by Turgalium CORS policy.' };
         }
         if (!originHeader && refererHeader) {
           const refOrigin = normalizeOrigin(refererHeader);
           if (!refOrigin || !isAllowedOrigin(refOrigin)) {
-            return { ok: false, status: 403, error: 'Cross-origin Referer blocked by Siphon CSRF policy.' };
+            return { ok: false, status: 403, error: 'Cross-origin Referer blocked by Turgalium CSRF policy.' };
           }
         }
         if (
           secFetchSite === 'cross-site' &&
           (!normalizedOrigin || !configuredAllowedOrigins.has(normalizedOrigin))
         ) {
-          return { ok: false, status: 403, error: 'Cross-site browser request blocked by Siphon CSRF policy.' };
+          return { ok: false, status: 403, error: 'Cross-site browser request blocked by Turgalium CSRF policy.' };
         }
         if (requireJsonForBrowser && method === 'POST' && (originHeader || secFetchSite)) {
           const ct = String(req.headers['content-type'] ?? '').toLowerCase();
@@ -725,7 +725,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
 
       const hasValidAdminSession = (): boolean => {
         if (!adminSessionToken) return true;
-        const supplied = req.headers['x-siphon-admin-session'];
+        const supplied = req.headers['x-turgalium-admin-session'];
         const value = Array.isArray(supplied) ? supplied[0] : supplied;
         return Boolean(value && timingSafeStringEqual(value.trim(), adminSessionToken));
       };
@@ -734,7 +734,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         const csrf = checkCrossOriginAndCsrf(true);
         if (!csrf.ok) return csrf;
         if (adminSessionToken && !hasValidAdminSession()) {
-          return { ok: false, status: 401, error: 'Missing or invalid X-Siphon-Admin-Session header.' };
+          return { ok: false, status: 401, error: 'Missing or invalid X-Turgalium-Admin-Session header.' };
         }
         return { ok: true };
       };
@@ -747,7 +747,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           isAllowedOrigin,
         });
         if (preflightRestricted && originHeader && !originAllowed) {
-          sendJson(res, 403, { error: 'Cross-origin preflight blocked by Siphon CORS policy.' }, preflightCors);
+          sendJson(res, 403, { error: 'Cross-origin preflight blocked by Turgalium CORS policy.' }, preflightCors);
           return;
         }
         res.writeHead(204, preflightCors);
@@ -800,7 +800,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         const hasPluginToken = Boolean(authHeader && agentEngine.verifyPluginToken(authHeader));
         if (!hasValidAdminSession() && !hasPluginToken) {
           return reply(401, {
-            error: 'Authentication required: supply X-Siphon-Admin-Session or Authorization: Bearer <token>.',
+            error: 'Authentication required: supply X-Turgalium-Admin-Session or Authorization: Bearer <token>.',
           });
         }
       }
@@ -809,7 +809,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         const protocolFee = getProtocolFeeConfig();
         return reply(200, {
           status: 'ok',
-          service: 'siphon-migrator',
+          service: 'turgalium-migrator',
           chains: CHAIN_LIST.length,
           solanaCctpDomain: SOLANA_CCTP_DOMAIN,
           protocolFeeBps: protocolFee.feeBps,
@@ -820,12 +820,12 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
 
       if (method === 'GET' && pathname === '/api/metrics') {
         if (adminSessionToken && !hasValidAdminSession()) {
-          return reply(401, { error: 'Missing or invalid X-Siphon-Admin-Session header.' });
+          return reply(401, { error: 'Missing or invalid X-Turgalium-Admin-Session header.' });
         }
         const now = (opts.nowMs ?? (() => Date.now()))();
         const jobs = jobStore.listJobs();
         return reply(200, {
-          service: 'siphon-migrator',
+          service: 'turgalium-migrator',
           timestamp: new Date(now).toISOString(),
           uptimeSec: Math.max(0, Math.floor((now - startedAtMs) / 1000)),
           requests: { ...runtimeMetrics },
@@ -904,17 +904,17 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
       }
 
       if (method === 'GET' && pathname === '/api/contract') {
-        const routerPath = path.join(CONTRACTS_DIR, 'SiphonRouter.sol');
-        const feeVaultPath = path.join(CONTRACTS_DIR, 'SiphonFeeVault.sol');
-        const delegatePath = path.join(CONTRACTS_DIR, 'SiphonSweepDelegate.sol');
-        const agentVaultPath = path.join(CONTRACTS_DIR, 'SiphonAgentVault.sol');
+        const routerPath = path.join(CONTRACTS_DIR, 'TurgaliumRouter.sol');
+        const feeVaultPath = path.join(CONTRACTS_DIR, 'TurgaliumFeeVault.sol');
+        const delegatePath = path.join(CONTRACTS_DIR, 'TurgaliumSweepDelegate.sol');
+        const agentVaultPath = path.join(CONTRACTS_DIR, 'TurgaliumAgentVault.sol');
         const source = fs.existsSync(routerPath) ? fs.readFileSync(routerPath, 'utf8') : '';
         const feeVaultSource = fs.existsSync(feeVaultPath) ? fs.readFileSync(feeVaultPath, 'utf8') : '';
         const delegateSource = fs.existsSync(delegatePath) ? fs.readFileSync(delegatePath, 'utf8') : '';
         const agentVaultSource = fs.existsSync(agentVaultPath) ? fs.readFileSync(agentVaultPath, 'utf8') : '';
         const protocolFee = getProtocolFeeConfig();
         return reply(200, {
-          name: 'SiphonRouter.sol',
+          name: 'TurgaliumRouter.sol',
           solidityVersion: '0.8.24',
           protocolFeeBps: protocolFee.feeBps,
           protocolFee,
@@ -925,10 +925,10 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           delegateSource,
           agentVaultSource,
           contracts: [
-            { id: 'router', filename: 'contracts/SiphonRouter.sol', title: 'SiphonRouter.sol', source },
-            { id: 'delegate', filename: 'contracts/SiphonSweepDelegate.sol', title: 'SiphonSweepDelegate.sol (EIP-7702)', source: delegateSource },
-            { id: 'agent', filename: 'contracts/SiphonAgentVault.sol', title: 'SiphonAgentVault.sol (Agents)', source: agentVaultSource },
-            { id: 'vault', filename: 'contracts/SiphonFeeVault.sol', title: 'SiphonFeeVault.sol', source: feeVaultSource },
+            { id: 'router', filename: 'contracts/TurgaliumRouter.sol', title: 'TurgaliumRouter.sol', source },
+            { id: 'delegate', filename: 'contracts/TurgaliumSweepDelegate.sol', title: 'TurgaliumSweepDelegate.sol (EIP-7702)', source: delegateSource },
+            { id: 'agent', filename: 'contracts/TurgaliumAgentVault.sol', title: 'TurgaliumAgentVault.sol (Agents)', source: agentVaultSource },
+            { id: 'vault', filename: 'contracts/TurgaliumFeeVault.sol', title: 'TurgaliumFeeVault.sol', source: feeVaultSource },
           ],
           chains: CHAIN_LIST.map((c) => ({
             chain: c.name,
@@ -1038,7 +1038,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         const authHeader = req.headers.authorization;
         const verifiedToken = authHeader ? agentEngine.verifyPluginToken(authHeader) : null;
         if (authHeader && !verifiedToken) {
-          return reply(401, { error: 'Invalid or revoked Siphon AI Plugin Bearer token.' });
+          return reply(401, { error: 'Invalid or revoked Turgalium AI Plugin Bearer token.' });
         }
         if (verifiedToken && !verifiedToken.scopes.includes('agent:propose')) {
           return reply(403, {
@@ -1048,12 +1048,12 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
 
         const hasAdminAuth = Boolean(adminSessionToken && hasValidAdminSession());
 
-        // When adminSessionToken or explicit SIPHON_REQUIRE_PLUGIN_AUTH is enabled, NEVER allow
+        // When adminSessionToken or explicit TURGALIUM_REQUIRE_PLUGIN_AUTH is enabled, NEVER allow
         // unauthenticated requests (even client: 'ui' or 'smart_contract_agent') to bypass auth.
         if ((adminSessionToken || forcePluginAuth) && !verifiedToken && !hasAdminAuth) {
           return reply(401, {
             error: adminSessionToken
-              ? "Authentication required: supply X-Siphon-Admin-Session or a Bearer token with 'agent:propose' scope."
+              ? "Authentication required: supply X-Turgalium-Admin-Session or a Bearer token with 'agent:propose' scope."
               : "Bearer token authentication with 'agent:propose' scope is required.",
           });
         }
@@ -1196,7 +1196,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           return reply(401, {
             jsonrpc: '2.0',
             id: null,
-            error: { code: -32001, message: 'Invalid or revoked Siphon MCP Bearer token.' },
+            error: { code: -32001, message: 'Invalid or revoked Turgalium MCP Bearer token.' },
           });
         }
         if (!verifiedToken && (requirePluginAuth || !isSameOriginLocalhostUi())) {
@@ -1206,7 +1206,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
             error: {
               code: -32001,
               message:
-                'Missing Siphon MCP Bearer token. Issue a scoped token in Siphon and pass Authorization: Bearer <token>.',
+                'Missing Turgalium MCP Bearer token. Issue a scoped token in Turgalium and pass Authorization: Bearer <token>.',
             },
           });
         }

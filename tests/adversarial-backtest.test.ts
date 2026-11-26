@@ -3,13 +3,13 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import path from 'node:path';
 import test from 'node:test';
-import { SiphonAgentEngine } from '../src/agent/mandate-engine.js';
+import { TurgaliumAgentEngine } from '../src/agent/mandate-engine.js';
 import { prepareRealExecution } from '../src/execution/tx-builder.js';
 import { scanPresetWallet } from '../src/scanner/classifier.js';
 import { checkAaveV3AccountSafety } from '../src/scanner/discovery.js';
 import { sanitizeTokenName, sanitizeTokenSymbol } from '../src/scanner/sanitize.js';
 import { scanUnifiedWallets } from '../src/scanner/unify.js';
-import { createSiphonServer } from '../src/server/app.js';
+import { createTurgaliumServer } from '../src/server/app.js';
 
 const SAMPLE_SOLANA_WALLET = 'AK9CKqppArTVRrmd4rQKzvjcmNUHnx5LBFx1HXoYaz2n';
 const ATTACKER_SOLANA_WALLET = '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
@@ -38,7 +38,7 @@ function sendRawHttp(port: number, rawRequest: string): Promise<string> {
 }
 
 test('Adversarial Backtest Suite: replays Audit Swarm 4 & Audit 3 exploits against live HTTP (:4464) & compiled stdio MCP', async () => {
-  const { server } = createSiphonServer({
+  const { server } = createTurgaliumServer({
     adminSessionToken: ADMIN_SECRET,
     requirePluginAuth: true,
   });
@@ -61,7 +61,7 @@ test('Adversarial Backtest Suite: replays Audit Swarm 4 & Audit 3 exploits again
   const base = `http://127.0.0.1:${port}`;
   const adminHeaders = {
     'Content-Type': 'application/json',
-    'X-Siphon-Admin-Session': ADMIN_SECRET,
+    'X-Turgalium-Admin-Session': ADMIN_SECRET,
   };
 
   try {
@@ -111,7 +111,7 @@ test('Adversarial Backtest Suite: replays Audit Swarm 4 & Audit 3 exploits again
       method: 'POST',
       headers: {
         'Content-Type': 'text/plain',
-        'X-Siphon-Admin-Session': ADMIN_SECRET,
+        'X-Turgalium-Admin-Session': ADMIN_SECRET,
       },
       body: JSON.stringify({
         ownerAddress: SAMPLE_EVM_WALLET_A,
@@ -317,7 +317,7 @@ test('Adversarial Backtest Suite: replays Audit Swarm 4 & Audit 3 exploits again
     assert.equal(approve2.status, 400);
 
     // autoApproveUnderUsd: 0 + sub-cent rounding bypass check (HIGH-1)
-    const localEngine = new SiphonAgentEngine();
+    const localEngine = new TurgaliumAgentEngine();
     const zeroAutoMandate = localEngine.createMandate({
       ownerAddress: SAMPLE_EVM_WALLET_A,
       lockedSolanaRecipient: SAMPLE_SOLANA_WALLET,
@@ -437,7 +437,7 @@ test('Adversarial Backtest Suite: replays Audit Swarm 4 & Audit 3 exploits again
         id: 55,
         method: 'tools/call',
         params: {
-          name: 'siphon_request_sweep_permission',
+          name: 'turgalium_request_sweep_permission',
           arguments: {
             actionType: 'bridge_solana',
             summary: 'x'.repeat(300),
@@ -510,8 +510,8 @@ test('Adversarial Backtest Suite: replays Audit Swarm 4 & Audit 3 exploits again
     const stdioChild = spawn(process.execPath, [compiledMcpPath], {
       env: {
         ...process.env,
-        SIPHON_API_URL: base,
-        SIPHON_API_TOKEN: tok.token,
+        TURGALIUM_API_URL: base,
+        TURGALIUM_API_TOKEN: tok.token,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -556,9 +556,9 @@ test('Adversarial Backtest Suite: replays Audit Swarm 4 & Audit 3 exploits again
 
       const listTools = await rpcCall(2, 'tools/list');
       const tools = (listTools.result as { tools: Array<{ name: string; annotations?: Record<string, boolean> }> }).tools;
-      assert.equal(tools.some((t) => t.name === 'siphon_create_agent_mandate'), false);
-      const scanTool = tools.find((t) => t.name === 'siphon_scan_wallets');
-      const proposeTool = tools.find((t) => t.name === 'siphon_request_sweep_permission');
+      assert.equal(tools.some((t) => t.name === 'turgalium_create_agent_mandate'), false);
+      const scanTool = tools.find((t) => t.name === 'turgalium_scan_wallets');
+      const proposeTool = tools.find((t) => t.name === 'turgalium_request_sweep_permission');
       assert.equal(scanTool?.annotations?.readOnlyHint, true);
       assert.equal(scanTool?.annotations?.destructiveHint, false);
       assert.equal(proposeTool?.annotations?.readOnlyHint, false);
@@ -566,14 +566,14 @@ test('Adversarial Backtest Suite: replays Audit Swarm 4 & Audit 3 exploits again
 
       // Exploit replay: attempt to mint mandate via stdio MCP -> blocked
       const mintBlocked = await rpcCall(3, 'tools/call', {
-        name: 'siphon_create_agent_mandate',
+        name: 'turgalium_create_agent_mandate',
         arguments: { ownerAddress: SAMPLE_EVM_WALLET_A, lockedSolanaRecipient: ATTACKER_SOLANA_WALLET },
       });
       assert.equal((mintBlocked.result as { isError?: boolean }).isError, true);
 
       // Legitimate stdio scan -> spoofed $1 sweep against live scanCache -> rejected
       const stdioScan = await rpcCall(4, 'tools/call', {
-        name: 'siphon_scan_wallets',
+        name: 'turgalium_scan_wallets',
         arguments: { wallets: [{ presetId: 'veteran_defi', label: 'Stdio Vault' }] },
       });
       const highAsset = (
@@ -582,7 +582,7 @@ test('Adversarial Backtest Suite: replays Audit Swarm 4 & Audit 3 exploits again
       assert.ok(highAsset);
 
       const spoofedStdio = await rpcCall(5, 'tools/call', {
-        name: 'siphon_request_sweep_permission',
+        name: 'turgalium_request_sweep_permission',
         arguments: {
           mandateId: mandate.mandateId,
           actionType: 'bridge_solana',
@@ -602,7 +602,7 @@ test('Adversarial Backtest Suite: replays Audit Swarm 4 & Audit 3 exploits again
 
       // Legitimate stdio sweep within remaining $120 daily cap & $50 auto tier -> auto_approved_by_mandate & synced!
       const legitStdio = await rpcCall(6, 'tools/call', {
-        name: 'siphon_request_sweep_permission',
+        name: 'turgalium_request_sweep_permission',
         arguments: {
           mandateId: mandate.mandateId,
           actionType: 'dust_convert',

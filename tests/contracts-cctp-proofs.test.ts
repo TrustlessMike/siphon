@@ -39,7 +39,7 @@ import {
   computeEmptySweepCallsHash,
   computeGaslessIntentEip712Digest,
   recoverEip712Signer,
-  SIPHON_WITNESS_TYPE_STRING,
+  TURGALIUM_WITNESS_TYPE_STRING,
   submitSignedGaslessIntent,
   SWEEP_INTENT_TYPE_STRING,
 } from '../src/relayer/sponsor.js';
@@ -400,12 +400,12 @@ test('HIGH-10 Backtest: extractCctpMessageFromLogs & fetchCctpAttestationForTx r
 // 2. SMART CONTRACT ADVERSARIAL INVARIANT & ABI PARITY BACKTEST
 // ============================================================================
 
-test('Smart Contract Adversarial Backtest: SiphonRouter, SiphonSweepDelegate, and SiphonFeeVault enforce all CRIT/HIGH/MED invariants & EIP-712 parity', () => {
-  const routerSol = fs.readFileSync(path.join(ROOT_DIR, 'contracts/SiphonRouter.sol'), 'utf8');
-  const delegateSol = fs.readFileSync(path.join(ROOT_DIR, 'contracts/SiphonSweepDelegate.sol'), 'utf8');
-  const vaultSol = fs.readFileSync(path.join(ROOT_DIR, 'contracts/SiphonFeeVault.sol'), 'utf8');
+test('Smart Contract Adversarial Backtest: TurgaliumRouter, TurgaliumSweepDelegate, and TurgaliumFeeVault enforce all CRIT/HIGH/MED invariants & EIP-712 parity', () => {
+  const routerSol = fs.readFileSync(path.join(ROOT_DIR, 'contracts/TurgaliumRouter.sol'), 'utf8');
+  const delegateSol = fs.readFileSync(path.join(ROOT_DIR, 'contracts/TurgaliumSweepDelegate.sol'), 'utf8');
+  const vaultSol = fs.readFileSync(path.join(ROOT_DIR, 'contracts/TurgaliumFeeVault.sol'), 'utf8');
 
-  // --- SiphonRouter.sol ---
+  // --- TurgaliumRouter.sol ---
   assert.ok(routerSol.includes('pragma solidity 0.8.24;'), 'Router pragma must be pinned');
   assert.ok(!routerSol.includes('mapping(address => bool) public allowedTargets;'), 'CRIT-01: shared allowedTargets MUST be removed');
   assert.ok(routerSol.includes('mapping(address => bool) public allowedSwapAggregators;'), 'CRIT-01: disjoint allowedSwapAggregators required');
@@ -414,7 +414,11 @@ test('Smart Contract Adversarial Backtest: SiphonRouter, SiphonSweepDelegate, an
   assert.ok(routerSol.includes('mapping(address => bool) public allowedFeeRecipients;'), 'HIGH-01: feeRecipient allowlist required');
   assert.ok(routerSol.includes('mapping(address => bool) public allowedRelayers;'), 'HIGH-02: relayer allowlist required');
   assert.ok(routerSol.includes('if (keccak256(abi.encode(swaps)) != witness.swapsHash)'), 'CRIT-03: Permit2 witness swapsHash enforcement required');
-  assert.ok(routerSol.includes(`"${SIPHON_WITNESS_TYPE_STRING}"`), 'CRIT-03: Permit2 SIPHON_WITNESS_TYPEHASH must match sponsor.ts byte-for-byte');
+  assert.ok(routerSol.includes(`"${TURGALIUM_WITNESS_TYPE_STRING}"`), 'CRIT-03: Permit2 TURGALIUM_WITNESS_TYPEHASH must match sponsor.ts byte-for-byte');
+  assert.ok(
+    routerSol.includes(`"TurgaliumSweepWitness witness)TokenPermissions(address token,uint256 amount)${TURGALIUM_WITNESS_TYPE_STRING}"`),
+    'CRIT-03: Permit2 TURGALIUM_WITNESS_TYPESTRING must order TokenPermissions alphabetically before TurgaliumSweepWitness'
+  );
   assert.ok(routerSol.includes('InsufficientCreditedBalance'), 'CRIT-03: pullFromUser=false must consume strictly current-tx credited delta');
   assert.ok(routerSol.includes('getReserveData(exitStep.underlyingAsset)'), 'MED-04: Aave aToken must be validated via Pool.getReserveData');
   assert.ok(routerSol.includes('function rescueNative('), 'MED-03: Router must be able to rescue native ETH');
@@ -427,11 +431,11 @@ test('Smart Contract Adversarial Backtest: SiphonRouter, SiphonSweepDelegate, an
   assert.ok(routerBridgeIdx > 0 && routerBurnIdx > routerBridgeIdx, 'MED-01: Router must bridge via CCTP BEFORE untrusted burn calls');
   assert.ok(routerSol.includes('uint16 public constant MIN_FEE_BPS = 0;'), 'Preservation tier: Router MIN_FEE_BPS must be 0');
   assert.ok(routerSol.includes('uint16 public constant MAX_FEE_BPS = 1000;'), 'Router MAX_FEE_BPS ceiling must remain 1000');
-  assert.ok(routerSol.includes('depositForBurnWithHook('), 'CCTP V2 hook support required in SiphonRouter');
-  assert.ok(routerSol.includes('function sweepWithMandate('), 'SiphonAgentVault on-chain mandate linkage required in SiphonRouter');
-  assert.ok(routerSol.includes('authorizeAgentAction('), 'Router must call SiphonAgentVault.authorizeAgentAction');
+  assert.ok(routerSol.includes('depositForBurnWithHook('), 'CCTP V2 hook support required in TurgaliumRouter');
+  assert.ok(routerSol.includes('function sweepWithMandate('), 'TurgaliumAgentVault on-chain mandate linkage required in TurgaliumRouter');
+  assert.ok(routerSol.includes('authorizeAgentAction('), 'Router must call TurgaliumAgentVault.authorizeAgentAction');
 
-  // --- SiphonSweepDelegate.sol ---
+  // --- TurgaliumSweepDelegate.sol ---
   assert.ok(delegateSol.includes('pragma solidity 0.8.24;'), 'Delegate pragma must be pinned');
   assert.ok(
     !delegateSol.includes('usdcAfter > usdcBefore ? (usdcAfter - usdcBefore) : usdcAfter'),
@@ -441,7 +445,7 @@ test('Smart Contract Adversarial Backtest: SiphonRouter, SiphonSweepDelegate, an
   assert.ok(delegateSol.includes('grossUsdc = intent.directUsdcAmount + swappedUsdc;'), 'CRIT-02: Explicit signed directUsdcAmount required');
   assert.ok(
     delegateSol.includes(`"${SWEEP_INTENT_TYPE_STRING}"`),
-    'CRIT-06: SWEEP_INTENT_TYPEHASH in SiphonSweepDelegate.sol MUST match sponsor.ts byte-for-byte'
+    'CRIT-06: SWEEP_INTENT_TYPEHASH in TurgaliumSweepDelegate.sol MUST match sponsor.ts byte-for-byte'
   );
   assert.ok(delegateSol.includes('address public immutable protocolFeeRecipient;'), 'HIGH-01: Immutable protocolFeeRecipient required for EIP-7702');
   assert.ok(delegateSol.includes('error UnauthorizedFeeRecipient'), 'HIGH-01: Must reject unauthorized feeRecipient');
@@ -451,7 +455,7 @@ test('Smart Contract Adversarial Backtest: SiphonRouter, SiphonSweepDelegate, an
   assert.ok(!delegateSol.includes('abi.decode(ret, (bool))'), 'HIGH-03: Burn loop must NOT call abi.decode(ret, (bool))');
 
   // Verify exact ERC-7201 storage slot derivation
-  const nsHash = BigInt('0x' + Buffer.from(keccak_256(new TextEncoder().encode('siphon.eip7702.sweep.delegate.v1'))).toString('hex'));
+  const nsHash = BigInt('0x' + Buffer.from(keccak_256(new TextEncoder().encode('turgalium.eip7702.sweep.delegate.v1'))).toString('hex'));
   const innerBuf = Buffer.from((nsHash - 1n).toString(16).padStart(64, '0'), 'hex');
   const erc7201Slot = '0x' + (BigInt('0x' + Buffer.from(keccak_256(innerBuf)).toString('hex')) & ~0xffn).toString(16).padStart(64, '0');
   assert.ok(delegateSol.includes(erc7201Slot), `LOW-03: Delegate must use exact ERC-7201 slot ${erc7201Slot}`);
@@ -466,17 +470,17 @@ test('Smart Contract Adversarial Backtest: SiphonRouter, SiphonSweepDelegate, an
     'MED-01: Delegate must execute revokes FIRST, CCTP bridge BEFORE untrusted burns, and burns LAST'
   );
 
-  // --- SiphonDelegateRegistry.sol ---
-  const registrySol = fs.readFileSync(path.join(ROOT_DIR, 'contracts/SiphonDelegateRegistry.sol'), 'utf8');
+  // --- TurgaliumDelegateRegistry.sol ---
+  const registrySol = fs.readFileSync(path.join(ROOT_DIR, 'contracts/TurgaliumDelegateRegistry.sol'), 'utf8');
   assert.ok(registrySol.includes('pragma solidity 0.8.24;'), 'Registry pragma must be pinned');
   assert.ok(registrySol.includes('function isAllowedRelayer(') && registrySol.includes('function isApprovedRelayer('), 'Registry relayer views required');
   assert.ok(registrySol.includes('function isAllowedSwapRouter(') && registrySol.includes('function isApprovedRouter('), 'Registry router views required');
   assert.ok(registrySol.includes('function pause(') && registrySol.includes('function unpause('), 'Registry kill-switch required');
   assert.ok(delegateSol.includes('uint16 public constant MIN_FEE_BPS = 0;'), 'Preservation tier: Delegate MIN_FEE_BPS must be 0');
-  assert.ok(delegateSol.includes('depositForBurnWithHook('), 'CCTP V2 hook support required in SiphonSweepDelegate');
-  assert.ok(delegateSol.includes('function executeSponsoredSweepWithMandate('), 'SiphonAgentVault on-chain mandate linkage required in SiphonSweepDelegate');
+  assert.ok(delegateSol.includes('depositForBurnWithHook('), 'CCTP V2 hook support required in TurgaliumSweepDelegate');
+  assert.ok(delegateSol.includes('function executeSponsoredSweepWithMandate('), 'TurgaliumAgentVault on-chain mandate linkage required in TurgaliumSweepDelegate');
 
-  // --- SiphonFeeVault.sol ---
+  // --- TurgaliumFeeVault.sol ---
   assert.ok(vaultSol.includes('pragma solidity 0.8.24;'), 'FeeVault pragma must be pinned');
   assert.ok(
     vaultSol.includes('function setPayees(Payee[] calldata nextPayees) external onlyOwner nonReentrant'),
@@ -504,17 +508,17 @@ test('CRIT-06/CRIT-07/HIGH-01/HIGH-04/MED-05 Relayer Replay: unconfigured router
   const attackerTreasury = '0x9999999999999999999999999999999999999999';
   const solDest = SAMPLE_SOLANA_WALLETS[0];
 
-  const prevRouterBase = process.env.SIPHON_ROUTER_BASE;
-  const prevDelegateBase = process.env.SIPHON_DELEGATE_BASE;
-  const prevFeeEnv = process.env.SIPHON_FEE_RECIPIENT_EVM;
-  const prevRelayerKey = process.env.SIPHON_RELAYER_PRIVATE_KEY;
+  const prevRouterBase = process.env.TURGALIUM_ROUTER_BASE;
+  const prevDelegateBase = process.env.TURGALIUM_DELEGATE_BASE;
+  const prevFeeEnv = process.env.TURGALIUM_FEE_RECIPIENT_EVM;
+  const prevRelayerKey = process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
 
   try {
     // 1. Unconfigured router -> NEVER emits 0x...51F0 live typedData!
-    delete process.env.SIPHON_ROUTER_BASE;
-    delete process.env.SIPHON_DELEGATE_BASE;
-    delete process.env.SIPHON_FEE_RECIPIENT_EVM;
-    delete process.env.SIPHON_RELAYER_PRIVATE_KEY;
+    delete process.env.TURGALIUM_ROUTER_BASE;
+    delete process.env.TURGALIUM_DELEGATE_BASE;
+    delete process.env.TURGALIUM_FEE_RECIPIENT_EVM;
+    delete process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
 
     const previewIntent = buildGaslessSweepIntent({
       chain: 'base',
@@ -540,14 +544,14 @@ test('CRIT-06/CRIT-07/HIGH-01/HIGH-04/MED-05 Relayer Replay: unconfigured router
       /preview-only/i
     );
 
-    // 2. HIGH-01: Server SIPHON_FEE_RECIPIENT_EVM cannot be overridden by client feeRecipientEvm
-    process.env.SIPHON_FEE_RECIPIENT_EVM = treasury;
+    // 2. HIGH-01: Server TURGALIUM_FEE_RECIPIENT_EVM cannot be overridden by client feeRecipientEvm
+    process.env.TURGALIUM_FEE_RECIPIENT_EVM = treasury;
     const feeCfg = getProtocolFeeConfig({ feeRecipientEvm: attackerTreasury });
     assert.equal(feeCfg.feeRecipientEvm, treasury, 'Client override MUST NOT hijack configured server treasury');
 
     // 3. HIGH-04: Circular 2.5x break-even bypass is FIXED!
     // $10 gross @ 7% fee = $0.70 fee; $1.50 gas -> onchain requires fee >= 0.5 * $1.50 = $0.75 (relayerRevenue $2.20 < $2.25)
-    process.env.SIPHON_ROUTER_BASE = '0x4444444444444444444444444444444444444444';
+    process.env.TURGALIUM_ROUTER_BASE = '0x4444444444444444444444444444444444444444';
     const marginalSweep = buildGaslessSweepIntent({
       chain: 'base',
       assets: [
@@ -569,7 +573,7 @@ test('CRIT-06/CRIT-07/HIGH-01/HIGH-04/MED-05 Relayer Replay: unconfigured router
       'HIGH-04: $10 gross / $1.50 gas ($0.70 fee < $0.75 margin) MUST be rejected offchain before hitting onchain RelayerBreakEvenNotMet'
     );
 
-    // 4. CRIT-06: EIP-7702 SweepIntent includes directUsdcAmount & callsHash matching SiphonSweepDelegate.sol
+    // 4. CRIT-06: EIP-7702 SweepIntent includes directUsdcAmount & callsHash matching TurgaliumSweepDelegate.sol
     const nativeAsset = makeAsset({
       id: 'base:eth',
       chain: 'base',
@@ -697,14 +701,14 @@ test('CRIT-06/CRIT-07/HIGH-01/HIGH-04/MED-05 Relayer Replay: unconfigured router
     assert.equal(p2Msg.permitted[0].token, EVM_CHAINS.base.usdcAddress);
     assert.equal(p2Msg.witness.swapsHash, computeEmptySwapsHash());
   } finally {
-    if (prevRouterBase === undefined) delete process.env.SIPHON_ROUTER_BASE;
-    else process.env.SIPHON_ROUTER_BASE = prevRouterBase;
-    if (prevDelegateBase === undefined) delete process.env.SIPHON_DELEGATE_BASE;
-    else process.env.SIPHON_DELEGATE_BASE = prevDelegateBase;
-    if (prevFeeEnv === undefined) delete process.env.SIPHON_FEE_RECIPIENT_EVM;
-    else process.env.SIPHON_FEE_RECIPIENT_EVM = prevFeeEnv;
-    if (prevRelayerKey === undefined) delete process.env.SIPHON_RELAYER_PRIVATE_KEY;
-    else process.env.SIPHON_RELAYER_PRIVATE_KEY = prevRelayerKey;
+    if (prevRouterBase === undefined) delete process.env.TURGALIUM_ROUTER_BASE;
+    else process.env.TURGALIUM_ROUTER_BASE = prevRouterBase;
+    if (prevDelegateBase === undefined) delete process.env.TURGALIUM_DELEGATE_BASE;
+    else process.env.TURGALIUM_DELEGATE_BASE = prevDelegateBase;
+    if (prevFeeEnv === undefined) delete process.env.TURGALIUM_FEE_RECIPIENT_EVM;
+    else process.env.TURGALIUM_FEE_RECIPIENT_EVM = prevFeeEnv;
+    if (prevRelayerKey === undefined) delete process.env.TURGALIUM_RELAYER_PRIVATE_KEY;
+    else process.env.TURGALIUM_RELAYER_PRIVATE_KEY = prevRelayerKey;
   }
 });
 

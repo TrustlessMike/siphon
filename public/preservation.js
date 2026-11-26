@@ -1,5 +1,5 @@
 /**
- * Siphon Capital-Preservation Optimizer, Tiered Fee Clarity, Route Auction Winner
+ * Turgalium Capital-Preservation Optimizer, Tiered Fee Clarity, Route Auction Winner
  * & Gas-Window Watchdog UI Module.
  * Self-contained browser module cleanly integrated without bloating public/app.js.
  */
@@ -664,7 +664,7 @@ async function runPreservationOptimization(scanReport) {
   }
 
   latestScanReport = scanReport;
-  window.dispatchEvent(new CustomEvent('siphon:scan-updated', { detail: { scanReport } }));
+  window.dispatchEvent(new CustomEvent('turgalium:scan-updated', { detail: { scanReport } }));
   const seq = ++optimizeSeq;
 
   try {
@@ -689,8 +689,8 @@ async function runPreservationOptimization(scanReport) {
 }
 
 function installScanObserver() {
-  if (window.__siphonPreservationInstalled) return;
-  window.__siphonPreservationInstalled = true;
+  if (window.__turgaliumPreservationInstalled) return;
+  window.__turgaliumPreservationInstalled = true;
 
   window.fetch = async function wrappedFetch(input, init) {
     const response = await nativeFetch(input, init);
@@ -777,7 +777,7 @@ function bindPreservationEvents() {
     refreshGasWatchAgents();
   });
 
-  window.addEventListener('siphon:wallet-changed', (ev) => {
+  window.addEventListener('turgalium:wallet-changed', (ev) => {
     const detail = ev?.detail;
     if (!detail || detail.family !== 'evm') return;
     if (detail.action === 'disconnect' || !detail.address) {
@@ -814,7 +814,7 @@ if (document.readyState === 'loading') {
   bindPreservationEvents();
 }
 
-window.__siphonPreservation = {
+window.__turgaliumPreservation = {
   getLatest: () => latestPreservation,
   getLatestRouteAuction: () => latestRouteAuction,
   computeTieredPreservationFee,
