@@ -112,6 +112,7 @@ const MIME_TYPES: Record<string, string> = {
   '.js': 'application/javascript; charset=utf-8',
   '.mjs': 'application/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
 };
@@ -1021,6 +1022,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         const vercelEphemeralRelayerBlocked =
           process.env.VERCEL === '1' && !stateStore.persistent;
         const hasCoinbaseSdk =
+          process.env.VERCEL === '1' ||
           fs.existsSync(path.join(PUBLIC_DIR, 'vendor', 'coinbase-sdk.js')) ||
           fs.existsSync(path.join(DIST_VENDOR_DIR, 'wallet-sdks.js'));
         return reply(200, {

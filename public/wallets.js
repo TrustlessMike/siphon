@@ -1904,7 +1904,43 @@ export function buildMobileWalletDeepLink(walletKey, targetUrl, refUrl) {
   if (key === 'solflare') {
     return `https://solflare.com/ul/v1/browse/${encodedUrl}?ref=${encodedRef}`;
   }
+  if (key === 'metamask') {
+    const stripped = cleanTarget.replace(/^https?:\/\//i, '');
+    return `https://metamask.app.link/dapp/${stripped}`;
+  }
+  if (key === 'coinbase') {
+    return `https://go.cb-w.com/dapp?cb_url=${encodedUrl}`;
+  }
   return null;
+}
+
+export function getMobileEvmDeepLinks(targetUrl, refUrl) {
+  return [
+    {
+      id: 'mobile-phantom-evm',
+      walletKey: 'phantom',
+      name: 'Open in Phantom Mobile',
+      subtitle: 'Universal Link · EVM + Solana',
+      logo: '/logos/phantom.svg',
+      deepLinkUrl: buildMobileWalletDeepLink('phantom', targetUrl, refUrl),
+    },
+    {
+      id: 'mobile-metamask-evm',
+      walletKey: 'metamask',
+      name: 'Open in MetaMask Mobile',
+      subtitle: 'Universal Link · 19 EVM Chains',
+      logo: '/logos/metamask.svg',
+      deepLinkUrl: buildMobileWalletDeepLink('metamask', targetUrl, refUrl),
+    },
+    {
+      id: 'mobile-coinbase-evm',
+      walletKey: 'coinbase',
+      name: 'Open in Coinbase Wallet',
+      subtitle: 'Universal Link · Base + EVM',
+      logo: '/logos/coinbase.svg',
+      deepLinkUrl: buildMobileWalletDeepLink('coinbase', targetUrl, refUrl),
+    },
+  ].filter((item) => Boolean(item.deepLinkUrl));
 }
 
 export function getMobileSolanaDeepLinks(targetUrl, refUrl) {
