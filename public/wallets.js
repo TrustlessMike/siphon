@@ -103,10 +103,45 @@ const CHAIN_ADD_PARAMS = {
     rpcUrls: ['https://worldchain-mainnet.g.alchemy.com/public'],
     blockExplorerUrls: ['https://worldscan.org'],
   },
+  999: {
+    chainId: '0x3e7',
+    chainName: 'HyperEVM',
+    nativeCurrency: { name: 'HYPE', symbol: 'HYPE', decimals: 18 },
+    rpcUrls: ['https://rpc.hyperliquid.xyz/evm'],
+    blockExplorerUrls: ['https://hyperevmscan.io'],
+  },
+  80094: {
+    chainId: '0x138de',
+    chainName: 'Berachain',
+    nativeCurrency: { name: 'BERA', symbol: 'BERA', decimals: 18 },
+    rpcUrls: ['https://rpc.berachain.com'],
+    blockExplorerUrls: ['https://berascan.com'],
+  },
+  324: {
+    chainId: '0x144',
+    chainName: 'zkSync Era',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    rpcUrls: ['https://mainnet.era.zksync.io'],
+    blockExplorerUrls: ['https://explorer.zksync.io'],
+  },
+  57073: {
+    chainId: '0xdef1',
+    chainName: 'Ink',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    rpcUrls: ['https://rpc-gel.inkonchain.com'],
+    blockExplorerUrls: ['https://explorer.inkonchain.com'],
+  },
+  100: {
+    chainId: '0x64',
+    chainName: 'Gnosis',
+    nativeCurrency: { name: 'xDAI', symbol: 'xDAI', decimals: 18 },
+    rpcUrls: ['https://gnosis-rpc.publicnode.com'],
+    blockExplorerUrls: ['https://gnosisscan.io'],
+  },
 };
 
 const SUPPORTED_CHAIN_IDS = [
-  1, 8453, 42161, 10, 137, 43114, 56, 146, 130, 59144, 534352, 5000, 81457, 480,
+  1, 8453, 42161, 10, 137, 43114, 56, 146, 130, 59144, 534352, 5000, 81457, 480, 999, 80094, 324, 57073, 100,
 ];
 
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -230,13 +265,31 @@ const CCTP_CLAIM_ALLOWED_PROGRAMS = new Set([
   'CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe',
 ]);
 
+const SOLANA_MEMO_V1_PROGRAM_STR = 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo';
+const SOLANA_MEMO_V2_PROGRAM_STR = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
+
 const JUPITER_KNOWN_PROGRAMS = new Set([
-  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
-  'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB',
-  'JUP3c2Uh3WA4Ng34tw6kPd2G4C5BB21Xo36Je1s32Ph',
-  'jupoNjAxXgZ4rjzxzPMP4oxduvQsQtZzyknqvzYNrNu',
-  'DCA265Vj8a9CEuX1eb1LWRnDT7uK6q1xMipnNyatn23M',
-  'PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu',
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', // Jupiter Aggregator v6
+  'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB', // Jupiter Aggregator v4
+  'JUP3c2Uh3WA4Ng34tw6kPd2G4C5BB21Xo36Je1s32Ph', // Jupiter Aggregator v3
+  'jupoNjAxXgZ4rjzxzPMP4oxduvQsQtZzyknqvzYNrNu', // Jupiter Limit Order v2
+  'DCA265Vj8a9CEuX1eb1LWRnDT7uK6q1xMipnNyatn23M', // Jupiter DCA
+  'PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu', // Jupiter Perpetuals
+  'jup3YeL8QhtSx1e253b2FDvsMNC87fDrgQZivbrndc9', // Jupiter Lend / Earn
+  'KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD', // Kamino Lending
+  '5ocnV1qiCgaQR8Jb8xWnVbApfaygJ8tNoZfgPwsgx9kx', // Sanctum S Controller (JupSOL)
+  'SP12tWFxD9oJsVWNavTTBZvMbA6gkAmxtVgxdqvyvhZ', // Sanctum Stake Pool
+]);
+
+const JUPITER_FLOW_ALLOWED_PROGRAMS = new Set([
+  ...JUPITER_KNOWN_PROGRAMS,
+  SOLANA_COMPUTE_BUDGET_PROGRAM_STR,
+  SOLANA_SYSTEM_PROGRAM_STR,
+  SOLANA_TOKEN_PROGRAM_STR,
+  SOLANA_TOKEN_2022_PROGRAM_STR,
+  SOLANA_ATA_PROGRAM_STR,
+  SOLANA_MEMO_V1_PROGRAM_STR,
+  SOLANA_MEMO_V2_PROGRAM_STR,
 ]);
 
 let cachedNodeSolanaWeb3 = null;
@@ -350,16 +403,23 @@ function assertValidCallForSign(call, expectedSolanaDestination, expectedSolanaA
   const dataLower = typeof call?.data === 'string' ? call.data.toLowerCase() : '';
   const isCctpV1 = dataLower.startsWith('0x6fd3504e');
   const isCctpV2 = dataLower.startsWith('0x8e0250ee');
-  if (expectedSolanaDestination && (isCctpV1 || isCctpV2)) {
-    const minCalldataLen = isCctpV2 ? 10 + 448 : 10 + 256;
+  // keccak256("depositForBurnWithHook(uint256,uint32,bytes32,address,bytes32,uint256,uint32,bytes)")[0..4] = 0x779b432d
+  const isCctpV2Hook = dataLower.startsWith('0x779b432d');
+  if (expectedSolanaDestination && (isCctpV1 || isCctpV2 || isCctpV2Hook)) {
+    const minCalldataLen = isCctpV2Hook ? 10 + 576 : isCctpV2 ? 10 + 448 : 10 + 256;
     if (dataLower.length < minCalldataLen) {
       throw new Error(
         'Pre-sign check failed: truncated CCTP depositForBurn calldata.'
       );
     }
-    const expectedOwnerBytes32 = solanaBase58ToBytes32Hex(expectedSolanaDestination).toLowerCase();
+    // Fail closed if canonical Solana USDC ATA derivation failed — never fall back to raw owner pubkey bytes32.
+    if (!expectedSolanaAtaBytes32 || !/^0x[0-9a-f]{64}$/i.test(String(expectedSolanaAtaBytes32))) {
+      throw new Error(
+        'Pre-sign check failed: unable to derive canonical Solana USDC ATA for CCTP depositForBurn verification.'
+      );
+    }
     const encodedRecipient = '0x' + dataLower.slice(10 + 128, 10 + 192);
-    const expectedTarget = expectedSolanaAtaBytes32 || expectedOwnerBytes32;
+    const expectedTarget = String(expectedSolanaAtaBytes32).toLowerCase();
     if (encodedRecipient !== expectedTarget) {
       throw new Error(
         'Pre-sign check failed: CCTP depositForBurn mintRecipient does not match your Solana USDC ATA.'
@@ -2377,34 +2437,135 @@ function validateDeserializedSolanaTx(
       );
     }
   } else if (flow === 'jupiter_yield' || flow === 'jupiter_predict') {
-    const hasJupiterProgram = inspected.compiledInstructions.some(
-      (ix) => JUPITER_KNOWN_PROGRAMS.has(ix.programId) || /^JUP/i.test(ix.programId || '')
-    );
-    if (!hasJupiterProgram) {
-      let hasNonTrivialProgram = false;
-      for (const ix of inspected.compiledInstructions) {
-        if (ix.programId === SOLANA_SYSTEM_PROGRAM_STR) {
-          const isSystemTransfer =
-            ix.data.length >= 4 &&
-            ix.data[0] === 2 &&
-            ix.data[1] === 0 &&
-            ix.data[2] === 0 &&
-            ix.data[3] === 0;
-          const destKey = inspected.staticKeys[ix.accountKeyIndexes[1]];
-          if (isSystemTransfer && destKey !== connectedAddress) {
-            throw new Error(
-              'Pre-sign check failed: blocked raw SystemProgram.transfer to external destination without a Jupiter program.'
-            );
-          }
-        } else if (ix.programId !== SOLANA_COMPUTE_BUDGET_PROGRAM_STR) {
-          hasNonTrivialProgram = true;
-        }
-      }
-      if (!hasNonTrivialProgram) {
+    let hasAllowedExecutionProgram = false;
+
+    for (const ix of inspected.compiledInstructions) {
+      if (!JUPITER_FLOW_ALLOWED_PROGRAMS.has(ix.programId)) {
         throw new Error(
-          `Pre-sign check failed: ${flow} transaction contains no Jupiter or protocol execution instruction.`
+          `Pre-sign check failed: ${flow} transaction invokes disallowed program ${ix.programId}.`
         );
       }
+
+      if (JUPITER_KNOWN_PROGRAMS.has(ix.programId)) {
+        hasAllowedExecutionProgram = true;
+      }
+
+      // Unconditionally audit ALL SystemProgram instructions (never bypass when Jupiter is present).
+      if (ix.programId === SOLANA_SYSTEM_PROGRAM_STR) {
+        if (!ix.data || ix.data.length < 4) {
+          throw new Error(
+            `Pre-sign check failed: malformed SystemProgram instruction in ${flow} transaction.`
+          );
+        }
+        const sysOpcode =
+          (ix.data[0] | (ix.data[1] << 8) | (ix.data[2] << 16) | (ix.data[3] << 24)) >>> 0;
+        if (sysOpcode === 2 || sysOpcode === 11) {
+          // Transfer (2) or TransferWithSeed (11): destination MUST be the connected wallet (e.g. self-wrap).
+          const destKey = inspected.staticKeys[ix.accountKeyIndexes[1]];
+          if (destKey !== connectedAddress) {
+            throw new Error(
+              `Pre-sign check failed: blocked raw SystemProgram.transfer to external destination in ${flow} transaction.`
+            );
+          }
+        } else if (sysOpcode === 0 || sysOpcode === 3) {
+          // CreateAccount (0) / CreateAccountWithSeed (3): allow only temp SPL Token / Token-2022 accounts.
+          // CreateAccount layout: u32 opcode (4) + u64 lamports (8) + u64 space (8) + pubkey owner (32) = 52 bytes.
+          if (sysOpcode === 0) {
+            if (ix.data.length < 52) {
+              throw new Error(
+                `Pre-sign check failed: truncated SystemProgram.createAccount instruction in ${flow} transaction.`
+              );
+            }
+            const ownerPubkey = bytesToBase58(ix.data.slice(20, 52));
+            if (
+              ownerPubkey !== SOLANA_TOKEN_PROGRAM_STR &&
+              ownerPubkey !== SOLANA_TOKEN_2022_PROGRAM_STR
+            ) {
+              throw new Error(
+                `Pre-sign check failed: blocked SystemProgram.createAccount assigned to disallowed program ${ownerPubkey}.`
+              );
+            }
+          } else {
+            // CreateAccountWithSeed: trailing 32 bytes are owner pubkey.
+            if (ix.data.length < 32) {
+              throw new Error(
+                `Pre-sign check failed: truncated SystemProgram.createAccountWithSeed instruction in ${flow} transaction.`
+              );
+            }
+            const ownerPubkey = bytesToBase58(ix.data.slice(ix.data.length - 32));
+            if (
+              ownerPubkey !== SOLANA_TOKEN_PROGRAM_STR &&
+              ownerPubkey !== SOLANA_TOKEN_2022_PROGRAM_STR
+            ) {
+              throw new Error(
+                `Pre-sign check failed: blocked SystemProgram.createAccountWithSeed assigned to disallowed program ${ownerPubkey}.`
+              );
+            }
+          }
+        } else {
+          throw new Error(
+            `Pre-sign check failed: blocked unsafe SystemProgram instruction (opcode ${sysOpcode}) in ${flow} transaction.`
+          );
+        }
+      }
+
+      // Unconditionally audit ALL SPL Token / Token-2022 instructions (block raw Transfer/Approve/SetAuthority/Burn).
+      if (ix.programId === SOLANA_TOKEN_PROGRAM_STR || ix.programId === SOLANA_TOKEN_2022_PROGRAM_STR) {
+        if (!ix.data || ix.data.length < 1) {
+          throw new Error(
+            `Pre-sign check failed: malformed SPL Token instruction in ${flow} transaction.`
+          );
+        }
+        const tokenOp = ix.data[0];
+        if (tokenOp === 17) {
+          // SyncNative (17) is safe for WSOL wrapping.
+        } else if (tokenOp === 9) {
+          // CloseAccount (9): destination AND authority MUST match connected wallet.
+          if (ix.accountKeyIndexes.length < 3) {
+            throw new Error(
+              `Pre-sign check failed: SPL CloseAccount instruction in ${flow} is missing required accounts.`
+            );
+          }
+          const destKey = inspected.staticKeys[ix.accountKeyIndexes[1]];
+          const ownerKey = inspected.staticKeys[ix.accountKeyIndexes[2]];
+          if (destKey !== connectedAddress || ownerKey !== connectedAddress) {
+            throw new Error(
+              `Pre-sign check failed: SPL CloseAccount in ${flow} must target connected Solana wallet.`
+            );
+          }
+        } else if (tokenOp === 1) {
+          // InitializeAccount (1): owner account (index 2) MUST be connected wallet.
+          const ownerKey = inspected.staticKeys[ix.accountKeyIndexes[2]];
+          if (ownerKey !== connectedAddress) {
+            throw new Error(
+              `Pre-sign check failed: SPL InitializeAccount in ${flow} must be owned by connected Solana wallet.`
+            );
+          }
+        } else if (tokenOp === 16 || tokenOp === 18) {
+          // InitializeAccount2 (16) / InitializeAccount3 (18): 32-byte owner pubkey starts at data[1..33].
+          if (ix.data.length < 33) {
+            throw new Error(
+              `Pre-sign check failed: truncated SPL InitializeAccount instruction in ${flow} transaction.`
+            );
+          }
+          const ownerKey = bytesToBase58(ix.data.slice(1, 33));
+          if (ownerKey !== connectedAddress) {
+            throw new Error(
+              `Pre-sign check failed: SPL InitializeAccount in ${flow} must be owned by connected Solana wallet.`
+            );
+          }
+        } else {
+          throw new Error(
+            `Pre-sign check failed: blocked disallowed SPL Token instruction (opcode ${tokenOp}) in ${flow} transaction.`
+          );
+        }
+      }
+    }
+
+    if (!hasAllowedExecutionProgram) {
+      throw new Error(
+        `Pre-sign check failed: ${flow} transaction contains no allowlisted Jupiter or protocol execution instruction.`
+      );
     }
   }
 }

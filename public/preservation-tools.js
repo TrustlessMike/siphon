@@ -24,6 +24,18 @@ const SUPPORTED_APPROVAL_CHAINS = [
   { id: 'polygon', label: 'Polygon', explorer: 'https://polygonscan.com/tx/' },
   { id: 'avalanche', label: 'Avalanche', explorer: 'https://snowtrace.io/tx/' },
   { id: 'bnb', label: 'BNB Chain', explorer: 'https://bscscan.com/tx/' },
+  { id: 'sonic', label: 'Sonic', explorer: 'https://sonicscan.org/tx/' },
+  { id: 'unichain', label: 'Unichain', explorer: 'https://uniscan.xyz/tx/' },
+  { id: 'linea', label: 'Linea', explorer: 'https://lineascan.build/tx/' },
+  { id: 'scroll', label: 'Scroll', explorer: 'https://scrollscan.com/tx/' },
+  { id: 'mantle', label: 'Mantle', explorer: 'https://mantlescan.xyz/tx/' },
+  { id: 'blast', label: 'Blast', explorer: 'https://blastscan.io/tx/' },
+  { id: 'worldchain', label: 'World Chain', explorer: 'https://worldscan.org/tx/' },
+  { id: 'hyperevm', label: 'HyperEVM', explorer: 'https://hyperevmscan.io/tx/' },
+  { id: 'berachain', label: 'Berachain', explorer: 'https://berascan.com/tx/' },
+  { id: 'zksync', label: 'zkSync Era', explorer: 'https://explorer.zksync.io/tx/' },
+  { id: 'ink', label: 'Ink', explorer: 'https://explorer.inkonchain.com/tx/' },
+  { id: 'gnosis', label: 'Gnosis', explorer: 'https://gnosisscan.io/tx/' },
 ];
 
 const SOLSCAN_ALLOWED_HOSTS = ['solscan.io'];
@@ -36,6 +48,18 @@ const EVM_EXPLORER_ALLOWED_HOSTS = [
   'polygonscan.com',
   'snowtrace.io',
   'bscscan.com',
+  'sonicscan.org',
+  'uniscan.xyz',
+  'lineascan.build',
+  'scrollscan.com',
+  'mantlescan.xyz',
+  'blastscan.io',
+  'worldscan.org',
+  'hyperevmscan.io',
+  'berascan.com',
+  'explorer.zksync.io',
+  'explorer.inkonchain.com',
+  'gnosisscan.io',
 ];
 
 const state = {
@@ -46,6 +70,7 @@ const state = {
   rentSigning: false,
   rentLastTx: null, // { signature, explorerUrl, count, reclaimedSol }
   rentSeq: 0,
+  userEditedRentOwner: false,
 
   // Yield Park
   strategies: [],
@@ -161,6 +186,18 @@ async function apiJson(url, opts = {}) {
   return data;
 }
 
+function resolveRentOwnerAddress() {
+  const customVal = document.getElementById('rentOwnerInput')?.value?.trim() || '';
+  if (customVal) {
+    return isValidSolanaBase58(customVal) ? customVal : '';
+  }
+  const connected = getConnectedSolanaAddress();
+  if (connected && isValidSolanaBase58(connected)) return connected;
+  const destVal = document.getElementById('solanaDestInput')?.value?.trim() || '';
+  if (isValidSolanaBase58(destVal)) return destVal;
+  return '';
+}
+
 function resolveSolanaAddress() {
   const connected = getConnectedSolanaAddress();
   if (connected && isValidSolanaBase58(connected)) return connected;
@@ -237,11 +274,14 @@ function updateSectionSummaryBadges() {
 // 1. EMPTY-ATA RENT VACUUM (1-CLICK RECLAIM FREE SOL)
 // =========================================================================
 
-async function runSolanaRentScan({ silent = false } = {}) {
-  const ownerAddress = resolveSolanaAddress();
+async function runSolanaRentScan({ silent = false, forceOwnerAddress = null } = {}) {
+  const customRaw = document.getElementById('rentOwnerInput')?.value?.trim() || '';
+  const ownerAddress = forceOwnerAddress || resolveRentOwnerAddress();
   if (!ownerAddress) {
     if (!silent) {
-      state.rentError = 'Connect a Solana wallet or enter a Solana address to scan empty ATAs.';
+      state.rentError = customRaw
+        ? 'Enter a valid Base58 Solana address to scan empty ATAs.'
+        : 'Connect a Solana wallet or enter a Solana address to scan empty ATAs.';
       renderRentVacuumCard();
       document.getElementById('rentOwnerInput')?.focus();
     }
@@ -294,7 +334,7 @@ async function handleReclaimSolClick() {
     (Array.isArray(scan?.transactions) ? scan.transactions[0] : null);
 
   if (!scan || scan.ownerAddress !== connectedSol || !txBase64) {
-    await runSolanaRentScan({ silent: false });
+    await runSolanaRentScan({ silent: false, forceOwnerAddress: connectedSol });
     scan = state.rentScan;
   }
 
@@ -365,8 +405,14 @@ function renderRentVacuumCard() {
   if (!host) return;
 
   const connectedSol = getConnectedSolanaAddress();
-  const activeSol = resolveSolanaAddress();
-  if (inputEl && document.activeElement !== inputEl && activeSol && inputEl.value !== activeSol) {
+  const activeSol = resolveRentOwnerAddress();
+  if (
+    inputEl &&
+    document.activeElement !== inputEl &&
+    !state.userEditedRentOwner &&
+    !inputEl.value.trim() &&
+    activeSol
+  ) {
     inputEl.value = activeSol;
   }
   if (scanBtn) {
@@ -1159,6 +1205,11 @@ function bindEvents() {
     });
   }
 
+  document.getElementById('rentOwnerInput')?.addEventListener('input', (ev) => {
+    const val = String(ev.target?.value || '').trim();
+    state.userEditedRentOwner = Boolean(val);
+  });
+
   document.getElementById('rentScanForm')?.addEventListener('submit', (ev) => {
     ev.preventDefault();
     runSolanaRentScan({ silent: false });
@@ -1241,11 +1292,24 @@ function bindEvents() {
       if (detail.action === 'disconnect' || !detail.address) {
         state.yieldAmountUsdc = 100;
         state.userEditedYieldAmount = false;
+        if (!state.userEditedRentOwner) {
+          const rentIn = document.getElementById('rentOwnerInput');
+          if (rentIn) rentIn.value = '';
+        }
+      } else if (!state.userEditedRentOwner) {
+        const rentIn = document.getElementById('rentOwnerInput');
+        if (rentIn) rentIn.value = detail.address;
       }
       renderRentVacuumCard();
       renderYieldParkCard();
       updateSectionSummaryBadges();
     }
+  });
+
+  window.addEventListener('turgalium:scan-cleared', () => {
+    state.latestScanReport = null;
+    renderApprovalRevokerCard();
+    updateSectionSummaryBadges();
   });
 
   // Sync with Turgalium app balance / wallet updates

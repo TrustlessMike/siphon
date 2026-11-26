@@ -209,8 +209,31 @@ function getActiveOutputAsset() {
 
 function getActiveProtocolFeeBps() {
   const sel = document.getElementById('protocolFeeSelect');
-  const parsed = Number(sel?.value ?? 700);
-  return Number.isFinite(parsed) && parsed >= 500 && parsed <= 1000 ? parsed : 700;
+  const raw = String(sel?.value ?? 'tiered').trim();
+  if (!raw || raw === 'tiered') return undefined;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 500 && parsed <= 1000 ? parsed : undefined;
+}
+
+function canAccessAdminRoutes() {
+  if (window.__turgaliumAdminAuth && typeof window.__turgaliumAdminAuth.canAccessAdmin === 'function') {
+    return Boolean(window.__turgaliumAdminAuth.canAccessAdmin());
+  }
+  return true;
+}
+
+function getAdminRequestHeaders() {
+  if (window.__turgaliumAdminAuth && typeof window.__turgaliumAdminAuth.getHeaders === 'function') {
+    return window.__turgaliumAdminAuth.getHeaders() || {};
+  }
+  return {};
+}
+
+function isAdminLocked() {
+  if (window.__turgaliumAdminAuth && typeof window.__turgaliumAdminAuth.isAdminLocked === 'function') {
+    return Boolean(window.__turgaliumAdminAuth.isAdminLocked());
+  }
+  return false;
 }
 
 function getCurrentSourceWallet() {
@@ -230,8 +253,8 @@ function getCurrentSolanaDest() {
 
 async function fetchJsonSilent(rawFetch, url, opts = {}) {
   const res = await rawFetch(url, {
-    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
     ...opts,
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
   });
   const data = await res.json();
   if (!res.ok) {
@@ -256,7 +279,14 @@ function updateSummaryProClarity(feeInfo, routeSummary) {
   row.classList.remove('hidden');
   const capPart = feeInfo.capUsd !== null ? ` cap ${fmtUsd(feeInfo.capUsd)}` : '';
   const routePart = routeSummary?.winnerLabel ? ` · ${routeSummary.winnerLabel}` : '';
-  valEl.textContent = `${feeInfo.feePercentLabel}${capPart} (save +${fmtUsd(feeInfo.savedVs7PctUsd)} vs 7%)${routePart}`;
+  const overrideBps = getActiveProtocolFeeBps();
+  if (overrideBps !== undefined) {
+    valEl.textContent = `Custom ${(overrideBps / 100).toFixed(1)}% flat (Tiered: ${feeInfo.feePercentLabel}${capPart})${routePart}`;
+  } else if (feeInfo.savedVs7PctUsd > 0) {
+    valEl.textContent = `Saving +${fmtUsd(feeInfo.savedVs7PctUsd)} vs 7%${routePart}`;
+  } else {
+    valEl.textContent = `${feeInfo.tierLabel}${routePart}`;
+  }
 }
 
 function createEl(tag, className, text) {
@@ -356,7 +386,7 @@ function renderPreservationStrip() {
     );
   }
 
-  const actions = createEl('div', 'preservation-actions');
+  const actions = createEl('div', 'preservation-actions pro-only');
   const applyBtn = createEl(
     'button',
     `btn-pill-dark btn-sm preservation-apply-btn${isApplied ? ' is-applied' : ''}`,
@@ -371,9 +401,9 @@ function renderPreservationStrip() {
   mainRow.appendChild(actions);
   card.appendChild(mainRow);
 
-  // Row 2: Tiered Preservation Fee + Winning Cross-Chain Route Auction Clarity
+  // Row 2: Pro-only Tiered Preservation Fee + Winning Cross-Chain Route Auction Clarity
   if (hasSweepable) {
-    const clarityRow = createEl('div', 'preservation-clarity-row');
+    const clarityRow = createEl('div', 'preservation-clarity-row pro-only');
 
     const feePill = createEl('span', 'preservation-pill preservation-pill-fee mono');
     feePill.id = 'preservationTieredFeePill';
@@ -485,6 +515,14 @@ function handleApplyOptimalRoute() {
 }
 
 async function registerGasWatchTrigger({ chain, maxBaseFeeGwei, estimatedSavingsUsd }) {
+  if (!canAccessAdminRoutes()) {
+    showPreservationToast(
+      'Admin session required — unlock above or run Turgalium locally to activate Gas-Window Watchdogs.'
+    );
+    document.getElementById('adminSessionTokenInput')?.focus();
+    return false;
+  }
+
   const sourceWallet = getCurrentSourceWallet();
   if (!sourceWallet) {
     showPreservationToast('Scan or connect an EVM wallet first before setting a gas watchdog.');
@@ -512,6 +550,7 @@ async function registerGasWatchTrigger({ chain, maxBaseFeeGwei, estimatedSavings
   try {
     const created = await fetchJsonSilent(nativeFetch, '/api/agents/gas-watch', {
       method: 'POST',
+      headers: getAdminRequestHeaders(),
       body: JSON.stringify({
         sourceWallet,
         solanaDestination,
@@ -545,16 +584,29 @@ async function handleQuickGasWatchClick() {
 }
 
 function renderGasWatchAgentsPanel() {
+  const locked = isAdminLocked();
   const liveBadge = document.getElementById('gasWatchLiveGweiBadge');
   if (liveBadge) {
     liveBadge.textContent =
       typeof latestEthGwei === 'number' && Number.isFinite(latestEthGwei)
         ? `Live L1: ${latestEthGwei.toFixed(1)} gwei`
+        : locked
+        ? 'Self-host / Unlock'
         : 'Live L1: —';
   }
 
   const listHost = document.getElementById('gasWatchListHost');
   if (!listHost) return;
+
+  if (locked) {
+    const lockedBox = createEl(
+      'div',
+      'agents-empty-state',
+      'Admin session required to manage server-side Gas-Window Watchdog alerts. Unlock above or run Turgalium locally.'
+    );
+    listHost.replaceChildren(lockedBox);
+    return;
+  }
 
   if (!activeGasTriggers.length) {
     const empty = createEl(
@@ -611,6 +663,7 @@ function renderGasWatchAgentsPanel() {
         try {
           await fetchJsonSilent(nativeFetch, `/api/agents/gas-watch/${encodeURIComponent(id)}/cancel`, {
             method: 'POST',
+            headers: getAdminRequestHeaders(),
             body: JSON.stringify({}),
           });
           await refreshGasWatchAgents();
@@ -641,8 +694,16 @@ function renderGasWatchAgentsPanel() {
 }
 
 async function refreshGasWatchAgents() {
+  if (!canAccessAdminRoutes()) {
+    activeGasTriggers = [];
+    renderGasWatchAgentsPanel();
+    return;
+  }
   try {
-    const data = await fetchJsonSilent(nativeFetch, '/api/agents/gas-watch', { method: 'GET' });
+    const data = await fetchJsonSilent(nativeFetch, '/api/agents/gas-watch', {
+      method: 'GET',
+      headers: getAdminRequestHeaders(),
+    });
     activeGasTriggers = Array.isArray(data.triggers) ? data.triggers : [];
     if (typeof data.ethereumGwei === 'number' && Number.isFinite(data.ethereumGwei)) {
       latestEthGwei = data.ethereumGwei;
@@ -651,6 +712,15 @@ async function refreshGasWatchAgents() {
   } catch {
     // Non-fatal: avoid console noise if auth/network unavailable
   }
+}
+
+function clearPreservationState() {
+  optimizeSeq += 1;
+  latestScanReport = null;
+  latestPreservation = null;
+  latestRouteAuction = null;
+  appliedRouteSignature = null;
+  renderPreservationStrip();
 }
 
 async function runPreservationOptimization(scanReport) {
@@ -667,14 +737,17 @@ async function runPreservationOptimization(scanReport) {
   window.dispatchEvent(new CustomEvent('turgalium:scan-updated', { detail: { scanReport } }));
   const seq = ++optimizeSeq;
 
+  const overrideFeeBps = getActiveProtocolFeeBps();
+  const bodyPayload = {
+    scanReport,
+    outputAsset: getActiveOutputAsset(),
+    ...(overrideFeeBps !== undefined ? { protocolFeeBps: overrideFeeBps } : {}),
+  };
+
   try {
     const data = await fetchJsonSilent(nativeFetch, '/api/optimize/preservation', {
       method: 'POST',
-      body: JSON.stringify({
-        scanReport,
-        outputAsset: getActiveOutputAsset(),
-        protocolFeeBps: getActiveProtocolFeeBps(),
-      }),
+      body: JSON.stringify(bodyPayload),
     });
     if (seq !== optimizeSeq) return;
     latestPreservation = data;
@@ -684,7 +757,10 @@ async function runPreservationOptimization(scanReport) {
     renderPreservationStrip();
     renderGasWatchAgentsPanel();
   } catch {
-    // Non-fatal silent failure keeps console clean
+    if (seq === optimizeSeq) {
+      latestPreservation = null;
+      renderPreservationStrip();
+    }
   }
 }
 
@@ -777,16 +853,23 @@ function bindPreservationEvents() {
     refreshGasWatchAgents();
   });
 
+  window.addEventListener('turgalium:scan-cleared', () => {
+    clearPreservationState();
+  });
+
+  window.addEventListener('turgalium:config-loaded', () => {
+    renderGasWatchAgentsPanel();
+  });
+
+  window.addEventListener('turgalium:admin-unlocked', () => {
+    refreshGasWatchAgents();
+  });
+
   window.addEventListener('turgalium:wallet-changed', (ev) => {
     const detail = ev?.detail;
     if (!detail || detail.family !== 'evm') return;
     if (detail.action === 'disconnect' || !detail.address) {
-      optimizeSeq += 1;
-      latestScanReport = null;
-      latestPreservation = null;
-      latestRouteAuction = null;
-      appliedRouteSignature = null;
-      renderPreservationStrip();
+      clearPreservationState();
     }
   });
 

@@ -1237,6 +1237,8 @@ select {
 .asset-row-val-col {
   text-align: right;
   white-space: nowrap;
+  min-width: 0;
+  max-width: 160px;
 }
 
 .asset-row-usd {
@@ -1252,6 +1254,10 @@ select {
   font-size: 11.5px;
   color: var(--ink-3);
   margin-top: 1px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .asset-row-tag {
@@ -2216,12 +2222,20 @@ select {
     width: 100%;
     height: 44px;
     overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
     border-top: 1px solid var(--border);
+    gap: 2px;
+    padding-right: 18px;
+  }
+  .app-tabs::-webkit-scrollbar {
+    display: none;
   }
   .app-tab {
     white-space: nowrap;
-    padding: 0 11px;
-    font-size: 13px;
+    padding: 0 10px;
+    font-size: 12.5px;
+    flex-shrink: 0;
   }
   .app-top-right {
     flex-wrap: wrap;
@@ -2420,12 +2434,20 @@ select {
     width: 100%;
     height: 44px;
     overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
     border-top: 1px solid var(--border);
+    gap: 2px;
+    padding-right: 18px;
+  }
+  .app-tabs::-webkit-scrollbar {
+    display: none;
   }
   .app-tab {
     white-space: nowrap;
-    padding: 0 11px;
-    font-size: 13px;
+    padding: 0 10px;
+    font-size: 12.5px;
+    flex-shrink: 0;
   }
   .app-top-right {
     flex-wrap: wrap;
@@ -2485,10 +2507,18 @@ select {
     padding: 10px 12px;
   }
   .asset-row {
-    grid-template-columns: 20px minmax(0, 1fr) auto;
+    grid-template-columns: 20px minmax(0, 1fr) minmax(0, auto);
     gap: 6px 8px;
     padding: 11px 12px;
     align-items: start;
+  }
+  .asset-row-id {
+    min-width: 0;
+    overflow: hidden;
+  }
+  .asset-row-val-col {
+    max-width: 124px;
+    overflow: hidden;
   }
   .asset-row-tag {
     display: flex;
@@ -3655,4 +3685,92 @@ html[data-ui-mode="pro"] .lite-only {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+/* Admin Session Locked State & Empty States in Agents & AI View */
+.agents-locked-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px 18px;
+  padding: 16px 18px;
+  margin-bottom: 16px;
+  background: var(--bg-paper, #fcfcfc);
+  border: 1px solid var(--border-strong, #d1d5db);
+}
+
+.agents-locked-copy {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+
+.agents-locked-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.agents-locked-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--hold-bg, #fffbeb);
+  border: 1px solid #fde68a;
+  color: #92400e;
+}
+
+.agents-unlock-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 1 320px;
+  min-width: 0;
+}
+
+.agents-unlock-form .field-input-xs {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+.agents-empty-state {
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px dashed var(--border-strong, #d1d5db);
+  background: var(--bg-well, #f4f5f7);
+  color: var(--ink-2, #52525b);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* Blocked / Zero-Value DeFi Badge */
+.defi-badge-blocked {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
+}
+
+/* Mobile <= 480px Pro-Mode Tab Bar Compact Polish + Scroll Affordance */
+@media (max-width: 480px) {
+  .app-tabs {
+    padding-right: 24px;
+    gap: 2px;
+  }
+  html[data-ui-mode="pro"] .app-tabs {
+    -webkit-mask-image: linear-gradient(to right, #000 0%, #000 calc(100% - 26px), transparent 100%);
+    mask-image: linear-gradient(to right, #000 0%, #000 calc(100% - 26px), transparent 100%);
+  }
+  .app-tab {
+    padding: 0 8px;
+    font-size: 12px;
+    gap: 5px;
+  }
+  .agents-unlock-form {
+    width: 100%;
+    flex-basis: 100%;
+  }
 }

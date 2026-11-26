@@ -2311,6 +2311,386 @@ def main():
             }
             ctxP.close()
 
+            # ------------------------------------------------------------------
+            # 8. WAVE 9 UI/UX, ZERO-401 ADMIN LOCK, UNIFIED TIERED FEE,
+            #    ECOSYSTEM STATE ISOLATION, 390px OVERFLOW, RENT PRIORITY,
+            #    BLOCKED LP NFT, 19 EVMs, & PRE-SIGN SECURITY REGRESSIONS
+            # ------------------------------------------------------------------
+            ctxW9 = browser.new_context(viewport={"width": 1440, "height": 900})
+            pgW9 = ctxW9.new_page()
+            errsW9 = []
+            http401W9 = []
+            badHttpW9 = []
+            rent_scan_owners = []
+
+            pgW9.on("pageerror", lambda e: errsW9.append(f"pageerror: {e}"))
+            pgW9.on("console", lambda m: errsW9.append(f"console.{m.type}: {m.text}") if m.type == "error" else None)
+
+            def on_w9_response(r):
+                if r.status == 401:
+                    http401W9.append(f"{r.status} {r.request.method} {r.url}")
+                elif r.status >= 400 and "/api/solana/balance" not in r.url:
+                    badHttpW9.append(f"{r.status} {r.request.method} {r.url}")
+
+            pgW9.on("response", on_w9_response)
+
+            pgW9.add_init_script("""
+              window.__copiedW9 = [];
+              try {
+                Object.defineProperty(navigator, 'clipboard', {
+                  configurable: true,
+                  value: {
+                    writeText: async (txt) => { window.__copiedW9.push(String(txt)); },
+                  },
+                });
+              } catch {}
+            """)
+
+            # 8A. Simulate public Vercel deployment with adminSessionRequired=true
+            def route_w9_config(route):
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "coinbaseSmartWalletEnabled": True,
+                        "walletConnectProjectId": None,
+                        "l2IndexerProvider": "rpc_multicall",
+                        "protocolFee": {
+                            "feeBps": 700,
+                            "feePercent": 7,
+                            "minFeeBps": 500,
+                            "maxFeeBps": 1000,
+                            "feeRecipientEvm": "0x1111111111111111111111111111111111111111",
+                            "feeRecipientSol": None,
+                            "feeDestinationType": "contract",
+                            "treasuryConfigured": True,
+                        },
+                        "gaslessRelayerConfigured": False,
+                        "requirePluginAuth": True,
+                        "adminSessionRequired": True,
+                    }),
+                )
+
+            def route_w9_admin_401(route):
+                route.fulfill(
+                    status=401,
+                    content_type="application/json",
+                    body=json.dumps({"error": "Missing or invalid X-Turgalium-Admin-Session header."}),
+                )
+
+            def route_w9_scan(route):
+                body = route.request.post_data_json or {}
+                scan_copy = json.loads(json.dumps(veteran_fixture))
+                scan_copy["walletAddress"] = body.get("address", VITALIK)
+                scan_copy["family"] = "evm"
+                # Add high-value asset ($80k), 36-digit huge balance token, blocked $0 LP NFT, and 1-item chain leg
+                scan_copy["assets"].extend([
+                    {
+                        "id": "eth-whale-usdc",
+                        "chain": "ethereum",
+                        "chainId": 1,
+                        "chainName": "Ethereum",
+                        "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                        "symbol": "USDC",
+                        "name": "USD Coin",
+                        "decimals": 6,
+                        "rawBalance": "80000000000",
+                        "uiBalance": 80000,
+                        "priceUsd": 1.0,
+                        "grossUsd": 80000,
+                        "kind": "erc20",
+                        "action": "BRIDGE_DIRECT_USDC",
+                        "actionReason": "Direct USDC bridge",
+                        "selectedByDefault": True,
+                        "estimatedGasUsd": 0.45,
+                        "batchedGasUsd": 0.25,
+                        "estimatedSlippageUsd": 0,
+                        "roiVerdict": "worth_it",
+                        "netRoiUsd": 79949.75,
+                    },
+                    {
+                        "id": "zksync-huge-amd",
+                        "chain": "zksync",
+                        "chainId": 324,
+                        "chainName": "zkSync Era",
+                        "address": "0x3333333333333333333333333333333333333333",
+                        "symbol": "AMD",
+                        "name": "Huge Supply Spam Token",
+                        "decimals": 18,
+                        "rawBalance": "880088008800880100000000000000000000000000000000000000",
+                        "uiBalance": 8.800880088008801e35,
+                        "priceUsd": 0,
+                        "grossUsd": 0,
+                        "kind": "dead_token",
+                        "action": "BURN_ZERO_LIQUIDITY",
+                        "actionReason": "Zero liquidity",
+                        "selectedByDefault": False,
+                        "estimatedGasUsd": 0.05,
+                        "batchedGasUsd": 0.02,
+                        "estimatedSlippageUsd": 0,
+                    },
+                    {
+                        "id": "eth-uni-v3-zero-lp",
+                        "chain": "ethereum",
+                        "chainId": 1,
+                        "chainName": "Ethereum",
+                        "address": "0xC36442b4a4522E871399CD717aBDD847Ab11FE88",
+                        "symbol": "UNI-V3-#112161",
+                        "name": "Uniswap V3 Position #112161",
+                        "protocol": "Uniswap V3",
+                        "decimals": 0,
+                        "rawBalance": "137378032570732",
+                        "uiBalance": 137378032570732,
+                        "priceUsd": 0,
+                        "grossUsd": 0,
+                        "kind": "defi_position",
+                        "action": "BURN_ZERO_LIQUIDITY",
+                        "actionReason": "Zero verified DEX liquidity ($0.00). Opt-in burn to 0x...dEaD",
+                        "selectedByDefault": False,
+                        "estimatedGasUsd": 1.2,
+                        "batchedGasUsd": 0.8,
+                        "estimatedSlippageUsd": 0,
+                        "roiVerdict": "negative_roi",
+                        "netRoiUsd": -1.2,
+                    },
+                    {
+                        "id": "unichain-single-eth",
+                        "chain": "unichain",
+                        "chainId": 130,
+                        "chainName": "Unichain",
+                        "address": "native",
+                        "symbol": "ETH",
+                        "name": "Ether",
+                        "decimals": 18,
+                        "rawBalance": "100000000000000000",
+                        "uiBalance": 0.1,
+                        "priceUsd": 2500,
+                        "grossUsd": 250,
+                        "kind": "native",
+                        "action": "SELL_AND_BRIDGE",
+                        "actionReason": "Liquid ETH",
+                        "selectedByDefault": True,
+                        "estimatedGasUsd": 0.02,
+                        "batchedGasUsd": 0.01,
+                        "estimatedSlippageUsd": 0.25,
+                        "roiVerdict": "worth_it",
+                        "netRoiUsd": 249.0,
+                    },
+                    {
+                        "id": "eth-pos-net-neg-roi",
+                        "chain": "ethereum",
+                        "chainId": 1,
+                        "chainName": "Ethereum",
+                        "address": "0x4444444444444444444444444444444444444444",
+                        "symbol": "BONDED",
+                        "name": "Bonded Pool",
+                        "decimals": 6,
+                        "rawBalance": "6855593690000",
+                        "uiBalance": 6855593.69,
+                        "priceUsd": 1.0,
+                        "grossUsd": 6855593.69,
+                        "kind": "erc20",
+                        "action": "SKIP_GAS_NEGATIVE",
+                        "actionReason": "Unroutable bonded pool",
+                        "selectedByDefault": False,
+                        "estimatedGasUsd": 0.5,
+                        "batchedGasUsd": 0.5,
+                        "estimatedSlippageUsd": 0,
+                        "roiVerdict": "negative_roi",
+                        "netRoiUsd": 6855593.69,
+                    },
+                ])
+                if not any(c.get("chain") == "unichain" for c in scan_copy["chains"]):
+                    scan_copy["chains"].append({"chain": "unichain", "chainName": "Unichain", "assetCount": 1, "totalUsd": 250})
+                if not any(c.get("chain") == "zksync" for c in scan_copy["chains"]):
+                    scan_copy["chains"].append({"chain": "zksync", "chainName": "zkSync Era", "assetCount": 1, "totalUsd": 0})
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(scan_copy))
+
+            def route_w9_rent_scan(route):
+                body = route.request.post_data_json or {}
+                rent_scan_owners.append(body.get("ownerAddress"))
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "ownerAddress": body.get("ownerAddress", ""),
+                        "totalTokenAccountsScanned": 2,
+                        "reclaimableCount": 0,
+                        "reclaimableSol": 0,
+                        "reclaimableUsd": 0,
+                        "rentPerEmptyAccountSol": 0.00203928,
+                        "reclaimableAccounts": [],
+                    }),
+                )
+
+            pgW9.route("**/api/config", route_w9_config)
+            pgW9.route("**/api/jobs*", route_w9_admin_401)
+            pgW9.route("**/api/agents/mandates*", route_w9_admin_401)
+            pgW9.route("**/api/agents/approvals*", route_w9_admin_401)
+            pgW9.route("**/api/agents/gas-watch*", route_w9_admin_401)
+            pgW9.route("**/api/plugin/setup*", route_w9_admin_401)
+            pgW9.route("**/api/plugin/tokens*", route_w9_admin_401)
+            pgW9.route("**/api/scan", route_w9_scan)
+            pgW9.route("**/api/solana/balance*", route_sol_balance)
+            pgW9.route("**/api/solana/rent-scan", route_w9_rent_scan)
+
+            pgW9.goto(BASE, wait_until="networkidle")
+            pgW9.wait_for_timeout(400)
+            assert not http401W9, f"Expected ZERO 401s on unauthenticated boot, got: {http401W9}"
+
+            # Open Migrator -> scan via input -> verify Lite mode purity & unified tiered fee
+            pgW9.click("#navLaunchBtn")
+            pgW9.wait_for_selector("#appShell:not(.hidden)", timeout=10000)
+            pgW9.fill("#appEvmInput", VITALIK)
+            pgW9.click("#appScanBtn")
+            pgW9.wait_for_selector("#preservationStripCard", timeout=15000)
+            pgW9.wait_for_timeout(200)
+
+            w9_lite = pgW9.evaluate("""() => {
+              const isVis = (sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                const st = getComputedStyle(el);
+                const r = el.getBoundingClientRect();
+                return st.display !== 'none' && r.width > 0 && r.height > 0;
+              };
+              return {
+                liteCost: document.getElementById('summaryLiteCostText')?.textContent?.trim() || '',
+                applyBtnVisible: isVis('#applyOptimalRouteBtn'),
+                clarityRowVisible: isVis('.preservation-clarity-row'),
+                evmBadgeCount: document.querySelector("#familyBar [data-family='evm'] .family-count")?.textContent?.trim() || '',
+                approvalOptCount: document.querySelectorAll('#approvalChainSelect option').length,
+                gasWatchOptCount: document.querySelectorAll('#gasWatchChainSelect option').length,
+                hasHyperEvm: Boolean(document.querySelector("#approvalChainSelect option[value='hyperevm']")),
+                hasGnosis: Boolean(document.querySelector("#gasWatchChainSelect option[value='gnosis']")),
+              };
+            }""")
+            # Unified tiered fee: $50 cap + small gas (~$50-$60), definitely NOT $5,600+ (7% flat)!
+            lite_fee_num = float(w9_lite["liteCost"].replace("~", "").replace("$", "").replace(",", ""))
+            assert 45.0 <= lite_fee_num <= 90.0, f"Lite Est. Fees should reflect $50 tiered cap, got {w9_lite}"
+            assert not w9_lite["applyBtnVisible"] and not w9_lite["clarityRowVisible"], f"Pro-only controls leaked in Lite Preservation Strip: {w9_lite}"
+            assert w9_lite["evmBadgeCount"] == "19", f"Expected dynamic 19 EVM badge, got {w9_lite}"
+            assert w9_lite["approvalOptCount"] == 19 and w9_lite["gasWatchOptCount"] == 19, w9_lite
+            assert w9_lite["hasHyperEvm"] and w9_lite["hasGnosis"], w9_lite
+
+            # 8B. Verify blocked $0.00 Uniswap V3 LP NFT has single coherent blocked badge & compact liquidity
+            lp_check = pgW9.evaluate("""() => {
+              const row = document.querySelector("[data-defi-asset-id='eth-uni-v3-zero-lp']");
+              if (!row) return null;
+              return {
+                text: row.innerText,
+                badgeCount: row.querySelectorAll('.defi-pos-badges > span').length,
+                hasBlockedBadge: Boolean(row.querySelector('.defi-badge-blocked')),
+                hasOneClick: row.innerText.includes('1-Click Extract'),
+                hasOptInBurn: row.innerText.toLowerCase().includes('opt-in burn'),
+                hasCompactLiq: row.innerText.includes('137.38T'),
+              };
+            }""")
+            assert lp_check and lp_check["hasBlockedBadge"] and lp_check["badgeCount"] == 1, lp_check
+            assert not lp_check["hasOneClick"] and not lp_check["hasOptInBurn"], lp_check
+            assert lp_check["hasCompactLiq"], lp_check
+
+            # 8C. Verify Rent Vacuum #rentOwnerInput priority over #solanaDestInput
+            pgW9.click("#toggleDestEditBtn")
+            pgW9.fill("#solanaDestInput", SOL_PUBKEY)
+            pgW9.locator("#solanaDestInput").dispatch_event("input")
+            pgW9.fill("#rentOwnerInput", SOL_PUBKEY_ALT)
+            pgW9.locator("#rentOwnerInput").dispatch_event("input")
+            pgW9.click("#scanSolanaRentBtn")
+            pgW9.wait_for_function("() => (document.getElementById('rentVacuumBody')?.innerText || '').includes('Clean wallet')", timeout=8000)
+            assert rent_scan_owners[-1] == SOL_PUBKEY_ALT, f"Rent Vacuum ignored #rentOwnerInput! Sent {rent_scan_owners}"
+
+            # 8D. Switch to Pro -> verify Tiered Protocol Fee, flat override, 1 item singular, comma formatting, Agents tab ZERO 401s
+            pgW9.click(".ui-mode-btn[data-ui-mode='pro']")
+            pgW9.wait_for_function("() => document.documentElement.dataset.uiMode === 'pro'", timeout=5000)
+            pro_fee_check = pgW9.evaluate("""() => ({
+              feeText: document.getElementById('summaryFeeText')?.textContent?.trim() || '',
+              queueText: document.getElementById('chainQueueList')?.innerText || '',
+              bondedRowText: document.querySelector("[data-row-asset='eth-pos-net-neg-roi']")?.innerText || '',
+              applyBtnVis: getComputedStyle(document.getElementById('applyOptimalRouteBtn')).display !== 'none',
+            })""")
+            assert "0.10%" in pro_fee_check["feeText"] and "$50.00" in pro_fee_check["feeText"], pro_fee_check
+            assert "1 item" in pro_fee_check["queueText"] and "1 items" not in pro_fee_check["queueText"], pro_fee_check
+            assert "6,855,593.69" in pro_fee_check["bondedRowText"] and "Negative ROI ($6855593" not in pro_fee_check["bondedRowText"], pro_fee_check
+            assert pro_fee_check["applyBtnVis"], pro_fee_check
+
+            # Switch to Agents & AI tab while adminSessionRequired=true -> ZERO 401s, clean locked UI, working Copy JSON
+            pgW9.click(".app-tab[data-view='agents']")
+            pgW9.wait_for_timeout(250)
+            agents_locked = pgW9.evaluate("""() => ({
+              bannerVisible: !document.getElementById('agentsAdminLockedBanner')?.classList.contains('hidden'),
+              claudeText: document.getElementById('claudeMcpConfigHost')?.textContent || '',
+              cliText: document.getElementById('claudeCodeCmdHost')?.textContent || '',
+              gptText: document.getElementById('chatgptPluginHost')?.textContent || '',
+              mandatesText: document.getElementById('agentMandatesHost')?.innerText || '',
+              tokensText: document.getElementById('pluginTokensHost')?.innerText || '',
+              gasWatchText: document.getElementById('gasWatchListHost')?.innerText || '',
+            })""")
+            assert agents_locked["bannerVisible"], agents_locked
+            assert "Loading…" not in agents_locked["claudeText"] and "mcpServers" in agents_locked["claudeText"], agents_locked
+            assert "Loading…" not in agents_locked["cliText"] and "claude mcp add" in agents_locked["cliText"], agents_locked
+            assert "Loading…" not in agents_locked["gptText"] and "openapi.json" in agents_locked["gptText"], agents_locked
+            assert len(agents_locked["mandatesText"].strip()) > 10 and len(agents_locked["tokensText"].strip()) > 10, agents_locked
+            assert "Admin session required" in agents_locked["gasWatchText"], agents_locked
+
+            pgW9.click("#copyClaudeMcpBtn")
+            pgW9.click("#issueMcpTokenBtn")
+            pgW9.click("#createGasWatchForm button[type='submit']")
+            pgW9.wait_for_timeout(200)
+            copied_w9 = pgW9.evaluate("() => window.__copiedW9")
+            assert len(copied_w9) >= 1 and "mcpServers" in copied_w9[0], copied_w9
+            assert not http401W9, f"Expected ZERO 401s in Agents & AI locked mode, got: {http401W9}"
+
+            # 8E. Mobile 390px huge-balance overflow check & Pro tab bar reachability
+            pgW9.click(".app-tab[data-view='scanner']")
+            pgW9.set_viewport_size({"width": 390, "height": 844})
+            pgW9.wait_for_timeout(200)
+            mobile_w9 = pgW9.evaluate("""() => {
+              const row = document.querySelector("[data-row-asset='zksync-huge-amd']");
+              const valCol = row?.querySelector('.asset-row-val-col');
+              const balEl = row?.querySelector('.asset-row-bal');
+              const rect = valCol?.getBoundingClientRect();
+              return {
+                docOverflow: document.documentElement.scrollWidth - window.innerWidth,
+                balText: balEl?.textContent?.trim() || '',
+                balTitle: balEl?.getAttribute('title') || '',
+                valColRight: rect ? Math.ceil(rect.right) : -1,
+                tabCount: document.querySelectorAll('.app-tab').length,
+              };
+            }""")
+            assert mobile_w9["docOverflow"] <= 0, f"Mobile 390px overflow with 36-digit balance: {mobile_w9}"
+            assert mobile_w9["valColRight"] <= 390 and len(mobile_w9["balText"]) <= 20, mobile_w9
+            assert "880,088,008" in mobile_w9["balTitle"], mobile_w9
+
+            # 8F. Ecosystem switch (EVM -> Cosmos) clears Preservation Strip AND Lite Est. Fees
+            pgW9.click(".ui-mode-btn[data-ui-mode='lite']")
+            pgW9.wait_for_timeout(120)
+            pgW9.click("#familyBar [data-family='cosmos']")
+            pgW9.wait_for_timeout(200)
+            iso_check = pgW9.evaluate("""() => ({
+              stripHidden: Boolean(document.getElementById('preservationStripHost')?.classList.contains('hidden')),
+              liteCost: document.getElementById('summaryLiteCostText')?.textContent?.trim() || '',
+              feeText: document.getElementById('summaryFeeText')?.textContent?.trim() || '',
+            })""")
+            assert iso_check["stripHidden"], f"Stale Preservation Strip leaked on Cosmos switch: {iso_check}"
+            assert iso_check["liteCost"] == "$0.00", f"Stale Lite Est. Fees leaked on Cosmos switch: {iso_check}"
+
+            assert not errsW9, f"Wave 9 errors: {errsW9}"
+            assert not badHttpW9, f"Wave 9 bad HTTP: {badHttpW9}"
+            assert not http401W9, f"Wave 9 unexpected 401s: {http401W9}"
+            results["wave9_ui_ux_and_zero_401"] = {
+                "ok": True,
+                "zero401OnBootAndAgents": True,
+                "unifiedTieredFeeVerified": True,
+                "ecosystemSwitchIsolated": True,
+                "mobile390HugeBalanceZeroOverflow": True,
+                "rentOwnerInputPriorityVerified": True,
+                "blockedLpNftCoherent": True,
+                "dynamic19EvmChainsSynced": True,
+                "litePreservationStripPure": True,
+            }
+            ctxW9.close()
+
             browser.close()
 
         print(json.dumps(results, indent=2))
