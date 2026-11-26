@@ -56,6 +56,8 @@ export interface ScanCacheLike {
 export interface McpToolContext {
   agentEngine: SiphonAgentEngine;
   scanCache: ScanCacheLike;
+  /** Optional verified Bearer token scopes; when provided, enforces per-tool scope checks */
+  tokenScopes?: string[];
   /** Optional injectable clients/hooks for deterministic unit tests and custom RPC routing */
   jupiterMarketsClient?: JupiterMarketsClient;
   unlockReaderOptions?: Omit<ReadLiveUnlockQueuesOptions, 'evmAddresses' | 'cosmosAddresses'>;
@@ -64,6 +66,19 @@ export interface McpToolContext {
   solanaYieldPlanner?: typeof buildSolanaYieldParkPlan;
   nowMs?: () => number;
 }
+
+const MCP_TOOL_REQUIRED_SCOPE: Record<string, string> = {
+  siphon_request_sweep_permission: 'agent:propose',
+  siphon_plan_dust_conversion: 'dust:plan',
+  siphon_scan_wallets: 'scan:read',
+  siphon_list_agent_mandates: 'scan:read',
+  siphon_list_pending_approvals: 'scan:read',
+  siphon_preservation_audit: 'scan:read',
+  siphon_list_unlock_schedule: 'scan:read',
+  siphon_solana_rent_scan: 'scan:read',
+  siphon_solana_yield_preview: 'scan:read',
+  siphon_degen_markets: 'scan:read',
+};
 
 export interface JsonRpcRequest {
   jsonrpc?: string;
@@ -570,6 +585,17 @@ export async function handleMcpJsonRpc(
     const knownTool = SIPHON_MCP_TOOLS.some((t) => t.name === toolName);
     if (!knownTool) {
       return jsonRpcError(id, -32602, `Unknown MCP tool: ${toolName}`);
+    }
+
+    if (ctx.tokenScopes !== undefined) {
+      const requiredScope = MCP_TOOL_REQUIRED_SCOPE[toolName];
+      if (requiredScope && !ctx.tokenScopes.includes(requiredScope)) {
+        return jsonRpcError(
+          id,
+          -32003,
+          `Insufficient token scope: tool '${toolName}' requires '${requiredScope}' scope.`
+        );
+      }
     }
 
     try {

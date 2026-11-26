@@ -4,6 +4,7 @@ import { DEAD_BURN_ADDRESS, EVM_CHAINS } from '../scanner/chains.js';
 import { planDustConversion } from '../scanner/dust.js';
 import { sanitizeFreeText } from '../scanner/sanitize.js';
 import type { AnyChainId, EvmChainId, ScanReport } from '../scanner/types.js';
+import type { SiphonStateStore } from '../storage/state-store.js';
 
 export type GasWatchStatus = 'watching' | 'ready' | 'cancelled' | 'expired';
 
@@ -49,6 +50,7 @@ export interface PreservationAgentStoreOptions {
   maxTriggers?: number;
   defaultTtlMs?: number;
   nowMs?: () => number;
+  stateStore?: SiphonStateStore;
 }
 
 export interface DustAutoHarvestOptions {
@@ -134,11 +136,38 @@ export class PreservationAgentStore {
   private readonly maxTriggers: number;
   private readonly defaultTtlMs: number;
   private readonly nowMs: () => number;
+  private readonly stateStore?: SiphonStateStore;
 
   constructor(opts: PreservationAgentStoreOptions = {}) {
     this.maxTriggers = Math.max(1, Math.floor(opts.maxTriggers ?? DEFAULT_MAX_TRIGGERS));
     this.defaultTtlMs = Math.max(60_000, Math.floor(opts.defaultTtlMs ?? DEFAULT_TTL_MS));
     this.nowMs = opts.nowMs ?? (() => Date.now());
+    this.stateStore = opts.stateStore;
+    if (this.stateStore) {
+      this.hydrateFromStore();
+    }
+  }
+
+  private hydrateFromStore(): void {
+    if (!this.stateStore) return;
+    const saved = this.stateStore.load<GasWatchTrigger[]>('preservation_agents', []);
+    if (Array.isArray(saved)) {
+      for (const item of saved) {
+        if (item && typeof item === 'object' && typeof item.id === 'string') {
+          this.triggers.set(item.id, item);
+        }
+      }
+      while (this.triggers.size > this.maxTriggers) {
+        const oldestKey = this.triggers.keys().next().value;
+        if (!oldestKey) break;
+        this.triggers.delete(oldestKey);
+      }
+    }
+  }
+
+  private persistTriggers(): void {
+    if (!this.stateStore) return;
+    this.stateStore.save('preservation_agents', Array.from(this.triggers.values()));
   }
 
   get capacity(): number {
@@ -223,6 +252,7 @@ export class PreservationAgentStore {
       if (!oldestKey) break;
       this.triggers.delete(oldestKey);
     }
+    this.persistTriggers();
 
     return { ...trigger };
   }
@@ -230,16 +260,24 @@ export class PreservationAgentStore {
   getTrigger(id: string): GasWatchTrigger | null {
     const item = this.triggers.get(id);
     if (!item) return null;
-    this.expireIfStale(item, this.nowMs());
+    if (this.expireIfStale(item, this.nowMs())) {
+      this.persistTriggers();
+    }
     return { ...item };
   }
 
   listTriggers(): GasWatchTrigger[] {
     const now = this.nowMs();
     const list: GasWatchTrigger[] = [];
+    let mutated = false;
     for (const item of this.triggers.values()) {
-      this.expireIfStale(item, now);
+      if (this.expireIfStale(item, now)) {
+        mutated = true;
+      }
       list.push({ ...item });
+    }
+    if (mutated) {
+      this.persistTriggers();
     }
     return list.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
@@ -252,6 +290,7 @@ export class PreservationAgentStore {
       item.cancelledAt = new Date(this.nowMs()).toISOString();
       item.autoExecuteAllowed = false;
       item.safetyNote = 'Trigger cancelled by user.';
+      this.persistTriggers();
     }
     return { ...item };
   }
@@ -311,6 +350,10 @@ export class PreservationAgentStore {
           : `Gas window met (${trigger.lastObservedGwei ?? trigger.maxBaseFeeGwei} ≤ ${trigger.maxBaseFeeGwei} gwei) — awaiting explicit user signature (no active signed mandate).`;
         readyTriggers.push({ ...trigger });
       }
+    }
+
+    if (evaluatedCount > 0) {
+      this.persistTriggers();
     }
 
     return {

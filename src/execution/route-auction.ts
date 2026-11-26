@@ -935,12 +935,16 @@ export async function fetchMayanSwiftQuote(params: {
 
   if (!candidatesList.length) return null;
 
-  // Prefer SWIFT quotes first, then highest expectedAmountOut
+  // Prefer SWIFT quotes first, then highest finite expectedAmountOut
   const sorted = [...candidatesList].sort((a, b) => {
     const aSwift = (a.type ?? '').toUpperCase().includes('SWIFT') ? 1 : 0;
     const bSwift = (b.type ?? '').toUpperCase().includes('SWIFT') ? 1 : 0;
     if (aSwift !== bSwift) return bSwift - aSwift;
-    return Number(b.expectedAmountOut ?? 0) - Number(a.expectedAmountOut ?? 0);
+    const aOut = Number(a.expectedAmountOut ?? 0);
+    const bOut = Number(b.expectedAmountOut ?? 0);
+    const safeA = Number.isFinite(aOut) ? aOut : -Infinity;
+    const safeB = Number.isFinite(bOut) ? bOut : -Infinity;
+    return safeB - safeA;
   });
 
   const best = sorted[0];
@@ -1042,7 +1046,8 @@ export async function fetchMayanSwiftQuote(params: {
   const gasUsd = Number(best.gasCostUsd ?? best.estimatedGasUsd ?? asset.batchedGasUsd ?? asset.estimatedGasUsd ?? 0);
   const bridgeFeeUsd = Number(best.bridgeFeeUsd ?? best.relayerFeeUsd ?? best.bridgeFee ?? 0);
   const estFeeUsd = r2((asset.grossUsd * feeConfig.feeBps) / 10_000);
-  const etaSeconds = Math.max(4, Math.round(Number(best.etaSeconds ?? best.eta ?? 14)));
+  const rawEta = Number(best.etaSeconds ?? best.eta ?? 14);
+  const etaSeconds = Number.isFinite(rawEta) ? Math.max(4, Math.round(rawEta)) : 14;
 
   return {
     provider: 'mayan_swift',
@@ -1262,7 +1267,8 @@ export async function fetchDeBridgeDlnQuote(params: {
 
   const gasUsd = Number(asset.batchedGasUsd || asset.estimatedGasUsd || 0);
   const estFeeUsd = r2((asset.grossUsd * feeConfig.feeBps) / 10_000);
-  const etaSeconds = Math.max(4, Math.round(Number(json.order?.approximateFulfillmentDelay ?? 15)));
+  const rawEta = Number(json.order?.approximateFulfillmentDelay ?? 15);
+  const etaSeconds = Number.isFinite(rawEta) ? Math.max(4, Math.round(rawEta)) : 15;
 
   return {
     provider: 'debridge_dln',
@@ -1540,7 +1546,9 @@ export async function runLiveParallelRouteAuction(
         netUsd: 0,
         liveNetUsd: 0,
         liveHaircutPct: 100,
-        etaSeconds: Math.max(1, Math.round(quote.estimatedSeconds)),
+        etaSeconds: Number.isFinite(quote.estimatedSeconds)
+          ? Math.max(1, Math.round(quote.estimatedSeconds))
+          : 15,
         latencyMs,
         requestId: quote.requestId,
         reason: txValidation.reason,
@@ -1580,7 +1588,9 @@ export async function runLiveParallelRouteAuction(
       netUsd: haircut.liveNetUsd,
       liveNetUsd: haircut.liveNetUsd,
       liveHaircutPct: haircut.liveHaircutPct,
-      etaSeconds: Math.max(1, Math.round(quote.estimatedSeconds)),
+      etaSeconds: Number.isFinite(quote.estimatedSeconds)
+        ? Math.max(1, Math.round(quote.estimatedSeconds))
+        : 15,
       latencyMs,
       requestId: quote.requestId,
       reason: haircut.passed ? undefined : haircut.reason,

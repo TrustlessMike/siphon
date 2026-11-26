@@ -10,6 +10,7 @@ import {
   SOLANA_TOKEN_PROGRAM_ID,
   solanaAddressToBytes32,
 } from './cctp.js';
+import { redactRpcUrl } from '../scanner/rpc.js';
 
 export const SOLANA_TOKEN_2022_PROGRAM_ID = new PublicKey(
   'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'
@@ -489,8 +490,8 @@ function hasBlockingToken2022Extension(
         }
       }
     }
-    // ConfidentialTransferAccount with pending/available balance cannot be closed blindly
-    if (extName === 'confidentialtransferaccount') {
+    // ConfidentialTransferAccount / ConfidentialTransferFeeAmount cannot be closed blindly
+    if (extName === 'confidentialtransferaccount' || extName === 'confidentialtransferfeeamount') {
       return true;
     }
   }
@@ -505,6 +506,7 @@ async function fetchSolanaRpc<T>(
 ): Promise<T> {
   let lastError: Error | null = null;
   for (const rpcUrl of rpcUrls) {
+    const safeUrl = redactRpcUrl(rpcUrl);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -521,7 +523,7 @@ async function fetchSolanaRpc<T>(
       });
       clearTimeout(timer);
       if (!res.ok) {
-        lastError = new Error(`Solana RPC HTTP ${res.status} from ${rpcUrl}`);
+        lastError = new Error(`Solana RPC HTTP ${res.status} from ${safeUrl}`);
         continue;
       }
       const json = (await res.json()) as {
@@ -529,7 +531,10 @@ async function fetchSolanaRpc<T>(
         error?: { code?: number; message?: string };
       };
       if (json.error) {
-        lastError = new Error(json.error.message || `Solana RPC error ${json.error.code ?? ''}`);
+        const msg = json.error.message
+          ? json.error.message.split(rpcUrl).join(safeUrl)
+          : `Solana RPC error ${json.error.code ?? ''}`;
+        lastError = new Error(msg);
         continue;
       }
       if (json.result !== undefined) {
@@ -538,7 +543,8 @@ async function fetchSolanaRpc<T>(
       lastError = new Error(`Solana RPC returned empty result for ${method}`);
     } catch (err) {
       clearTimeout(timer);
-      lastError = err instanceof Error ? err : new Error(String(err));
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      lastError = new Error(rawMsg.split(rpcUrl).join(safeUrl));
     }
   }
   throw lastError ?? new Error(`All Solana RPC endpoints failed for ${method}.`);
@@ -607,6 +613,26 @@ export async function scanReclaimableSolanaRent(
     throw new Error(
       `maxAccountsPerTx must be an integer between 1 and ${MAX_CLOSE_ACCOUNTS_PER_TX}.`
     );
+  }
+
+  // Validate all caller-provided options BEFORE issuing any upstream RPC requests
+  if (opts.solPriceUsd !== undefined) {
+    if (typeof opts.solPriceUsd !== 'number' || !Number.isFinite(opts.solPriceUsd) || opts.solPriceUsd <= 0) {
+      throw new Error('solPriceUsd must be a finite positive number.');
+    }
+  }
+  if (opts.recentBlockhash !== undefined && opts.recentBlockhash !== null && opts.recentBlockhash !== '') {
+    validateSolanaBlockhash(opts.recentBlockhash);
+  }
+  if (opts.computeUnitPriceMicroLamports !== undefined) {
+    if (
+      typeof opts.computeUnitPriceMicroLamports !== 'number' ||
+      !Number.isInteger(opts.computeUnitPriceMicroLamports) ||
+      opts.computeUnitPriceMicroLamports < 0 ||
+      opts.computeUnitPriceMicroLamports > 10_000_000
+    ) {
+      throw new Error('computeUnitPriceMicroLamports must be an integer between 0 and 10,000,000.');
+    }
   }
 
   const programsToScan: Array<{ id: string; kind: SolanaTokenProgramKind }> = [
@@ -723,7 +749,7 @@ export async function scanReclaimableSolanaRent(
       continue;
     }
     const accountOwner = typeof info.owner === 'string' ? info.owner.trim() : '';
-    if (accountOwner && accountOwner !== ownerClean) {
+    if (!accountOwner || accountOwner !== ownerClean) {
       skippedUncloseableCount += 1;
       continue;
     }

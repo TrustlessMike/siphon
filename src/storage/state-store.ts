@@ -148,7 +148,30 @@ export class FileStateStore implements SiphonStateStore {
         return (parsed as PersistedEnvelope<T>).data;
       }
       return parsed as T;
-    } catch {
+    } catch (err) {
+      const ts = Date.now();
+      const quarantinePath = `${filePath}.corrupt.${ts}`;
+      let quarantinedAs: string | null = null;
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.renameSync(filePath, quarantinePath);
+          quarantinedAs = path.basename(quarantinePath);
+        }
+      } catch {
+        // best-effort quarantine
+      }
+      console.warn(
+        JSON.stringify({
+          ts: new Date(ts).toISOString(),
+          level: 'warn',
+          service: 'siphon-migrator',
+          event: 'state_store_corrupt_file_quarantined',
+          namespace,
+          file: path.basename(filePath),
+          quarantinedAs,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
       return fallback;
     }
   }

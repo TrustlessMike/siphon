@@ -46,6 +46,17 @@ interface TrackedGaslessIntent {
   chainId: number;
   userAddress: string;
   routerAddress: string | null;
+  solanaRecipient: string;
+  feeRecipient: string | null;
+  feeBps: number;
+  nonce: string;
+  minNetUsdcOut: string;
+  maxGasReimbursementUsdc: string;
+  swapsHash?: string;
+  callsHash?: string;
+  directUsdcAmount?: string;
+  usdcAddress?: string;
+  cctpMessenger?: string | null;
   deadline: number;
   eligible: boolean;
   rejectionReason?: string;
@@ -72,6 +83,7 @@ interface PersistedGaslessIntentState {
 
 const issuedIntents = new Map<string, TrackedGaslessIntent>();
 const consumedDigests = new Map<string, ConsumedDigestRecord>();
+const broadcastingIntentIds = new Set<string>();
 let activeIntentStateStore: SiphonStateStore | null = null;
 
 function hydrateGaslessIntentsFromStore(store: SiphonStateStore): void {
@@ -134,7 +146,326 @@ function keccakUtf8(text: string): Uint8Array {
 function encodeWordUint(value: bigint | number | string): Uint8Array {
   const big = typeof value === 'bigint' ? value : BigInt(value);
   if (big < 0n) throw new Error('ABI uint word cannot be negative');
+  if (big >= 1n << 256n) throw new Error('ABI uint word exceeds uint256 max');
   return Buffer.from(big.toString(16).padStart(64, '0'), 'hex');
+}
+
+function selectorFromSignature(sig: string): string {
+  return '0x' + Buffer.from(keccakUtf8(sig).slice(0, 4)).toString('hex');
+}
+
+// Exact Solidity ABI 4-byte selectors for SiphonRouter & SiphonSweepDelegate sponsored entrypoints
+export const RELAYER_ALLOWED_SELECTORS = {
+  sweepWithPermit2Batch: selectorFromSignature(
+    'sweepWithPermit2Batch(address,((address,uint256)[],uint256,uint256),(bytes32,uint256,uint256,uint16,address,bytes32),bytes,uint256,(address,uint256,bool,address,bytes)[])'
+  ),
+  executeSponsoredSweep: selectorFromSignature(
+    'executeSponsoredSweep((bytes32,address,address,address,uint16,uint256,uint256,uint256,uint256,uint256,(uint8,address,address,uint256)[],(address,uint256,uint256,address,bytes)[],(address,uint256)[],(address,address)[]),uint256,uint8,bytes32,bytes32)'
+  ),
+  executeSponsoredSweepV2: selectorFromSignature(
+    'executeSponsoredSweepV2((bytes32,address,address,address,uint16,uint256,uint256,uint256,uint256,uint256,(uint8,address,address,uint256)[],(address,uint256,uint256,address,bytes)[],(address,uint256)[],(address,address)[]),uint256,(bytes32,uint256,uint32,bytes),uint256,uint8,bytes32,bytes32)'
+  ),
+} as const;
+
+function readAbiWord(argsHex: string, byteOffset: number): string | null {
+  const charOffset = byteOffset * 2;
+  if (!Number.isSafeInteger(charOffset) || charOffset < 0 || charOffset + 64 > argsHex.length) {
+    return null;
+  }
+  return argsHex.slice(charOffset, charOffset + 64);
+}
+
+function readAbiUint(argsHex: string, byteOffset: number): bigint | null {
+  const word = readAbiWord(argsHex, byteOffset);
+  if (!word) return null;
+  return BigInt('0x' + word);
+}
+
+function readAbiAddress(argsHex: string, byteOffset: number): string | null {
+  const word = readAbiWord(argsHex, byteOffset);
+  if (!word || !word.startsWith('0'.repeat(24))) return null;
+  return '0x' + word.slice(24).toLowerCase();
+}
+
+function readAbiOffset(argsHex: string, byteOffset: number, baseByteOffset = 0): number | null {
+  const raw = readAbiUint(argsHex, byteOffset);
+  if (raw === null) return null;
+  const maxBytes = BigInt(argsHex.length / 2);
+  const abs = BigInt(baseByteOffset) + raw;
+  if (abs < 0n || abs > maxBytes) return null;
+  return Number(abs);
+}
+
+/**
+ * Verifies that client-supplied `txCalldata` strictly matches the persisted server intent's
+ * allowed contract selector, user address, witness/intent parameters, nonce, deadline,
+ * gas reimbursement cap, and verified user EIP-712 signature. Fails closed on any mismatch.
+ */
+export function verifyRelayerCalldataMatchesIntent(
+  tracked: Pick<
+    TrackedGaslessIntent,
+    | 'mode'
+    | 'userAddress'
+    | 'solanaRecipient'
+    | 'feeRecipient'
+    | 'feeBps'
+    | 'nonce'
+    | 'deadline'
+    | 'minNetUsdcOut'
+    | 'maxGasReimbursementUsdc'
+    | 'swapsHash'
+    | 'callsHash'
+    | 'directUsdcAmount'
+    | 'usdcAddress'
+    | 'cctpMessenger'
+  >,
+  txCalldata: string,
+  signature: string
+): { ok: true; selector: string } | { ok: false; reason: string } {
+  if (typeof txCalldata !== 'string') {
+    return { ok: false, reason: 'txCalldata must be a 0x-prefixed hex string.' };
+  }
+  const clean = txCalldata.trim();
+  if (!/^0x([0-9a-fA-F]{2}){4,}$/.test(clean)) {
+    return { ok: false, reason: 'txCalldata must be valid even-length hex with a 4-byte function selector.' };
+  }
+  const lower = clean.toLowerCase();
+  const selector = lower.slice(0, 10);
+  const argsHex = lower.slice(10);
+  const cleanSig = signature.trim().toLowerCase();
+
+  if (tracked.mode === 'permit2_batch') {
+    if (selector !== RELAYER_ALLOWED_SELECTORS.sweepWithPermit2Batch) {
+      return {
+        ok: false,
+        reason: `Calldata selector ${selector} does not match expected SiphonRouter.sweepWithPermit2Batch (${RELAYER_ALLOWED_SELECTORS.sweepWithPermit2Batch}).`,
+      };
+    }
+    // Head layout (11 words = 352 bytes):
+    // 0: address user
+    // 1: offset -> permit (PermitBatchTransferFrom)
+    // 2..7: inline static SiphonSweepWitness (solanaRecipient, minNetUsdcOut, maxGasReimbursementUsdc, feeBps, feeRecipient, swapsHash)
+    // 8: offset -> bytes permitSignature
+    // 9: uint256 gasReimbursementUsdc
+    // 10: offset -> SwapStep[] swaps
+    const userAddr = readAbiAddress(argsHex, 0);
+    if (!userAddr || userAddr !== tracked.userAddress.toLowerCase()) {
+      return { ok: false, reason: 'txCalldata user parameter does not match persisted intent userAddress.' };
+    }
+
+    const permitOff = readAbiOffset(argsHex, 32);
+    if (permitOff === null) {
+      return { ok: false, reason: 'txCalldata permit offset is out of bounds.' };
+    }
+    const permitNonce = readAbiUint(argsHex, permitOff + 32);
+    const permitDeadline = readAbiUint(argsHex, permitOff + 64);
+    if (permitNonce === null || permitNonce.toString() !== tracked.nonce) {
+      return { ok: false, reason: 'txCalldata permit.nonce does not match persisted intent nonce.' };
+    }
+    if (permitDeadline === null || permitDeadline !== BigInt(tracked.deadline)) {
+      return { ok: false, reason: 'txCalldata permit.deadline does not match persisted intent deadline.' };
+    }
+
+    const witnessSolana = readAbiWord(argsHex, 64);
+    const witnessMinNet = readAbiUint(argsHex, 96);
+    const witnessMaxGas = readAbiUint(argsHex, 128);
+    const witnessFeeBps = readAbiUint(argsHex, 160);
+    const witnessFeeRecipient = readAbiAddress(argsHex, 192);
+    const witnessSwapsHash = readAbiWord(argsHex, 224);
+
+    if (!witnessSolana || '0x' + witnessSolana !== tracked.solanaRecipient.toLowerCase()) {
+      return { ok: false, reason: 'txCalldata witness.solanaRecipient does not match persisted intent.' };
+    }
+    if (witnessMinNet === null || witnessMinNet.toString() !== tracked.minNetUsdcOut) {
+      return { ok: false, reason: 'txCalldata witness.minNetUsdcOut does not match persisted intent.' };
+    }
+    if (witnessMaxGas === null || witnessMaxGas.toString() !== tracked.maxGasReimbursementUsdc) {
+      return { ok: false, reason: 'txCalldata witness.maxGasReimbursementUsdc does not match persisted intent.' };
+    }
+    if (witnessFeeBps === null || witnessFeeBps !== BigInt(tracked.feeBps)) {
+      return { ok: false, reason: 'txCalldata witness.feeBps does not match persisted intent.' };
+    }
+    if (!tracked.feeRecipient || !witnessFeeRecipient || witnessFeeRecipient !== tracked.feeRecipient.toLowerCase()) {
+      return { ok: false, reason: 'txCalldata witness.feeRecipient does not match persisted intent.' };
+    }
+    if (tracked.swapsHash && (!witnessSwapsHash || '0x' + witnessSwapsHash !== tracked.swapsHash.toLowerCase())) {
+      return { ok: false, reason: 'txCalldata witness.swapsHash does not match persisted intent.' };
+    }
+
+    const sigOff = readAbiOffset(argsHex, 256);
+    if (sigOff === null) {
+      return { ok: false, reason: 'txCalldata permitSignature offset is out of bounds.' };
+    }
+    const sigLen = readAbiUint(argsHex, sigOff);
+    if (sigLen !== 65n) {
+      return { ok: false, reason: 'txCalldata permitSignature must be 65 bytes.' };
+    }
+    const sigCharStart = (sigOff + 32) * 2;
+    if (sigCharStart + 130 > argsHex.length) {
+      return { ok: false, reason: 'txCalldata permitSignature bytes truncated.' };
+    }
+    const embeddedSig = '0x' + argsHex.slice(sigCharStart, sigCharStart + 130);
+    if (embeddedSig !== cleanSig) {
+      return { ok: false, reason: 'txCalldata permitSignature does not match verified user signature.' };
+    }
+
+    const gasReimb = readAbiUint(argsHex, 288);
+    if (gasReimb === null || gasReimb > BigInt(tracked.maxGasReimbursementUsdc)) {
+      return { ok: false, reason: 'txCalldata gasReimbursementUsdc exceeds persisted intent cap.' };
+    }
+
+    const swapsOff = readAbiOffset(argsHex, 320);
+    if (swapsOff === null || readAbiUint(argsHex, swapsOff) === null) {
+      return { ok: false, reason: 'txCalldata swaps array offset is out of bounds.' };
+    }
+
+    return { ok: true, selector };
+  }
+
+  // eip7702_delegate mode: allow executeSponsoredSweep or executeSponsoredSweepV2
+  const isV1 = selector === RELAYER_ALLOWED_SELECTORS.executeSponsoredSweep;
+  const isV2 = selector === RELAYER_ALLOWED_SELECTORS.executeSponsoredSweepV2;
+  if (!isV1 && !isV2) {
+    return {
+      ok: false,
+      reason: `Calldata selector ${selector} does not match expected SiphonSweepDelegate.executeSponsoredSweep or executeSponsoredSweepV2.`,
+    };
+  }
+
+  const intentOff = readAbiOffset(argsHex, 0);
+  if (intentOff === null) {
+    return { ok: false, reason: 'txCalldata SweepIntent offset is out of bounds.' };
+  }
+
+  const gasReimbOffset = isV1 ? 32 : 96;
+  const vOffset = isV1 ? 64 : 128;
+  const rOffset = isV1 ? 96 : 160;
+  const sOffset = isV1 ? 128 : 192;
+
+  const gasReimb = readAbiUint(argsHex, gasReimbOffset);
+  if (gasReimb === null || gasReimb > BigInt(tracked.maxGasReimbursementUsdc)) {
+    return { ok: false, reason: 'txCalldata gasReimbursementUsdc exceeds persisted intent cap.' };
+  }
+
+  const vWord = readAbiUint(argsHex, vOffset);
+  const rWord = readAbiWord(argsHex, rOffset);
+  const sWord = readAbiWord(argsHex, sOffset);
+  if (vWord === null || !rWord || !sWord) {
+    return { ok: false, reason: 'txCalldata ECDSA (v, r, s) words are truncated.' };
+  }
+  const expectedR = cleanSig.slice(2, 66);
+  const expectedS = cleanSig.slice(66, 130);
+  const expectedV = BigInt('0x' + cleanSig.slice(130, 132));
+  if (vWord !== expectedV || rWord !== expectedR || sWord !== expectedS) {
+    return { ok: false, reason: 'txCalldata (v, r, s) signature does not match verified user signature.' };
+  }
+
+  const intentSolana = readAbiWord(argsHex, intentOff);
+  const intentUsdc = readAbiAddress(argsHex, intentOff + 32);
+  const intentMessenger = readAbiAddress(argsHex, intentOff + 64);
+  const intentFeeRecipient = readAbiAddress(argsHex, intentOff + 96);
+  const intentFeeBps = readAbiUint(argsHex, intentOff + 128);
+  const intentDirectUsdc = readAbiUint(argsHex, intentOff + 160);
+  const intentMinNet = readAbiUint(argsHex, intentOff + 192);
+  const intentMaxGas = readAbiUint(argsHex, intentOff + 224);
+  const intentNonce = readAbiUint(argsHex, intentOff + 256);
+  const intentDeadline = readAbiUint(argsHex, intentOff + 288);
+
+  if (!intentSolana || '0x' + intentSolana !== tracked.solanaRecipient.toLowerCase()) {
+    return { ok: false, reason: 'txCalldata intent.solanaRecipient does not match persisted intent.' };
+  }
+  if (tracked.usdcAddress && (!intentUsdc || intentUsdc !== tracked.usdcAddress.toLowerCase())) {
+    return { ok: false, reason: 'txCalldata intent.usdc does not match persisted intent.' };
+  }
+  if (tracked.cctpMessenger && (!intentMessenger || intentMessenger !== tracked.cctpMessenger.toLowerCase())) {
+    return { ok: false, reason: 'txCalldata intent.cctpMessenger does not match persisted intent.' };
+  }
+  if (!tracked.feeRecipient || !intentFeeRecipient || intentFeeRecipient !== tracked.feeRecipient.toLowerCase()) {
+    return { ok: false, reason: 'txCalldata intent.feeRecipient does not match persisted intent.' };
+  }
+  if (intentFeeBps === null || intentFeeBps !== BigInt(tracked.feeBps)) {
+    return { ok: false, reason: 'txCalldata intent.feeBps does not match persisted intent.' };
+  }
+  if (tracked.directUsdcAmount !== undefined && (intentDirectUsdc === null || intentDirectUsdc.toString() !== tracked.directUsdcAmount)) {
+    return { ok: false, reason: 'txCalldata intent.directUsdcAmount does not match persisted intent.' };
+  }
+  if (intentMinNet === null || intentMinNet.toString() !== tracked.minNetUsdcOut) {
+    return { ok: false, reason: 'txCalldata intent.minNetUsdcOut does not match persisted intent.' };
+  }
+  if (intentMaxGas === null || intentMaxGas.toString() !== tracked.maxGasReimbursementUsdc) {
+    return { ok: false, reason: 'txCalldata intent.maxGasReimbursementUsdc does not match persisted intent.' };
+  }
+  if (intentNonce === null || intentNonce.toString() !== tracked.nonce) {
+    return { ok: false, reason: 'txCalldata intent.nonce does not match persisted intent.' };
+  }
+  if (intentDeadline === null || intentDeadline !== BigInt(tracked.deadline)) {
+    return { ok: false, reason: 'txCalldata intent.deadline does not match persisted intent.' };
+  }
+
+  return { ok: true, selector };
+}
+
+/**
+ * Encodes valid `SiphonRouter.sweepWithPermit2Batch(...)` calldata bound to a prepared
+ * `GaslessSweepIntentPlan` and verified user EIP-712 signature (with empty swaps array by default).
+ */
+export function encodePermit2SweepCalldata(params: {
+  plan: GaslessSweepIntentPlan;
+  signature: string;
+  gasReimbursementUsdc?: bigint | string;
+}): string {
+  if (params.plan.mode !== 'permit2_batch') {
+    throw new Error('encodePermit2SweepCalldata requires a permit2_batch intent plan.');
+  }
+  if (!params.plan.feeRecipientEvm) {
+    throw new Error('Intent plan missing feeRecipientEvm.');
+  }
+  const cleanSig = params.signature.trim().toLowerCase().replace(/^0x/, '');
+  if (!/^[0-9a-f]{130}$/.test(cleanSig)) {
+    throw new Error('Invalid 65-byte Permit2 signature.');
+  }
+  const gasReimb = BigInt(params.gasReimbursementUsdc ?? 0n);
+  const permitted = params.plan.coveredAssets;
+
+  // Dynamic section 1: permit = (TokenPermissions[] permitted, uint256 nonce, uint256 deadline)
+  const permitBytes = concatBytes([
+    encodeWordUint(96n), // offset to permitted[] inside permit tuple (3 words)
+    encodeWordUint(params.plan.nonce),
+    encodeWordUint(params.plan.deadline),
+    encodeWordUint(permitted.length),
+    ...permitted.flatMap((a) => [encodeWordAddress(a.address), encodeWordUint(a.rawBalance)]),
+  ]);
+
+  // Dynamic section 2: bytes permitSignature (65 bytes padded to 96 bytes)
+  const sigPadded = Buffer.from(cleanSig.padEnd(192, '0'), 'hex');
+  const sigBytes = concatBytes([encodeWordUint(65n), sigPadded]);
+
+  // Dynamic section 3: empty SwapStep[] swaps
+  const swapsBytes = encodeWordUint(0n);
+
+  const headSizeBytes = 11 * 32; // 352 bytes
+  const permitOffset = BigInt(headSizeBytes);
+  const sigOffset = permitOffset + BigInt(permitBytes.length);
+  const swapsOffset = sigOffset + BigInt(sigBytes.length);
+
+  const encoded = concatBytes([
+    encodeWordAddress(params.plan.userAddress),
+    encodeWordUint(permitOffset),
+    encodeWordBytes32(params.plan.solanaMintRecipientBytes32),
+    encodeWordUint(params.plan.minNetUsdcOut),
+    encodeWordUint(params.plan.maxGasReimbursementUsdc),
+    encodeWordUint(params.plan.protocolFeeBps),
+    encodeWordAddress(params.plan.feeRecipientEvm),
+    encodeWordBytes32(params.plan.swapsHash ?? computeEmptySwapsHash()),
+    encodeWordUint(sigOffset),
+    encodeWordUint(gasReimb),
+    encodeWordUint(swapsOffset),
+    permitBytes,
+    sigBytes,
+    swapsBytes,
+  ]);
+
+  return RELAYER_ALLOWED_SELECTORS.sweepWithPermit2Batch + Buffer.from(encoded).toString('hex');
 }
 
 function encodeWordAddress(addr: string): Uint8Array {
@@ -429,6 +760,7 @@ export function isSponsorRelayerConfigured(chain?: EvmChainId): boolean {
 export function clearTrackedGaslessIntentsForTest(): void {
   issuedIntents.clear();
   consumedDigests.clear();
+  broadcastingIntentIds.clear();
 }
 
 /**
@@ -754,6 +1086,20 @@ export function buildGaslessSweepIntent(params: {
     chainId: cfg.chainId,
     userAddress: params.userAddress.toLowerCase(),
     routerAddress,
+    solanaRecipient: solanaMintRecipientBytes32.toLowerCase(),
+    feeRecipient: effectiveFeeRecipient ? effectiveFeeRecipient.toLowerCase() : null,
+    feeBps: feeConfig.feeBps,
+    nonce,
+    minNetUsdcOut,
+    maxGasReimbursementUsdc,
+    ...(mode === 'eip7702_delegate'
+      ? {
+          directUsdcAmount,
+          callsHash,
+          usdcAddress: cfg.usdcAddress.toLowerCase(),
+          cctpMessenger: cfg.cctpTokenMessenger ? cfg.cctpTokenMessenger.toLowerCase() : null,
+        }
+      : { swapsHash }),
     deadline,
     eligible: sponsorEligible,
     rejectionReason: sponsorRejectionReason,
@@ -842,13 +1188,21 @@ export function buildGaslessSweepIntent(params: {
  *   - Enforces single-use replay protection (`consumed = true`)
  *   - NEVER marks unverified or non-broadcast intents as `'attested'` or settled
  */
-export function submitSignedGaslessIntent(params: {
+function validateSignedGaslessIntentPreConsume(params: {
   intentId: string;
   chain: EvmChainId;
   userAddress: string;
   signature: string;
   deadline: number;
-}): SignedIntentReceipt {
+}): {
+  cfg: (typeof EVM_CHAINS)[EvmChainId];
+  tracked: TrackedGaslessIntent;
+  normalizedDigest: string;
+  sig: string;
+  recoveredSigner: string;
+  signatureFingerprint: string;
+  configured: boolean;
+} {
   const cfg = EVM_CHAINS[params.chain];
   if (!cfg) throw new Error(`Unsupported chain: ${params.chain}`);
 
@@ -864,6 +1218,9 @@ export function submitSignedGaslessIntent(params: {
   }
   if (tracked.consumed) {
     throw new Error(`Gasless sweep intent ${params.intentId} has already been consumed (replay rejected).`);
+  }
+  if (broadcastingIntentIds.has(params.intentId)) {
+    throw new Error(`Gasless sweep intent ${params.intentId} is already broadcasting (concurrent submission rejected).`);
   }
   if (tracked.previewOnly || !tracked.routerConfigured || !tracked.eip712Digest) {
     throw new Error(
@@ -897,12 +1254,24 @@ export function submitSignedGaslessIntent(params: {
     );
   }
 
-  // Single-use replay protection: mark consumed immediately after cryptographic verification & persist
+  const signatureFingerprint =
+    '0x' + crypto.createHash('sha256').update(sig).digest('hex').slice(0, 16);
+  const configured = isSponsorRelayerConfigured(params.chain);
+
+  return { cfg, tracked, normalizedDigest, sig, recoveredSigner, signatureFingerprint, configured };
+}
+
+function markGaslessIntentConsumed(
+  tracked: TrackedGaslessIntent,
+  normalizedDigest: string,
+  txHash?: string
+): void {
   tracked.consumed = true;
+  if (txHash) tracked.txHash = txHash;
   consumedDigests.set(normalizedDigest, {
     digest: normalizedDigest,
-    intentId: params.intentId,
-    chain: params.chain,
+    intentId: tracked.intentId,
+    chain: tracked.chain,
     consumedAt: Date.now(),
     deadline: tracked.deadline,
   });
@@ -912,11 +1281,18 @@ export function submitSignedGaslessIntent(params: {
     consumedDigests.delete(oldestDigest);
   }
   persistGaslessIntents();
+}
 
-  const signatureFingerprint =
-    '0x' + crypto.createHash('sha256').update(sig).digest('hex').slice(0, 16);
-  const configured = isSponsorRelayerConfigured(params.chain);
-
+function buildBaseSignedIntentReceipt(
+  params: { intentId: string; chain: EvmChainId; userAddress: string },
+  verified: {
+    cfg: (typeof EVM_CHAINS)[EvmChainId];
+    recoveredSigner: string;
+    signatureFingerprint: string;
+    configured: boolean;
+  }
+): SignedIntentReceipt {
+  const { cfg, recoveredSigner, signatureFingerprint, configured } = verified;
   return {
     accepted: configured,
     broadcasted: false,
@@ -940,13 +1316,30 @@ export function submitSignedGaslessIntent(params: {
   };
 }
 
+export function submitSignedGaslessIntent(params: {
+  intentId: string;
+  chain: EvmChainId;
+  userAddress: string;
+  signature: string;
+  deadline: number;
+}): SignedIntentReceipt {
+  const verified = validateSignedGaslessIntentPreConsume(params);
+  // Single-use replay protection: mark consumed immediately after cryptographic verification & persist
+  markGaslessIntentConsumed(verified.tracked, verified.normalizedDigest);
+  return buildBaseSignedIntentReceipt(params, verified);
+}
+
 /**
  * Verifies a user-signed EIP-712 gasless sweep intent AND attempts real onchain broadcast
  * via `broadcastSignedRelayerTx()` when `SIPHON_RELAYER_PRIVATE_KEY`, router, and execution
  * calldata (`txCalldata`) are available.
  *
- * Always fails closed honestly (`broadcasted: false`, never fabricates tx hashes) if the
- * relayer key, router, calldata, or upstream RPC is unavailable.
+ * Security & reliability guarantees:
+ *   - Strictly verifies `txCalldata` selector + persisted intent parameters + signature BEFORE consuming intent.
+ *   - Uses an in-flight `broadcastingIntentIds` guard and rolls back on pre-broadcast validation/RPC errors
+ *     so transient RPC failures never permanently burn valid user intents.
+ *   - Always fails closed honestly (`broadcasted: false`, never fabricates tx hashes) if the
+ *     relayer key, router, calldata, or upstream RPC is unavailable.
  */
 export async function submitAndBroadcastSignedGaslessIntent(params: {
   intentId: string;
@@ -963,8 +1356,8 @@ export async function submitAndBroadcastSignedGaslessIntent(params: {
   sendRawTransaction?: (ctx: RelayerCustomBroadcasterContext) => Promise<string>;
   rpcCall?: typeof evmJsonRpcCall;
 }): Promise<SignedIntentReceipt & { broadcastResult?: RelayerBroadcastResult }> {
-  // Cryptographic EIP-712 verification + fail-closed single-use replay persistence
-  const receipt = submitSignedGaslessIntent({
+  // 1. Validate intent + cryptographic EIP-712 signature BEFORE marking consumed
+  const verified = validateSignedGaslessIntentPreConsume({
     intentId: params.intentId,
     chain: params.chain,
     userAddress: params.userAddress,
@@ -972,19 +1365,37 @@ export async function submitAndBroadcastSignedGaslessIntent(params: {
     deadline: params.deadline,
   });
 
-  if (!receipt.accepted) {
-    return receipt;
+  // 2. If txCalldata is supplied, strictly verify it matches the persisted intent BEFORE consuming!
+  const trimmedCalldata = typeof params.txCalldata === 'string' ? params.txCalldata.trim() : '';
+  if (params.txCalldata !== undefined && params.txCalldata !== null && trimmedCalldata !== '') {
+    const calldataCheck = verifyRelayerCalldataMatchesIntent(
+      verified.tracked,
+      trimmedCalldata,
+      verified.sig
+    );
+    if (!calldataCheck.ok) {
+      throw new Error(`Invalid relayer txCalldata: ${calldataCheck.reason}`);
+    }
+  } else if (params.txCalldata !== undefined && typeof params.txCalldata !== 'string') {
+    throw new Error('Invalid relayer txCalldata: expected a 0x-prefixed hex string.');
   }
 
-  const tracked = issuedIntents.get(params.intentId);
-  const targetContract =
-    tracked?.mode === 'eip7702_delegate'
-      ? params.userAddress
-      : tracked?.routerAddress ?? getChainRouterAddress(params.chain);
+  const baseReceipt = buildBaseSignedIntentReceipt(params, verified);
 
-  if (!params.txCalldata?.trim()) {
+  if (!baseReceipt.accepted) {
+    markGaslessIntentConsumed(verified.tracked, verified.normalizedDigest);
+    return baseReceipt;
+  }
+
+  const targetContract =
+    verified.tracked.mode === 'eip7702_delegate'
+      ? params.userAddress
+      : verified.tracked.routerAddress ?? getChainRouterAddress(params.chain);
+
+  if (!trimmedCalldata) {
+    markGaslessIntentConsumed(verified.tracked, verified.normalizedDigest);
     return {
-      ...receipt,
+      ...baseReceipt,
       broadcasted: false,
       settlementStatus: 'queued_pending_broadcast',
       diagnostic:
@@ -992,44 +1403,52 @@ export async function submitAndBroadcastSignedGaslessIntent(params: {
     };
   }
 
-  const broadcastResult = await broadcastSignedRelayerTx({
-    chain: params.chain,
-    to: targetContract,
-    data: params.txCalldata,
-    gasLimit: params.gasLimit,
-    maxFeePerGasWei: params.maxFeePerGasWei,
-    maxPriorityFeePerGasWei: params.maxPriorityFeePerGasWei,
-    nonce: params.nonce,
-    rpcUrls: params.rpcUrls,
-    sendRawTransaction: params.sendRawTransaction,
-    rpcCall: params.rpcCall,
-  });
+  // 3. Guard against concurrent duplicate broadcasts while allowing rollback on transient RPC failures
+  broadcastingIntentIds.add(params.intentId);
+  try {
+    const broadcastResult = await broadcastSignedRelayerTx({
+      chain: params.chain,
+      to: targetContract,
+      data: trimmedCalldata,
+      gasLimit: params.gasLimit,
+      maxFeePerGasWei: params.maxFeePerGasWei,
+      maxPriorityFeePerGasWei: params.maxPriorityFeePerGasWei,
+      nonce: params.nonce,
+      rpcUrls: params.rpcUrls,
+      sendRawTransaction: params.sendRawTransaction,
+      rpcCall: params.rpcCall,
+    });
 
-  if (!broadcastResult.broadcasted || !broadcastResult.txHash) {
+    if (!broadcastResult.broadcasted || !broadcastResult.txHash) {
+      // Only mark consumed if raw tx may have reached mempool (invalid_tx_hash);
+      // pre-broadcast validation or RPC errors leave the intent unconsumed for safe retry.
+      if (broadcastResult.reasonCode === 'invalid_tx_hash') {
+        markGaslessIntentConsumed(verified.tracked, verified.normalizedDigest);
+      }
+      return {
+        ...baseReceipt,
+        broadcasted: false,
+        settlementStatus: 'queued_pending_broadcast',
+        relayerAddress: broadcastResult.relayerAddress,
+        diagnostic: broadcastResult.diagnostic,
+        nextStep: `EIP-712 signature verified, but relayer broadcast did not complete: ${broadcastResult.diagnostic}`,
+        broadcastResult,
+      };
+    }
+
+    markGaslessIntentConsumed(verified.tracked, verified.normalizedDigest, broadcastResult.txHash);
+
     return {
-      ...receipt,
-      broadcasted: false,
-      settlementStatus: 'queued_pending_broadcast',
+      ...baseReceipt,
+      broadcasted: true,
+      settlementStatus: 'broadcast',
+      txHash: broadcastResult.txHash,
       relayerAddress: broadcastResult.relayerAddress,
       diagnostic: broadcastResult.diagnostic,
-      nextStep: `EIP-712 signature verified, but relayer broadcast did not complete: ${broadcastResult.diagnostic}`,
+      nextStep: `Sponsored EIP-1559 transaction broadcast on ${baseReceipt.chainName}: ${broadcastResult.txHash}.`,
       broadcastResult,
     };
+  } finally {
+    broadcastingIntentIds.delete(params.intentId);
   }
-
-  if (tracked) {
-    tracked.txHash = broadcastResult.txHash;
-    persistGaslessIntents();
-  }
-
-  return {
-    ...receipt,
-    broadcasted: true,
-    settlementStatus: 'broadcast',
-    txHash: broadcastResult.txHash,
-    relayerAddress: broadcastResult.relayerAddress,
-    diagnostic: broadcastResult.diagnostic,
-    nextStep: `Sponsored EIP-1559 transaction broadcast on ${receipt.chainName}: ${broadcastResult.txHash}.`,
-    broadcastResult,
-  };
 }

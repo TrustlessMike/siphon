@@ -119,7 +119,18 @@ export async function handleDegenRoutes(ctx: DegenRouteContext): Promise<boolean
 
     const action = match[2] as 'claim' | 'close';
     let body: { ownerPubkey?: string; walletAddress?: string } = {};
-    try {
+    const rawContentLength = req.headers['content-length'];
+    const declaredLength = Array.isArray(rawContentLength) ? rawContentLength[0] : rawContentLength;
+    const hasContentType = Boolean(req.headers['content-type']);
+    const hasTransferEncoding = Boolean(req.headers['transfer-encoding']);
+    const isGenuinelyEmptyWithoutContentType =
+      !hasContentType &&
+      !hasTransferEncoding &&
+      (declaredLength === undefined || declaredLength.trim() === '0');
+
+    if (!isGenuinelyEmptyWithoutContentType) {
+      // Rethrow HttpError (400 malformed JSON, 413 oversized >32 KiB, 415 wrong Content-Type)
+      // instead of silently swallowing invalid payloads.
       const parsed = await readJsonBody<{ ownerPubkey?: string; walletAddress?: string }>(
         req,
         MAX_DEGEN_JSON_BODY_BYTES
@@ -127,9 +138,6 @@ export async function handleDegenRoutes(ctx: DegenRouteContext): Promise<boolean
       if (parsed && typeof parsed === 'object') {
         body = parsed;
       }
-    } catch {
-      // Allow empty POST body for claim/close actions while rejecting malformed oversized payloads below
-      body = {};
     }
 
     const ownerPubkey =

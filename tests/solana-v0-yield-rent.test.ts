@@ -778,9 +778,10 @@ test('buildSolanaYieldParkPlan quotes JupSOL via Jupiter Swap API, builds verifi
         seenQuoteUrl = url;
         const hdrs = (init?.headers ?? {}) as Record<string, string>;
         if (hdrs['x-api-key']) seenSwapApiKey = hdrs['x-api-key'];
+        const reqAmount = new URL(url).searchParams.get('amount') ?? '900000000';
         return jsonResponse({
           inputMint: SOLANA_USDC_MINT,
-          inAmount: '900000000',
+          inAmount: reqAmount,
           outputMint: SOLANA_JUPSOL_MINT,
           outAmount: '5420000000', // 5.42 JupSOL
           otherAmountThreshold: '5392900000',

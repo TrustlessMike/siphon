@@ -80,10 +80,26 @@ export async function handleApprovalRoutes(ctx: ApprovalRouteContext): Promise<b
       return true;
     }
 
-    const walletAddress = (body.walletAddress ?? body.address ?? '').trim();
+    const rawWallet = body.walletAddress !== undefined ? body.walletAddress : body.address;
+    const walletAddress = typeof rawWallet === 'string' ? rawWallet.trim() : '';
     if (!walletAddress) {
-      reply(400, { error: 'walletAddress is required.' });
+      reply(400, { error: 'walletAddress must be a non-empty string.' });
       return true;
+    }
+
+    let multicallChunkSize: number | undefined;
+    if (body.multicallChunkSize !== undefined) {
+      if (
+        typeof body.multicallChunkSize !== 'number' ||
+        !Number.isFinite(body.multicallChunkSize) ||
+        !Number.isInteger(body.multicallChunkSize) ||
+        body.multicallChunkSize < 1 ||
+        body.multicallChunkSize > 200
+      ) {
+        reply(400, { error: 'multicallChunkSize must be a finite integer between 1 and 200.' });
+        return true;
+      }
+      multicallChunkSize = body.multicallChunkSize;
     }
 
     if (body.tokens !== undefined && !Array.isArray(body.tokens)) {
@@ -125,7 +141,7 @@ export async function handleApprovalRoutes(ctx: ApprovalRouteContext): Promise<b
       const result = await runScan(chainRaw, walletAddress, body.tokens, combinedSpenders, {
         includeKnownSpenders,
         unlimitedOnly: Boolean(body.unlimitedOnly),
-        multicallChunkSize: body.multicallChunkSize,
+        multicallChunkSize,
       });
       reply(200, result);
     } catch (err) {

@@ -146,7 +146,8 @@ export function computePreservationFee(
       ? Math.max(0, Math.min(MAX_PROTOCOL_FEE_BPS, Math.round(opts.baselineFlatFeeBps)))
       : DEFAULT_PROTOCOL_FEE_BPS;
 
-  if (!Number.isFinite(grossUsdInput) || grossUsdInput <= 0) {
+  const grossUsd = round2(grossUsdInput);
+  if (!Number.isFinite(grossUsdInput) || grossUsd <= 0) {
     return {
       grossUsd: 0,
       mode,
@@ -166,7 +167,6 @@ export function computePreservationFee(
     };
   }
 
-  const grossUsd = round2(grossUsdInput);
   const baselineFlatFeeUsd = round2((grossUsd * baselineBps) / 10_000);
 
   if (mode === 'self_custody' || mode === 'partner_subsidized') {
@@ -228,10 +228,13 @@ export function computePreservationFee(
       : resolvePreservationFeeBps(matchedTier.feeBps);
 
   const resolvedCapUsd =
-    opts.maxFeeUsdCap !== undefined
-      ? opts.maxFeeUsdCap !== null && Number.isFinite(opts.maxFeeUsdCap) && opts.maxFeeUsdCap >= 0
-        ? round2(opts.maxFeeUsdCap)
-        : null
+    opts.maxFeeUsdCap === null
+      ? null
+      : opts.maxFeeUsdCap !== undefined &&
+        typeof opts.maxFeeUsdCap === 'number' &&
+        Number.isFinite(opts.maxFeeUsdCap) &&
+        opts.maxFeeUsdCap >= 0
+      ? round2(opts.maxFeeUsdCap)
       : matchedTier.maxFeeUsdCap;
 
   const uncappedFeeUsd = round2((grossUsd * nominalFeeBps) / 10_000);
