@@ -398,6 +398,11 @@ def main():
                 return st.display !== 'none' && r.width > 0 && r.height > 0;
               };
               const cardText = document.querySelector('.sweep-summary-card')?.innerText || '';
+              const appText = document.getElementById('appShell')?.innerText || '';
+              const ctaRect = document.getElementById('runLiveQueueBtn')?.getBoundingClientRect();
+              const bodyBg = getComputedStyle(document.body).backgroundColor;
+              const ctaBg = getComputedStyle(document.getElementById('runLiveQueueBtn')).backgroundColor;
+              const brandLogos = Array.from(document.querySelectorAll('.brand-logo-img')).map(i => i.getAttribute('src') || '');
               return {
                 mode: document.documentElement.dataset.uiMode,
                 liteCostVisible: isVis('#summaryLiteCostText'),
@@ -412,6 +417,11 @@ def main():
                 defiTechVisible: isVis('.defi-tech-details'),
                 hasEipInLiteCard: /EIP-5792|Permit2|7702|Bridge Route|Protocol Fee/i.test(cardText),
                 overflowLite: document.documentElement.scrollWidth - window.innerWidth,
+                bodyBg,
+                ctaBg,
+                ctaTopLite: ctaRect ? Math.round(ctaRect.top) : 99999,
+                hasRawEmoji: /[⚡🔄🛡️⏳⊘⚠✕✓◉○]/.test(appText),
+                brandLogos,
               };
             }""")
             assert lite_check["mode"] == "lite", lite_check
@@ -429,9 +439,14 @@ def main():
             ]), f"Pro-only controls leaked in Lite mode: {lite_check}"
             assert not lite_check["hasEipInLiteCard"], f"Technical EIP/route copy leaked in Lite card: {lite_check}"
             assert lite_check["overflowLite"] <= 0, lite_check
+            assert lite_check["bodyBg"] == "rgb(11, 14, 19)", f"Expected Jupiter obsidian #0B0E13 body bg, got {lite_check['bodyBg']}"
+            assert lite_check["ctaBg"] == "rgb(199, 242, 132)", f"Expected Jupiter lime #C7F284 CTA bg, got {lite_check['ctaBg']}"
+            assert lite_check["ctaTopLite"] <= 760, f"Desktop Lite CTA pushed below fold: y={lite_check['ctaTopLite']}"
+            assert not lite_check["hasRawEmoji"], f"Raw emoji or Unicode status symbol found in Lite UI!"
+            assert len(lite_check["brandLogos"]) == 2 and all("/logos/turgalium.svg" in s for s in lite_check["brandLogos"]), lite_check
             maybe_shot(pgD, "goal_desktop_lite_1440.png", full_page=True)
 
-            # Switch to Pro mode and verify all Pro controls + EIP / program data appear
+            # Switch to Pro mode and verify all Pro controls + EIP / program data appear + CTA stays above fold
             pgD.click(".ui-mode-btn[data-ui-mode='pro']")
             pgD.wait_for_function("() => document.documentElement.dataset.uiMode === 'pro'", timeout=5000)
             pro_check = pgD.evaluate("""() => {
@@ -442,6 +457,8 @@ def main():
                 const r = el.getBoundingClientRect();
                 return st.display !== 'none' && r.width > 0 && r.height > 0;
               };
+              const ctaRect = document.getElementById('runLiveQueueBtn')?.getBoundingClientRect();
+              const appText = document.getElementById('appShell')?.innerText || '';
               return {
                 mode: document.documentElement.dataset.uiMode,
                 stored: localStorage.getItem('turgalium_ui_mode'),
@@ -453,6 +470,8 @@ def main():
                 chainQueueVisible: isVis('#chainQueueList'),
                 agentsTabVisible: isVis(".app-tab[data-view='agents']"),
                 contractTabVisible: isVis(".app-tab[data-view='contract']"),
+                ctaTopPro: ctaRect ? Math.round(ctaRect.top) : 99999,
+                hasRawEmojiPro: /[⚡🔄🛡️⏳⊘⚠✕✓◉○]/.test(appText),
               };
             }""")
             assert pro_check["mode"] == "pro" and pro_check["stored"] == "pro", pro_check
@@ -466,6 +485,8 @@ def main():
                 pro_check["agentsTabVisible"],
                 pro_check["contractTabVisible"],
             ]), f"Pro controls missing in Pro mode: {pro_check}"
+            assert pro_check["ctaTopPro"] <= 760, f"Desktop Pro CTA pushed below fold: y={pro_check['ctaTopPro']}"
+            assert not pro_check["hasRawEmojiPro"], f"Raw emoji or Unicode status symbol found in Pro UI!"
             maybe_shot(pgD, "goal_desktop_pro_1440.png", full_page=True)
 
             # 1E. Zero-Default-Dest Guard Backtest: sweep, per-chain batch, DeFi extract, and mandate MUST be hard-blocked!
@@ -659,6 +680,10 @@ def main():
             results["desktop_1440"] = {
                 "ok": True,
                 "liteAndProVerified": True,
+                "jupiterDarkObsidianVerified": True,
+                "zeroRawEmojis": True,
+                "ctaTopLitePx": lite_check["ctaTopLite"],
+                "ctaTopProPx": pro_check["ctaTopPro"],
                 "zeroDefaultDestVerified": True,
                 "rafPausedWhenHidden": True,
                 "atomicRequiredForFeeBatch": True,
@@ -924,7 +949,7 @@ def main():
 
             # 2D. Direct Client-Side Pre-Sign Assertions + ton_rawSign Removal + ensureEvmChain Switch Check
             wallet_safety = pgS.evaluate(f"""async () => {{
-              const w = await import('/wallets.js?v=7');
+              const w = await import('/wallets.js?v=8');
               const checks = {{}};
 
               // 1. Blind ton_rawSign must be removed and throw structured TonConnect guidance
@@ -1433,7 +1458,14 @@ def main():
             }""")
             assert badge_vis["total"] > 0 and badge_vis["visible"] == badge_vis["total"], f"Mobile safety badges hidden: {badge_vis}"
 
-            # Verify Lite mode 0px overflow on mobile before switching to Pro for full-view checks
+            # Verify Lite mode 0px overflow + Mobile Sweep CTA near top (y < 600px, NOT 40,664px down!)
+            pgM.evaluate("() => window.scrollTo(0, 0)")
+            pgM.wait_for_timeout(120)
+            mobile_cta_top = pgM.evaluate("""() => {
+              const r = document.getElementById('runLiveQueueBtn')?.getBoundingClientRect();
+              return r ? Math.round(r.top) : 99999;
+            }""")
+            assert mobile_cta_top < 600, f"Mobile 390px Sweep CTA buried too low: y={mobile_cta_top}px"
             overflowM["scanner_lite"] = pgM.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
             maybe_shot(pgM, "goal_mobile_lite_390.png", full_page=True)
 
@@ -1461,6 +1493,7 @@ def main():
             assert not errsM, f"Mobile errors: {errsM}"
             results["mobile_390"] = {
                 "ok": True,
+                "mobileCtaTopPx": mobile_cta_top,
                 "connectedNav": connected_nav_m,
                 "toastRect": toast_rect,
                 "visibleSafetyBadges": badge_vis,
@@ -2683,6 +2716,45 @@ def main():
             assert iso_check["stripHidden"], f"Stale Preservation Strip leaked on Cosmos switch: {iso_check}"
             assert iso_check["liteCost"] == "$0.00", f"Stale Lite Est. Fees leaked on Cosmos switch: {iso_check}"
 
+            # 8G. Verify client-side address family auto-detection (no manual family pill click needed)
+            auto_detect_check = pgW9.evaluate("""() => {
+              const fn = window.__turgaliumDetectAddressFamily;
+              if (typeof fn !== 'function') return null;
+              const appIn = document.getElementById('appEvmInput');
+              if (appIn) {
+                appIn.value = 'vitalik.eth';
+                appIn.dispatchEvent(new Event('input', { bubbles: true }));
+              }
+              const evmPillAfterEns = document.querySelector("#familyBar [data-family='evm']")?.classList.contains('active');
+              if (appIn) {
+                appIn.value = 'celestia1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3y3clr6';
+                appIn.dispatchEvent(new Event('input', { bubbles: true }));
+              }
+              const cosmosPillAfterCelestia = document.querySelector("#familyBar [data-family='cosmos']")?.classList.contains('active');
+              return {
+                ens: fn('vitalik.eth'),
+                evm: fn('0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045'),
+                cosmos: fn('celestia1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3y3clr6'),
+                sui: fn('0x' + 'a'.repeat(64)),
+                ton: fn('EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c'),
+                tron: fn('TNPeeaaFB7K9cmo4uQpcU32zGK8G1NYqeL'),
+                btc: fn('bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4'),
+                evmPillAfterEns,
+                cosmosPillAfterCelestia,
+              };
+            }""")
+            assert auto_detect_check == {
+                "ens": "evm",
+                "evm": "evm",
+                "cosmos": "cosmos",
+                "sui": "sui",
+                "ton": "ton",
+                "tron": "tron",
+                "btc": "btc",
+                "evmPillAfterEns": True,
+                "cosmosPillAfterCelestia": True,
+            }, f"Auto-detect family check failed: {auto_detect_check}"
+
             assert not errsW9, f"Wave 9 errors: {errsW9}"
             assert not badHttpW9, f"Wave 9 bad HTTP: {badHttpW9}"
             assert not http401W9, f"Wave 9 unexpected 401s: {http401W9}"
@@ -2696,6 +2768,7 @@ def main():
                 "blockedLpNftCoherent": True,
                 "dynamic19EvmChainsSynced": True,
                 "litePreservationStripPure": True,
+                "autoDetectFamilyVerified": True,
             }
             ctxW9.close()
 

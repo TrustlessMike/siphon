@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <defs>
+    <linearGradient id="jupGrad" x1="6" y1="8" x2="26" y2="24" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#C7F284"/>
+      <stop offset="50%" stop-color="#14F195"/>
+      <stop offset="100%" stop-color="#24C1D9"/>
+    </linearGradient>
+  </defs>
+  <circle cx="16" cy="16" r="14.5" fill="#131820" stroke="#263140" stroke-width="1"/>
+  <path d="M8.2 12.2c2.5-2.6 5.8-4 9.5-3.8 2.8.15 5.2 1.2 6.8 2.8" stroke="url(#jupGrad)" stroke-width="2.6" stroke-linecap="round"/>
+  <path d="M6.8 16.4c3-2.2 6.4-3.1 10.2-2.7 3 .3 5.5 1.4 7.8 3.2" stroke="url(#jupGrad)" stroke-width="2.6" stroke-linecap="round"/>
+  <path d="M8.6 20.6c2.5-1.5 5.4-2.1 8.6-1.7 2.4.3 4.5 1.1 6.2 2.4" stroke="url(#jupGrad)" stroke-width="2.4" stroke-linecap="round"/>
+</svg>

@@ -3144,9 +3144,9 @@ export function listAvailableFamilyWallets(family) {
     if (window.keplr) addCosmos('keplr', 'Keplr', '/logos/keplr.svg', window.keplr);
     if (window.leap) addCosmos('leap', 'Leap Wallet', '/logos/leap.svg', window.leap);
     if (window.cosmostation?.providers?.keplr) {
-      addCosmos('cosmostation', 'Cosmostation', '/logos/cosmos.svg', window.cosmostation.providers.keplr);
+      addCosmos('cosmostation', 'Cosmostation', '/logos/cosmostation.svg', window.cosmostation.providers.keplr);
     } else if (window.cosmostation?.cosmos) {
-      addCosmos('cosmostation', 'Cosmostation', '/logos/cosmos.svg', window.cosmostation.cosmos, 'Cosmostation API');
+      addCosmos('cosmostation', 'Cosmostation', '/logos/cosmostation.svg', window.cosmostation.cosmos, 'Cosmostation API');
     }
     if (window.okxwallet?.keplr) {
       addCosmos('okx-cosmos', 'OKX Wallet (Cosmos)', '/logos/okx.svg', window.okxwallet.keplr);

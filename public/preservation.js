@@ -307,6 +307,22 @@ function createEl(tag, className, text) {
   return el;
 }
 
+function uiIconSvg(name, size = 13) {
+  if (typeof window !== 'undefined') {
+    if (typeof window.renderTurgaliumUiIcon === 'function') {
+      return window.renderTurgaliumUiIcon(name, size);
+    }
+    if (typeof window.renderUiIcon === 'function') {
+      return window.renderUiIcon(name, size);
+    }
+  }
+  const s = Number(size) || 13;
+  if (name === 'check') {
+    return `<span class="ui-icon" aria-hidden="true"><svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>`;
+  }
+  return '';
+}
+
 function renderPreservationStrip() {
   const host = document.getElementById('preservationStripHost');
   if (!host) return;
@@ -369,7 +385,7 @@ function renderPreservationStrip() {
   const card = createEl('div', 'preservation-strip');
   card.id = 'preservationStripCard';
 
-  // Row 1: Primary metrics + Apply Optimal Route CTA
+  // Row 1: Calm single-row metrics (Lite + Pro) + Pro Apply Optimal Route CTA
   const mainRow = createEl('div', 'preservation-main-row');
   const metrics = createEl('div', 'preservation-metrics');
 
@@ -382,8 +398,8 @@ function renderPreservationStrip() {
   metrics.appendChild(
     createEl(
       'span',
-      'preservation-pill preservation-pill-saved mono',
-      `+${fmtUsd(savedNum)} saved vs manual swaps`
+      'preservation-pill preservation-pill-saved',
+      `+${fmtUsd(savedNum)} saved vs manual`
     )
   );
 
@@ -391,7 +407,7 @@ function renderPreservationStrip() {
     metrics.appendChild(
       createEl(
         'span',
-        'preservation-pill preservation-pill-popups mono',
+        'preservation-pill preservation-pill-popups pro-only',
         `${popupsNaive} → ${popupsOpt} popups`
       )
     );
@@ -400,11 +416,15 @@ function renderPreservationStrip() {
   const actions = createEl('div', 'preservation-actions pro-only');
   const applyBtn = createEl(
     'button',
-    `btn-pill-dark btn-sm preservation-apply-btn${isApplied ? ' is-applied' : ''}`,
-    isApplied ? 'Optimal Route Applied ✓' : 'Apply Optimal Route'
+    `btn-pill-dark btn-sm preservation-apply-btn${isApplied ? ' is-applied' : ''}`
   );
   applyBtn.type = 'button';
   applyBtn.id = 'applyOptimalRouteBtn';
+  if (isApplied) {
+    applyBtn.innerHTML = `${uiIconSvg('check', 13)}<span>Optimal Route Applied</span>`;
+  } else {
+    applyBtn.textContent = 'Apply Optimal Route';
+  }
   applyBtn.addEventListener('click', handleApplyOptimalRoute);
   actions.appendChild(applyBtn);
 
@@ -412,11 +432,11 @@ function renderPreservationStrip() {
   mainRow.appendChild(actions);
   card.appendChild(mainRow);
 
-  // Row 2: Pro-only Tiered Preservation Fee + Winning Cross-Chain Route Auction Clarity
+  // Row 2 (Pro only, compact): Tiered Fee + Route Winner + inline breakdown (keeps Pro strip <= 86px)
   if (hasSweepable) {
     const clarityRow = createEl('div', 'preservation-clarity-row pro-only');
 
-    const feePill = createEl('span', 'preservation-pill preservation-pill-fee mono');
+    const feePill = createEl('span', 'preservation-pill preservation-pill-fee');
     feePill.id = 'preservationTieredFeePill';
     const capPart = feeInfo.capUsd !== null ? ` cap ${fmtUsd(feeInfo.capUsd)}` : '';
     const savePart =
@@ -427,7 +447,7 @@ function renderPreservationStrip() {
     clarityRow.appendChild(feePill);
 
     if (routeSummary?.winnerLabel) {
-      const routePill = createEl('span', 'preservation-pill preservation-pill-route mono');
+      const routePill = createEl('span', 'preservation-pill preservation-pill-route');
       routePill.id = 'preservationRouteWinnerPill';
       let routeText = `Route Winner: ${routeSummary.winnerLabel}`;
       if (routeSummary.savedOverRunnerUpUsd > 0) {
@@ -438,28 +458,20 @@ function renderPreservationStrip() {
       clarityRow.appendChild(routePill);
     }
 
+    if (savedNum > 0) {
+      const breakdown = createEl('span', 'preservation-breakdown');
+      breakdown.appendChild(createEl('span', '', `Gas ${fmtUsd(t.dollarsSavedGasUsd)}`));
+      breakdown.appendChild(createEl('span', '', `Approvals ${fmtUsd(t.dollarsSavedApprovalsUsd)}`));
+      breakdown.appendChild(createEl('span', '', `Eff. ${effNum.toFixed(1)}%`));
+      clarityRow.appendChild(breakdown);
+    }
+
     card.appendChild(clarityRow);
   }
 
-  // Row 3: Pro-only granular savings breakdown
-  if (savedNum > 0) {
-    const breakdown = createEl('div', 'preservation-breakdown mono pro-only');
-    breakdown.appendChild(createEl('span', '', `Route: ${recLabel}`));
-    breakdown.appendChild(createEl('span', '', `Gas ${fmtUsd(t.dollarsSavedGasUsd)}`));
-    breakdown.appendChild(createEl('span', '', `Approvals ${fmtUsd(t.dollarsSavedApprovalsUsd)}`));
-    breakdown.appendChild(
-      createEl('span', '', `Route Auction ${fmtUsd(t.dollarsSavedRouteAuctionUsd)}`)
-    );
-    breakdown.appendChild(
-      createEl('span', '', `Neg-ROI Pruned ${fmtUsd(t.dollarsSavedNegativeRoiPrunedUsd)}`)
-    );
-    breakdown.appendChild(createEl('span', '', `Execution Eff. ${effNum.toFixed(1)}%`));
-    card.appendChild(breakdown);
-  }
-
-  // Row 4: Gas-Window Watchdog quick pill + Unlock schedule chip
+  // Optional Pro sub-row: Gas-Window Watchdog quick pill + Unlock schedule chip (hidden in Lite)
   if (showGasPill || nextUnlock) {
-    const subRow = createEl('div', 'preservation-sub-row');
+    const subRow = createEl('div', 'preservation-sub-row pro-only');
 
     if (showGasPill) {
       const gasBtn = createEl(
@@ -488,7 +500,7 @@ function renderPreservationStrip() {
       subRow.appendChild(
         createEl(
           'span',
-          'preservation-unlock-chip mono',
+          'preservation-unlock-chip',
           `${unlocks.length} scheduled · ${nextUnlock.symbol} (${nextUnlock.actionLabel})`
         )
       );

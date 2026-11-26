@@ -1,3 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" viewBox="0 0 24 24">
-  <path fill="#F59E0B" d="M12 2.5 14.6 9.4 21.5 12l-6.9 2.6L12 21.5l-2.6-6.9L2.5 12l6.9-2.6L12 2.5Z"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <defs>
+    <linearGradient id="sparkGrad" x1="4" y1="4" x2="20" y2="20" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FDE047"/>
+      <stop offset="55%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#EA580C"/>
+    </linearGradient>
+  </defs>
+  <circle cx="12" cy="12" r="10.5" fill="#1C140A" stroke="#F59E0B" stroke-opacity="0.35" stroke-width="0.75"/>
+  <path d="M12 4.2l1.85 5.45 5.95 2.35-5.95 2.35L12 19.8l-1.85-5.45L4.2 12l5.95-2.35L12 4.2Z" fill="url(#sparkGrad)"/>
+  <path d="M12 7.5l.85 3.15L16 12l-3.15 1.35L12 16.5l-.85-3.15L8 12l3.15-1.35L12 7.5Z" fill="#FFFBEB" fill-opacity="0.85"/>
 </svg>

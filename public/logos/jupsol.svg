@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+  <defs>
+    <linearGradient id="jupsolRing" x1="3" y1="3" x2="29" y2="29" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#C7F284"/>
+      <stop offset="55%" stop-color="#14F195"/>
+      <stop offset="100%" stop-color="#24C1D9"/>
+    </linearGradient>
+  </defs>
+  <circle cx="16" cy="16" r="14.5" fill="#131820" stroke="url(#jupsolRing)" stroke-width="1.8"/>
+  <path d="M10.2 12.2h11.8l-2 2.2H8.2l2-2.2Z" fill="#C7F284"/>
+  <path d="M8.2 15.8h11.8l2 2.2H10.2l-2-2.2Z" fill="#14F195"/>
+  <path d="M10.2 19.4h11.8l-2 2.2H8.2l2-2.2Z" fill="#24C1D9"/>
+</svg>
