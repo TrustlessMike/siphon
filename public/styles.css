@@ -111,6 +111,12 @@ select option {
   display: block;
 }
 
+.tg-ui-icon {
+  display: inline-block;
+  vertical-align: -0.125em;
+  flex-shrink: 0;
+}
+
 .code-inline {
   font-family: var(--font-mono);
   font-size: 12px;

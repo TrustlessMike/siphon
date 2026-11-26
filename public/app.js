@@ -605,12 +605,12 @@ function getProtocolLogoPath(protocol) {
   if (p.includes('sky') || p.includes('maker')) return resolveLogo('/logos/sky.svg', '/logos/vault.svg');
   if (p.includes('yearn')) return resolveLogo('/logos/yearn.svg', '/logos/vault.svg');
   if (p.includes('aerodrome')) return resolveLogo('/logos/aerodrome.svg', '/logos/vault.svg');
-  if (p.includes('velodrome')) return resolveLogo('/logos/velodrome.svg', '/logos/vault.svg');
+  if (p.includes('velodrome')) return '/logos/vault.svg';
   if (p.includes('hyperlend')) return resolveLogo('/logos/hyperlend.svg', '/logos/hyperevm.svg');
   if (p.includes('kodiak')) return resolveLogo('/logos/kodiak.svg', '/logos/berachain.svg');
   if (p.includes('bex') || p.includes('balancer')) return resolveLogo('/logos/bex.svg', '/logos/berachain.svg');
   if (p.includes('moonwell')) return resolveLogo('/logos/moonwell.svg', '/logos/base.svg');
-  if (p.includes('pendle')) return resolveLogo('/logos/pendle.svg', '/logos/vault.svg');
+  if (p.includes('pendle')) return '/logos/vault.svg';
   if (p.includes('jupiter')) return resolveLogo('/logos/jupiter.svg', '/logos/solana.svg');
   if (p.includes('kamino')) return resolveLogo('/logos/kamino.svg', '/logos/vault.svg');
   if (p.includes('sanctum')) return resolveLogo('/logos/sanctum.svg', '/logos/solana.svg');
