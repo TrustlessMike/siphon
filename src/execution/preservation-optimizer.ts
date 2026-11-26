@@ -1,3 +1,9 @@
+import {
+  readLiveUnlockQueues,
+  type LiveUnlockScheduleItem,
+  type ReadLiveUnlockQueuesOptions,
+} from '../defi/unlock-readers.js';
+import { validateCosmosAddress, validateEvmHexAddress } from '../scanner/address.js';
 import { EVM_CHAINS, getProtocolFeeConfig } from '../scanner/chains.js';
 import {
   estimateBridgeFixedFeeUsd,
@@ -72,7 +78,7 @@ export interface ChainGasTimingRecommendation {
 
 export interface UnlockScheduleItem {
   id: string;
-  kind: 'defi_unlock' | 'cctp_claim';
+  kind: 'defi_unlock' | 'cctp_claim' | 'lido_withdrawal' | 'ethena_cooldown' | 'cosmos_unbonding';
   chain: AnyChainId;
   chainName: string;
   symbol: string;
@@ -83,6 +89,18 @@ export interface UnlockScheduleItem {
   secondsRemaining: number;
   status: 'ready_to_claim' | 'locked_waiting' | 'attestation_pending';
   actionLabel: string;
+  source?:
+    | 'scan_index'
+    | 'cctp_attestation'
+    | 'lido_withdrawal_queue'
+    | 'ethena_susde'
+    | 'cosmos_staking';
+  uiAmount?: number;
+  rawAmount?: string;
+  requestId?: string;
+  validatorAddress?: string;
+  contractAddress?: string;
+  claimMethod?: string;
 }
 
 export interface AttestedCctpLegInput {
@@ -106,6 +124,12 @@ export interface PreservationPlanOptions {
   hasSolanaUsdcAta?: boolean;
   nowMs?: number;
   attestedCctpLegs?: AttestedCctpLegInput[];
+  /** Query live on-chain Lido / Ethena / Cosmos unlock queues and merge into unlockSchedule */
+  fetchLiveUnlockQueues?: boolean;
+  /** Optional injectable hooks/overrides for live unlock-queue readers (triggers live read when provided) */
+  liveUnlockReaderOptions?: Omit<ReadLiveUnlockQueuesOptions, 'evmAddresses' | 'cosmosAddresses' | 'nowMs'>;
+  /** Optional pre-fetched live unlock-queue items to merge into unlockSchedule */
+  liveUnlockItems?: LiveUnlockScheduleItem[];
 }
 
 export interface PreservationPlanReport {
@@ -586,10 +610,135 @@ function buildChainRouteCandidates(params: {
   };
 }
 
-function buildUnlockSchedule(
+function isLiveUnlockSource(source?: UnlockScheduleItem['source']): boolean {
+  return (
+    source === 'lido_withdrawal_queue' ||
+    source === 'ethena_susde' ||
+    source === 'cosmos_staking'
+  );
+}
+
+/**
+ * Extracts all unique valid EVM and Cosmos wallet addresses referenced in a ScanReport.
+ */
+export function extractScanWalletAddresses(scan: ScanReport): {
+  evmAddresses: string[];
+  cosmosAddresses: string[];
+} {
+  const evmSet = new Map<string, string>();
+  const cosmosSet = new Set<string>();
+
+  const consider = (raw?: string) => {
+    if (typeof raw !== 'string' || !raw.trim()) return;
+    for (const part of raw.split(',')) {
+      const clean = part.trim();
+      if (!clean) continue;
+      const evm = validateEvmHexAddress(clean);
+      if (evm.valid && evm.normalized) {
+        evmSet.set(evm.normalized.toLowerCase(), evm.normalized);
+        continue;
+      }
+      const cosmos = validateCosmosAddress(clean);
+      if (cosmos.valid && cosmos.normalized) {
+        cosmosSet.add(cosmos.normalized);
+      }
+    }
+  };
+
+  consider(scan.walletAddress);
+  for (const uw of scan.unifiedWallets ?? []) {
+    consider(uw.address);
+  }
+  for (const a of scan.assets ?? []) {
+    consider(a.sourceWallet);
+  }
+
+  return {
+    evmAddresses: Array.from(evmSet.values()),
+    cosmosAddresses: Array.from(cosmosSet.values()),
+  };
+}
+
+/**
+ * Merges scan-indexed DeFi unlocks, attested CCTP legs, and live on-chain unlock-queue items
+ * (Lido Withdrawal Queue, Ethena sUSDe cooldowns, Cosmos unbonding delegations),
+ * deduplicating overlapping entries (preferring live on-chain data over heuristic cooldowns)
+ * and sorting strictly soonest-first.
+ */
+export function mergeUnlockSchedule(
+  items: readonly UnlockScheduleItem[]
+): UnlockScheduleItem[] {
+  const hasLiveEthena = items.some((i) => i.source === 'ethena_susde' && i.chain === 'ethereum');
+  const hasLiveLido = items.some(
+    (i) => i.source === 'lido_withdrawal_queue' && i.chain === 'ethereum'
+  );
+
+  const byId = new Map<string, UnlockScheduleItem>();
+  const semanticIndex = new Map<string, string>();
+
+  for (const item of items) {
+    // Supersede heuristic scan cooldown placeholders when real live on-chain queue data is present
+    if (item.source === 'scan_index' && item.id.startsWith('cooldown:')) {
+      const symLower = item.symbol.toLowerCase();
+      const protoLower = item.protocol.toLowerCase();
+      if (hasLiveEthena && item.chain === 'ethereum' && (symLower === 'susde' || protoLower.includes('ethena'))) {
+        continue;
+      }
+      if (
+        hasLiveLido &&
+        item.chain === 'ethereum' &&
+        (symLower === 'steth' || symLower === 'wsteth' || protoLower.includes('lido'))
+      ) {
+        continue;
+      }
+    }
+
+    const existingById = byId.get(item.id);
+    if (existingById) {
+      if (isLiveUnlockSource(item.source) && !isLiveUnlockSource(existingById.source)) {
+        byId.set(item.id, item);
+      }
+      continue;
+    }
+
+    // Semantic deduplication for identical (chain, symbol, unlock minute) entries across scan vs live readers
+    const unlockMinuteBucket = Math.floor(item.unlockAtMs / 60_000);
+    const semanticKey =
+      item.kind === 'cctp_claim' || item.kind === 'lido_withdrawal' || item.kind === 'cosmos_unbonding'
+        ? item.id
+        : `${item.chain}:${item.symbol.toLowerCase()}:${unlockMinuteBucket}`;
+
+    const priorId = semanticIndex.get(semanticKey);
+    if (priorId) {
+      const prior = byId.get(priorId);
+      if (prior && isLiveUnlockSource(item.source) && !isLiveUnlockSource(prior.source)) {
+        byId.delete(priorId);
+        byId.set(item.id, item);
+        semanticIndex.set(semanticKey, item.id);
+      }
+      continue;
+    }
+
+    byId.set(item.id, item);
+    semanticIndex.set(semanticKey, item.id);
+  }
+
+  return Array.from(byId.values()).sort((a, b) => {
+    if (a.unlockAtMs !== b.unlockAtMs) return a.unlockAtMs - b.unlockAtMs;
+    if (a.status !== b.status) {
+      if (a.status === 'ready_to_claim') return -1;
+      if (b.status === 'ready_to_claim') return 1;
+    }
+    if (b.estimatedUsd !== a.estimatedUsd) return b.estimatedUsd - a.estimatedUsd;
+    return a.id.localeCompare(b.id);
+  });
+}
+
+export function buildUnlockSchedule(
   scan: ScanReport,
   attestedCctpLegs: AttestedCctpLegInput[] | undefined,
-  nowMs: number
+  nowMs: number,
+  liveItems?: readonly UnlockScheduleItem[]
 ): UnlockScheduleItem[] {
   const items: UnlockScheduleItem[] = [];
 
@@ -616,6 +765,7 @@ function buildUnlockSchedule(
           secondsRemaining === 0
             ? `Claim & bridge ${asset.symbol}`
             : `Unlocks in ${formatDurationShort(secondsRemaining)}`,
+        source: 'scan_index',
       });
     } else if (hasCooldown && asset.kind === 'defi_position') {
       // Cooldown detected without explicit timestamp: surface a 7-day standard unbonding reminder
@@ -637,6 +787,7 @@ function buildUnlockSchedule(
           asset.defiExitPlan?.exitStrategy === 'direct_swap_bypass_cooldown'
             ? `Instant DEX bypass available (avoids cooldown)`
             : `Cooldown active — track unlock`,
+        source: 'scan_index',
       });
     }
   }
@@ -678,10 +829,15 @@ function buildUnlockSchedule(
         leg.attestationStatus === 'complete'
           ? `Claim $${r2(leg.amountUsdc).toFixed(2)} USDC on Solana`
           : `Attesting (~${formatDurationShort(secondsRemaining)})`,
+      source: 'cctp_attestation',
     });
   }
 
-  return items.sort((a, b) => a.unlockAtMs - b.unlockAtMs);
+  if (liveItems && liveItems.length > 0) {
+    items.push(...liveItems);
+  }
+
+  return mergeUnlockSchedule(items);
 }
 
 function formatDurationShort(totalSec: number): string {
@@ -1077,7 +1233,38 @@ export async function evaluatePreservationPlan(
       .reduce((s, g) => s + g.estimatedWaitSavingsUsd, 0)
   );
 
-  const unlockSchedule = buildUnlockSchedule(scanReport, options.attestedCctpLegs, nowMs);
+  const mergedLiveUnlockItems: UnlockScheduleItem[] = [...(options.liveUnlockItems ?? [])];
+  if (options.fetchLiveUnlockQueues || options.liveUnlockReaderOptions) {
+    const { evmAddresses, cosmosAddresses } = extractScanWalletAddresses(scanReport);
+    if (evmAddresses.length > 0 || cosmosAddresses.length > 0) {
+      const ethChainSummary = scanReport.chains.find((c) => c.chain === 'ethereum');
+      const ethPriceUsd =
+        options.liveUnlockReaderOptions?.ethPriceUsd ??
+        (ethChainSummary && Number.isFinite(ethChainSummary.nativePriceUsd) && ethChainSummary.nativePriceUsd > 0
+          ? ethChainSummary.nativePriceUsd
+          : DEFAULT_NATIVE_PRICE_USD.ethereum);
+      try {
+        const liveQueues = await readLiveUnlockQueues({
+          ...options.liveUnlockReaderOptions,
+          evmAddresses,
+          cosmosAddresses,
+          nowMs,
+          timeoutMs: options.liveUnlockReaderOptions?.timeoutMs ?? options.rpcTimeoutMs,
+          ethPriceUsd,
+        });
+        mergedLiveUnlockItems.push(...liveQueues.items);
+      } catch {
+        // Fail-safe: live unlock-queue read failures never abort preservation planning
+      }
+    }
+  }
+
+  const unlockSchedule = buildUnlockSchedule(
+    scanReport,
+    options.attestedCctpLegs,
+    nowMs,
+    mergedLiveUnlockItems
+  );
 
   return {
     generatedAt: new Date(nowMs).toISOString(),
