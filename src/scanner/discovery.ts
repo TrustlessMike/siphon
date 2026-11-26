@@ -292,6 +292,669 @@ export async function probeDefiReceiptContracts(
   return detected;
 }
 
+/**
+ * Cryptographically verified 4-byte keccak256 ABI selectors for expanded DeFi receipt detection:
+ * Morpho Blue / MetaMorpho ERC-4626 vaults, Fluid fTokens, Beefy mooTokens,
+ * Pendle SY/PT/YT receipts, and Curve / Convex gauge staking tokens.
+ */
+export const EXPANDED_DEFI_SELECTORS = {
+  // Morpho Blue / MetaMorpho ERC-4626
+  morphoSingleton: '0x3acb5624', // MORPHO()
+  morphoCurator: '0xe66f53b7', // curator()
+
+  // Fluid fTokens (Instadapp Fluid ERC-4626)
+  fluidLiquidity: '0x1a686502', // liquidity()
+
+  // Beefy Finance mooTokens (Vault V6/V7)
+  beefyWant: '0x1f1fcd51', // want()
+  beefyPricePerFullShare: '0x77c7b8fc', // getPricePerFullShare()
+  beefyStrategy: '0xa8c62e76', // strategy()
+  beefyStrategyVault: '0xfbfa77cf', // vault()
+  beefyBalance: '0xb69ef8a8', // balance()
+
+  // Pendle SY / PT / YT receipts
+  pendleSy: '0xafd27bf5', // SY()
+  pendlePt: '0xd94073d4', // PT()
+  pendleYt: '0x781c18db', // YT()
+  pendleExpiry: '0xe184c9be', // expiry()
+  pendleYieldToken: '0x76d5de85', // yieldToken()
+  pendleAssetInfo: '0xa40bee50', // assetInfo()
+
+  // Curve LiquidityGauge & Convex BaseRewardPool
+  curveLpToken: '0x82c63066', // lp_token()
+  curveWorkingSupply: '0x17e28089', // working_supply()
+  convexStakingToken: '0x72f702f3', // stakingToken()
+  convexOperator: '0x570ca735', // operator()
+  convexPid: '0xf1068454', // pid()
+  convexRewardToken: '0xf7c618c1', // rewardToken()
+} as const;
+
+/** Canonical Morpho Blue singleton contracts by EVM chain (fail-closed allowlist). */
+export const MORPHO_BLUE_SINGLETONS: Partial<Record<EvmChainId, string>> = {
+  ethereum: '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb',
+  base: '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb',
+  arbitrum: '0x6c247b1F6182318877311737BaC0844bAa518F5e',
+  optimism: '0xce95AfbB8EA029495c66020883F87aaE8864AF92',
+  polygon: '0x1bF0c2541F820E775182832f06c0B7Fc27A25f67',
+  unichain: '0x8f5ae9CddB9f68de460C77730b018Ae7E04a140A',
+  worldchain: '0xE741BC7c34758b4caE05062794E8Ae24978AF432',
+  scroll: '0x2dB5a9056cF113342E9C06a26C255c24A19f59d7',
+  ink: '0x857f37517a5f32d1239c58958f14c3f41a2b1f26',
+};
+
+/** Canonical Instadapp Fluid Liquidity Layer singletons by EVM chain (fail-closed allowlist). */
+export const FLUID_LIQUIDITY_SINGLETONS: Partial<Record<EvmChainId, string>> = {
+  ethereum: '0x52Aa899454998Be5b000Ad077a46Bbe360F4e497',
+  arbitrum: '0x52Aa899454998Be5b000Ad077a46Bbe360F4e497',
+  base: '0x52Aa899454998Be5b000Ad077a46Bbe360F4e497',
+  polygon: '0x52Aa899454998Be5b000Ad077a46Bbe360F4e497',
+};
+
+/** Canonical Convex Booster contracts by EVM chain (fail-closed allowlist). */
+export const CONVEX_BOOSTER_CONTRACTS: Partial<Record<EvmChainId, string>> = {
+  ethereum: '0xF403C135812408BFbE8713b5A23a04b3D48AAE31',
+  arbitrum: '0xF403C135812408BFbE8713b5A23a04b3D48AAE31',
+  polygon: '0xF403C135812408BFbE8713b5A23a04b3D48AAE31',
+  optimism: '0xF403C135812408BFbE8713b5A23a04b3D48AAE31',
+};
+
+export type ExpandedDefiProtocolKind =
+  | 'morpho_vault'
+  | 'fluid_ftoken'
+  | 'beefy_mootoken'
+  | 'pendle_sy'
+  | 'pendle_pt'
+  | 'pendle_yt'
+  | 'curve_gauge'
+  | 'convex_gauge';
+
+export interface ExpandedDefiDetection {
+  kind: ExpandedDefiProtocolKind;
+  protocol: string;
+  protocolAddress: string;
+  underlyingAddress: string;
+  /** Optional secondary protocol contract (e.g. Morpho Blue singleton, Fluid Liquidity, Beefy strategy, Pendle SY) */
+  controllerAddress?: string;
+  /** True when the receipt is ERC-4626 redeem()-compatible */
+  erc4626Compatible: boolean;
+  /** Optional Pendle maturity timestamp (epoch seconds) */
+  expiryTimestamp?: number;
+  /** Optional Beefy pricePerFullShare (1e18 scaled) */
+  pricePerFullShare?: bigint;
+  /** Optional Convex pool id */
+  poolId?: number;
+}
+
+export interface ExpandedDefiProbeSignals {
+  chain: EvmChainId;
+  tokenAddress: string;
+  erc4626Asset?: string | null;
+  morphoSingleton?: string | null;
+  fluidLiquidity?: string | null;
+  beefyWant?: string | null;
+  beefyPricePerFullShare?: bigint | null;
+  beefyStrategy?: string | null;
+  beefyBalance?: bigint | null;
+  pendleSy?: string | null;
+  pendlePt?: string | null;
+  pendleYt?: string | null;
+  pendleExpiry?: bigint | null;
+  pendleYieldToken?: string | null;
+  curveLpToken?: string | null;
+  curveWorkingSupply?: bigint | null;
+  convexStakingToken?: string | null;
+  convexOperator?: string | null;
+  convexPid?: bigint | null;
+  // Pass-2 onchain authentication & backing signals
+  totalAssets?: bigint | null;
+  convertToAssets?: bigint | null;
+  vaultUnderlyingBalance?: bigint | null;
+  controllerUnderlyingBalance?: bigint | null;
+  beefyStrategyVault?: string | null;
+  pendleCrossRefMatch?: boolean;
+  pendleSyYieldToken?: string | null;
+  totalSupply?: bigint | null;
+  userShares?: bigint;
+}
+
+/**
+ * Pure, strictly fail-closed classifier for expanded DeFi protocol receipts:
+ *  - Morpho Blue / MetaMorpho ERC-4626 vaults (verified against MORPHO_BLUE_SINGLETONS + onchain backing)
+ *  - Fluid fTokens (verified against FLUID_LIQUIDITY_SINGLETONS + onchain backing)
+ *  - Beefy mooTokens (verified via want() + strategy() + strategy.vault() === token + getPricePerFullShare() > 0 + balance() > 0)
+ *  - Pendle PT / YT / SY receipts (verified via SY/PT/YT cross-references + non-zero expiry/yieldToken/totalSupply)
+ *  - Convex BaseRewardPool gauges (verified against CONVEX_BOOSTER_CONTRACTS + stakingToken backing)
+ *  - Curve LiquidityGauge tokens (verified via lp_token() + working_supply() > 0 + lp_token.balanceOf(gauge) > 0)
+ */
+export function classifyExpandedDefiProbeResult(
+  signals: ExpandedDefiProbeSignals
+): ExpandedDefiDetection | null {
+  const addrLower = signals.tokenAddress.toLowerCase();
+  const userShares = signals.userShares ?? 0n;
+
+  // 1. Morpho Blue / MetaMorpho ERC-4626 Vault
+  const expectedMorpho = MORPHO_BLUE_SINGLETONS[signals.chain]?.toLowerCase();
+  if (
+    expectedMorpho &&
+    signals.morphoSingleton?.toLowerCase() === expectedMorpho &&
+    signals.erc4626Asset &&
+    signals.erc4626Asset.toLowerCase() !== addrLower
+  ) {
+    const backedByVault =
+      signals.vaultUnderlyingBalance !== null &&
+      signals.vaultUnderlyingBalance !== undefined &&
+      signals.vaultUnderlyingBalance > 0n &&
+      (userShares <= 0n ||
+        (signals.convertToAssets !== null &&
+          signals.convertToAssets !== undefined &&
+          signals.vaultUnderlyingBalance >= signals.convertToAssets));
+    const backedByMorpho =
+      signals.controllerUnderlyingBalance !== null &&
+      signals.controllerUnderlyingBalance !== undefined &&
+      signals.controllerUnderlyingBalance > 0n &&
+      (userShares <= 0n ||
+        (signals.convertToAssets !== null &&
+          signals.convertToAssets !== undefined &&
+          signals.controllerUnderlyingBalance >= signals.convertToAssets));
+
+    if (
+      signals.totalAssets !== null &&
+      signals.totalAssets !== undefined &&
+      signals.totalAssets > 0n &&
+      signals.convertToAssets !== null &&
+      signals.convertToAssets !== undefined &&
+      signals.convertToAssets > 0n &&
+      (backedByVault || backedByMorpho)
+    ) {
+      return {
+        kind: 'morpho_vault',
+        protocol: 'Morpho Vault (MetaMorpho)',
+        protocolAddress: addrLower,
+        underlyingAddress: signals.erc4626Asset.toLowerCase(),
+        controllerAddress: expectedMorpho,
+        erc4626Compatible: true,
+      };
+    }
+    return null;
+  }
+
+  // 2. Fluid fTokens (Instadapp Fluid ERC-4626)
+  const expectedFluid = FLUID_LIQUIDITY_SINGLETONS[signals.chain]?.toLowerCase();
+  if (
+    expectedFluid &&
+    signals.fluidLiquidity?.toLowerCase() === expectedFluid &&
+    signals.erc4626Asset &&
+    signals.erc4626Asset.toLowerCase() !== addrLower
+  ) {
+    const backedByVault =
+      signals.vaultUnderlyingBalance !== null &&
+      signals.vaultUnderlyingBalance !== undefined &&
+      signals.vaultUnderlyingBalance > 0n;
+    const backedByFluid =
+      signals.controllerUnderlyingBalance !== null &&
+      signals.controllerUnderlyingBalance !== undefined &&
+      signals.controllerUnderlyingBalance > 0n &&
+      (userShares <= 0n ||
+        (signals.convertToAssets !== null &&
+          signals.convertToAssets !== undefined &&
+          signals.controllerUnderlyingBalance >= signals.convertToAssets));
+
+    if (
+      signals.totalAssets !== null &&
+      signals.totalAssets !== undefined &&
+      signals.totalAssets > 0n &&
+      signals.convertToAssets !== null &&
+      signals.convertToAssets !== undefined &&
+      signals.convertToAssets > 0n &&
+      (backedByVault || backedByFluid)
+    ) {
+      return {
+        kind: 'fluid_ftoken',
+        protocol: 'Fluid fToken',
+        protocolAddress: addrLower,
+        underlyingAddress: signals.erc4626Asset.toLowerCase(),
+        controllerAddress: expectedFluid,
+        erc4626Compatible: true,
+      };
+    }
+    return null;
+  }
+
+  // 3. Beefy mooTokens (Vault V6/V7)
+  if (
+    signals.beefyWant &&
+    signals.beefyWant.toLowerCase() !== addrLower &&
+    signals.beefyStrategy &&
+    signals.beefyStrategy.toLowerCase() !== addrLower &&
+    signals.beefyPricePerFullShare !== null &&
+    signals.beefyPricePerFullShare !== undefined &&
+    signals.beefyPricePerFullShare > 0n &&
+    signals.beefyBalance !== null &&
+    signals.beefyBalance !== undefined &&
+    signals.beefyBalance > 0n
+  ) {
+    // Fail-closed: strategy.vault() MUST point back to this vault contract
+    if (signals.beefyStrategyVault?.toLowerCase() === addrLower) {
+      return {
+        kind: 'beefy_mootoken',
+        protocol: 'Beefy Vault',
+        protocolAddress: addrLower,
+        underlyingAddress: signals.beefyWant.toLowerCase(),
+        controllerAddress: signals.beefyStrategy.toLowerCase(),
+        erc4626Compatible: false,
+        pricePerFullShare: signals.beefyPricePerFullShare,
+      };
+    }
+    return null;
+  }
+
+  // 4. Pendle PT / YT / SY receipts
+  if (
+    signals.pendleSy &&
+    signals.pendleSy.toLowerCase() !== addrLower &&
+    signals.pendleExpiry !== null &&
+    signals.pendleExpiry !== undefined &&
+    signals.pendleExpiry > 0n &&
+    signals.pendleExpiry < 10_000_000_000n
+  ) {
+    const expiryNum = Number(signals.pendleExpiry);
+    if (signals.pendleYt && signals.pendleYt.toLowerCase() !== addrLower && !signals.pendlePt) {
+      if (signals.pendleCrossRefMatch && signals.pendleSyYieldToken) {
+        return {
+          kind: 'pendle_pt',
+          protocol: 'Pendle PT',
+          protocolAddress: addrLower,
+          underlyingAddress: signals.pendleSyYieldToken.toLowerCase(),
+          controllerAddress: signals.pendleSy.toLowerCase(),
+          erc4626Compatible: false,
+          expiryTimestamp: expiryNum,
+        };
+      }
+      return null;
+    }
+    if (signals.pendlePt && signals.pendlePt.toLowerCase() !== addrLower && !signals.pendleYt) {
+      if (signals.pendleCrossRefMatch && signals.pendleSyYieldToken) {
+        return {
+          kind: 'pendle_yt',
+          protocol: 'Pendle YT',
+          protocolAddress: addrLower,
+          underlyingAddress: signals.pendleSyYieldToken.toLowerCase(),
+          controllerAddress: signals.pendleSy.toLowerCase(),
+          erc4626Compatible: false,
+          expiryTimestamp: expiryNum,
+        };
+      }
+      return null;
+    }
+  }
+
+  if (
+    signals.pendleYieldToken &&
+    signals.pendleYieldToken.toLowerCase() !== addrLower &&
+    signals.totalSupply !== null &&
+    signals.totalSupply !== undefined &&
+    signals.totalSupply > 0n &&
+    signals.vaultUnderlyingBalance !== null &&
+    signals.vaultUnderlyingBalance !== undefined &&
+    signals.vaultUnderlyingBalance > 0n
+  ) {
+    return {
+      kind: 'pendle_sy',
+      protocol: 'Pendle SY',
+      protocolAddress: addrLower,
+      underlyingAddress: signals.pendleYieldToken.toLowerCase(),
+      erc4626Compatible: false,
+    };
+  }
+
+  // 5. Convex BaseRewardPool gauge (operator === canonical Convex Booster)
+  const expectedConvexBooster = CONVEX_BOOSTER_CONTRACTS[signals.chain]?.toLowerCase();
+  if (
+    expectedConvexBooster &&
+    signals.convexOperator?.toLowerCase() === expectedConvexBooster &&
+    signals.convexStakingToken &&
+    signals.convexStakingToken.toLowerCase() !== addrLower &&
+    signals.convexPid !== null &&
+    signals.convexPid !== undefined &&
+    signals.convexPid < 100_000n &&
+    signals.totalSupply !== null &&
+    signals.totalSupply !== undefined &&
+    signals.totalSupply > 0n
+  ) {
+    return {
+      kind: 'convex_gauge',
+      protocol: 'Convex Gauge',
+      protocolAddress: addrLower,
+      underlyingAddress: signals.convexStakingToken.toLowerCase(),
+      controllerAddress: expectedConvexBooster,
+      erc4626Compatible: false,
+      poolId: Number(signals.convexPid),
+    };
+  }
+
+  // 6. Curve LiquidityGauge (lp_token() + working_supply() > 0 + lp_token.balanceOf(gauge) > 0)
+  if (
+    signals.curveLpToken &&
+    signals.curveLpToken.toLowerCase() !== addrLower &&
+    signals.curveWorkingSupply !== null &&
+    signals.curveWorkingSupply !== undefined &&
+    signals.curveWorkingSupply > 0n &&
+    signals.vaultUnderlyingBalance !== null &&
+    signals.vaultUnderlyingBalance !== undefined &&
+    signals.vaultUnderlyingBalance > 0n
+  ) {
+    return {
+      kind: 'curve_gauge',
+      protocol: 'Curve Gauge',
+      protocolAddress: addrLower,
+      underlyingAddress: signals.curveLpToken.toLowerCase(),
+      erc4626Compatible: false,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Lightweight symbol/name metadata hint matcher for expanded DeFi receipt protocols.
+ * Never authorizes onchain execution by itself — used only as a fast classification hint
+ * alongside onchain verification in `probeExpandedDefiContracts`.
+ */
+export function identifyDefiProtocolByMetadata(params: {
+  symbol?: string | null;
+  name?: string | null;
+}): { kind: ExpandedDefiProtocolKind; protocol: string } | null {
+  const sym = (params.symbol ?? '').trim();
+  const name = (params.name ?? '').trim().toLowerCase();
+  const symLower = sym.toLowerCase();
+
+  if (
+    /^gt[a-z0-9]{2,}$/i.test(sym) ||
+    /^steak[a-z0-9]{2,}$/i.test(sym) ||
+    /^bb[a-z0-9]{2,}$/i.test(sym) ||
+    name.includes('metamorpho') ||
+    name.includes('morpho vault') ||
+    name.includes('morpho blue')
+  ) {
+    return { kind: 'morpho_vault', protocol: 'Morpho Vault (MetaMorpho)' };
+  }
+  if (/^f(usdc|usdt|weth|eth|wsteth|wbtc|dai|usds|susde)$/i.test(sym) || name.includes('fluid ')) {
+    return { kind: 'fluid_ftoken', protocol: 'Fluid fToken' };
+  }
+  if (/^moo[A-Za-z0-9_-]{2,}$/.test(sym) || name.includes('beefy')) {
+    return { kind: 'beefy_mootoken', protocol: 'Beefy Vault' };
+  }
+  if (/^PT-[A-Za-z0-9._-]+/i.test(sym) || name.startsWith('pt ')) {
+    return { kind: 'pendle_pt', protocol: 'Pendle PT' };
+  }
+  if (/^YT-[A-Za-z0-9._-]+/i.test(sym) || name.startsWith('yt ')) {
+    return { kind: 'pendle_yt', protocol: 'Pendle YT' };
+  }
+  if (/^SY-[A-Za-z0-9._-]+/i.test(sym) || name.startsWith('sy ')) {
+    return { kind: 'pendle_sy', protocol: 'Pendle SY' };
+  }
+  if (/^cvx[a-z0-9._-]*-f$/i.test(sym) || name.includes('convex') || symLower.includes('cvxcrv')) {
+    return { kind: 'convex_gauge', protocol: 'Convex Gauge' };
+  }
+  if (/-gauge$/i.test(sym) || name.includes('curve') && name.includes('gauge')) {
+    return { kind: 'curve_gauge', protocol: 'Curve Gauge' };
+  }
+  return null;
+}
+
+/**
+ * Probes arbitrary discovered ERC-20 contracts in 2 fail-closed Multicall3 passes to identify
+ * expanded DeFi receipt tokens:
+ *  - Morpho Blue / MetaMorpho ERC-4626 vaults (`MORPHO()` + `asset()` + backing)
+ *  - Fluid fTokens (`liquidity()` + `asset()` + backing)
+ *  - Beefy mooTokens (`want()` + `getPricePerFullShare()` + `strategy()` + `balance()` + `strategy.vault() === token`)
+ *  - Pendle SY / PT / YT receipts (`SY()`, `PT()`, `YT()`, `expiry()`, `yieldToken()` + cross-reference)
+ *  - Curve / Convex gauge tokens (`lp_token()` + `working_supply()` / `stakingToken()` + `operator()` + `pid()`)
+ *
+ * Strictly fail-closed: RPC errors, spoofed singletons, unbacked vaults, or mismatched cross-references
+ * are always rejected silently without throwing.
+ */
+export async function probeExpandedDefiContracts(params: {
+  chain: EvmChainId;
+  tokenAddresses: string[];
+  rawBalances?: Map<string, bigint>;
+}): Promise<Map<string, ExpandedDefiDetection>> {
+  const detected = new Map<string, ExpandedDefiDetection>();
+  const cfg = EVM_CHAINS[params.chain];
+  const unique = Array.from(
+    new Set(
+      params.tokenAddresses
+        .filter((a) => /^0x[0-9a-fA-F]{40}$/.test(a))
+        .map((a) => a.toLowerCase())
+    )
+  ).slice(0, 16);
+  if (!cfg || !unique.length) return detected;
+
+  // Pass 1 — 16 probes per token in 1 Multicall3 batch
+  const PROBES_PER_TOKEN = 16;
+  const calls = unique.flatMap((target) => [
+    { target, allowFailure: true, callData: DEFI_SELECTORS.asset }, // 0
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.morphoSingleton }, // 1
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.fluidLiquidity }, // 2
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.beefyWant }, // 3
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.beefyPricePerFullShare }, // 4
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.beefyStrategy }, // 5
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.beefyBalance }, // 6
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.pendleSy }, // 7
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.pendlePt }, // 8
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.pendleYt }, // 9
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.pendleExpiry }, // 10
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.pendleYieldToken }, // 11
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.curveLpToken }, // 12
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.curveWorkingSupply }, // 13
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.convexStakingToken }, // 14
+    { target, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.convexOperator }, // 15
+  ]);
+
+  try {
+    const mcData = encodeMulticall3Aggregate3(calls);
+    const json = await evmJsonRpcCall<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [{ to: cfg.multicall3, data: mcData }, 'latest'],
+      4000
+    );
+    if (!json.result || json.result === '0x') return detected;
+    const results = decodeMulticall3Aggregate3(json.result);
+
+    type VerifyPlan = {
+      signals: ExpandedDefiProbeSignals;
+      kindHint:
+        | 'morpho'
+        | 'fluid'
+        | 'beefy'
+        | 'pendle_pt'
+        | 'pendle_yt'
+        | 'pendle_sy'
+        | 'convex'
+        | 'curve';
+      callStartIndex: number;
+      callCount: number;
+    };
+
+    const verifyCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
+    const plans: VerifyPlan[] = [];
+    const expectedMorpho = MORPHO_BLUE_SINGLETONS[params.chain]?.toLowerCase();
+    const expectedFluid = FLUID_LIQUIDITY_SINGLETONS[params.chain]?.toLowerCase();
+    const expectedConvex = CONVEX_BOOSTER_CONTRACTS[params.chain]?.toLowerCase();
+
+    for (let i = 0; i < unique.length; i++) {
+      const addr = unique[i];
+      const base = i * PROBES_PER_TOKEN;
+      const userShares = params.rawBalances?.get(addr) ?? 0n;
+      const probeShares = userShares > 0n ? userShares : 1n;
+
+      const erc4626Asset = results[base]?.success ? decodeAbiAddressWord(results[base].returnData) : null;
+      const morphoSingleton = results[base + 1]?.success ? decodeAbiAddressWord(results[base + 1].returnData) : null;
+      const fluidLiquidity = results[base + 2]?.success ? decodeAbiAddressWord(results[base + 2].returnData) : null;
+      const beefyWant = results[base + 3]?.success ? decodeAbiAddressWord(results[base + 3].returnData) : null;
+      const beefyPps = results[base + 4]?.success ? decodeAbiUint256Word(results[base + 4].returnData) : null;
+      const beefyStrategy = results[base + 5]?.success ? decodeAbiAddressWord(results[base + 5].returnData) : null;
+      const beefyBalance = results[base + 6]?.success ? decodeAbiUint256Word(results[base + 6].returnData) : null;
+      const pendleSy = results[base + 7]?.success ? decodeAbiAddressWord(results[base + 7].returnData) : null;
+      const pendlePt = results[base + 8]?.success ? decodeAbiAddressWord(results[base + 8].returnData) : null;
+      const pendleYt = results[base + 9]?.success ? decodeAbiAddressWord(results[base + 9].returnData) : null;
+      const pendleExpiry = results[base + 10]?.success ? decodeAbiUint256Word(results[base + 10].returnData) : null;
+      const pendleYieldToken = results[base + 11]?.success ? decodeAbiAddressWord(results[base + 11].returnData) : null;
+      const curveLpToken = results[base + 12]?.success ? decodeAbiAddressWord(results[base + 12].returnData) : null;
+      const curveWorkingSupply = results[base + 13]?.success ? decodeAbiUint256Word(results[base + 13].returnData) : null;
+      const convexStakingToken = results[base + 14]?.success ? decodeAbiAddressWord(results[base + 14].returnData) : null;
+      const convexOperator = results[base + 15]?.success ? decodeAbiAddressWord(results[base + 15].returnData) : null;
+
+      const baseSignals: ExpandedDefiProbeSignals = {
+        chain: params.chain,
+        tokenAddress: addr,
+        erc4626Asset,
+        morphoSingleton,
+        fluidLiquidity,
+        beefyWant,
+        beefyPricePerFullShare: beefyPps,
+        beefyStrategy,
+        beefyBalance,
+        pendleSy,
+        pendlePt,
+        pendleYt,
+        pendleExpiry,
+        pendleYieldToken,
+        curveLpToken,
+        curveWorkingSupply,
+        convexStakingToken,
+        convexOperator,
+        userShares,
+      };
+
+      const start = verifyCalls.length;
+      if (expectedMorpho && morphoSingleton?.toLowerCase() === expectedMorpho && erc4626Asset && erc4626Asset !== addr) {
+        verifyCalls.push(
+          { target: addr, allowFailure: true, callData: DEFI_SELECTORS.erc4626TotalAssets },
+          { target: addr, allowFailure: true, callData: encodeErc4626ConvertToAssets(probeShares) },
+          { target: erc4626Asset, allowFailure: true, callData: `${DEFI_SELECTORS.balanceOf}${pad32Hex(addr)}` },
+          { target: erc4626Asset, allowFailure: true, callData: `${DEFI_SELECTORS.balanceOf}${pad32Hex(expectedMorpho)}` }
+        );
+        plans.push({ signals: baseSignals, kindHint: 'morpho', callStartIndex: start, callCount: 4 });
+        continue;
+      }
+
+      if (expectedFluid && fluidLiquidity?.toLowerCase() === expectedFluid && erc4626Asset && erc4626Asset !== addr) {
+        verifyCalls.push(
+          { target: addr, allowFailure: true, callData: DEFI_SELECTORS.erc4626TotalAssets },
+          { target: addr, allowFailure: true, callData: encodeErc4626ConvertToAssets(probeShares) },
+          { target: erc4626Asset, allowFailure: true, callData: `${DEFI_SELECTORS.balanceOf}${pad32Hex(addr)}` },
+          { target: erc4626Asset, allowFailure: true, callData: `${DEFI_SELECTORS.balanceOf}${pad32Hex(expectedFluid)}` }
+        );
+        plans.push({ signals: baseSignals, kindHint: 'fluid', callStartIndex: start, callCount: 4 });
+        continue;
+      }
+
+      if (beefyWant && beefyWant !== addr && beefyStrategy && beefyStrategy !== addr && beefyPps && beefyPps > 0n && beefyBalance && beefyBalance > 0n) {
+        verifyCalls.push({
+          target: beefyStrategy,
+          allowFailure: true,
+          callData: EXPANDED_DEFI_SELECTORS.beefyStrategyVault,
+        });
+        plans.push({ signals: baseSignals, kindHint: 'beefy', callStartIndex: start, callCount: 1 });
+        continue;
+      }
+
+      if (pendleSy && pendleSy !== addr && pendleExpiry && pendleExpiry > 0n && pendleYt && pendleYt !== addr && !pendlePt) {
+        verifyCalls.push(
+          { target: pendleYt, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.pendlePt },
+          { target: pendleSy, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.pendleYieldToken }
+        );
+        plans.push({ signals: baseSignals, kindHint: 'pendle_pt', callStartIndex: start, callCount: 2 });
+        continue;
+      }
+
+      if (pendleSy && pendleSy !== addr && pendleExpiry && pendleExpiry > 0n && pendlePt && pendlePt !== addr && !pendleYt) {
+        verifyCalls.push(
+          { target: pendlePt, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.pendleYt },
+          { target: pendleSy, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.pendleYieldToken }
+        );
+        plans.push({ signals: baseSignals, kindHint: 'pendle_yt', callStartIndex: start, callCount: 2 });
+        continue;
+      }
+
+      if (pendleYieldToken && pendleYieldToken !== addr) {
+        verifyCalls.push(
+          { target: addr, allowFailure: true, callData: DEFI_SELECTORS.totalSupply },
+          { target: pendleYieldToken, allowFailure: true, callData: `${DEFI_SELECTORS.balanceOf}${pad32Hex(addr)}` }
+        );
+        plans.push({ signals: baseSignals, kindHint: 'pendle_sy', callStartIndex: start, callCount: 2 });
+        continue;
+      }
+
+      if (expectedConvex && convexOperator?.toLowerCase() === expectedConvex && convexStakingToken && convexStakingToken !== addr) {
+        verifyCalls.push(
+          { target: addr, allowFailure: true, callData: EXPANDED_DEFI_SELECTORS.convexPid },
+          { target: addr, allowFailure: true, callData: DEFI_SELECTORS.totalSupply }
+        );
+        plans.push({ signals: baseSignals, kindHint: 'convex', callStartIndex: start, callCount: 2 });
+        continue;
+      }
+
+      if (curveLpToken && curveLpToken !== addr && curveWorkingSupply && curveWorkingSupply > 0n) {
+        verifyCalls.push({
+          target: curveLpToken,
+          allowFailure: true,
+          callData: `${DEFI_SELECTORS.balanceOf}${pad32Hex(addr)}`,
+        });
+        plans.push({ signals: baseSignals, kindHint: 'curve', callStartIndex: start, callCount: 1 });
+      }
+    }
+
+    if (verifyCalls.length > 0) {
+      const verifyMc = encodeMulticall3Aggregate3(verifyCalls);
+      const verifyJson = await evmJsonRpcCall<string>(
+        cfg.rpcUrls,
+        'eth_call',
+        [{ to: cfg.multicall3, data: verifyMc }, 'latest'],
+        4000
+      );
+      if (verifyJson.result && verifyJson.result !== '0x') {
+        const vRes = decodeMulticall3Aggregate3(verifyJson.result);
+        for (const plan of plans) {
+          const idx = plan.callStartIndex;
+          const s = plan.signals;
+          if (plan.kindHint === 'morpho' || plan.kindHint === 'fluid') {
+            s.totalAssets = vRes[idx]?.success ? decodeAbiUint256Word(vRes[idx].returnData) : null;
+            s.convertToAssets = vRes[idx + 1]?.success ? decodeAbiUint256Word(vRes[idx + 1].returnData) : null;
+            s.vaultUnderlyingBalance = vRes[idx + 2]?.success ? decodeAbiUint256Word(vRes[idx + 2].returnData) : null;
+            s.controllerUnderlyingBalance = vRes[idx + 3]?.success ? decodeAbiUint256Word(vRes[idx + 3].returnData) : null;
+          } else if (plan.kindHint === 'beefy') {
+            s.beefyStrategyVault = vRes[idx]?.success ? decodeAbiAddressWord(vRes[idx].returnData) : null;
+          } else if (plan.kindHint === 'pendle_pt' || plan.kindHint === 'pendle_yt') {
+            const crossRefAddr = vRes[idx]?.success ? decodeAbiAddressWord(vRes[idx].returnData) : null;
+            s.pendleCrossRefMatch = crossRefAddr?.toLowerCase() === s.tokenAddress.toLowerCase();
+            s.pendleSyYieldToken = vRes[idx + 1]?.success ? decodeAbiAddressWord(vRes[idx + 1].returnData) : null;
+          } else if (plan.kindHint === 'pendle_sy') {
+            s.totalSupply = vRes[idx]?.success ? decodeAbiUint256Word(vRes[idx].returnData) : null;
+            s.vaultUnderlyingBalance = vRes[idx + 1]?.success ? decodeAbiUint256Word(vRes[idx + 1].returnData) : null;
+          } else if (plan.kindHint === 'convex') {
+            s.convexPid = vRes[idx]?.success ? decodeAbiUint256Word(vRes[idx].returnData) : null;
+            s.totalSupply = vRes[idx + 1]?.success ? decodeAbiUint256Word(vRes[idx + 1].returnData) : null;
+          } else if (plan.kindHint === 'curve') {
+            s.vaultUnderlyingBalance = vRes[idx]?.success ? decodeAbiUint256Word(vRes[idx].returnData) : null;
+          }
+
+          const classified = classifyExpandedDefiProbeResult(s);
+          if (classified) {
+            detected.set(s.tokenAddress.toLowerCase(), classified);
+          }
+        }
+      }
+    }
+  } catch {
+    // non-fatal probe (strictly fail-closed)
+  }
+
+  return detected;
+}
+
 export interface AaveAccountSafety {
   checked: boolean;
   hasActiveDebt: boolean;

@@ -487,7 +487,7 @@ html[data-ui-mode="lite"] .preservation-strip {
 .ptools-grid {
   margin-top: 14px;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   min-width: 0;
 }
@@ -879,6 +879,24 @@ html[data-ui-mode="lite"] .preservation-strip {
   margin-top: auto;
 }
 
+.ptool-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: var(--ink-0, #0a0a0a);
+  flex-shrink: 0;
+}
+
+.ptool-dust-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.85fr) auto;
+  gap: 8px;
+  align-items: end;
+  min-width: 0;
+}
+
 @media (max-width: 1120px) {
   .ptools-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -891,6 +909,19 @@ html[data-ui-mode="lite"] .preservation-strip {
   }
 }
 
+@media (max-width: 720px) {
+  #yieldStrategySelect,
+  #approvalChainSelect,
+  #splDustTargetSelect,
+  #splDustMaxUsdInput,
+  .ptool-select,
+  .ptool-input,
+  .gas-watch-select,
+  .gas-watch-input {
+    font-size: 16px;
+  }
+}
+
 @media (max-width: 560px) {
   .preservation-tools-section {
     padding: 13px;
@@ -898,7 +929,8 @@ html[data-ui-mode="lite"] .preservation-strip {
   .ptool-control-row {
     flex-direction: column;
   }
-  .ptool-field-row {
+  .ptool-field-row,
+  .ptool-dust-controls {
     grid-template-columns: minmax(0, 1fr);
   }
   .ptool-kpi-grid {

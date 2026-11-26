@@ -1,8 +1,14 @@
-# Fly.io deployment manifest for Turgalium Migrator
+# Fly.io deployment manifest for Turgalium Migrator (0% protocol fees, MIT open source)
 # Before first deploy:
 #   1. fly volumes create turgalium_data --region iad --size 1
 #   2. fly secrets set TURGALIUM_ADMIN_SESSION_TOKEN="$(openssl rand -hex 32)"
-#   3. fly secrets set TURGALIUM_ALLOWED_HOSTS="turgalium-migrator.fly.dev" TURGALIUM_ALLOWED_ORIGIN="https://turgalium-migrator.fly.dev" TURGALIUM_PUBLIC_BASE_URL="https://turgalium-migrator.fly.dev"
+#   3. fly secrets set \
+#        TURGALIUM_ALLOWED_HOSTS="turgalium-migrator.fly.dev" \
+#        TURGALIUM_ALLOWED_ORIGIN="https://turgalium-migrator.fly.dev" \
+#        TURGALIUM_PUBLIC_BASE_URL="https://turgalium-migrator.fly.dev"
+#   4. Optional gasless relayer & custom RPC secrets:
+#        fly secrets set TURGALIUM_RELAYER_PRIVATE_KEY="0x..." ETH_RPC_URL="https://..." SOLANA_RPC_URL="https://..."
+#   5. fly deploy
 
 app = "turgalium-migrator"
 primary_region = "iad"

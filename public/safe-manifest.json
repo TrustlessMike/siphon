@@ -1,0 +1,5 @@
+{
+  "name": "Turgalium",
+  "description": "Zero-fee open-source 30-chain DeFi unwind and dust sweeper to Solana. Build and export non-custodial Safe Transaction Builder batches.",
+  "iconPath": "logos/turgalium.svg"
+}

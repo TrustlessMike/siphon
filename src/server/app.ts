@@ -21,6 +21,15 @@ import {
 import { runDefiPreflightBatch } from '../defi/preflight.js';
 import { buildPreSignSimulationProof, verifyOnchainExecutionProof } from '../execution/proof.js';
 import {
+  buildSafeTransactionBatch,
+  type SafeBatchBuildInput,
+} from '../execution/safe-batch.js';
+import {
+  generateTaxCsvExport,
+  type TaxExportFormat,
+  type TaxSweepEvent,
+} from '../execution/tax-export.js';
+import {
   checkLiveExecutionStatus,
   prepareChainBatchExecution,
   prepareRealExecution,
@@ -118,6 +127,7 @@ const MIME_TYPES: Record<string, string> = {
 };
 
 const MAX_JSON_BODY_BYTES = 1_048_576; // 1 MiB safety cap for scan/tx payloads
+const MAX_EXPORT_JSON_BODY_BYTES = 524_288; // 512 KiB strict cap for Safe batch / tax CSV export payloads
 const MAX_PRIVILEGED_JSON_BODY_BYTES = 65_536; // 64 KiB strict cap for agent/plugin/MCP/job endpoints
 const DEFAULT_SCAN_CACHE_MAX = 40;
 const DEFAULT_SCAN_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -600,6 +610,10 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
     'Content-Type': MIME_TYPES[ext],
   };
   if (safePath.startsWith('/logos/')) {
+    headers['Cross-Origin-Resource-Policy'] = 'cross-origin';
+  }
+  if (safePath === '/safe-manifest.json') {
+    headers['Access-Control-Allow-Origin'] = '*';
     headers['Cross-Origin-Resource-Policy'] = 'cross-origin';
   }
   if (ext === '.html' || ext === '.js' || ext === '.mjs' || ext === '.css') {
@@ -2495,6 +2509,80 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         })
       ) {
         return;
+      }
+
+      if (method === 'POST' && pathname === '/api/export/safe-batch') {
+        const body = await readJsonBody<SafeBatchBuildInput>(req, MAX_EXPORT_JSON_BODY_BYTES);
+        try {
+          const safeBatch = buildSafeTransactionBatch(body);
+          return reply(200, safeBatch);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Invalid Safe Transaction Builder batch payload.',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/export/tax-csv') {
+        const body = await readJsonBody<{
+          format?: TaxExportFormat;
+          events?: TaxSweepEvent[];
+          scanId?: string;
+          scan?: ScanReport;
+          assets?: ScannedAsset[];
+          outputAsset?: 'USDC' | 'SOL';
+          generatedAt?: string | number;
+          responseMode?: 'csv' | 'json';
+        }>(req, MAX_EXPORT_JSON_BODY_BYTES);
+
+        const resolvedScan =
+          body.scan ??
+          (typeof body.scanId === 'string' && body.scanId.trim()
+            ? scanCache.get(body.scanId.trim())
+            : undefined);
+        if (body.scanId && !resolvedScan && !body.events && !body.assets) {
+          return reply(400, { error: 'Unknown or expired scanId for tax CSV export.' });
+        }
+
+        try {
+          const exported = generateTaxCsvExport({
+            format: body.format as TaxExportFormat,
+            events: body.events,
+            scan: resolvedScan,
+            assets: body.assets,
+            outputAsset: body.outputAsset,
+            generatedAt: body.generatedAt,
+          });
+          const wantsJson =
+            body.responseMode === 'json' || url.searchParams.get('mode') === 'json';
+          if (wantsJson) {
+            return reply(200, exported);
+          }
+
+          const csvBuf = Buffer.from(exported.csv, 'utf8');
+          const csvHeaders: Record<string, string> = {
+            'Content-Type': exported.contentType,
+            'Content-Disposition': `attachment; filename="${exported.filename}"`,
+            'Content-Length': String(csvBuf.byteLength),
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+            'X-Frame-Options': 'DENY',
+            'Referrer-Policy': 'no-referrer',
+            'Cross-Origin-Resource-Policy': 'same-origin',
+            'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+            'X-Turgalium-Tax-Format': exported.format,
+            'X-Turgalium-Tax-Rows': String(exported.rowCount),
+            ...corsHeaders,
+            ...rateLimitHeaders,
+          };
+          res.writeHead(200, csvHeaders);
+          res.end(csvBuf);
+          return;
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Invalid tax CSV export payload.',
+          });
+        }
       }
 
       if (pathname.startsWith('/api/solana/') && (await handleSolanaRoutes({ method, pathname, url, req, reply, readJsonBody }))) {

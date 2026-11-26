@@ -9,7 +9,8 @@
     <meta name="apple-mobile-web-app-title" content="Turgalium" />
     <title>Turgalium — Sweep 30 Chains to Solana</title>
     <link rel="icon" type="image/svg+xml" href="/logos/turgalium.svg?v=3" />
-    <link rel="apple-touch-icon" href="/logos/turgalium.svg?v=3" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180.png" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -17,7 +18,7 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=11" />
+    <link rel="stylesheet" href="/styles.css?v=12" />
     <link rel="stylesheet" href="/degen.css?v=3" />
     <link rel="stylesheet" href="/preservation.css?v=4" />
   </head>
@@ -195,6 +196,9 @@
       </header>
 
       <main class="app-container">
+        <!-- PERSISTENT IN-FLIGHT BRIDGE TRACKER (Restored from localStorage < 24h) -->
+        <section class="inflight-bridge-banner hidden" id="inflightBridgeBanner" aria-label="In-flight bridge transfers" aria-live="polite"></section>
+
         <!-- ======================================================= -->
         <!-- VIEW 1: SWEEP WORKSPACE                                 -->
         <!-- ======================================================= -->
@@ -505,7 +509,10 @@
                     <span class="agent-pulse-dot" id="agentPulseDot"></span>
                     <strong>Background Agent</strong>
                   </div>
-                  <span class="muted-xs" id="agentProgressMeta">Idle</span>
+                  <div class="inline-logo-row" style="gap:8px;">
+                    <span class="muted-xs" id="agentProgressMeta">Idle</span>
+                    <button type="button" class="text-action hidden" id="agentShareReceiptBtn">Share Receipt</button>
+                  </div>
                 </div>
                 <div class="agent-progress-track">
                   <div class="agent-progress-fill" id="agentProgressFill" style="width: 0%"></div>
@@ -658,9 +665,10 @@
               <p class="lite-only">Live settlement tracking for your sweeps to Solana.</p>
               <p class="pro-only">Live settlement tracking for multi-chain sweeps, convergence topology, and zero-liquidity burn receipts.</p>
             </div>
-            <div class="btn-row pro-only">
-              <button type="button" class="btn-outline-sm" id="downloadBurnCsvBtn">Export Burn CSV</button>
-              <button type="button" class="btn-pill-dark btn-sm" id="copyBurnJsonBtn">Copy Burn JSON</button>
+            <div class="btn-row">
+              <button type="button" class="btn-pill-dark btn-sm" id="openReceiptModalBtn">Share Receipt</button>
+              <button type="button" class="btn-outline-sm pro-only" id="downloadBurnCsvBtn">Export Burn CSV</button>
+              <button type="button" class="btn-outline-sm pro-only" id="copyBurnJsonBtn">Copy Burn JSON</button>
             </div>
           </div>
 
@@ -1043,6 +1051,50 @@
       </div>
     </div>
 
+    <!-- FLOATING IN-FLIGHT BRIDGE PILL (Visible on Homepage when pending bridge < 24h exists) -->
+    <div class="inflight-site-pill hidden" id="inflightSitePill" role="status" aria-live="polite"></div>
+
+    <!-- SHAREABLE MIGRATION RECEIPT MODAL (DAYLIGHT PORCELAIN) -->
+    <div class="wallet-modal-backdrop receipt-modal-backdrop hidden" id="receiptModalBackdrop" role="dialog" aria-modal="true" aria-labelledby="receiptModalTitle">
+      <div class="wallet-modal receipt-modal">
+        <div class="wallet-modal-head">
+          <div>
+            <h3 id="receiptModalTitle">Sweep Receipt</h3>
+            <p id="receiptModalSub" class="muted-xs">Privacy-safe porcelain card — wallet addresses hidden by default.</p>
+          </div>
+          <button type="button" class="wallet-modal-close" id="receiptModalCloseBtn" aria-label="Close receipt modal">×</button>
+        </div>
+
+        <div class="receipt-modal-body">
+          <div class="receipt-canvas-stage">
+            <canvas
+              id="receiptCardCanvas"
+              class="receipt-card-canvas"
+              width="1200"
+              height="630"
+              aria-label="Turgalium sweep migration receipt card"
+            ></canvas>
+          </div>
+
+          <div class="receipt-summary-box" id="receiptSummaryPreview"></div>
+
+          <div class="receipt-privacy-row">
+            <label class="inline-check receipt-privacy-toggle">
+              <input type="checkbox" id="receiptIncludeAddrToggle" />
+              <span>Include truncated address</span>
+            </label>
+            <span class="muted-xs" id="receiptPrivacyStatus">No wallet addresses included</span>
+          </div>
+
+          <div class="receipt-modal-actions">
+            <button type="button" class="btn-pill-dark" id="receiptDownloadPngBtn">Download PNG</button>
+            <button type="button" class="btn-outline-sm" id="receiptCopySummaryBtn">Copy Summary</button>
+            <button type="button" class="btn-outline-sm" id="receiptShareXBtn">Share on X</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- STICKY MOBILE SWEEP BAR (visible on mobile when CTA scrolls out of view) -->
     <div class="mobile-sticky-sweep hidden" id="mobileStickySweepBar" role="region" aria-label="Quick sweep bar">
       <div class="mobile-sticky-sweep-meta">
@@ -1056,7 +1108,7 @@
 
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>
 
-    <script type="module" src="/app.js?v=13"></script>
+    <script type="module" src="/app.js?v=14"></script>
     <script type="module" src="/preservation.js?v=4"></script>
   </body>
 </html>

@@ -1,6 +1,6 @@
 {
   "name": "turgalium-migrator",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "license": "MIT",
   "description": "Zero-fee open-source 30-chain DeFi & dust migrator to Solana with 1-click DeFi extraction, EIP-5792/7702 batching, Circle CCTP V2 Fast Transfer, and Claude MCP / ChatGPT plugins",
   "homepage": "https://turgalium.vercel.app",
@@ -22,6 +22,20 @@
     "url": "https://github.com/TrustlessMike/turgalium.git"
   },
   "type": "module",
+  "bin": {
+    "turgalium-mcp": "dist/src/mcp/server.js"
+  },
+  "exports": {
+    ".": "./dist/src/sdk/index.js",
+    "./mcp": "./dist/src/mcp/server.js"
+  },
+  "files": [
+    "dist",
+    "public",
+    "contracts",
+    "LICENSE",
+    "README.md"
+  ],
   "engines": {
     "node": "22.x"
   },

@@ -1313,7 +1313,9 @@ def main():
 
             pgX.locator("[data-extract-protocol='Morpho / Vaults']").click()
             pgX.wait_for_function("() => (window.__stage2BatchCalls || []).length === 2", timeout=15000)
+            pgX.locator("[data-stepper-step='withdraw'].is-done").wait_for(state="visible", timeout=15000)
             assert pgX.locator("[data-stepper-step='withdraw'].is-done").count() == 1
+            pgX.locator("[data-stepper-step='bridge'].is-done").wait_for(state="visible", timeout=15000)
             assert pgX.locator("[data-stepper-step='bridge'].is-done").count() == 1
             assert not errsX, f"DeFi 2-stage errors: {errsX}"
             results["defi_two_stage_auto_bridge"] = {"ok": True, "autoStage2TxCount": 2}
