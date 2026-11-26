@@ -104,8 +104,15 @@ contract SiphonDelegateRegistry {
 
     function setAllowedSwapRouter(address router, bool allowed) public onlyOwner {
         if (router == address(0)) revert InvalidAddress();
-        if (allowed && allowedDefiProtocols[router]) {
-            revert DisjointAllowlistViolation(router);
+        if (allowed) {
+            if (router.code.length == 0) revert InvalidAddress();
+            if (
+                allowedDefiProtocols[router] ||
+                allowedAgentVaults[router] ||
+                allowedDelegateImplementations[router]
+            ) {
+                revert DisjointAllowlistViolation(router);
+            }
         }
         allowedSwapRouters[router] = allowed;
         emit SwapRouterUpdated(router, allowed);
@@ -113,8 +120,11 @@ contract SiphonDelegateRegistry {
 
     function setAllowedDefiProtocol(address protocol, bool allowed) public onlyOwner {
         if (protocol == address(0)) revert InvalidAddress();
-        if (allowed && allowedSwapRouters[protocol]) {
-            revert DisjointAllowlistViolation(protocol);
+        if (allowed) {
+            if (protocol.code.length == 0) revert InvalidAddress();
+            if (allowedSwapRouters[protocol]) {
+                revert DisjointAllowlistViolation(protocol);
+            }
         }
         allowedDefiProtocols[protocol] = allowed;
         emit DefiProtocolUpdated(protocol, allowed);
@@ -122,12 +132,24 @@ contract SiphonDelegateRegistry {
 
     function setAllowedDelegateImplementation(address implementation, bool allowed) public onlyOwner {
         if (implementation == address(0)) revert InvalidAddress();
+        if (allowed) {
+            if (implementation.code.length == 0) revert InvalidAddress();
+            if (allowedSwapRouters[implementation]) {
+                revert DisjointAllowlistViolation(implementation);
+            }
+        }
         allowedDelegateImplementations[implementation] = allowed;
         emit DelegateImplementationUpdated(implementation, allowed);
     }
 
     function setAllowedAgentVault(address vault, bool allowed) public onlyOwner {
         if (vault == address(0)) revert InvalidAddress();
+        if (allowed) {
+            if (vault.code.length == 0) revert InvalidAddress();
+            if (allowedSwapRouters[vault]) {
+                revert DisjointAllowlistViolation(vault);
+            }
+        }
         allowedAgentVaults[vault] = allowed;
         emit AgentVaultUpdated(vault, allowed);
     }

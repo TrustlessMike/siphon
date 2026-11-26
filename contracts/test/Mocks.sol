@@ -196,22 +196,41 @@ contract MockAaveV3Pool {
 }
 
 contract MockCompoundV3Comet {
+    address public immutable baseToken;
     mapping(address => mapping(address => uint256)) public balances;
+    mapping(address => uint256) public borrowBalanceOf;
+
+    constructor(address _baseToken) {
+        baseToken = _baseToken;
+    }
+
+    function balanceOf(address account) external view returns (uint256) {
+        return balances[account][baseToken];
+    }
 
     function creditUser(address user, address asset, uint256 amount) external {
         balances[user][asset] += amount;
     }
 
-    function withdrawFrom(address src, address to, address asset, uint256 amount) external {
-        require(balances[src][asset] >= amount, "INSUFFICIENT_COMET");
-        balances[src][asset] -= amount;
+    function _withdrawInternal(address src, address to, address asset, uint256 amount) private {
+        uint256 bal = balances[src][asset];
+        if (asset == baseToken && amount > bal) {
+            // Mirrors real Compound v3 Comet: withdrawing baseToken > supplied balance creates leveraged borrow debt!
+            balances[src][asset] = 0;
+            borrowBalanceOf[src] += (amount - bal);
+        } else {
+            require(bal >= amount, "INSUFFICIENT_COMET");
+            balances[src][asset] = bal - amount;
+        }
         MockERC20(asset).mint(to, amount);
     }
 
+    function withdrawFrom(address src, address to, address asset, uint256 amount) external {
+        _withdrawInternal(src, to, asset, amount);
+    }
+
     function withdraw(address asset, uint256 amount) external {
-        require(balances[msg.sender][asset] >= amount, "INSUFFICIENT_COMET");
-        balances[msg.sender][asset] -= amount;
-        MockERC20(asset).mint(msg.sender, amount);
+        _withdrawInternal(msg.sender, msg.sender, asset, amount);
     }
 }
 

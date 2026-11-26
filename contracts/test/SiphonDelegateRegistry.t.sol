@@ -19,6 +19,11 @@ contract SiphonDelegateRegistryTest is TestBase {
 
     function setUp() public {
         registry = new SiphonDelegateRegistry(owner);
+        // Contract allowlist targets must have deployed bytecode (L-3)
+        vm.etch(router1, hex"00");
+        vm.etch(defi1, hex"00");
+        vm.etch(delegateImpl, hex"00");
+        vm.etch(agentVault, hex"00");
     }
 
     function test_ConstructorRejectsZeroOwner() public {
@@ -68,9 +73,40 @@ contract SiphonDelegateRegistryTest is TestBase {
         vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, router1));
         registry.setAllowedDefiProtocol(router1, true);
 
+        vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, router1));
+        registry.setAllowedAgentVault(router1, true);
+
+        vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, router1));
+        registry.setAllowedDelegateImplementation(router1, true);
+
         registry.setAllowedDefiProtocol(defi1, true);
         vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, defi1));
         registry.setAllowedSwapRouter(defi1, true);
+
+        registry.setAllowedAgentVault(agentVault, true);
+        vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, agentVault));
+        registry.setAllowedSwapRouter(agentVault, true);
+
+        registry.setAllowedDelegateImplementation(delegateImpl, true);
+        vm.expectRevert(abi.encodeWithSelector(SiphonDelegateRegistry.DisjointAllowlistViolation.selector, delegateImpl));
+        registry.setAllowedSwapRouter(delegateImpl, true);
+        vm.stopPrank();
+    }
+
+    function test_ContractAllowlistSettersRejectEoAs() public {
+        address eoaAddr = address(0x9999);
+        vm.startPrank(owner);
+        vm.expectRevert(SiphonDelegateRegistry.InvalidAddress.selector);
+        registry.setAllowedSwapRouter(eoaAddr, true);
+
+        vm.expectRevert(SiphonDelegateRegistry.InvalidAddress.selector);
+        registry.setAllowedDefiProtocol(eoaAddr, true);
+
+        vm.expectRevert(SiphonDelegateRegistry.InvalidAddress.selector);
+        registry.setAllowedDelegateImplementation(eoaAddr, true);
+
+        vm.expectRevert(SiphonDelegateRegistry.InvalidAddress.selector);
+        registry.setAllowedAgentVault(eoaAddr, true);
         vm.stopPrank();
     }
 
