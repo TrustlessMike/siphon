@@ -570,18 +570,38 @@ html[data-ui-mode="lite"] .preservation-strip {
   min-width: 0;
 }
 
+.ptool-control-row > .ptool-input,
+.ptool-control-row > .ptool-select {
+  flex: 1 1 0;
+}
+
 .ptool-input,
 .ptool-select {
-  flex: 1 1 0;
+  display: block;
   min-width: 0;
   width: 100%;
+  min-height: 38px;
+  height: auto;
   background: var(--bg-surface, #ffffff);
   border: 1px solid var(--border-strong, #d1d5db);
   border-radius: 10px;
-  padding: 7px 10px;
+  padding: 8px 11px;
   font-size: 12px;
+  line-height: 1.35;
   color: var(--ink-0, #0a0a0a);
   outline: none;
+  box-sizing: border-box;
+}
+
+.ptool-select {
+  -webkit-appearance: none;
+  appearance: none;
+  padding-right: 34px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%230a0a0a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 15px 15px;
+  text-overflow: ellipsis;
 }
 
 .ptool-input::placeholder {
@@ -919,6 +939,11 @@ html[data-ui-mode="lite"] .preservation-strip {
   .gas-watch-select,
   .gas-watch-input {
     font-size: 16px;
+    line-height: 1.35;
+    min-height: 44px;
+    height: auto;
+    padding-top: 10px;
+    padding-bottom: 10px;
   }
 }
 
@@ -928,6 +953,10 @@ html[data-ui-mode="lite"] .preservation-strip {
   }
   .ptool-control-row {
     flex-direction: column;
+  }
+  .ptool-control-row > .ptool-input,
+  .ptool-control-row > .ptool-select {
+    flex: 0 0 auto;
   }
   .ptool-field-row,
   .ptool-dust-controls {
