@@ -6,9 +6,9 @@
 
 import {
   getConnectedSolanaAddress,
-  getConnectedSolanaWalletName,
+  isUserRejectedError,
   isValidSolanaBase58,
-  listAvailableSolanaWallets,
+  signAndSendSolanaVersionedTx,
 } from './wallets.js?v=7';
 
 const DEFAULT_FALLBACK_GAME_MODES = [
@@ -80,9 +80,8 @@ const HIGH_RISK_WARN_PCT = 25;
 const MIN_JUPITER_ORDER_USD = 5;
 const DEFAULT_YIELD_APY_PCT = 7;
 const YIELD_HORIZON_DAYS = 30;
-const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-
-let walletSdksPromise = null;
+const JUPITER_ALLOWED_HOSTS = ['jup.ag'];
+const SOLSCAN_ALLOWED_HOSTS = ['solscan.io'];
 
 const state = {
   initialized: false,
@@ -111,6 +110,7 @@ const state = {
   selected: null, // { eventId, eventTitle, eventSlug, jupiterUrl, marketId, marketTitle, side, yes, no }
   stakeUsd: 25,
   orderPreview: null,
+  orderPreviewBindingKey: null,
   orderPreviewError: null,
   orderPreviewLoading: false,
   signingOrder: false,
@@ -140,13 +140,25 @@ function esc(value) {
     .replaceAll("'", '&#39;');
 }
 
-function safeHttpsUrl(raw, fallback = 'https://jup.ag/prediction') {
+function hostMatchesAllowlist(hostname, allowedHosts) {
+  if (!Array.isArray(allowedHosts) || allowedHosts.length === 0) return true;
+  const host = String(hostname || '').toLowerCase();
+  return allowedHosts.some((rawAllowed) => {
+    const allowed = String(rawAllowed || '').toLowerCase().replace(/^\*\./, '');
+    return Boolean(allowed) && (host === allowed || host.endsWith(`.${allowed}`));
+  });
+}
+
+function safeHttpsUrl(raw, fallback = 'https://jup.ag/prediction', allowedHosts = JUPITER_ALLOWED_HOSTS) {
   if (typeof raw !== 'string') return fallback;
   const trimmed = raw.trim();
   if (!trimmed || trimmed.startsWith('//')) return fallback;
   try {
     const parsed = new URL(trimmed);
     if (parsed.protocol !== 'https:' || !parsed.hostname || parsed.username || parsed.password) {
+      return fallback;
+    }
+    if (allowedHosts && !hostMatchesAllowlist(parsed.hostname, allowedHosts)) {
       return fallback;
     }
     return parsed.toString();
@@ -156,8 +168,26 @@ function safeHttpsUrl(raw, fallback = 'https://jup.ag/prediction') {
 }
 
 function safeImageUrl(raw) {
-  const url = safeHttpsUrl(raw, '');
+  const url = safeHttpsUrl(raw, '', null);
   return url || null;
+}
+
+function buildOrderBindingKey(walletAddress, marketId, side, stakeUsd) {
+  return `${String(walletAddress || '').trim()}|${String(marketId || '').trim()}|${String(side || '').trim()}|${Number(stakeUsd).toFixed(2)}`;
+}
+
+function clearOrderSigningState({ clearPositionFeedback = false } = {}) {
+  state.previewSeq += 1;
+  state.orderPreview = null;
+  state.orderPreviewBindingKey = null;
+  state.orderPreviewError = null;
+  state.orderPreviewLoading = false;
+  state.lastOrderTx = null;
+  state.liveTxStatus = null;
+  state.liveTxError = null;
+  if (clearPositionFeedback) {
+    state.positionActionFeedback = null;
+  }
 }
 
 function fmtUsd(amount, decimals = 2) {
@@ -196,61 +226,6 @@ function shortSig(sig) {
   const s = String(sig || '').trim();
   if (s.length <= 16) return s;
   return `${s.slice(0, 6)}…${s.slice(-6)}`;
-}
-
-function base64ToUint8Array(b64) {
-  if (typeof b64 !== 'string' || !b64.trim()) return null;
-  try {
-    const binary = atob(b64.trim());
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  } catch {
-    return null;
-  }
-}
-
-function bytesToBase58(bytes) {
-  if (!bytes || !bytes.length) return '';
-  const digits = [0];
-  for (let i = 0; i < bytes.length; i += 1) {
-    let carry = bytes[i];
-    for (let j = 0; j < digits.length; j += 1) {
-      carry += digits[j] << 8;
-      digits[j] = carry % 58;
-      carry = (carry / 58) | 0;
-    }
-    while (carry > 0) {
-      digits.push(carry % 58);
-      carry = (carry / 58) | 0;
-    }
-  }
-  let out = '';
-  for (let k = 0; k < bytes.length && bytes[k] === 0; k += 1) out += '1';
-  for (let q = digits.length - 1; q >= 0; q -= 1) out += BASE58_ALPHABET[digits[q]];
-  return out;
-}
-
-function extractSignatureString(res) {
-  if (!res) return null;
-  if (Array.isArray(res) && res.length > 0) {
-    return extractSignatureString(res[0]);
-  }
-  if (typeof res === 'string') return res.trim() || null;
-  const raw = res.signature ?? res.txid ?? res.hash ?? null;
-  if (typeof raw === 'string') return raw.trim() || null;
-  if (raw instanceof Uint8Array) return bytesToBase58(raw);
-  if (Array.isArray(raw)) return bytesToBase58(Uint8Array.from(raw));
-  return null;
-}
-
-async function loadWalletSdks() {
-  if (!walletSdksPromise) {
-    walletSdksPromise = import('/vendor/wallet-sdks.js').catch(() => null);
-  }
-  return walletSdksPromise;
 }
 
 function computeLocalSidePocket(
@@ -381,176 +356,9 @@ function getSelectedSolanaWallet() {
   return isValidSolanaBase58(raw) ? raw : '';
 }
 
-function resolveActiveSolanaSigner() {
-  const connectedAddress = getConnectedSolanaAddress();
-  const connectedName = (getConnectedSolanaWalletName() || '').toLowerCase();
-
-  // 1. Check Wallet Standard providers first (Phantom, Solflare, Backpack, etc.)
-  const available = listAvailableSolanaWallets();
-  const stdCandidates = available.filter(
-    (w) =>
-      w.kind === 'standard' &&
-      typeof w.wallet?.features?.['solana:signAndSendTransaction']?.signAndSendTransaction === 'function'
-  );
-  if (stdCandidates.length > 0) {
-    const chosen =
-      (connectedName
-        ? stdCandidates.find((w) => w.name.toLowerCase() === connectedName)
-        : null) ||
-      stdCandidates.find((w) =>
-        Array.isArray(w.wallet?.accounts) &&
-        w.wallet.accounts.some((a) => !connectedAddress || a?.address === connectedAddress)
-      ) ||
-      stdCandidates[0];
-    if (chosen) {
-      const account =
-        (chosen.wallet.accounts || []).find((a) => !connectedAddress || a?.address === connectedAddress) ||
-        (chosen.wallet.accounts || [])[0] ||
-        null;
-      if (account) {
-        return {
-          kind: 'standard',
-          name: chosen.name || 'Solana Wallet',
-          wallet: chosen.wallet,
-          account,
-        };
-      }
-    }
-  }
-
-  // 2. Check injected legacy Solana wallets (Phantom, Solflare, Backpack, generic window.solana)
-  if (typeof window !== 'undefined') {
-    const injectedCandidates = [
-      { name: 'Phantom', provider: window.phantom?.solana },
-      { name: 'Solflare', provider: window.solflare },
-      { name: 'Backpack', provider: window.backpack?.solana || window.backpack },
-      { name: window.solana?.isPhantom ? 'Phantom' : 'Solana Wallet', provider: window.solana },
-    ];
-    const preferred =
-      (connectedName
-        ? injectedCandidates.find(
-            (c) =>
-              c.name.toLowerCase() === connectedName &&
-              c.provider &&
-              (typeof c.provider.signAndSendTransaction === 'function' ||
-                typeof c.provider.request === 'function')
-          )
-        : null) ||
-      injectedCandidates.find(
-        (c) =>
-          c.provider &&
-          (typeof c.provider.signAndSendTransaction === 'function' ||
-            typeof c.provider.request === 'function')
-      );
-    if (preferred) {
-      return {
-        kind: 'legacy',
-        name: preferred.name,
-        provider: preferred.provider,
-      };
-    }
-  }
-
-  return null;
-}
-
 function hasConnectedSolanaSigner() {
-  const wallet = getSelectedSolanaWallet();
-  if (!wallet) return false;
-  return Boolean(resolveActiveSolanaSigner());
-}
-
-/**
- * Decodes a base64 Solana VersionedTransaction via `/vendor/wallet-sdks.js` and prompts
- * the active Phantom / Solflare / Backpack / Wallet Standard signer via `signAndSendTransaction`.
- */
-async function signAndSendJupiterTx(transactionBase64) {
-  const txBytes = base64ToUint8Array(transactionBase64);
-  if (!txBytes || txBytes.length < 16) {
-    throw new Error('Invalid or empty Jupiter transaction payload.');
-  }
-
-  const signer = resolveActiveSolanaSigner();
-  if (!signer) {
-    throw new Error('No connected Solana wallet signer found (Phantom, Solflare, or Backpack).');
-  }
-
-  // Decode VersionedTransaction via /vendor/wallet-sdks.js
-  let versionedTx = null;
-  const sdks = await loadWalletSdks();
-  if (sdks?.VersionedTransaction?.deserialize) {
-    try {
-      versionedTx = sdks.VersionedTransaction.deserialize(txBytes);
-    } catch {
-      versionedTx = null;
-    }
-  }
-
-  if (signer.kind === 'standard') {
-    const feature = signer.wallet.features['solana:signAndSendTransaction'];
-    const serialized = versionedTx ? versionedTx.serialize() : txBytes;
-    const res = await feature.signAndSendTransaction({
-      transaction: serialized,
-      account: signer.account,
-      chain: 'solana:mainnet',
-    });
-    const signature = extractSignatureString(res);
-    if (!signature) {
-      throw new Error(`${signer.name} did not return a transaction signature.`);
-    }
-    return {
-      signature,
-      walletName: signer.name,
-      solscanUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
-    };
-  }
-
-  const provider = signer.provider;
-  if (typeof provider.connect === 'function' && !provider.isConnected && !provider.publicKey) {
-    await provider.connect();
-  }
-
-  const txArg =
-    versionedTx || {
-      version: 0,
-      serialize: () => txBytes,
-      serializedTransactionBase64: transactionBase64,
-    };
-
-  if (typeof provider.signAndSendTransaction === 'function') {
-    const res = await provider.signAndSendTransaction(txArg, {
-      skipPreflight: false,
-      preflightCommitment: 'confirmed',
-    });
-    const signature = extractSignatureString(res);
-    if (!signature) {
-      throw new Error(`${signer.name} did not return a transaction signature.`);
-    }
-    return {
-      signature,
-      walletName: signer.name,
-      solscanUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
-    };
-  }
-
-  if (typeof provider.request === 'function') {
-    const serialized = versionedTx ? versionedTx.serialize() : txBytes;
-    const res = await provider.request({
-      method: 'signAndSendTransaction',
-      params: { message: bytesToBase58(serialized) },
-    });
-    const signature = extractSignatureString(res);
-    if (!signature) {
-      throw new Error(`${signer.name} did not return a transaction signature.`);
-    }
-    return {
-      signature,
-      walletName: signer.name,
-      solscanUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
-    };
-  }
-
-  throw new Error(`${signer.name} does not expose signAndSendTransaction.`);
+  const connected = getConnectedSolanaAddress();
+  return Boolean(connected && isValidSolanaBase58(connected));
 }
 
 function pickInitialSelection(events) {
@@ -755,7 +563,19 @@ async function fetchPositions({ silent = false } = {}) {
 
 async function handlePositionAction(positionId, action) {
   if (!positionId || state.positionBusyId) return;
-  const owner = getSelectedSolanaWallet();
+  const connected = getConnectedSolanaAddress();
+  if (!connected || !isValidSolanaBase58(connected)) {
+    state.positionActionFeedback = {
+      positionId,
+      type: 'error',
+      message: 'Connect your Solana wallet (Phantom, Solflare, or Backpack) to claim or exit positions inline.',
+      jupiterUrl: 'https://jup.ag/prediction/portfolio',
+    };
+    renderPositionsStrip();
+    document.getElementById('connectSolBtn')?.click();
+    return;
+  }
+
   state.positionBusyId = positionId;
   state.positionActionFeedback = {
     positionId,
@@ -769,9 +589,18 @@ async function handlePositionAction(positionId, action) {
     const resp = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(owner ? { ownerPubkey: owner } : {}),
+      body: JSON.stringify({ ownerPubkey: connected }),
     });
     const data = await resp.json().catch(() => ({}));
+
+    if (getConnectedSolanaAddress() !== connected) {
+      state.positionActionFeedback = {
+        positionId,
+        type: 'error',
+        message: 'Connected Solana wallet changed before signing. Please retry.',
+      };
+      return;
+    }
 
     if (!resp.ok) {
       state.positionActionFeedback = {
@@ -783,7 +612,7 @@ async function handlePositionAction(positionId, action) {
       return;
     }
 
-    if (data?.available && data?.transactionBase64 && hasConnectedSolanaSigner()) {
+    if (data?.available && data?.transactionBase64) {
       state.positionActionFeedback = {
         positionId,
         type: 'info',
@@ -791,7 +620,11 @@ async function handlePositionAction(positionId, action) {
       };
       renderPositionsStrip();
 
-      const signed = await signAndSendJupiterTx(data.transactionBase64);
+      const signed = await signAndSendSolanaVersionedTx(data.transactionBase64, {
+        expectedFeePayer: connected,
+        flow: 'jupiter_predict',
+        autoConnect: false,
+      });
       state.positionActionFeedback = {
         positionId,
         type: 'success',
@@ -799,7 +632,7 @@ async function handlePositionAction(positionId, action) {
           action === 'claim'
             ? `Claim submitted via ${signed.walletName} (${shortSig(signed.signature)})`
             : `Early exit submitted via ${signed.walletName} (${shortSig(signed.signature)})`,
-        solscanUrl: signed.solscanUrl,
+        solscanUrl: signed.explorerUrl,
       };
       renderPositionsStrip();
       // Refresh live positions after tx dispatch
@@ -815,13 +648,17 @@ async function handlePositionAction(positionId, action) {
         (action === 'claim'
           ? 'Open Jupiter Portfolio to claim your $1.00 winning payout.'
           : 'Open Jupiter Portfolio to close this position early.'),
-      jupiterUrl: safeHttpsUrl(data?.jupiterUrl, 'https://jup.ag/prediction/portfolio'),
+      jupiterUrl: safeHttpsUrl(data?.jupiterUrl, 'https://jup.ag/prediction/portfolio', JUPITER_ALLOWED_HOSTS),
     };
   } catch (err) {
     state.positionActionFeedback = {
       positionId,
       type: 'error',
-      message: err instanceof Error ? err.message : `Wallet rejected or failed ${action} transaction.`,
+      message: isUserRejectedError(err)
+        ? `Signature rejected in Solana wallet. ${action === 'claim' ? 'Claim' : 'Exit'} cancelled.`
+        : err instanceof Error
+          ? err.message
+          : `Wallet rejected or failed ${action} transaction.`,
       jupiterUrl: 'https://jup.ag/prediction/portfolio',
     };
   } finally {
@@ -835,6 +672,7 @@ async function requestOrderPreview(requestLiveTx = false) {
   const quote = getActiveQuote(sel);
   if (!sel || !quote) {
     state.orderPreview = null;
+    state.orderPreviewBindingKey = null;
     state.orderPreviewError = null;
     renderSlip();
     return null;
@@ -844,18 +682,21 @@ async function requestOrderPreview(requestLiveTx = false) {
   const stake = Number(state.stakeUsd);
   if (!Number.isFinite(stake) || stake <= 0) {
     state.orderPreview = null;
+    state.orderPreviewBindingKey = null;
     state.orderPreviewError = 'Enter a stake greater than $0.00.';
     renderSlip();
     return null;
   }
   if (stake < MIN_JUPITER_ORDER_USD - 1e-9) {
     state.orderPreview = null;
+    state.orderPreviewBindingKey = null;
     state.orderPreviewError = `Jupiter Prediction minimum order size is $${MIN_JUPITER_ORDER_USD.toFixed(2)} USDC.`;
     renderSlip();
     return null;
   }
   if (stake > pocket.maxDegenBudgetUsd + 1e-9) {
     state.orderPreview = null;
+    state.orderPreviewBindingKey = null;
     state.orderPreviewError =
       pocket.mode === 'yield_funded'
         ? `Stake ${fmtUsd(stake)} exceeds your 30d Yield-Funded budget of ${fmtUsd(pocket.maxDegenBudgetUsd)} (100% principal untouched).`
@@ -863,6 +704,18 @@ async function requestOrderPreview(requestLiveTx = false) {
     renderSlip();
     return null;
   }
+
+  const connectedSol = getConnectedSolanaAddress();
+  if (requestLiveTx && (!connectedSol || !isValidSolanaBase58(connectedSol))) {
+    state.orderPreview = null;
+    state.orderPreviewBindingKey = null;
+    state.liveTxStatus = null;
+    state.liveTxError = 'Connect your Solana wallet (Phantom, Solflare, or Backpack) to build an inline order transaction.';
+    renderSlip();
+    return null;
+  }
+  const boundWallet = connectedSol && isValidSolanaBase58(connectedSol) ? connectedSol : '';
+  const bindingKey = buildOrderBindingKey(boundWallet, sel.marketId, sel.side, stake);
 
   const seq = ++state.previewSeq;
   state.orderPreviewLoading = true;
@@ -889,7 +742,7 @@ async function requestOrderPreview(requestLiveTx = false) {
         eventSlug: sel.eventSlug,
         eventTitle: sel.eventTitle,
         marketTitle: sel.marketTitle,
-        walletAddress: getSelectedSolanaWallet() || undefined,
+        walletAddress: requestLiveTx ? boundWallet : boundWallet || undefined,
         requestLiveTx,
       }),
     });
@@ -899,6 +752,7 @@ async function requestOrderPreview(requestLiveTx = false) {
 
     if (!resp.ok) {
       state.orderPreview = null;
+      state.orderPreviewBindingKey = null;
       state.orderPreviewError = data?.error || `Order preview rejected (HTTP ${resp.status}).`;
       if (requestLiveTx) state.liveTxStatus = null;
       renderSlip();
@@ -906,6 +760,7 @@ async function requestOrderPreview(requestLiveTx = false) {
     }
 
     state.orderPreview = data;
+    state.orderPreviewBindingKey = bindingKey;
     state.orderPreviewError = null;
     if (requestLiveTx) {
       if (data?.liveOrder?.available) {
@@ -919,6 +774,7 @@ async function requestOrderPreview(requestLiveTx = false) {
   } catch (err) {
     if (seq !== state.previewSeq) return null;
     state.orderPreviewLoading = false;
+    state.orderPreviewBindingKey = null;
     state.orderPreviewError = err instanceof Error ? err.message : 'Preview request failed.';
     if (requestLiveTx) state.liveTxStatus = null;
     renderSlip();
@@ -928,16 +784,36 @@ async function requestOrderPreview(requestLiveTx = false) {
 
 async function handleSignAndPlaceOrder() {
   if (state.signingOrder) return;
-  const wallet = getSelectedSolanaWallet();
-  if (!wallet) {
+  const connected = getConnectedSolanaAddress();
+  if (!connected || !isValidSolanaBase58(connected)) {
+    state.liveTxError = 'Connect Phantom, Solflare, or Backpack to sign inline, or click "Open on Jupiter ↗".';
+    renderSlip();
     document.getElementById('connectSolBtn')?.click();
     return;
   }
-  if (!hasConnectedSolanaSigner()) {
-    state.liveTxError = 'Connect Phantom, Solflare, or Backpack to sign inline, or click "Open on Jupiter ↗".';
+
+  const sel = state.selected;
+  const quote = getActiveQuote(sel);
+  if (!sel || !quote) {
+    state.liveTxError = 'Select a market outcome before signing.';
     renderSlip();
     return;
   }
+
+  const pocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
+  const stake = Number(state.stakeUsd);
+  if (!Number.isFinite(stake) || stake < MIN_JUPITER_ORDER_USD - 1e-9) {
+    state.liveTxError = `Jupiter Prediction minimum order size is $${MIN_JUPITER_ORDER_USD.toFixed(2)} USDC.`;
+    renderSlip();
+    return;
+  }
+  if (stake > pocket.maxDegenBudgetUsd + 1e-9) {
+    state.liveTxError = `Stake ${fmtUsd(stake)} exceeds your capped side-pocket of ${fmtUsd(pocket.maxDegenBudgetUsd)}.`;
+    renderSlip();
+    return;
+  }
+
+  const expectedKey = buildOrderBindingKey(connected, sel.marketId, sel.side, stake);
 
   state.signingOrder = true;
   state.liveTxError = null;
@@ -945,8 +821,12 @@ async function handleSignAndPlaceOrder() {
   renderSlip();
 
   try {
-    let txBase64 = state.orderPreview?.liveOrder?.transactionBase64 || null;
-    let orderId = state.orderPreview?.liveOrder?.orderId || null;
+    const canReusePreview =
+      state.orderPreviewBindingKey === expectedKey &&
+      Boolean(state.orderPreview?.liveOrder?.transactionBase64);
+
+    let txBase64 = canReusePreview ? state.orderPreview.liveOrder.transactionBase64 : null;
+    let orderId = canReusePreview ? state.orderPreview.liveOrder.orderId || null : null;
 
     if (!txBase64) {
       const built = await requestOrderPreview(true);
@@ -957,13 +837,40 @@ async function handleSignAndPlaceOrder() {
       }
     }
 
+    // Re-validate connected wallet, stake cap, and binding key right before signing
+    const liveConnected = getConnectedSolanaAddress();
+    const livePocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
+    const liveStake = Number(state.stakeUsd);
+    const liveKey = state.selected
+      ? buildOrderBindingKey(liveConnected, state.selected.marketId, state.selected.side, liveStake)
+      : '';
+    if (
+      !liveConnected ||
+      liveConnected !== connected ||
+      !Number.isFinite(liveStake) ||
+      liveStake < MIN_JUPITER_ORDER_USD - 1e-9 ||
+      liveStake > livePocket.maxDegenBudgetUsd + 1e-9 ||
+      liveKey !== expectedKey ||
+      state.orderPreviewBindingKey !== expectedKey
+    ) {
+      state.orderPreview = null;
+      state.orderPreviewBindingKey = null;
+      state.liveTxStatus = null;
+      state.liveTxError = 'Order parameters or connected Solana wallet changed — please retry signing.';
+      return;
+    }
+
     state.liveTxStatus = 'Confirm order signature in your Solana wallet…';
     renderSlip();
 
-    const signed = await signAndSendJupiterTx(txBase64);
+    const signed = await signAndSendSolanaVersionedTx(txBase64, {
+      expectedFeePayer: connected,
+      flow: 'jupiter_predict',
+      autoConnect: false,
+    });
     state.lastOrderTx = {
       signature: signed.signature,
-      solscanUrl: signed.solscanUrl,
+      solscanUrl: signed.explorerUrl,
       walletName: signed.walletName,
       orderId,
     };
@@ -976,10 +883,15 @@ async function handleSignAndPlaceOrder() {
         liveOrder: { ...state.orderPreview.liveOrder, transactionBase64: null },
       };
     }
+    state.orderPreviewBindingKey = null;
     renderSlip();
     fetchPositions({ silent: true });
   } catch (err) {
-    state.liveTxError = err instanceof Error ? err.message : 'Solana wallet signing cancelled or failed.';
+    state.liveTxError = isUserRejectedError(err)
+      ? 'Signature rejected in Solana wallet. Order cancelled.'
+      : err instanceof Error
+        ? err.message
+        : 'Solana wallet signing cancelled or failed.';
     state.liveTxStatus = null;
   } finally {
     state.signingOrder = false;
@@ -1138,6 +1050,7 @@ function renderPocketBar() {
         state.availableUsdc = Math.round(val * 100) / 100;
         state.balanceSource = 'Custom balance';
         state.userEditedBalance = true;
+        clearOrderSigningState();
         const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
         if (state.stakeUsd > nextPocket.maxDegenBudgetUsd || state.stakeUsd <= 0) {
           state.stakeUsd = nextPocket.maxDegenBudgetUsd;
@@ -1160,6 +1073,7 @@ function renderPocketBar() {
         state.sidePocketMode = 'percent';
         state.riskPct = 10;
       }
+      clearOrderSigningState();
       const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
       state.stakeUsd = nextPocket.maxDegenBudgetUsd;
       renderPocketBar();
@@ -1175,6 +1089,7 @@ function renderPocketBar() {
       if (!Number.isFinite(nextPct)) return;
       state.sidePocketMode = 'percent';
       state.riskPct = nextPct;
+      clearOrderSigningState();
       const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
       state.stakeUsd = nextPocket.maxDegenBudgetUsd;
       renderPocketBar();
@@ -1191,6 +1106,7 @@ function renderPocketBar() {
       if (!Number.isFinite(val) || val < 0) return;
       state.sidePocketMode = 'percent';
       state.riskPct = val;
+      clearOrderSigningState();
       const nextPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
       state.stakeUsd = nextPocket.maxDegenBudgetUsd;
       renderPocketBar();
@@ -1202,6 +1118,7 @@ function renderPocketBar() {
 
   document.getElementById('degenSyncBalanceBtn')?.addEventListener('click', () => {
     syncBalanceFromSiphon(true);
+    clearOrderSigningState();
     renderPocketBar();
     renderMarketsSection();
     renderSlip();
@@ -1337,8 +1254,8 @@ function renderPositionsStrip() {
     ? `
       <div class="degen-pos-feedback is-${esc(feedback.type)} mono">
         <span>${esc(feedback.message)}</span>
-        ${feedback.solscanUrl ? `<a href="${esc(safeHttpsUrl(feedback.solscanUrl, 'https://solscan.io'))}" target="_blank" rel="noopener noreferrer" class="degen-solscan-link">View on Solscan ↗</a>` : ''}
-        ${feedback.jupiterUrl ? `<a href="${esc(safeHttpsUrl(feedback.jupiterUrl, 'https://jup.ag/prediction/portfolio'))}" target="_blank" rel="noopener noreferrer" class="degen-jup-link">Open on Jupiter ↗</a>` : ''}
+        ${feedback.solscanUrl ? `<a href="${esc(safeHttpsUrl(feedback.solscanUrl, 'https://solscan.io', SOLSCAN_ALLOWED_HOSTS))}" target="_blank" rel="noopener noreferrer" class="degen-solscan-link">View on Solscan ↗</a>` : ''}
+        ${feedback.jupiterUrl ? `<a href="${esc(safeHttpsUrl(feedback.jupiterUrl, 'https://jup.ag/prediction/portfolio', JUPITER_ALLOWED_HOSTS))}" target="_blank" rel="noopener noreferrer" class="degen-jup-link">Open on Jupiter ↗</a>` : ''}
       </div>
     `
     : '';
@@ -1623,9 +1540,7 @@ function renderMarketsSection() {
         yes: market.yes,
         no: market.no,
       };
-      state.liveTxStatus = null;
-      state.liveTxError = null;
-      state.lastOrderTx = null;
+      clearOrderSigningState();
       const curPocket = computeLocalSidePocket(state.availableUsdc, state.riskPct, state.sidePocketMode, state.yieldApyPct);
       if (!Number.isFinite(state.stakeUsd) || state.stakeUsd <= 0 || state.stakeUsd > curPocket.maxDegenBudgetUsd) {
         state.stakeUsd = curPocket.maxDegenBudgetUsd;
@@ -1711,7 +1626,7 @@ function renderSlip() {
       </a>
       ${
         state.feedMeta.apiKeyConfigured && !geoBlocked
-          ? `<button type="button" class="degen-live-tx-btn mono" id="degenBuildLiveTxBtn">${signerReady ? 'Sign & Place Order in Wallet' : 'Connect Solana for 1-Click Inline Signing'}</button>`
+          ? `<button type="button" class="degen-live-tx-btn mono" id="degenBuildLiveTxBtn" ${!canLaunch || state.signingOrder || state.orderPreviewLoading ? 'disabled' : ''}>${signerReady ? 'Sign & Place Order in Wallet' : 'Connect Solana for 1-Click Inline Signing'}</button>`
           : ''
       }
     `;
@@ -1721,7 +1636,7 @@ function renderSlip() {
     ? `
       <div class="degen-tx-success mono" role="status">
         <span>Placed via ${esc(state.lastOrderTx.walletName)} · ${esc(shortSig(state.lastOrderTx.signature))}</span>
-        <a href="${esc(safeHttpsUrl(state.lastOrderTx.solscanUrl, 'https://solscan.io'))}" target="_blank" rel="noopener noreferrer" class="degen-solscan-link">Solscan ↗</a>
+        <a href="${esc(safeHttpsUrl(state.lastOrderTx.solscanUrl, 'https://solscan.io', SOLSCAN_ALLOWED_HOSTS))}" target="_blank" rel="noopener noreferrer" class="degen-solscan-link">Solscan ↗</a>
       </div>
     `
     : '';
@@ -1815,8 +1730,7 @@ function renderSlip() {
   document.getElementById('degenSlipYesBtn')?.addEventListener('click', () => {
     if (!sel.yes) return;
     state.selected = { ...sel, side: 'yes' };
-    state.lastOrderTx = null;
-    state.liveTxError = null;
+    clearOrderSigningState();
     renderMarketsSection();
     renderSlip();
     requestOrderPreview(false);
@@ -1825,8 +1739,7 @@ function renderSlip() {
   document.getElementById('degenSlipNoBtn')?.addEventListener('click', () => {
     if (!sel.no) return;
     state.selected = { ...sel, side: 'no' };
-    state.lastOrderTx = null;
-    state.liveTxError = null;
+    clearOrderSigningState();
     renderMarketsSection();
     renderSlip();
     requestOrderPreview(false);
@@ -1837,7 +1750,7 @@ function renderSlip() {
     stakeInput.addEventListener('change', () => {
       const val = Number(stakeInput.value);
       state.stakeUsd = Number.isFinite(val) ? Math.round(val * 100) / 100 : 0;
-      state.lastOrderTx = null;
+      clearOrderSigningState();
       renderSlip();
       requestOrderPreview(false);
     });
@@ -1848,7 +1761,7 @@ function renderSlip() {
       const frac = Number(btn.dataset.stakeFrac);
       if (!Number.isFinite(frac)) return;
       state.stakeUsd = Math.floor(pocket.maxDegenBudgetUsd * frac * 100) / 100;
-      state.lastOrderTx = null;
+      clearOrderSigningState();
       renderSlip();
       requestOrderPreview(false);
     });
@@ -1859,7 +1772,7 @@ function renderSlip() {
   });
 
   document.getElementById('degenBuildLiveTxBtn')?.addEventListener('click', () => {
-    if (!getSelectedSolanaWallet()) {
+    if (!hasConnectedSolanaSigner()) {
       document.getElementById('connectSolBtn')?.click();
       return;
     }
@@ -1929,6 +1842,27 @@ function initDegenModule() {
     });
   });
 
+  // Strict state isolation on Solana wallet connect / account switch / disconnect
+  window.addEventListener('siphon:wallet-changed', (event) => {
+    const detail = event?.detail;
+    if (!detail || detail.family !== 'solana') return;
+    clearOrderSigningState({ clearPositionFeedback: true });
+    state.positionsSeq += 1;
+    state.positions = [];
+    state.positionsSummary = null;
+    state.positionsError = null;
+    state.positionsGeoBlocked = false;
+    state.positionsOwner = '';
+    updateTabBadge();
+    if (pane.classList.contains('active')) {
+      renderSlip();
+      renderPositionsStrip();
+      if (getSelectedSolanaWallet()) {
+        fetchPositions({ silent: false });
+      }
+    }
+  });
+
   // Clean event-driven balance & Solana wallet sync dispatched by app.js
   window.addEventListener('siphon:balance-updated', (event) => {
     const detail = event?.detail && typeof event.detail === 'object' ? event.detail : null;
@@ -1941,6 +1875,9 @@ function initDegenModule() {
 
     const nextWallet = getSelectedSolanaWallet();
     const walletChanged = nextWallet !== state.positionsOwner;
+    if (walletChanged) {
+      clearOrderSigningState({ clearPositionFeedback: true });
+    }
 
     if (pane.classList.contains('active')) {
       renderPocketBar();
@@ -1952,6 +1889,7 @@ function initDegenModule() {
       }
     } else if (!nextWallet && state.positionsOwner) {
       // Clear stale positions immediately when wallet disconnects
+      state.positionsSeq += 1;
       state.positionsOwner = '';
       state.positions = [];
       state.positionsSummary = null;
@@ -1961,6 +1899,7 @@ function initDegenModule() {
 
   // Graceful fallback if #solanaDestInput is edited directly by the user
   document.getElementById('solanaDestInput')?.addEventListener('change', () => {
+    clearOrderSigningState({ clearPositionFeedback: true });
     if (pane.classList.contains('active')) {
       renderSlip();
       fetchPositions({ silent: false });

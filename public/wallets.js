@@ -161,12 +161,13 @@ export function isValidSolanaBase58(addr) {
 export function isUserRejectedError(err) {
   const code = err?.code ?? err?.cause?.code ?? err?.data?.originalError?.code;
   if (code === 4001 || code === 'ACTION_REJECTED') return true;
-  const msg = String(err?.message || '').toLowerCase();
+  const msg = String(err?.message ?? (typeof err === 'string' ? err : '')).toLowerCase();
   return (
     msg.includes('user rejected') ||
     msg.includes('user denied') ||
     msg.includes('rejected the request') ||
-    msg.includes('action_rejected')
+    msg.includes('action_rejected') ||
+    /user cancel|transaction cancel|rejected by user/i.test(msg)
   );
 }
 
@@ -200,22 +201,136 @@ function assertFromMatchesConnected(expectedFrom) {
 }
 
 const solanaAtaBytes32Cache = new Map();
+const SOLANA_USDC_MINT_STR = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const SOLANA_TOKEN_PROGRAM_STR = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const SOLANA_TOKEN_2022_PROGRAM_STR = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+const SOLANA_ATA_PROGRAM_STR = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+const SOLANA_COMPUTE_BUDGET_PROGRAM_STR = 'ComputeBudget111111111111111111111111111111';
+const SOLANA_SYSTEM_PROGRAM_STR = '11111111111111111111111111111111';
+
+const RENT_RECLAIM_ALLOWED_PROGRAMS = new Set([
+  SOLANA_COMPUTE_BUDGET_PROGRAM_STR,
+  SOLANA_TOKEN_PROGRAM_STR,
+  SOLANA_TOKEN_2022_PROGRAM_STR,
+]);
+
+const CCTP_MESSAGE_TRANSMITTER_PROGRAMS = new Set([
+  'CCTPmbSD7gX1bxKPAmg77w8oFzNFpaQiQUWD43TKaecd', // Circle CCTP V1 MessageTransmitter
+  'CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC', // Circle CCTP V2 MessageTransmitter
+]);
+
+const CCTP_CLAIM_ALLOWED_PROGRAMS = new Set([
+  SOLANA_COMPUTE_BUDGET_PROGRAM_STR,
+  SOLANA_ATA_PROGRAM_STR,
+  SOLANA_TOKEN_PROGRAM_STR,
+  SOLANA_TOKEN_2022_PROGRAM_STR,
+  'CCTPmbSD7gX1bxKPAmg77w8oFzNFpaQiQUWD43TKaecd',
+  'CCTPiPYPc6AsJuwueEnWgSgucamXDZwBd53dQ11YiKX3',
+  'CCTPV2Sm4AdWt5296sk4P66VBZ7bEhcARwFaaS9YPbeC',
+  'CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe',
+]);
+
+const JUPITER_KNOWN_PROGRAMS = new Set([
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
+  'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB',
+  'JUP3c2Uh3WA4Ng34tw6kPd2G4C5BB21Xo36Je1s32Ph',
+  'jupoNjAxXgZ4rjzxzPMP4oxduvQsQtZzyknqvzYNrNu',
+  'DCA265Vj8a9CEuX1eb1LWRnDT7uK6q1xMipnNyatn23M',
+  'PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu',
+]);
+
+let cachedNodeSolanaWeb3 = null;
+
+async function loadSolanaWeb3Primitives() {
+  try {
+    const mod = await loadWalletSdkBundle({ initCoinbase: false });
+    if (mod?.VersionedTransaction?.deserialize) {
+      return {
+        VersionedTransaction: mod.VersionedTransaction,
+        Transaction: mod.Transaction || null,
+        PublicKey: mod.PublicKey || null,
+        deriveSolanaUsdcAtaBytes32Hex: mod.deriveSolanaUsdcAtaBytes32Hex || null,
+      };
+    }
+  } catch {
+    // Fallback below when running in Node.js test harness where /vendor/wallet-sdks.js is an HTTP route
+  }
+  if (typeof process !== 'undefined' && process.versions?.node) {
+    if (!cachedNodeSolanaWeb3) {
+      cachedNodeSolanaWeb3 = await import('@solana/web3.js');
+    }
+    if (cachedNodeSolanaWeb3?.VersionedTransaction?.deserialize) {
+      return {
+        VersionedTransaction: cachedNodeSolanaWeb3.VersionedTransaction,
+        Transaction: cachedNodeSolanaWeb3.Transaction || null,
+        PublicKey: cachedNodeSolanaWeb3.PublicKey || null,
+        deriveSolanaUsdcAtaBytes32Hex: null,
+      };
+    }
+  }
+  return null;
+}
+
+function bytes32HexToBase58(hex) {
+  const clean = String(hex || '').trim().replace(/^0x/i, '');
+  if (!/^[0-9a-fA-F]{64}$/.test(clean)) return null;
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i += 1) {
+    bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytesToBase58(bytes);
+}
 
 async function resolveExpectedSolanaUsdcAtaBytes32Hex(ownerBase58) {
   const trimmed = String(ownerBase58 || '').trim();
   if (!trimmed) return null;
   if (solanaAtaBytes32Cache.has(trimmed)) return solanaAtaBytes32Cache.get(trimmed);
   try {
-    const mod = await loadWalletSdkBundle();
-    if (typeof mod?.deriveSolanaUsdcAtaBytes32Hex === 'function') {
-      const ataHex = mod.deriveSolanaUsdcAtaBytes32Hex(trimmed).toLowerCase();
+    const prims = await loadSolanaWeb3Primitives();
+    if (typeof prims?.deriveSolanaUsdcAtaBytes32Hex === 'function') {
+      const ataHex = prims.deriveSolanaUsdcAtaBytes32Hex(trimmed).toLowerCase();
+      solanaAtaBytes32Cache.set(trimmed, ataHex);
+      return ataHex;
+    }
+    if (prims?.PublicKey?.findProgramAddressSync) {
+      const ownerPk = new prims.PublicKey(trimmed);
+      const tokenProg = new prims.PublicKey(SOLANA_TOKEN_PROGRAM_STR);
+      const usdcMint = new prims.PublicKey(SOLANA_USDC_MINT_STR);
+      const ataProg = new prims.PublicKey(SOLANA_ATA_PROGRAM_STR);
+      const [ata] = prims.PublicKey.findProgramAddressSync(
+        [ownerPk.toBytes(), tokenProg.toBytes(), usdcMint.toBytes()],
+        ataProg
+      );
+      const ataHex =
+        '0x' +
+        Array.from(ata.toBytes())
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join('');
       solanaAtaBytes32Cache.set(trimmed, ataHex);
       return ataHex;
     }
   } catch {
-    // Fallback to null if SDK bundle is unavailable in non-browser harness
+    // Fallback to null if SDK bundle is unavailable
   }
   return null;
+}
+
+async function resolveExpectedSolanaUsdcAtaBase58(ownerBase58) {
+  const hex = await resolveExpectedSolanaUsdcAtaBytes32Hex(ownerBase58);
+  return hex ? bytes32HexToBase58(hex) : null;
+}
+
+function dispatchWalletChangedEvent(detail) {
+  if (typeof window === 'undefined' || typeof window.dispatchEvent !== 'function') return;
+  try {
+    const ev =
+      typeof CustomEvent === 'function'
+        ? new CustomEvent('siphon:wallet-changed', { detail })
+        : Object.assign(new Event('siphon:wallet-changed'), { detail });
+    window.dispatchEvent(ev);
+  } catch {
+    // ignore non-browser dispatch errors
+  }
 }
 
 function assertValidCallForSign(call, expectedSolanaDestination, expectedSolanaAtaBytes32 = null) {
@@ -467,10 +582,26 @@ export function normalizePaymasterUrl(raw) {
   if (!trimmed) return null;
   try {
     const parsed = new URL(trimmed);
+    if (parsed.username || parsed.password) return null;
+    if (parsed.protocol === 'https:') {
+      return parsed.toString();
+    }
     const host = parsed.hostname.toLowerCase();
     const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '[::1]';
-    if (parsed.protocol === 'https:' || (parsed.protocol === 'http:' && isLoopback)) {
-      return parsed.toString();
+    if (parsed.protocol === 'http:' && isLoopback) {
+      const winHost =
+        typeof window !== 'undefined' && typeof window.location?.hostname === 'string'
+          ? window.location.hostname.toLowerCase()
+          : null;
+      const isLocalOrigin =
+        winHost === null ||
+        winHost === '127.0.0.1' ||
+        winHost === 'localhost' ||
+        winHost === '[::1]' ||
+        winHost === '::1';
+      if (isLocalOrigin) {
+        return parsed.toString();
+      }
     }
     return null;
   } catch {
@@ -646,8 +777,18 @@ function attachEvmListeners(provider, callbacks = {}) {
       callbacks.onAccountsChanged?.(null);
       return;
     }
+    const previousAddress = connectedEvmAddress;
     connectedEvmAddress = next;
     await detectWalletBatchCapabilities(connectedEvmAddress);
+    if (String(previousAddress || '').toLowerCase() !== String(connectedEvmAddress).toLowerCase()) {
+      dispatchWalletChangedEvent({
+        family: 'evm',
+        action: 'accountChanged',
+        address: connectedEvmAddress,
+        previousAddress,
+        walletName: connectedWalletName,
+      });
+    }
     callbacks.onAccountsChanged?.(connectedEvmAddress);
   };
   const onChain = async () => {
@@ -669,6 +810,8 @@ function attachEvmListeners(provider, callbacks = {}) {
 
 export function disconnectEvmWallet() {
   const prevProvider = activeEvmProvider;
+  const prevAddress = connectedEvmAddress;
+  const prevWalletName = connectedWalletName;
   detachEvmListeners();
   activeEvmProvider = null;
   connectedEvmAddress = null;
@@ -688,6 +831,15 @@ export function disconnectEvmWallet() {
       // ignore provider disconnect errors
     }
   }
+  if (prevAddress || prevProvider) {
+    dispatchWalletChangedEvent({
+      family: 'evm',
+      action: 'disconnect',
+      address: null,
+      previousAddress: prevAddress,
+      walletName: prevWalletName,
+    });
+  }
 }
 
 function detachSolanaListeners() {
@@ -703,6 +855,8 @@ function detachSolanaListeners() {
 
 export function disconnectSolanaWallet() {
   const prev = activeSolanaSession;
+  const prevAddress = connectedSolanaAddress;
+  const prevWalletName = connectedSolanaWalletName;
   detachSolanaListeners();
   connectedSolanaAddress = null;
   connectedSolanaWalletName = null;
@@ -718,6 +872,15 @@ export function disconnectSolanaWallet() {
     } catch {
       // ignore
     }
+  }
+  if (prevAddress || prev) {
+    dispatchWalletChangedEvent({
+      family: 'solana',
+      action: 'disconnect',
+      address: null,
+      previousAddress: prevAddress,
+      walletName: prevWalletName,
+    });
   }
 }
 
@@ -949,12 +1112,20 @@ export async function connectEvmWallet(optionsOrCallback) {
   if (!accounts || !accounts[0]) {
     throw new Error('Wallet connection was cancelled.');
   }
+  const previousAddress = connectedEvmAddress;
   activeEvmProvider = provider;
   connectedEvmAddress = accounts[0];
   connectedWalletName = chosen.name;
 
   const capabilities = await detectWalletBatchCapabilities(connectedEvmAddress);
   attachEvmListeners(provider, opts);
+  dispatchWalletChangedEvent({
+    family: 'evm',
+    action: 'connect',
+    address: connectedEvmAddress,
+    previousAddress,
+    walletName: chosen.name,
+  });
 
   return { address: connectedEvmAddress, walletName: chosen.name, capabilities };
 }
@@ -1079,11 +1250,19 @@ export async function connectCoinbaseSmartWallet(callbacks = {}) {
   if (!accounts || !accounts[0]) {
     throw new Error('Coinbase Wallet connection was cancelled.');
   }
+  const previousAddress = connectedEvmAddress;
   activeEvmProvider = provider;
   connectedEvmAddress = accounts[0];
   connectedWalletName = 'Coinbase Wallet';
   const capabilities = await detectWalletBatchCapabilities(connectedEvmAddress);
   attachEvmListeners(provider, callbacks);
+  dispatchWalletChangedEvent({
+    family: 'evm',
+    action: 'connect',
+    address: connectedEvmAddress,
+    previousAddress,
+    walletName: 'Coinbase Wallet',
+  });
 
   return { address: connectedEvmAddress, walletName: 'Coinbase Wallet', capabilities };
 }
@@ -1123,6 +1302,7 @@ export async function connectWalletConnect(callbacks = {}) {
   if (!accounts || !accounts[0]) {
     throw new Error('WalletConnect session cancelled.');
   }
+  const previousAddress = connectedEvmAddress;
   activeEvmProvider = provider;
   connectedEvmAddress = accounts[0];
   connectedWalletName = 'WalletConnect';
@@ -1130,6 +1310,13 @@ export async function connectWalletConnect(callbacks = {}) {
   attachEvmListeners(provider, {
     ...callbacks,
     onDisconnect: () => callbacks.onAccountsChanged?.(null),
+  });
+  dispatchWalletChangedEvent({
+    family: 'evm',
+    action: 'connect',
+    address: connectedEvmAddress,
+    previousAddress,
+    walletName: 'WalletConnect',
   });
 
   return { address: connectedEvmAddress, walletName: 'WalletConnect', capabilities };
@@ -1817,6 +2004,7 @@ export async function connectSolanaWallet(options = {}) {
     throw new Error('Solana wallet connection was superseded by a newer request.');
   }
 
+  const previousConnectedAddress = connectedSolanaAddress;
   connectedSolanaAddress = pubkey;
   connectedSolanaWalletName = chosen.name;
 
@@ -1837,6 +2025,13 @@ export async function connectSolanaWallet(options = {}) {
       detachSolanaListeners();
       connectedSolanaAddress = null;
       connectedSolanaWalletName = null;
+      dispatchWalletChangedEvent({
+        family: 'solana',
+        action: 'disconnect',
+        address: null,
+        previousAddress,
+        walletName: chosen.name,
+      });
       options.onAccountChanged?.(null, {
         previousAddress,
         reason: reason || 'disconnect',
@@ -1846,6 +2041,13 @@ export async function connectSolanaWallet(options = {}) {
     }
     if (nextStr === previousAddress) return;
     connectedSolanaAddress = nextStr;
+    dispatchWalletChangedEvent({
+      family: 'solana',
+      action: 'accountChanged',
+      address: nextStr,
+      previousAddress,
+      walletName: chosen.name,
+    });
     options.onAccountChanged?.(nextStr, {
       previousAddress,
       reason: reason || 'accountChanged',
@@ -1897,6 +2099,13 @@ export async function connectSolanaWallet(options = {}) {
     }
   }
   session.cleanup = cleanup;
+  dispatchWalletChangedEvent({
+    family: 'solana',
+    action: 'connect',
+    address: pubkey,
+    previousAddress: previousConnectedAddress,
+    walletName: chosen.name,
+  });
 
   return { address: pubkey, walletName: chosen.name };
 }
@@ -1944,12 +2153,267 @@ function extractSolanaSignature(res) {
   return null;
 }
 
+function findMatchingSolanaStandardAccount(accounts, expectedAddress, walletName = 'Solana Wallet') {
+  if (!Array.isArray(accounts) || !accounts.length || !expectedAddress) {
+    throw new Error(
+      `Pre-sign check failed: connected Solana account (${String(expectedAddress || '').slice(0, 6)}…) is not exposed by ${walletName}.`
+    );
+  }
+  const match = accounts.find((a) => extractSolanaPubkeyString(a?.address) === expectedAddress);
+  if (!match) {
+    throw new Error(
+      `Pre-sign check failed: connected Solana account (${expectedAddress.slice(0, 6)}…) does not match any active Wallet Standard account in ${walletName}.`
+    );
+  }
+  return match;
+}
+
+async function deserializeAndInspectSolanaTx(txBytes, { allowLegacyFallback = false } = {}) {
+  const prims = await loadSolanaWeb3Primitives();
+  if (!prims?.VersionedTransaction?.deserialize) {
+    throw new Error('Pre-sign check failed: Solana VersionedTransaction deserializer is unavailable.');
+  }
+
+  let versionedTx = null;
+  let legacyTx = null;
+  try {
+    versionedTx = prims.VersionedTransaction.deserialize(txBytes);
+  } catch (vErr) {
+    if (allowLegacyFallback && typeof prims.Transaction?.from === 'function') {
+      try {
+        legacyTx = prims.Transaction.from(txBytes);
+      } catch (lErr) {
+        throw new Error(
+          `Pre-sign check failed: invalid Solana transaction bytes (${lErr instanceof Error ? lErr.message : String(lErr)}).`
+        );
+      }
+    } else {
+      throw new Error(
+        `Pre-sign check failed: failed to deserialize Solana VersionedTransaction (${vErr instanceof Error ? vErr.message : String(vErr)}).`
+      );
+    }
+  }
+
+  if (versionedTx) {
+    const msg = versionedTx.message;
+    const staticKeys = Array.isArray(msg?.staticAccountKeys)
+      ? msg.staticAccountKeys.map((k) => extractSolanaPubkeyString(k))
+      : [];
+    const addressTableLookups = Array.isArray(msg?.addressTableLookups) ? msg.addressTableLookups : [];
+    const compiledInstructions = Array.isArray(msg?.compiledInstructions)
+      ? msg.compiledInstructions.map((ix) => {
+          const programIdIndex = Number(ix?.programIdIndex);
+          const programId =
+            Number.isInteger(programIdIndex) && programIdIndex >= 0 && programIdIndex < staticKeys.length
+              ? staticKeys[programIdIndex]
+              : null;
+          const accountKeyIndexes = Array.isArray(ix?.accountKeyIndexes)
+            ? ix.accountKeyIndexes.map((idx) => Number(idx))
+            : [];
+          const data = ix?.data instanceof Uint8Array ? ix.data : new Uint8Array(ix?.data || []);
+          return { programIdIndex, programId, accountKeyIndexes, data };
+        })
+      : [];
+    return {
+      txObject: versionedTx,
+      serialized: versionedTx.serialize(),
+      isLegacy: false,
+      feePayer: staticKeys[0] || null,
+      staticKeys,
+      addressTableLookups,
+      compiledInstructions,
+    };
+  }
+
+  // Legacy Transaction fallback (only when explicitly allowed)
+  const feePayer = extractSolanaPubkeyString(legacyTx?.feePayer);
+  const staticKeys = [];
+  const keyIndexMap = new Map();
+  const addKey = (kStr) => {
+    if (!kStr) return -1;
+    if (keyIndexMap.has(kStr)) return keyIndexMap.get(kStr);
+    const idx = staticKeys.length;
+    staticKeys.push(kStr);
+    keyIndexMap.set(kStr, idx);
+    return idx;
+  };
+  if (feePayer) addKey(feePayer);
+  const compiledInstructions = (Array.isArray(legacyTx?.instructions) ? legacyTx.instructions : []).map((ix) => {
+    const programId = extractSolanaPubkeyString(ix?.programId);
+    const programIdIndex = addKey(programId);
+    const accountKeyIndexes = (Array.isArray(ix?.keys) ? ix.keys : []).map((meta) =>
+      addKey(extractSolanaPubkeyString(meta?.pubkey))
+    );
+    const data = ix?.data instanceof Uint8Array ? ix.data : new Uint8Array(ix?.data || []);
+    return { programIdIndex, programId, accountKeyIndexes, data };
+  });
+  return {
+    txObject: legacyTx,
+    serialized: txBytes,
+    isLegacy: true,
+    feePayer,
+    staticKeys,
+    addressTableLookups: [],
+    compiledInstructions,
+  };
+}
+
+function validateDeserializedSolanaTx(
+  inspected,
+  { connectedAddress, expectedFeePayer = null, flow = null, allowedProgramIds = null, expectedRecipientAta = null } = {}
+) {
+  if (!inspected?.feePayer) {
+    throw new Error('Pre-sign check failed: deserialized Solana transaction is missing a fee payer.');
+  }
+  if (!connectedAddress || inspected.feePayer !== connectedAddress) {
+    throw new Error(
+      `Pre-sign check failed: deserialized transaction fee payer (${inspected.feePayer.slice(0, 6)}…) does not match connected Solana wallet (${String(connectedAddress || '').slice(0, 6)}…).`
+    );
+  }
+  if (expectedFeePayer && inspected.feePayer !== String(expectedFeePayer).trim()) {
+    throw new Error(
+      `Pre-sign check failed: deserialized transaction fee payer (${inspected.feePayer.slice(0, 6)}…) does not match expected fee payer (${String(expectedFeePayer).slice(0, 6)}…).`
+    );
+  }
+  if (!Array.isArray(inspected.compiledInstructions) || inspected.compiledInstructions.length === 0) {
+    throw new Error('Pre-sign check failed: deserialized Solana transaction contains no instructions.');
+  }
+
+  for (const ix of inspected.compiledInstructions) {
+    if (!ix.programId) {
+      throw new Error('Pre-sign check failed: Solana instruction references an unresolved program ID.');
+    }
+  }
+
+  if (allowedProgramIds) {
+    const allowedSet = allowedProgramIds instanceof Set ? allowedProgramIds : new Set(allowedProgramIds);
+    for (const ix of inspected.compiledInstructions) {
+      if (!allowedSet.has(ix.programId)) {
+        throw new Error(
+          `Pre-sign check failed: Solana instruction invokes disallowed program ${ix.programId}.`
+        );
+      }
+    }
+  }
+
+  if (flow === 'rent_reclaim') {
+    if (inspected.addressTableLookups.length !== 0) {
+      throw new Error(
+        'Pre-sign check failed: rent reclaim transaction must not use Address Lookup Tables (ALTs).'
+      );
+    }
+    let closeInstructionCount = 0;
+    for (const ix of inspected.compiledInstructions) {
+      if (!RENT_RECLAIM_ALLOWED_PROGRAMS.has(ix.programId)) {
+        throw new Error(
+          `Pre-sign check failed: rent reclaim transaction invokes disallowed program ${ix.programId}.`
+        );
+      }
+      if (ix.programId === SOLANA_TOKEN_PROGRAM_STR || ix.programId === SOLANA_TOKEN_2022_PROGRAM_STR) {
+        if (!ix.data || ix.data.length < 1 || ix.data[0] !== 9) {
+          throw new Error(
+            `Pre-sign check failed: rent reclaim Token instruction must use CloseAccount opcode (9), got ${ix.data?.[0] ?? 'empty'}.`
+          );
+        }
+        if (ix.accountKeyIndexes.length < 3) {
+          throw new Error(
+            'Pre-sign check failed: rent reclaim CloseAccount instruction is missing required account keys.'
+          );
+        }
+        const destinationKey = inspected.staticKeys[ix.accountKeyIndexes[1]];
+        const ownerKey = inspected.staticKeys[ix.accountKeyIndexes[2]];
+        if (destinationKey !== connectedAddress) {
+          throw new Error(
+            `Pre-sign check failed: CloseAccount rent destination (${String(destinationKey || 'missing').slice(0, 6)}…) does not match connected Solana wallet.`
+          );
+        }
+        if (ownerKey !== connectedAddress) {
+          throw new Error(
+            `Pre-sign check failed: CloseAccount authority (${String(ownerKey || 'missing').slice(0, 6)}…) does not match connected Solana wallet.`
+          );
+        }
+        closeInstructionCount += 1;
+      }
+    }
+    if (closeInstructionCount === 0) {
+      throw new Error(
+        'Pre-sign check failed: rent reclaim transaction contains no SPL CloseAccount instructions.'
+      );
+    }
+  } else if (flow === 'cctp_claim') {
+    let hasMessageTransmitter = false;
+    for (const ix of inspected.compiledInstructions) {
+      if (!CCTP_CLAIM_ALLOWED_PROGRAMS.has(ix.programId)) {
+        throw new Error(
+          `Pre-sign check failed: CCTP claim transaction invokes disallowed program ${ix.programId}.`
+        );
+      }
+      if (CCTP_MESSAGE_TRANSMITTER_PROGRAMS.has(ix.programId)) {
+        hasMessageTransmitter = true;
+      }
+      if (ix.programId === SOLANA_TOKEN_PROGRAM_STR || ix.programId === SOLANA_TOKEN_2022_PROGRAM_STR) {
+        if (!ix.data || ix.data.length < 1 || ix.data[0] !== 9) {
+          throw new Error(
+            'Pre-sign check failed: bundled Token instruction in CCTP claim must be CloseAccount (opcode 9).'
+          );
+        }
+        const destKey = inspected.staticKeys[ix.accountKeyIndexes[1]];
+        const ownerKey = inspected.staticKeys[ix.accountKeyIndexes[2]];
+        if (destKey !== connectedAddress || ownerKey !== connectedAddress) {
+          throw new Error(
+            'Pre-sign check failed: bundled CloseAccount in CCTP claim must target connected Solana wallet.'
+          );
+        }
+      }
+    }
+    if (!hasMessageTransmitter) {
+      throw new Error(
+        'Pre-sign check failed: CCTP claim transaction is missing Circle MessageTransmitter instruction.'
+      );
+    }
+    if (!expectedRecipientAta || !inspected.staticKeys.includes(expectedRecipientAta)) {
+      throw new Error(
+        'Pre-sign check failed: CCTP claim transaction staticAccountKeys do not include canonical recipient USDC ATA.'
+      );
+    }
+  } else if (flow === 'jupiter_yield' || flow === 'jupiter_predict') {
+    const hasJupiterProgram = inspected.compiledInstructions.some(
+      (ix) => JUPITER_KNOWN_PROGRAMS.has(ix.programId) || /^JUP/i.test(ix.programId || '')
+    );
+    if (!hasJupiterProgram) {
+      let hasNonTrivialProgram = false;
+      for (const ix of inspected.compiledInstructions) {
+        if (ix.programId === SOLANA_SYSTEM_PROGRAM_STR) {
+          const isSystemTransfer =
+            ix.data.length >= 4 &&
+            ix.data[0] === 2 &&
+            ix.data[1] === 0 &&
+            ix.data[2] === 0 &&
+            ix.data[3] === 0;
+          const destKey = inspected.staticKeys[ix.accountKeyIndexes[1]];
+          if (isSystemTransfer && destKey !== connectedAddress) {
+            throw new Error(
+              'Pre-sign check failed: blocked raw SystemProgram.transfer to external destination without a Jupiter program.'
+            );
+          }
+        } else if (ix.programId !== SOLANA_COMPUTE_BUDGET_PROGRAM_STR) {
+          hasNonTrivialProgram = true;
+        }
+      }
+      if (!hasNonTrivialProgram) {
+        throw new Error(
+          `Pre-sign check failed: ${flow} transaction contains no Jupiter or protocol execution instruction.`
+        );
+      }
+    }
+  }
+}
+
 /**
  * Signs and submits a server-built Circle CCTP Solana `receiveMessage` claim transaction plan
  * using Phantom, Backpack, or Solflare (Wallet Standard `solana:signAndSendTransaction` or legacy
  * `provider.signAndSendTransaction` / `provider.request`).
- * Fails closed on recipient/ATA mismatch and surfaces clean fallback instructions if the wallet
- * does not expose `signAndSendTransaction`.
+ * Fails closed on deserialization error, fee-payer mismatch, disallowed program IDs, or recipient/ATA mismatch.
  */
 export async function claimCctpOnSolana(claimPlan, options = {}) {
   if (!claimPlan || typeof claimPlan !== 'object') {
@@ -1973,18 +2437,24 @@ export async function claimCctpOnSolana(claimPlan, options = {}) {
     throw new Error('Solana CCTP claim plan contains no executable instructions.');
   }
 
-  // Verify canonical USDC ATA bytes32 when browser SDK bundle is available
-  if (claimPlan.expectedMintRecipientBytes32) {
-    const derivedAtaHex = await resolveExpectedSolanaUsdcAtaBytes32Hex(claimPlan.solanaDestination);
-    if (
-      derivedAtaHex &&
-      derivedAtaHex.toLowerCase() !== String(claimPlan.expectedMintRecipientBytes32).toLowerCase()
-    ) {
-      throw new Error(
-        'Pre-sign check failed: CCTP claim mintRecipient does not match canonical Solana USDC ATA PDA.'
-      );
-    }
+  // Verify canonical USDC ATA bytes32 & base58
+  const derivedAtaHex = await resolveExpectedSolanaUsdcAtaBytes32Hex(claimPlan.solanaDestination);
+  if (
+    claimPlan.expectedMintRecipientBytes32 &&
+    derivedAtaHex &&
+    derivedAtaHex.toLowerCase() !== String(claimPlan.expectedMintRecipientBytes32).toLowerCase()
+  ) {
+    throw new Error(
+      'Pre-sign check failed: CCTP claim mintRecipient does not match canonical Solana USDC ATA PDA.'
+    );
   }
+  const derivedAtaBase58 = derivedAtaHex ? bytes32HexToBase58(derivedAtaHex) : null;
+  if (derivedAtaBase58 && String(claimPlan.recipientUsdcAta).trim() !== derivedAtaBase58) {
+    throw new Error(
+      'Pre-sign check failed: CCTP claim recipientUsdcAta does not match canonical Solana USDC ATA PDA.'
+    );
+  }
+  const canonicalRecipientAta = derivedAtaBase58 || String(claimPlan.recipientUsdcAta).trim();
 
   // Ensure a Solana wallet session is connected
   if (!activeSolanaSession || !connectedSolanaAddress) {
@@ -2023,18 +2493,30 @@ export async function claimCctpOnSolana(claimPlan, options = {}) {
     throw err;
   }
 
+  // Real client-side deserialization & fail-closed pre-sign verification of CCTP claim tx
+  const inspected = await deserializeAndInspectSolanaTx(txBytes, { allowLegacyFallback: false });
+  validateDeserializedSolanaTx(inspected, {
+    connectedAddress: connectedSolanaAddress,
+    expectedFeePayer: options.expectedFeePayer || connectedSolanaAddress,
+    flow: 'cctp_claim',
+    allowedProgramIds: options.allowedProgramIds || null,
+    expectedRecipientAta: canonicalRecipientAta,
+  });
+
   const walletName = connectedSolanaWalletName || 'Solana Wallet';
+  const serialized = inspected.serialized;
 
   // 1. Wallet Standard (`solana:signAndSendTransaction`) — Phantom, Backpack, Solflare modern standard
   if (activeSolanaSession?.kind === 'standard') {
     const stdFeature = activeSolanaSession.wallet?.features?.['solana:signAndSendTransaction'];
     if (typeof stdFeature?.signAndSendTransaction === 'function') {
-      const account = pickSolanaStandardAccount(activeSolanaSession.wallet.accounts);
-      if (!account) {
-        throw new Error(`No active Solana account exposed by ${walletName}.`);
-      }
+      const account = findMatchingSolanaStandardAccount(
+        activeSolanaSession.wallet.accounts,
+        connectedSolanaAddress,
+        walletName
+      );
       const res = await stdFeature.signAndSendTransaction({
-        transaction: txBytes,
+        transaction: serialized,
         account,
         chain: 'solana:mainnet',
       });
@@ -2047,7 +2529,7 @@ export async function claimCctpOnSolana(claimPlan, options = {}) {
         signature,
         walletName,
         mode: 'wallet_standard_sign_and_send',
-        explorerUrl: `https://solscan.io/tx/${signature}`,
+        explorerUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
         recipientUsdcAta: claimPlan.recipientUsdcAta,
         amountUsdc: claimPlan.amountUsdc,
       };
@@ -2066,17 +2548,8 @@ export async function claimCctpOnSolana(claimPlan, options = {}) {
       : null);
 
   if (provider && typeof provider.signAndSendTransaction === 'function') {
-    const txLike = {
-      serialize: () => txBytes,
-      serializeMessage: () => msgBytes || txBytes,
-      recentBlockhash: claimPlan.recentBlockhash,
-      feePayer: claimPlan.payer || connectedSolanaAddress,
-      instructions: claimPlan.instructions,
-      serializedTransactionBase64: claimPlan.serializedTransactionBase64,
-      serializedMessageBase64: claimPlan.serializedMessageBase64,
-    };
     try {
-      const res = await provider.signAndSendTransaction(txLike, {
+      const res = await provider.signAndSendTransaction(inspected.txObject, {
         skipPreflight: false,
         preflightCommitment: 'confirmed',
       });
@@ -2089,7 +2562,7 @@ export async function claimCctpOnSolana(claimPlan, options = {}) {
         signature,
         walletName,
         mode: 'legacy_sign_and_send',
-        explorerUrl: `https://solscan.io/tx/${signature}`,
+        explorerUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
         recipientUsdcAta: claimPlan.recipientUsdcAta,
         amountUsdc: claimPlan.amountUsdc,
       };
@@ -2108,7 +2581,7 @@ export async function claimCctpOnSolana(claimPlan, options = {}) {
             signature,
             walletName,
             mode: 'provider_request_sign_and_send',
-            explorerUrl: `https://solscan.io/tx/${signature}`,
+            explorerUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
             recipientUsdcAta: claimPlan.recipientUsdcAta,
             amountUsdc: claimPlan.amountUsdc,
           };
@@ -2132,7 +2605,7 @@ export async function claimCctpOnSolana(claimPlan, options = {}) {
       signature,
       walletName,
       mode: 'provider_request_sign_and_send',
-      explorerUrl: `https://solscan.io/tx/${signature}`,
+      explorerUrl: `https://solscan.io/tx/${encodeURIComponent(signature)}`,
       recipientUsdcAta: claimPlan.recipientUsdcAta,
       amountUsdc: claimPlan.amountUsdc,
     };
@@ -2154,10 +2627,10 @@ export async function claimCctpOnSolana(claimPlan, options = {}) {
 }
 
 /**
- * Signs and submits an arbitrary server-built Solana VersionedTransaction (base64),
- * such as Empty-ATA Rent Reclaim or Jupiter Swap Yield Park, using the connected
- * Solana wallet (Wallet Standard `solana:signAndSendTransaction`, legacy provider
- * `signAndSendTransaction`, or JSON-RPC `request`).
+ * Signs and submits a server-built Solana VersionedTransaction (base64),
+ * such as Empty-ATA Rent Reclaim, Jupiter Swap Yield Park, or Jupiter Prediction Order.
+ * ALWAYS deserializes and verifies fee payer, Wallet Standard account match, and
+ * flow-specific program/instruction constraints before touching the wallet.
  */
 export async function signAndSendSolanaVersionedTx(base64Tx, options = {}) {
   const cleanB64 = String(base64Tx || '').trim();
@@ -2183,27 +2656,37 @@ export async function signAndSendSolanaVersionedTx(base64Tx, options = {}) {
     );
   }
 
-  let versionedTx = null;
-  try {
-    const sdkMod = await loadWalletSdkBundle({ initCoinbase: false });
-    if (sdkMod?.VersionedTransaction?.deserialize) {
-      versionedTx = sdkMod.VersionedTransaction.deserialize(txBytes);
-    }
-  } catch {
-    versionedTx = null;
+  const inspected = await deserializeAndInspectSolanaTx(txBytes, {
+    allowLegacyFallback: Boolean(options.allowLegacyFallback),
+  });
+
+  let expectedRecipientAta = options.expectedRecipientAta || null;
+  if (options.flow === 'cctp_claim' && !expectedRecipientAta) {
+    expectedRecipientAta = await resolveExpectedSolanaUsdcAtaBase58(
+      options.expectedSolanaDestination || connectedSolanaAddress
+    );
   }
 
+  validateDeserializedSolanaTx(inspected, {
+    connectedAddress: connectedSolanaAddress,
+    expectedFeePayer: options.expectedFeePayer || null,
+    flow: options.flow || null,
+    allowedProgramIds: options.allowedProgramIds || null,
+    expectedRecipientAta,
+  });
+
   const walletName = connectedSolanaWalletName || 'Solana Wallet';
-  const serialized = versionedTx ? versionedTx.serialize() : txBytes;
+  const serialized = inspected.serialized;
 
   // 1. Wallet Standard (`solana:signAndSendTransaction`)
   if (activeSolanaSession?.kind === 'standard') {
     const stdFeature = activeSolanaSession.wallet?.features?.['solana:signAndSendTransaction'];
     if (typeof stdFeature?.signAndSendTransaction === 'function') {
-      const account = pickSolanaStandardAccount(activeSolanaSession.wallet.accounts);
-      if (!account) {
-        throw new Error(`No active Solana account exposed by ${walletName}.`);
-      }
+      const account = findMatchingSolanaStandardAccount(
+        activeSolanaSession.wallet.accounts,
+        connectedSolanaAddress,
+        walletName
+      );
       const res = await stdFeature.signAndSendTransaction({
         transaction: serialized,
         account,
@@ -2234,14 +2717,8 @@ export async function signAndSendSolanaVersionedTx(base64Tx, options = {}) {
       : null);
 
   if (provider && typeof provider.signAndSendTransaction === 'function') {
-    const txArg =
-      versionedTx || {
-        version: 0,
-        serialize: () => serialized,
-        serializedTransactionBase64: cleanB64,
-      };
     try {
-      const res = await provider.signAndSendTransaction(txArg, {
+      const res = await provider.signAndSendTransaction(inspected.txObject, {
         skipPreflight: false,
         preflightCommitment: 'confirmed',
       });
@@ -2300,8 +2777,9 @@ export async function signAndSendSolanaVersionedTx(base64Tx, options = {}) {
 
 /**
  * Validates and submits one or more ERC-20 `approve(spender, 0)` revoke calls on an EVM chain.
- * Uses EIP-5792 `wallet_sendCalls` batching when available and cleanly falls back to sequential
- * `eth_sendTransaction` if the wallet does not support EIP-5792 (never falling back on 4001 rejection).
+ * Uses EIP-5792 `wallet_sendCalls` batching when available (verifying confirmation via
+ * `waitForEip5792Batch`), and cleanly falls back to sequential `eth_sendTransaction` if the
+ * wallet does not support EIP-5792 (never falling back on 4001 rejection).
  */
 export async function sendEvmRevokeCalls({ chainId, calls, expectedFrom } = {}) {
   if (!activeEvmProvider || !connectedEvmAddress) {
@@ -2312,6 +2790,11 @@ export async function sendEvmRevokeCalls({ chainId, calls, expectedFrom } = {}) 
   }
   assertFromMatchesConnected(expectedFrom);
 
+  const targetChainId = Number(chainId ?? calls[0]?.chainId);
+  if (!Number.isInteger(targetChainId) || targetChainId <= 0) {
+    throw new Error(`Pre-sign check failed: invalid target chainId (${chainId}).`);
+  }
+
   const normalizedCalls = calls.map((raw) => {
     const to = String(raw?.to || '').trim();
     const data = String(raw?.data || '').trim();
@@ -2319,6 +2802,11 @@ export async function sendEvmRevokeCalls({ chainId, calls, expectedFrom } = {}) 
     assertValidEvmAddress(to, 'ERC-20 token contract');
     if (value !== '0x0' && value !== '0x00') {
       throw new Error('Pre-sign check failed: ERC-20 revoke call must have value 0x0.');
+    }
+    if (raw?.chainId !== undefined && raw?.chainId !== null && Number(raw.chainId) !== targetChainId) {
+      throw new Error(
+        `Pre-sign check failed: mixed chainId in revoke batch (call chainId ${raw.chainId} !== target ${targetChainId}).`
+      );
     }
     const cleanHex = data.toLowerCase();
     // Must be strict approve(address,uint256(0)): 0x095ea7b3 + 24 zero nibbles + 40 addr nibbles + 64 zero nibbles
@@ -2332,18 +2820,21 @@ export async function sendEvmRevokeCalls({ chainId, calls, expectedFrom } = {}) 
         'Pre-sign check failed: calldata is not a strict ERC-20 approve(spender, 0) revocation.'
       );
     }
+    const spenderAddr = '0x' + cleanHex.slice(10 + 24, 10 + 64);
+    if (spenderAddr === ZERO_EVM_ADDR) {
+      throw new Error('Pre-sign check failed: ERC-20 revoke spender cannot be the zero address.');
+    }
     return {
       to,
       data: cleanHex,
       value: '0x0',
-      chainId: Number(raw?.chainId || chainId),
+      chainId: targetChainId,
     };
   });
 
-  const targetChainId = Number(chainId || normalizedCalls[0].chainId);
   await ensureEvmChain(targetChainId);
 
-  // Use EIP-5792 batch when revoking multiple approvals and wallet supports it (or single call if batch supported)
+  // Use EIP-5792 batch when revoking multiple approvals and wallet supports it
   if (normalizedCalls.length > 1) {
     try {
       const batchRes = await sendEip5792Batch({
@@ -2352,11 +2843,23 @@ export async function sendEvmRevokeCalls({ chainId, calls, expectedFrom } = {}) 
         atomicRequired: false,
         expectedFrom: expectedFrom || connectedEvmAddress,
       });
+      const settled = await waitForEip5792Batch(batchRes.batchId);
+      if (settled.failed) {
+        throw new Error(
+          `EIP-5792 revoke batch failed or reverted onchain (status: ${settled.status}).`
+        );
+      }
+      if (!settled.confirmed) {
+        throw new Error(
+          `EIP-5792 revoke batch did not confirm (${settled.status}) — check your wallet before retrying.`
+        );
+      }
       return {
         mode: 'eip5792',
         batchId: batchRes.batchId,
-        txHashes: [],
+        txHashes: settled.txHashes || [],
         revokedCount: normalizedCalls.length,
+        revokedIndices: normalizedCalls.map((_, idx) => idx),
       };
     } catch (err) {
       if (isUserRejectedError(err) || !err?.unsupportedEip5792) {
@@ -2367,18 +2870,33 @@ export async function sendEvmRevokeCalls({ chainId, calls, expectedFrom } = {}) 
   }
 
   const txHashes = [];
-  for (const call of normalizedCalls) {
-    const hash = await sendRealEvmTransaction(
-      { ...call, chainId: targetChainId },
-      { expectedFrom: expectedFrom || connectedEvmAddress }
-    );
-    if (hash) txHashes.push(String(hash));
+  const revokedIndices = [];
+  for (let i = 0; i < normalizedCalls.length; i += 1) {
+    const call = normalizedCalls[i];
+    try {
+      const hash = await sendRealEvmTransaction(
+        { ...call, chainId: targetChainId },
+        { expectedFrom: expectedFrom || connectedEvmAddress }
+      );
+      if (hash) txHashes.push(String(hash));
+      revokedIndices.push(i);
+    } catch (err) {
+      const wrapped = err instanceof Error ? err : new Error(String(err?.message || err || 'Revoke transaction failed.'));
+      if (err && typeof err === 'object' && 'code' in err && wrapped.code === undefined) {
+        wrapped.code = err.code;
+      }
+      wrapped.revokedIndices = revokedIndices;
+      wrapped.txHashes = txHashes;
+      wrapped.partialSuccess = revokedIndices.length > 0;
+      throw wrapped;
+    }
   }
   return {
     mode: 'sequential',
     batchId: null,
     txHashes,
-    revokedCount: txHashes.length || normalizedCalls.length,
+    revokedCount: revokedIndices.length,
+    revokedIndices,
   };
 }
 
@@ -3568,6 +4086,7 @@ export async function connectFamilyWallet(family, opts = {}) {
     }
   } else if (family === 'tron') {
     const onTronMessage = (event) => {
+      if (event.source !== window || event.origin !== window.location.origin) return;
       if (!isCurrentSession()) return;
       const msg = event?.data?.message;
       if (!msg || typeof msg !== 'object') return;

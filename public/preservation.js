@@ -471,7 +471,7 @@ function handleApplyOptimalRoute() {
   }
 
   if (select) {
-    const opt = select.querySelector(`option[value="${recPref}"]`);
+    const opt = Array.from(select.options).find((o) => o.value === recPref);
     const targetVal = opt && !opt.disabled ? recPref : 'auto';
     select.value = targetVal;
     select.dispatchEvent(new Event('change', { bubbles: true }));
@@ -775,6 +775,19 @@ function bindPreservationEvents() {
 
   document.getElementById('refreshGasWatchBtn')?.addEventListener('click', () => {
     refreshGasWatchAgents();
+  });
+
+  window.addEventListener('siphon:wallet-changed', (ev) => {
+    const detail = ev?.detail;
+    if (!detail || detail.family !== 'evm') return;
+    if (detail.action === 'disconnect' || !detail.address) {
+      optimizeSeq += 1;
+      latestScanReport = null;
+      latestPreservation = null;
+      latestRouteAuction = null;
+      appliedRouteSignature = null;
+      renderPreservationStrip();
+    }
   });
 
   document.getElementById('createGasWatchForm')?.addEventListener('submit', async (ev) => {

@@ -1804,8 +1804,19 @@ def main():
             pgP.route("**/api/scan", route_scan_deterministic)
             pgP.route("**/api/solana/balance*", route_sol_balance)
 
-            # Valid base64 dummy bytes (>=16 bytes) for Solana VersionedTransaction signing mock
-            dummy_sol_tx_b64 = "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAED"
+            # Real valid serialized Solana v0 VersionedTransactions for SOL_PUBKEY (verified client-side pre-sign!)
+            valid_rent_tx_b64 = (
+                "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAQAC"
+                "BGdSBVwgs+nYdGZW3fc4VVB/h6tth1I+THan+jYJapnrdi21Noh+IPEBWNlBTldZCfDwJVI0HANhIg8iNglqmdADBkZv"
+                "5SEXMv/srbpyw5vnvIzlu8X3EmssQ5s6QAAAAAbd9uHXZaGT2cvhRs7reawctIXtX1s3kTqM9YV+/wCpAAAAAAAAAAAA"
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAgAFAkCcAAADAwEAAAEJAA=="
+            )
+            valid_yield_tx_b64 = (
+                "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAQAC"
+                "A2dSBVwgs+nYdGZW3fc4VVB/h6tth1I+THan+jYJapnrAwZGb+UhFzL/7K26csOb57yM5bvF9xJrLEObOkAAAAAEedVb"
+                "8jHAbu50xW7OaBUH/bGy3qP0jlECsc2iVrwTjwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgEABQJADQMA"
+                "AgEABAECAwQA"
+            )
 
             def route_rent_scan_mock(route):
                 body = route.request.post_data_json or {}
@@ -1892,8 +1903,8 @@ def main():
                             ],
                             "reclaimedLamports": 6117840,
                             "reclaimedSol": 0.00611784,
-                            "serializedTransactionBase64": dummy_sol_tx_b64,
-                            "serializedMessageBase64": dummy_sol_tx_b64,
+                            "serializedTransactionBase64": valid_rent_tx_b64,
+                            "serializedMessageBase64": valid_rent_tx_b64,
                         },
                         "txBuildWarning": None,
                     }),
@@ -1952,7 +1963,7 @@ def main():
                                 "version": 0,
                                 "feePayer": body.get("ownerAddress", SOL_PUBKEY),
                                 "serializedByteLength": 64,
-                                "swapTransactionBase64": dummy_sol_tx_b64,
+                                "swapTransactionBase64": valid_yield_tx_b64,
                             }
                             if build_tx
                             else None
@@ -2231,6 +2242,33 @@ def main():
                 pgP.wait_for_timeout(180)
                 overflowP[f"degen_{label}"] = pgP.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
 
+            # 7H. Wave 8C Hardening: verify Lite mode resets burnToggle/executionMode and wallet disconnect isolates state
+            pgP.set_viewport_size({"width": 1440, "height": 900})
+            pgP.click(".app-tab[data-view='scanner']")
+            pgP.wait_for_timeout(120)
+            pgP.click(".ui-mode-btn[data-ui-mode='pro']")
+            pgP.click(".mode-opt[data-exec-mode='gasless']")
+            pgP.evaluate("() => { const b = document.getElementById('burnToggle'); if (b) { b.checked = true; b.dispatchEvent(new Event('change')); } }")
+            pgP.click(".ui-mode-btn[data-ui-mode='lite']")
+            pgP.wait_for_timeout(150)
+            lite_reset = pgP.evaluate("""() => ({
+              burnChecked: Boolean(document.getElementById('burnToggle')?.checked),
+              directActive: Boolean(document.querySelector('.mode-opt[data-exec-mode="direct"]')?.classList.contains('active')),
+            })""")
+            assert lite_reset["burnChecked"] is False and lite_reset["directActive"] is True, lite_reset
+
+            # Disconnect EVM wallet -> clears scan, preservation strip, and approval revoker state cleanly
+            pgP.click("#connectEvmBtn")
+            pgP.wait_for_selector("#walletModalDisconnectBtn", timeout=5000)
+            pgP.click("#walletModalDisconnectBtn")
+            pgP.click("#walletModalCloseBtn")
+            pgP.wait_for_timeout(150)
+            post_disconnect = pgP.evaluate("""() => ({
+              stripHidden: Boolean(document.getElementById('preservationStripHost')?.classList.contains('hidden')),
+              approvalScanNull: window.__siphonPreservationTools?.getState?.().approvalScan === null,
+            })""")
+            assert post_disconnect["stripHidden"] and post_disconnect["approvalScanNull"], post_disconnect
+
             xss_p = pgP.evaluate("() => Boolean(window.__xssP)")
             assert not xss_p, "XSS payload executed in Preservation Tools!"
             assert all(v <= 0 for v in overflowP.values()), f"Preservation/Degen overflow: {overflowP}"
@@ -2244,6 +2282,7 @@ def main():
                 "approvalsSingleAndBatchRevoked": True,
                 "gasWatchdogCreatedAndCancelled": True,
                 "degenCapDefault10Clamped50": True,
+                "liteResetAndDisconnectIsolationVerified": True,
                 "xssBlocked": True,
                 "overflowPx": overflowP,
             }
