@@ -565,9 +565,11 @@ def main():
             assert "Matched bit-for-bit" in proofText, proofText
 
             pgD.click(".mode-opt[data-exec-mode='gasless']")
-            pgD.route(
-                "**/api/relayer/submit",
-                lambda route: route.fulfill(
+            relayer_submitted = {"done": False}
+
+            def route_relayer_submit_mock(route):
+                relayer_submitted["done"] = True
+                route.fulfill(
                     status=200,
                     content_type="application/json",
                     body=json.dumps({
@@ -578,12 +580,18 @@ def main():
                         "settlementStatus": "intent_verified_awaiting_deployment",
                         "nextStep": "Gasless intent verified in E2E mock (real ecrecover verified in unit suite).",
                     }),
-                ),
-            )
+                )
+
+            pgD.route("**/api/relayer/submit", route_relayer_submit_mock)
             pgD.click("[data-exec-chain-batch='optimism']")
             pgD.wait_for_selector("#agentStatusCard:not(.hidden)", timeout=10000)
             pgD.wait_for_function("() => (window.__rpcD || []).some(r => r.method === 'eth_signTypedData_v4')", timeout=10000)
-            pgD.unroute("**/api/relayer/submit")
+            pgD.wait_for_function(
+                "() => (document.getElementById('agentLegsFeed')?.innerText || '').includes('Gasless intent verified in E2E mock')",
+                timeout=10000,
+            )
+            assert relayer_submitted["done"], "Expected mocked POST /api/relayer/submit to complete before unrouting"
+            pgD.unroute("**/api/relayer/submit", route_relayer_submit_mock)
 
             pgD.click(".mode-opt[data-exec-mode='direct']")
             pgD.click("[data-exec-chain-batch='base']")

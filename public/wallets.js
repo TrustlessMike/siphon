@@ -2459,14 +2459,20 @@ function validateDeserializedSolanaTx(
         }
         const sysOpcode =
           (ix.data[0] | (ix.data[1] << 8) | (ix.data[2] << 16) | (ix.data[3] << 24)) >>> 0;
-        if (sysOpcode === 2 || sysOpcode === 11) {
-          // Transfer (2) or TransferWithSeed (11): destination MUST be the connected wallet (e.g. self-wrap).
+        if (sysOpcode === 2) {
+          // Transfer (2): destination (accountKeyIndexes[1]) MUST be the connected wallet (e.g. self-wrap).
           const destKey = inspected.staticKeys[ix.accountKeyIndexes[1]];
           if (destKey !== connectedAddress) {
             throw new Error(
               `Pre-sign check failed: blocked raw SystemProgram.transfer to external destination in ${flow} transaction.`
             );
           }
+        } else if (sysOpcode === 11) {
+          // Reject SystemProgram.TransferWithSeed (11) outright: recipient is accountKeyIndexes[2] and
+          // Jupiter/yield/predict flows never require seed-derived SOL transfers.
+          throw new Error(
+            `Pre-sign check failed: blocked SystemProgram.transferWithSeed (opcode 11) in ${flow} transaction.`
+          );
         } else if (sysOpcode === 0 || sysOpcode === 3) {
           // CreateAccount (0) / CreateAccountWithSeed (3): allow only temp SPL Token / Token-2022 accounts.
           // CreateAccount layout: u32 opcode (4) + u64 lamports (8) + u64 space (8) + pubkey owner (32) = 52 bytes.

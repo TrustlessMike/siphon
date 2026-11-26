@@ -1479,6 +1479,36 @@ test('Wave 8C [C-1]: signAndSendSolanaVersionedTx deserializes fail-closed, veri
   );
   assert.equal(signCalls, 0);
 
+  // 6b. jupiter_yield / jupiter_predict MUST reject SystemProgram.TransferWithSeed (opcode 11) outright,
+  // even when bundled with Jupiter V6 and with accountKeyIndexes[1] === ownerA!
+  const transferWithSeedData = Buffer.alloc(12);
+  transferWithSeedData.writeUInt32LE(11, 0); // SystemProgram.TransferWithSeed
+  const transferWithSeedB64 = buildSignedReadyV0Base64(SOL_ADDR_A, [
+    new TransactionInstruction({
+      programId: JUPITER_V6_PROGRAM,
+      keys: [{ pubkey: ownerA, isSigner: true, isWritable: true }],
+      data: Buffer.from([1, 2, 3, 4]),
+    }),
+    new TransactionInstruction({
+      programId: SystemProgram.programId,
+      keys: [
+        { pubkey: dummyAta, isSigner: false, isWritable: true },
+        { pubkey: ownerA, isSigner: true, isWritable: false }, // base_account at index 1
+        { pubkey: ownerB, isSigner: false, isWritable: true }, // recipient at index 2
+      ],
+      data: transferWithSeedData,
+    }),
+  ]);
+  await assert.rejects(
+    () => wallets.signAndSendSolanaVersionedTx(transferWithSeedB64, { flow: 'jupiter_yield', autoConnect: false }),
+    /transferWithSeed/i
+  );
+  await assert.rejects(
+    () => wallets.signAndSendSolanaVersionedTx(transferWithSeedB64, { flow: 'jupiter_predict', autoConnect: false }),
+    /transferWithSeed/i
+  );
+  assert.equal(signCalls, 0);
+
   // 7. Valid rent_reclaim VersionedTransaction (ComputeBudget + CloseAccount to ownerA) -> SUCCEEDS!
   const validRentB64 = buildSignedReadyV0Base64(SOL_ADDR_A, [
     ComputeBudgetProgram.setComputeUnitLimit({ units: 40_000 }),
