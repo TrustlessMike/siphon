@@ -1,11 +1,51 @@
 import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { SiphonAgentEngine, type AgentActionType } from '../agent/mandate-engine.js';
+import { solanaAddressToBytes32 } from '../bridge/cctp.js';
+import {
+  scanReclaimableSolanaRent,
+  SOLANA_EMPTY_ATA_RENT_SOL,
+} from '../bridge/solana-rent.js';
+import {
+  readLiveUnlockQueues,
+  type ReadLiveUnlockQueuesOptions,
+} from '../defi/unlock-readers.js';
+import {
+  ALLOWED_JUPITER_CATEGORIES,
+  ALLOWED_JUPITER_FILTERS,
+  JupiterMarketsClient,
+  type JupiterCategory,
+  type JupiterFilter,
+} from '../degen/jupiter-markets.js';
+import {
+  buildUnlockSchedule,
+  evaluatePreservationPlan,
+  extractScanWalletAddresses,
+  mergeUnlockSchedule,
+  type AttestedCctpLegInput,
+  type UnlockScheduleItem,
+} from '../execution/preservation-optimizer.js';
+import {
+  detectAddress,
+  validateCosmosAddress,
+  validateEvmHexAddress,
+} from '../scanner/address.js';
+import { DEAD_BURN_ADDRESS } from '../scanner/chains.js';
 import { planDustConversion } from '../scanner/dust.js';
 import { sanitizeFreeText, sanitizeTokenName, sanitizeTokenSymbol } from '../scanner/sanitize.js';
 import { scanUnifiedWallets } from '../scanner/unify.js';
-import type { AnyChainId, ChainFamily, ScanReport } from '../scanner/types.js';
+import type { AnyChainId, ChainFamily, EvmChainId, ScanReport } from '../scanner/types.js';
 import { BoundedTtlCache } from '../server/cache.js';
+import {
+  buildSolanaYieldParkPlan,
+  calculateYieldPreservationSplit,
+  DEFAULT_PRESERVE_PCT,
+  MAX_PRESERVE_PCT,
+  MAX_TOTAL_USDC_AMOUNT,
+  MIN_PRESERVE_PCT,
+  SOLANA_YIELD_STRATEGIES,
+  type SolanaYieldStrategyId,
+} from '../solana/yield-park.js';
 
 export interface ScanCacheLike {
   get(key: string): ScanReport | undefined;
@@ -16,6 +56,13 @@ export interface ScanCacheLike {
 export interface McpToolContext {
   agentEngine: SiphonAgentEngine;
   scanCache: ScanCacheLike;
+  /** Optional injectable clients/hooks for deterministic unit tests and custom RPC routing */
+  jupiterMarketsClient?: JupiterMarketsClient;
+  unlockReaderOptions?: Omit<ReadLiveUnlockQueuesOptions, 'evmAddresses' | 'cosmosAddresses'>;
+  gasPriceFetcher?: (chain: EvmChainId) => Promise<number | null>;
+  solanaRentScanner?: typeof scanReclaimableSolanaRent;
+  solanaYieldPlanner?: typeof buildSolanaYieldParkPlan;
+  nowMs?: () => number;
 }
 
 export interface JsonRpcRequest {
@@ -28,8 +75,15 @@ export interface JsonRpcRequest {
 const MCP_PROTOCOL_VERSION = '2025-03-26';
 const SUPPORTED_PROTOCOL_VERSIONS = new Set(['2024-11-05', '2025-03-26', '2025-06-18']);
 const MAX_STDIO_LINE_BYTES = 65_536;
+const ZERO_EVM_ADDRESS = '0x0000000000000000000000000000000000000000';
 const VALID_FAMILIES = new Set<string>(['evm', 'cosmos', 'sui', 'aptos', 'ton', 'tron', 'btc']);
 const VALID_ACTIONS = new Set<string>(['dust_convert', 'defi_withdraw', 'bridge_solana', 'burn_zero_liq']);
+const VALID_YIELD_STRATEGIES = new Set<string>(Object.keys(SOLANA_YIELD_STRATEGIES));
+const VALID_JUPITER_CATEGORIES = new Set<string>(ALLOWED_JUPITER_CATEGORIES);
+const VALID_JUPITER_FILTERS = new Set<string>(ALLOWED_JUPITER_FILTERS);
+const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F-\u009F]/;
+
+const defaultMcpJupiterClient = new JupiterMarketsClient();
 
 export const SIPHON_MCP_TOOLS = [
   {
@@ -162,6 +216,195 @@ export const SIPHON_MCP_TOOLS = [
       properties: {},
     },
   },
+  {
+    name: 'siphon_preservation_audit',
+    description:
+      'Run Siphon Capital-Preservation Route Auction (evaluatePreservationPlan) for a cached scanId or walletAddress, returning exact dollars saved (gas batching, Permit2/EIP-2612 approvals, negative-ROI pruning, route auction), best bridge route per chain, and Ethereum L1 gas-timing advice. Read-only.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        scanId: { type: 'string', minLength: 1, maxLength: 128 },
+        walletAddress: {
+          type: 'string',
+          minLength: 3,
+          maxLength: 160,
+          description: 'Previously scanned wallet address (0x…, cosmos1…, bc1…, EQ…, T…)',
+        },
+        outputAsset: { type: 'string', enum: ['USDC', 'SOL'], default: 'USDC' },
+        protocolFeeBps: { type: 'integer', minimum: 0, maximum: 1000 },
+        maxBaseFeeGwei: { type: 'number', exclusiveMinimum: 0, maximum: 500, default: 15 },
+        hasSolanaUsdcAta: { type: 'boolean' },
+        fetchLiveGas: { type: 'boolean', default: false },
+        includeLiveUnlocks: { type: 'boolean', default: false },
+      },
+    },
+  },
+  {
+    name: 'siphon_list_unlock_schedule',
+    description:
+      'Return live pending on-chain unlocks across Ethereum Lido Withdrawal Queue (stETH NFTs), Ethena sUSDe cooldowns, Cosmos staking unbonding delegations, scan-indexed DeFi locks, and attested Circle CCTP claims, deduplicated and sorted soonest-first. Read-only.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        scanId: { type: 'string', minLength: 1, maxLength: 128 },
+        evmAddress: {
+          type: 'string',
+          minLength: 42,
+          maxLength: 42,
+          description: '20-byte Ethereum 0x wallet address for live Lido Withdrawal Queue & Ethena sUSDe cooldown queries',
+        },
+        cosmosAddresses: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 10,
+          items: {
+            type: 'string',
+            minLength: 39,
+            maxLength: 90,
+            description: 'Valid Bech32 Cosmos address (cosmos1…, osmo1…, celestia1…, inj1…)',
+          },
+        },
+        includeLiveOnChain: { type: 'boolean', default: true },
+        attestedCctpLegs: {
+          type: 'array',
+          maxItems: 25,
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['chain', 'amountUsdc', 'attestationStatus'],
+            properties: {
+              chain: { type: 'string', minLength: 2, maxLength: 32 },
+              chainName: { type: 'string', maxLength: 48 },
+              amountUsdc: { type: 'number', exclusiveMinimum: 0, maximum: 100_000_000 },
+              txHash: { type: 'string', maxLength: 128 },
+              attestationStatus: { type: 'string', enum: ['pending_confirmations', 'complete'] },
+              estimatedReadyAt: { type: 'number', minimum: 0 },
+            },
+          },
+        },
+      },
+    },
+  },
+  {
+    name: 'siphon_solana_rent_scan',
+    description:
+      'Scan a Solana wallet across SPL Token and Token-2022 programs for zero-balance non-frozen empty Associated Token Accounts (ATAs) eligible for free SOL rent recovery (0.00203928 SOL per empty account). Read-only; never signs or submits transactions.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['ownerAddress'],
+      properties: {
+        ownerAddress: {
+          type: 'string',
+          minLength: 32,
+          maxLength: 64,
+          description: 'Valid non-zero Solana base58 public key',
+        },
+        solPriceUsd: { type: 'number', exclusiveMinimum: 0, maximum: 100_000 },
+        maxAccountsPerTx: { type: 'integer', minimum: 1, maximum: 20, default: 20 },
+      },
+    },
+  },
+  {
+    name: 'siphon_solana_yield_preview',
+    description:
+      'Compute Siphon Preservation-First Solana post-arrival split: default 90% Preserved Yield (JupSOL, Jupiter Lend jlUSDC, or Kamino USDC) + 10% Degen Side-Pocket with exact micro-USDC accounting and projected APY. Read-only preview; never signs or swaps autonomously.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['totalUsdcAmount'],
+      properties: {
+        ownerAddress: {
+          type: 'string',
+          minLength: 32,
+          maxLength: 64,
+          description: 'Optional Solana base58 public key for live Jupiter quote preview',
+        },
+        totalUsdcAmount: {
+          type: 'number',
+          exclusiveMinimum: 0,
+          maximum: MAX_TOTAL_USDC_AMOUNT,
+        },
+        preservePct: {
+          type: 'number',
+          minimum: MIN_PRESERVE_PCT,
+          maximum: MAX_PRESERVE_PCT,
+          default: DEFAULT_PRESERVE_PCT,
+        },
+        strategy: {
+          type: 'string',
+          enum: ['jupsol', 'jupiter_lend_usdc', 'kamino_usdc'],
+          default: 'jupiter_lend_usdc',
+        },
+        fetchLiveQuote: { type: 'boolean', default: false },
+      },
+    },
+  },
+  {
+    name: 'siphon_degen_markets',
+    description:
+      'List live trending Jupiter Prediction Markets & implied odds for AI-assisted market research. Strictly read-only: NEVER places bets, builds signed orders, or moves funds autonomously without explicit user approval in Siphon.',
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        category: {
+          type: 'string',
+          enum: [...ALLOWED_JUPITER_CATEGORIES],
+          default: 'all',
+        },
+        filter: {
+          type: 'string',
+          enum: [...ALLOWED_JUPITER_FILTERS],
+          default: 'trending',
+        },
+        query: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 120,
+          description: 'Optional keyword search across live Jupiter Prediction events',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 25,
+          default: 10,
+        },
+      },
+    },
+  },
 ];
 
 function jsonRpcError(id: string | number | null, code: number, message: string): Record<string, unknown> {
@@ -174,6 +417,76 @@ function jsonRpcError(id: string | number | null, code: number, message: string)
 
 function isValidRpcId(id: unknown): id is string | number | null | undefined {
   return id === undefined || id === null || typeof id === 'string' || (typeof id === 'number' && Number.isFinite(id));
+}
+
+function parseStrictFiniteNumber(raw: unknown): number | null {
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? raw : null;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function assertValidEvmAddressStrict(raw: unknown, field: string): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof raw !== 'string') {
+    return { ok: false, error: `Invalid params: ${field} must be a 20-byte 0x EVM address string.` };
+  }
+  const clean = raw.trim();
+  if (!clean || CONTROL_CHAR_RE.test(clean)) {
+    return { ok: false, error: `Invalid params: ${field} contains invalid or control characters.` };
+  }
+  const res = validateEvmHexAddress(clean);
+  if (!res.valid || !res.normalized) {
+    return { ok: false, error: `Invalid params: ${field} — ${res.reason ?? 'invalid EVM address.'}` };
+  }
+  const lower = res.normalized.toLowerCase();
+  if (lower === ZERO_EVM_ADDRESS || lower === DEAD_BURN_ADDRESS.toLowerCase()) {
+    return { ok: false, error: `Invalid params: ${field} cannot be the zero or burn address.` };
+  }
+  return { ok: true, value: res.normalized };
+}
+
+function assertValidSolanaAddressStrict(raw: unknown, field: string): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof raw !== 'string') {
+    return { ok: false, error: `Invalid params: ${field} must be a valid Solana base58 address string.` };
+  }
+  const clean = raw.trim();
+  if (clean.length < 32 || clean.length > 64 || CONTROL_CHAR_RE.test(clean)) {
+    return { ok: false, error: `Invalid params: ${field} must be a valid Solana base58 public key.` };
+  }
+  try {
+    solanaAddressToBytes32(clean);
+    return { ok: true, value: clean };
+  } catch {
+    return { ok: false, error: `Invalid params: ${field} must be a valid non-zero Solana base58 public key.` };
+  }
+}
+
+function findCachedScanByWallet(scanCache: ScanCacheLike, walletAddress: string): ScanReport | undefined {
+  const needle = walletAddress.trim();
+  if (!needle) return undefined;
+  const needleLower = needle.toLowerCase();
+  const scans = Array.from(scanCache.values()).reverse();
+  for (const scan of scans) {
+    if (scan.walletAddress) {
+      const candidate = scan.walletAddress.trim();
+      if (candidate === needle || candidate.toLowerCase() === needleLower) {
+        return scan;
+      }
+    }
+    if (Array.isArray(scan.unifiedWallets)) {
+      const matchedUnified = scan.unifiedWallets.some(
+        (w) => typeof w.address === 'string' && w.address.trim().toLowerCase() === needleLower
+      );
+      if (matchedUnified) return scan;
+    }
+  }
+  return undefined;
 }
 
 export async function handleMcpJsonRpc(
@@ -209,7 +522,7 @@ export async function handleMcpJsonRpc(
         capabilities: { tools: {} },
         serverInfo: {
           name: 'siphon-migrator-mcp',
-          version: '1.0.0',
+          version: '2.0.0',
         },
       },
     };
@@ -261,6 +574,8 @@ export async function handleMcpJsonRpc(
 
     try {
       let result: unknown;
+      const nowMs = (ctx.nowMs ?? (() => Date.now()))();
+
       if (toolName === 'siphon_scan_wallets') {
         if (!Array.isArray(args.wallets) || args.wallets.length === 0 || args.wallets.length > 20) {
           return jsonRpcError(id, -32602, 'Invalid params: wallets must be an array of 1 to 20 wallet descriptors.');
@@ -385,6 +700,560 @@ export async function handleMcpJsonRpc(
         });
       } else if (toolName === 'siphon_list_pending_approvals') {
         result = { approvals: ctx.agentEngine.listApprovals() };
+      } else if (toolName === 'siphon_preservation_audit') {
+        const hasScanId = args.scanId !== undefined;
+        const hasWallet = args.walletAddress !== undefined;
+        if (!hasScanId && !hasWallet) {
+          return jsonRpcError(id, -32602, 'Invalid params: provide scanId or walletAddress.');
+        }
+
+        let scanIdClean: string | undefined;
+        if (hasScanId) {
+          if (
+            typeof args.scanId !== 'string' ||
+            !args.scanId.trim() ||
+            args.scanId.length > 128 ||
+            CONTROL_CHAR_RE.test(args.scanId)
+          ) {
+            return jsonRpcError(id, -32602, 'Invalid params: scanId must be a non-empty string <= 128 chars.');
+          }
+          scanIdClean = args.scanId.trim();
+        }
+
+        let walletClean: string | undefined;
+        if (hasWallet) {
+          if (
+            typeof args.walletAddress !== 'string' ||
+            !args.walletAddress.trim() ||
+            args.walletAddress.length > 160 ||
+            CONTROL_CHAR_RE.test(args.walletAddress)
+          ) {
+            return jsonRpcError(id, -32602, 'Invalid params: walletAddress must be a valid wallet address string.');
+          }
+          const detected = detectAddress(args.walletAddress.trim());
+          if (!detected) {
+            return jsonRpcError(
+              id,
+              -32602,
+              'Invalid params: walletAddress is not a valid EVM, Cosmos, Sui, Aptos, TON, Tron, or Bitcoin address.'
+            );
+          }
+          const lower = detected.normalized.toLowerCase();
+          if (lower === ZERO_EVM_ADDRESS || lower === DEAD_BURN_ADDRESS.toLowerCase()) {
+            return jsonRpcError(id, -32602, 'Invalid params: walletAddress cannot be the zero or burn address.');
+          }
+          walletClean = detected.normalized;
+        }
+
+        if (args.outputAsset !== undefined && args.outputAsset !== 'USDC' && args.outputAsset !== 'SOL') {
+          return jsonRpcError(id, -32602, "Invalid params: outputAsset must be 'USDC' or 'SOL'.");
+        }
+
+        let protocolFeeBps: number | undefined;
+        if (args.protocolFeeBps !== undefined) {
+          const parsed = parseStrictFiniteNumber(args.protocolFeeBps);
+          if (parsed === null || !Number.isInteger(parsed) || parsed < 0 || parsed > 1000) {
+            return jsonRpcError(id, -32602, 'Invalid params: protocolFeeBps must be an integer in [0, 1000].');
+          }
+          protocolFeeBps = parsed;
+        }
+
+        let maxBaseFeeGwei: number | undefined;
+        if (args.maxBaseFeeGwei !== undefined) {
+          const parsed = parseStrictFiniteNumber(args.maxBaseFeeGwei);
+          if (parsed === null || parsed <= 0 || parsed > 500) {
+            return jsonRpcError(id, -32602, 'Invalid params: maxBaseFeeGwei must be a finite number in (0, 500].');
+          }
+          maxBaseFeeGwei = parsed;
+        }
+
+        if (args.hasSolanaUsdcAta !== undefined && typeof args.hasSolanaUsdcAta !== 'boolean') {
+          return jsonRpcError(id, -32602, 'Invalid params: hasSolanaUsdcAta must be a boolean.');
+        }
+        if (args.fetchLiveGas !== undefined && typeof args.fetchLiveGas !== 'boolean') {
+          return jsonRpcError(id, -32602, 'Invalid params: fetchLiveGas must be a boolean.');
+        }
+        if (args.includeLiveUnlocks !== undefined && typeof args.includeLiveUnlocks !== 'boolean') {
+          return jsonRpcError(id, -32602, 'Invalid params: includeLiveUnlocks must be a boolean.');
+        }
+
+        const scan =
+          (scanIdClean ? ctx.scanCache.get(scanIdClean) : undefined) ??
+          (walletClean ? findCachedScanByWallet(ctx.scanCache, walletClean) : undefined);
+        if (!scan) {
+          throw new Error('Cached scan not found — call siphon_scan_wallets first.');
+        }
+
+        const plan = await evaluatePreservationPlan(scan, {
+          outputAsset: (args.outputAsset as 'USDC' | 'SOL' | undefined) ?? 'USDC',
+          protocolFeeBps,
+          maxBaseFeeGwei,
+          hasSolanaUsdcAta: args.hasSolanaUsdcAta as boolean | undefined,
+          fetchLiveGas: Boolean(args.fetchLiveGas),
+          gasPriceFetcher: ctx.gasPriceFetcher,
+          fetchLiveUnlockQueues: Boolean(args.includeLiveUnlocks),
+          liveUnlockReaderOptions:
+            args.includeLiveUnlocks || ctx.unlockReaderOptions
+              ? ctx.unlockReaderOptions
+              : undefined,
+          nowMs,
+        });
+
+        result = {
+          readOnly: true,
+          scanId: scan.scanId,
+          walletAddress: plan.walletAddress,
+          generatedAt: plan.generatedAt,
+          outputAsset: plan.outputAsset,
+          protocolFeeBps: plan.protocolFeeBps,
+          recommendedBridgePreference: plan.recommendedBridgePreference,
+          recommendedRouteLabel: plan.recommendedRouteLabel,
+          totals: plan.totals,
+          chains: plan.chains.map((c) => ({
+            chain: c.chain,
+            chainName: sanitizeFreeText(c.chainName, 48),
+            sweepableAssetCount: c.sweepableAssetCount,
+            prunedNegativeRoiCount: c.prunedNegativeRoiCount,
+            grossUsd: c.grossUsd,
+            bestRoute: c.bestRoute,
+            bestRouteLabel: c.bestRouteLabel,
+            recommendedBridgePreference: c.recommendedBridgePreference,
+            bestNetUsdPreserved: c.bestNetUsdPreserved,
+            bestPreservationRatePct: c.bestPreservationRatePct,
+            routeAuctionSavingsUsd: c.routeAuctionSavingsUsd,
+            gasSavedUsd: c.gasSavedUsd,
+            approvalsSavedUsd: c.approvalsSavedUsd,
+            negativeRoiPrunedSavedUsd: c.negativeRoiPrunedSavedUsd,
+            popupsEliminated: c.popupsEliminated,
+            rationale: sanitizeFreeText(c.rationale, 200),
+          })),
+          gasTiming: plan.gasTiming,
+          unlockScheduleCount: plan.unlockSchedule.length,
+          unlockSchedule: plan.unlockSchedule,
+        };
+      } else if (toolName === 'siphon_list_unlock_schedule') {
+        const hasScanId = args.scanId !== undefined;
+        const hasEvm = args.evmAddress !== undefined;
+        const hasCosmos = args.cosmosAddresses !== undefined;
+        const hasCctp = args.attestedCctpLegs !== undefined;
+
+        if (!hasScanId && !hasEvm && !hasCosmos && !hasCctp) {
+          return jsonRpcError(
+            id,
+            -32602,
+            'Invalid params: provide at least one of scanId, evmAddress, cosmosAddresses, or attestedCctpLegs.'
+          );
+        }
+
+        let scan: ScanReport | undefined;
+        if (hasScanId) {
+          if (
+            typeof args.scanId !== 'string' ||
+            !args.scanId.trim() ||
+            args.scanId.length > 128 ||
+            CONTROL_CHAR_RE.test(args.scanId)
+          ) {
+            return jsonRpcError(id, -32602, 'Invalid params: scanId must be a non-empty string <= 128 chars.');
+          }
+          scan = ctx.scanCache.get(args.scanId.trim());
+          if (!scan) {
+            throw new Error('scanId not found — call siphon_scan_wallets first.');
+          }
+        }
+
+        const evmAddresses: string[] = [];
+        if (hasEvm) {
+          const check = assertValidEvmAddressStrict(args.evmAddress, 'evmAddress');
+          if (!check.ok) return jsonRpcError(id, -32602, check.error);
+          evmAddresses.push(check.value);
+        }
+
+        const cosmosAddresses: string[] = [];
+        if (hasCosmos) {
+          if (!Array.isArray(args.cosmosAddresses) || args.cosmosAddresses.length === 0 || args.cosmosAddresses.length > 10) {
+            return jsonRpcError(id, -32602, 'Invalid params: cosmosAddresses must be an array of 1 to 10 Bech32 Cosmos addresses.');
+          }
+          for (const rawAddr of args.cosmosAddresses) {
+            if (typeof rawAddr !== 'string' || CONTROL_CHAR_RE.test(rawAddr)) {
+              return jsonRpcError(id, -32602, 'Invalid params: each cosmosAddress must be a valid Bech32 string.');
+            }
+            const validated = validateCosmosAddress(rawAddr);
+            if (!validated.valid || !validated.normalized) {
+              return jsonRpcError(
+                id,
+                -32602,
+                `Invalid params: malformed cosmosAddress — ${validated.reason ?? 'invalid Bech32 address.'}`
+              );
+            }
+            cosmosAddresses.push(validated.normalized);
+          }
+        }
+
+        if (args.includeLiveOnChain !== undefined && typeof args.includeLiveOnChain !== 'boolean') {
+          return jsonRpcError(id, -32602, 'Invalid params: includeLiveOnChain must be a boolean.');
+        }
+        const includeLiveOnChain = args.includeLiveOnChain !== false;
+
+        const attestedCctpLegs: AttestedCctpLegInput[] = [];
+        if (hasCctp) {
+          if (!Array.isArray(args.attestedCctpLegs) || args.attestedCctpLegs.length > 25) {
+            return jsonRpcError(id, -32602, 'Invalid params: attestedCctpLegs must be an array of <= 25 entries.');
+          }
+          for (const rawLeg of args.attestedCctpLegs) {
+            if (!rawLeg || typeof rawLeg !== 'object' || Array.isArray(rawLeg)) {
+              return jsonRpcError(id, -32602, 'Invalid params: each attestedCctpLeg must be an object.');
+            }
+            const leg = rawLeg as Record<string, unknown>;
+            if (typeof leg.chain !== 'string' || !leg.chain.trim() || leg.chain.length > 32 || CONTROL_CHAR_RE.test(leg.chain)) {
+              return jsonRpcError(id, -32602, 'Invalid params: attestedCctpLeg.chain must be a valid chain id.');
+            }
+            const amountUsdc = parseStrictFiniteNumber(leg.amountUsdc);
+            if (amountUsdc === null || amountUsdc <= 0 || amountUsdc > 100_000_000) {
+              return jsonRpcError(id, -32602, 'Invalid params: attestedCctpLeg.amountUsdc must be a finite positive number.');
+            }
+            if (leg.attestationStatus !== 'pending_confirmations' && leg.attestationStatus !== 'complete') {
+              return jsonRpcError(
+                id,
+                -32602,
+                "Invalid params: attestedCctpLeg.attestationStatus must be 'pending_confirmations' or 'complete'."
+              );
+            }
+            let estimatedReadyAt: number | undefined;
+            if (leg.estimatedReadyAt !== undefined) {
+              const parsedReady = parseStrictFiniteNumber(leg.estimatedReadyAt);
+              if (parsedReady === null || parsedReady < 0) {
+                return jsonRpcError(id, -32602, 'Invalid params: attestedCctpLeg.estimatedReadyAt must be a non-negative number.');
+              }
+              estimatedReadyAt = parsedReady;
+            }
+            attestedCctpLegs.push({
+              chain: leg.chain.trim() as AnyChainId,
+              chainName: typeof leg.chainName === 'string' ? sanitizeFreeText(leg.chainName, 48) : undefined,
+              amountUsdc,
+              txHash: typeof leg.txHash === 'string' ? sanitizeFreeText(leg.txHash, 128) : undefined,
+              attestationStatus: leg.attestationStatus,
+              estimatedReadyAt,
+            });
+          }
+        }
+
+        // Also pull EVM & Cosmos wallet addresses from cached scan if supplied
+        if (scan) {
+          const extracted = extractScanWalletAddresses(scan);
+          evmAddresses.push(...extracted.evmAddresses);
+          cosmosAddresses.push(...extracted.cosmosAddresses);
+        }
+
+        const warnings: string[] = [];
+        let liveItems: UnlockScheduleItem[] = [];
+        if (includeLiveOnChain && (evmAddresses.length > 0 || cosmosAddresses.length > 0)) {
+          const liveReport = await readLiveUnlockQueues({
+            ...ctx.unlockReaderOptions,
+            evmAddresses,
+            cosmosAddresses,
+            nowMs,
+          });
+          liveItems = liveReport.items;
+          warnings.push(...liveReport.warnings);
+        }
+
+        const schedule = scan
+          ? buildUnlockSchedule(scan, attestedCctpLegs, nowMs, liveItems)
+          : buildUnlockSchedule(
+              {
+                scanId: 'live_unlock_lookup',
+                mode: 'live_rpc',
+                walletAddress: evmAddresses[0] ?? cosmosAddresses[0] ?? '',
+                scannedAt: new Date(nowMs).toISOString(),
+                scanDurationMs: 0,
+                chainsScanned: 0,
+                chains: [],
+                assets: [],
+                totals: {
+                  grossUsd: 0,
+                  defiGrossUsd: 0,
+                  liquidGrossUsd: 0,
+                  protocolFeeBps: 0,
+                  protocolFeeUsd: 0,
+                  singleTxGasUsd: 0,
+                  batchedGasUsd: 0,
+                  gasSavedUsd: 0,
+                  estimatedSlippageUsd: 0,
+                  netSolanaUsdc: 0,
+                  solEquivalent: 0,
+                  solPriceUsd: 150,
+                  defiPositionCount: 0,
+                  liquidDustCount: 0,
+                  burnCandidateCount: 0,
+                  honeypotSkippedCount: 0,
+                  gasNegativeCount: 0,
+                },
+                warnings: [],
+              },
+              attestedCctpLegs,
+              nowMs,
+              liveItems
+            );
+
+        const merged = mergeUnlockSchedule(schedule).map((item) => ({
+          ...item,
+          symbol: sanitizeTokenSymbol(item.symbol),
+          protocol: sanitizeFreeText(item.protocol, 64),
+          actionLabel: sanitizeFreeText(item.actionLabel, 140),
+        }));
+
+        const readyItems = merged.filter((i) => i.status === 'ready_to_claim');
+        const lockedItems = merged.filter((i) => i.status !== 'ready_to_claim');
+        const totalEstimatedUsd = Number(merged.reduce((s, i) => s + i.estimatedUsd, 0).toFixed(2));
+        const readyToClaimUsd = Number(readyItems.reduce((s, i) => s + i.estimatedUsd, 0).toFixed(2));
+
+        result = {
+          readOnly: true,
+          generatedAt: new Date(nowMs).toISOString(),
+          totalItems: merged.length,
+          readyToClaimCount: readyItems.length,
+          lockedWaitingCount: lockedItems.length,
+          totalEstimatedUsd,
+          readyToClaimUsd,
+          unlockSchedule: merged,
+          warnings,
+        };
+      } else if (toolName === 'siphon_solana_rent_scan') {
+        const ownerCheck = assertValidSolanaAddressStrict(args.ownerAddress, 'ownerAddress');
+        if (!ownerCheck.ok) {
+          return jsonRpcError(id, -32602, ownerCheck.error);
+        }
+
+        let solPriceUsd: number | undefined;
+        if (args.solPriceUsd !== undefined) {
+          const parsed = parseStrictFiniteNumber(args.solPriceUsd);
+          if (parsed === null || parsed <= 0 || parsed > 100_000) {
+            return jsonRpcError(id, -32602, 'Invalid params: solPriceUsd must be a finite number in (0, 100000].');
+          }
+          solPriceUsd = parsed;
+        }
+
+        let maxAccountsPerTx: number | undefined;
+        if (args.maxAccountsPerTx !== undefined) {
+          const parsed = parseStrictFiniteNumber(args.maxAccountsPerTx);
+          if (parsed === null || !Number.isInteger(parsed) || parsed < 1 || parsed > 20) {
+            return jsonRpcError(id, -32602, 'Invalid params: maxAccountsPerTx must be an integer in [1, 20].');
+          }
+          maxAccountsPerTx = parsed;
+        }
+
+        const scanner = ctx.solanaRentScanner ?? scanReclaimableSolanaRent;
+        const scanRes = await scanner(ownerCheck.value, {
+          includeUnsignedTx: false,
+          solPriceUsd,
+          skipPriceFetch: solPriceUsd !== undefined,
+          maxAccountsPerTx,
+        });
+
+        result = {
+          readOnly: true,
+          ownerAddress: scanRes.ownerAddress,
+          rentPerEmptyAccountSol: scanRes.rentPerEmptyAccountSol ?? SOLANA_EMPTY_ATA_RENT_SOL,
+          totalTokenAccountsScanned: scanRes.totalTokenAccountsScanned,
+          reclaimableCount: scanRes.reclaimableCount,
+          skippedNonZeroCount: scanRes.skippedNonZeroCount,
+          skippedFrozenCount: scanRes.skippedFrozenCount,
+          skippedUncloseableCount: scanRes.skippedUncloseableCount,
+          reclaimableLamports: scanRes.reclaimableLamports,
+          reclaimableSol: scanRes.reclaimableSol,
+          solPriceUsd: scanRes.solPriceUsd,
+          reclaimableUsd: scanRes.reclaimableUsd,
+          maxAccountsPerTx: scanRes.maxAccountsPerTx,
+          batchesRequired: scanRes.batchesRequired,
+          reclaimableAccounts: scanRes.reclaimableAccounts.slice(0, 50),
+        };
+      } else if (toolName === 'siphon_solana_yield_preview') {
+        const totalUsdcAmount = parseStrictFiniteNumber(args.totalUsdcAmount);
+        if (totalUsdcAmount === null || totalUsdcAmount <= 0 || totalUsdcAmount > MAX_TOTAL_USDC_AMOUNT) {
+          return jsonRpcError(
+            id,
+            -32602,
+            `Invalid params: totalUsdcAmount must be a finite number in (0, ${MAX_TOTAL_USDC_AMOUNT}].`
+          );
+        }
+
+        let preservePct = DEFAULT_PRESERVE_PCT;
+        if (args.preservePct !== undefined) {
+          const parsed = parseStrictFiniteNumber(args.preservePct);
+          if (parsed === null || parsed < MIN_PRESERVE_PCT || parsed > MAX_PRESERVE_PCT) {
+            return jsonRpcError(
+              id,
+              -32602,
+              `Invalid params: preservePct must be a finite number in [${MIN_PRESERVE_PCT}, ${MAX_PRESERVE_PCT}] (Preservation-First guard).`
+            );
+          }
+          preservePct = parsed;
+        }
+
+        const rawStrategy = args.strategy ?? 'jupiter_lend_usdc';
+        if (typeof rawStrategy !== 'string' || !VALID_YIELD_STRATEGIES.has(rawStrategy)) {
+          return jsonRpcError(
+            id,
+            -32602,
+            `Invalid params: strategy must be one of ${Array.from(VALID_YIELD_STRATEGIES).join(', ')}.`
+          );
+        }
+        const strategyId = rawStrategy as SolanaYieldStrategyId;
+
+        let ownerAddress: string | undefined;
+        if (args.ownerAddress !== undefined) {
+          const ownerCheck = assertValidSolanaAddressStrict(args.ownerAddress, 'ownerAddress');
+          if (!ownerCheck.ok) {
+            return jsonRpcError(id, -32602, ownerCheck.error);
+          }
+          ownerAddress = ownerCheck.value;
+        }
+
+        if (args.fetchLiveQuote !== undefined && typeof args.fetchLiveQuote !== 'boolean') {
+          return jsonRpcError(id, -32602, 'Invalid params: fetchLiveQuote must be a boolean.');
+        }
+        const fetchLiveQuote = Boolean(args.fetchLiveQuote);
+
+        if (ownerAddress && (ctx.solanaYieldPlanner || fetchLiveQuote)) {
+          const planner = ctx.solanaYieldPlanner ?? buildSolanaYieldParkPlan;
+          const plan = await planner({
+            ownerAddress,
+            totalUsdcAmount,
+            preservePct,
+            strategy: strategyId,
+            buildTransaction: false,
+            fetchLiveApy: fetchLiveQuote,
+          });
+          result = {
+            readOnly: true,
+            autonomousExecutionAllowed: false,
+            ...plan,
+            transaction: null,
+          };
+        } else {
+          const strategy = SOLANA_YIELD_STRATEGIES[strategyId];
+          const split = calculateYieldPreservationSplit(totalUsdcAmount, preservePct);
+          const estimatedApyPct = strategy.baselineApyPct;
+          const projectedAnnualYieldUsd = Number(((split.yieldUsdc * estimatedApyPct) / 100).toFixed(2));
+          const projectedMonthlyYieldUsd = Number((projectedAnnualYieldUsd / 12).toFixed(2));
+          const projectedDailyYieldUsd = Number((projectedAnnualYieldUsd / 365).toFixed(4));
+
+          result = {
+            readOnly: true,
+            autonomousExecutionAllowed: false,
+            planVersion: 'siphon-solana-yield-park-v1',
+            ownerAddress: ownerAddress ?? null,
+            strategy,
+            split,
+            apy: {
+              estimatedApyPct,
+              source: 'baseline_estimate',
+              apyRangePct: strategy.apyRangePct,
+            },
+            projections: {
+              projectedAnnualYieldUsd,
+              projectedMonthlyYieldUsd,
+              projectedDailyYieldUsd,
+              yieldFundedDegenMonthlyBudgetUsd: projectedMonthlyYieldUsd,
+            },
+            jupiterQuote: null,
+            transaction: null,
+            warnings: [],
+          };
+        }
+      } else if (toolName === 'siphon_degen_markets') {
+        let category: JupiterCategory = 'all';
+        if (args.category !== undefined) {
+          if (typeof args.category !== 'string' || !VALID_JUPITER_CATEGORIES.has(args.category.trim().toLowerCase())) {
+            return jsonRpcError(
+              id,
+              -32602,
+              `Invalid params: category must be one of ${ALLOWED_JUPITER_CATEGORIES.join(', ')}.`
+            );
+          }
+          category = args.category.trim().toLowerCase() as JupiterCategory;
+        }
+
+        let filter: JupiterFilter = 'trending';
+        if (args.filter !== undefined) {
+          if (typeof args.filter !== 'string' || !VALID_JUPITER_FILTERS.has(args.filter.trim().toLowerCase())) {
+            return jsonRpcError(
+              id,
+              -32602,
+              `Invalid params: filter must be one of ${ALLOWED_JUPITER_FILTERS.join(', ')}.`
+            );
+          }
+          filter = args.filter.trim().toLowerCase() as JupiterFilter;
+        }
+
+        let query: string | undefined;
+        if (args.query !== undefined) {
+          if (
+            typeof args.query !== 'string' ||
+            !args.query.trim() ||
+            args.query.trim().length > 120 ||
+            CONTROL_CHAR_RE.test(args.query)
+          ) {
+            return jsonRpcError(id, -32602, 'Invalid params: query must be a non-empty string <= 120 chars without control characters.');
+          }
+          query = sanitizeFreeText(args.query, 120);
+          if (!query) {
+            return jsonRpcError(id, -32602, 'Invalid params: query cannot be blank.');
+          }
+        }
+
+        let limit = 10;
+        if (args.limit !== undefined) {
+          const parsed = parseStrictFiniteNumber(args.limit);
+          if (parsed === null || !Number.isInteger(parsed) || parsed < 1 || parsed > 25) {
+            return jsonRpcError(id, -32602, 'Invalid params: limit must be an integer in [1, 25].');
+          }
+          limit = parsed;
+        }
+
+        const jupClient = ctx.jupiterMarketsClient ?? defaultMcpJupiterClient;
+        const feed = query
+          ? await jupClient.searchEvents({ query, limit })
+          : await jupClient.fetchEvents({ category, filter, limit });
+
+        result = {
+          readOnly: true,
+          autonomousBettingAllowed: false,
+          safetyNotice:
+            'Strictly read-only Jupiter Prediction Market research feed. Never places bets autonomously; user must explicitly review side-pocket caps and sign in the Siphon Degen tab.',
+          ok: feed.ok,
+          live: feed.live,
+          source: feed.source,
+          fetchedAt: feed.fetchedAt,
+          category: feed.category,
+          filter: feed.filter,
+          query: feed.query,
+          geoBlocked: feed.geoBlocked ?? false,
+          totalReturned: feed.events.length,
+          events: feed.events.map((ev) => ({
+            eventId: ev.eventId,
+            slug: ev.slug,
+            jupiterUrl: ev.jupiterUrl,
+            title: sanitizeFreeText(ev.title, 160),
+            subtitle: sanitizeFreeText(ev.subtitle, 160),
+            category: ev.category,
+            isActive: ev.isActive,
+            isLive: ev.isLive,
+            closeTime: ev.closeTime,
+            volumeUsd: ev.volumeUsd,
+            volume24hrUsd: ev.volume24hrUsd,
+            markets: ev.markets.slice(0, 6).map((m) => ({
+              marketId: m.marketId,
+              title: sanitizeFreeText(m.title, 140),
+              status: m.status,
+              closeTime: m.closeTime,
+              volumeUsd: m.volumeUsd,
+              yes: m.yes,
+              no: m.no,
+            })),
+          })),
+          error: feed.error ? sanitizeFreeText(feed.error, 200) : undefined,
+        };
       }
 
       return {
@@ -409,6 +1278,11 @@ export async function handleMcpJsonRpc(
 
   return jsonRpcError(id, -32601, `Unsupported MCP method: ${method}`);
 }
+
+/**
+ * Ergonomic alias for `handleMcpJsonRpc` used by MCP v2 callers and tests.
+ */
+export const handleMcpRequest = handleMcpJsonRpc;
 
 /**
  * Proxies stdio MCP JSON-RPC requests to a running Siphon HTTP server (`POST /mcp`)

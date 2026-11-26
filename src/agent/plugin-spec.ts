@@ -4,12 +4,12 @@ export function buildAiPluginManifest(baseUrl: string) {
   const cleanBase = baseUrl.replace(/\/$/, '');
   return {
     schema_version: 'v1',
-    name_for_human: 'Siphon Multi-Chain Sweep & Dust Agent',
+    name_for_human: 'Siphon Multi-Chain Sweep & Preservation Agent',
     name_for_model: 'siphon_migrator',
     description_for_human:
-      'Scan unified wallets across 25 chains (EVM, Cosmos, Sui, Aptos, TON, Tron, Bitcoin), plan batch dust conversion, verify pre-sign cryptographic proofs, and propose permission-gated sweeps to Solana.',
+      'Scan unified wallets across 25 chains, run capital-preservation route audits, track live Lido/Ethena/Cosmos unlocks, reclaim Solana empty-ATA rent, preview 90/10 Solana yield splits, research Jupiter Prediction Markets, and propose permission-gated sweeps to Solana.',
     description_for_model:
-      'Use Siphon to inspect single or unified multi-chain wallets, calculate profitable batch dust conversions, simulate pre-sign cryptographic proofs, inspect SiphonAgentVault policy mandates, and submit permission-gated sweep requests. NEVER assume funds move without explicit user approval or an active SiphonAgentVault mandate.',
+      'Use Siphon to inspect unified multi-chain wallets, run capital-preservation audits, inspect live Lido/Ethena/Cosmos unlock queues and CCTP claims, scan Solana empty-ATA rent recovery, preview 90% yield + 10% Degen side-pocket splits, research trending Jupiter Prediction Markets (read-only), and submit permission-gated sweep requests. NEVER assume funds move or bets are placed without explicit user approval or an active SiphonAgentVault mandate.',
     auth: {
       type: 'user_http',
       authorization_type: 'bearer',
@@ -30,10 +30,10 @@ export function buildOpenApiSpec(baseUrl: string) {
   return {
     openapi: '3.1.0',
     info: {
-      title: 'Siphon Multi-Chain Migrator & Permissioned Agent API',
-      version: '1.0.0',
+      title: 'Siphon Multi-Chain Migrator & Preservation Agent API',
+      version: '2.0.0',
       description:
-        'ChatGPT Action & AI Agent API for unifying multi-chain wallets across 25 chains, converting dust in batches, verifying pre-sign proofs, and submitting human-permissioned sweep requests to Solana.',
+        'ChatGPT Action & AI Agent API (v2) for unifying multi-chain wallets across 25 chains, running capital-preservation route audits, reading live on-chain Lido/Ethena/Cosmos unlock queues, scanning Solana empty-ATA rent, previewing 90/10 Solana yield splits, researching Jupiter Prediction Markets (read-only), and submitting human-permissioned sweep requests to Solana.',
     },
     servers: [{ url: cleanBase, description: 'Siphon Local / Hosted Server' }],
     components: {
@@ -107,6 +107,220 @@ export function buildOpenApiSpec(baseUrl: string) {
           responses: { '200': { description: 'DustConversionPlan with convertibleAssetIds and batch rescue gain' } },
         },
       },
+      '/api/optimize/preservation': {
+        post: {
+          operationId: 'siphon_preservation_audit',
+          'x-openai-isConsequential': false,
+          summary:
+            'Run Capital-Preservation Route Auction for a cached scanId or walletAddress: exact dollars saved, best route per chain, and Ethereum L1 gas-timing advice',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    scanId: { type: 'string', minLength: 1, maxLength: 128 },
+                    walletAddress: {
+                      type: 'string',
+                      minLength: 3,
+                      maxLength: 160,
+                      description: 'Previously scanned wallet address',
+                    },
+                    outputAsset: { type: 'string', enum: ['USDC', 'SOL'], default: 'USDC' },
+                    protocolFeeBps: { type: 'integer', minimum: 0, maximum: 1000 },
+                    maxBaseFeeGwei: { type: 'number', exclusiveMinimum: 0, maximum: 500, default: 15 },
+                    hasSolanaUsdcAta: { type: 'boolean' },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description:
+                'PreservationPlanReport with exact dollars saved, per-chain route auction winners, L1 gas-timing advice, and unlock schedule',
+            },
+          },
+        },
+      },
+      '/api/optimize/unlock-schedule': {
+        post: {
+          operationId: 'siphon_list_unlock_schedule',
+          'x-openai-isConsequential': false,
+          summary:
+            'List live pending Lido stETH withdrawal NFTs, Ethena sUSDe cooldowns, Cosmos unbonding delegations, scan-indexed DeFi locks, and attested CCTP claims sorted soonest-first',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    scanId: { type: 'string', minLength: 1, maxLength: 128 },
+                    evmAddress: {
+                      type: 'string',
+                      minLength: 42,
+                      maxLength: 42,
+                      description: 'Ethereum 0x address for live Lido & Ethena cooldown queries',
+                    },
+                    cosmosAddresses: {
+                      type: 'array',
+                      minItems: 1,
+                      maxItems: 10,
+                      items: { type: 'string', minLength: 39, maxLength: 90 },
+                      description: 'Valid Bech32 Cosmos addresses (cosmos1…, osmo1…, celestia1…, inj1…)',
+                    },
+                    includeLiveOnChain: { type: 'boolean', default: true },
+                    attestedCctpLegs: {
+                      type: 'array',
+                      maxItems: 25,
+                      items: {
+                        type: 'object',
+                        required: ['chain', 'amountUsdc', 'attestationStatus'],
+                        properties: {
+                          chain: { type: 'string', minLength: 2, maxLength: 32 },
+                          amountUsdc: { type: 'number', exclusiveMinimum: 0, maximum: 100_000_000 },
+                          txHash: { type: 'string', maxLength: 128 },
+                          attestationStatus: { type: 'string', enum: ['pending_confirmations', 'complete'] },
+                          estimatedReadyAt: { type: 'number', minimum: 0 },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Deduplicated, soonest-first unlockSchedule across Lido, Ethena, Cosmos, DeFi locks, and CCTP claims',
+            },
+          },
+        },
+      },
+      '/api/solana/rent-scan': {
+        post: {
+          operationId: 'siphon_solana_rent_scan',
+          'x-openai-isConsequential': false,
+          summary:
+            'Scan a Solana wallet for zero-balance empty SPL/Token-2022 Associated Token Accounts eligible for free SOL rent recovery (0.00203928 SOL per empty account)',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['ownerAddress'],
+                  properties: {
+                    ownerAddress: {
+                      type: 'string',
+                      minLength: 32,
+                      maxLength: 64,
+                      description: 'Valid non-zero Solana base58 public key',
+                    },
+                    solPriceUsd: { type: 'number', exclusiveMinimum: 0, maximum: 100_000 },
+                    maxAccountsPerTx: { type: 'integer', minimum: 1, maximum: 20, default: 20 },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'SolanaRentScanResult with reclaimable empty ATA count, reclaimableSol, and reclaimableUsd',
+            },
+          },
+        },
+      },
+      '/api/solana/yield-park': {
+        post: {
+          operationId: 'siphon_solana_yield_preview',
+          'x-openai-isConsequential': false,
+          summary:
+            'Preview the 90% Preserved Yield (JupSOL, Jupiter Lend jlUSDC, or Kamino USDC) + 10% Degen Side-Pocket split with exact micro-USDC accounting and projected APY (read-only)',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['totalUsdcAmount'],
+                  properties: {
+                    ownerAddress: {
+                      type: 'string',
+                      minLength: 32,
+                      maxLength: 64,
+                      description: 'Optional Solana base58 public key',
+                    },
+                    totalUsdcAmount: { type: 'number', exclusiveMinimum: 0, maximum: 100_000_000 },
+                    preservePct: { type: 'number', minimum: 50, maximum: 100, default: 90 },
+                    strategy: {
+                      type: 'string',
+                      enum: ['jupsol', 'jupiter_lend_usdc', 'kamino_usdc'],
+                      default: 'jupiter_lend_usdc',
+                    },
+                    fetchLiveQuote: { type: 'boolean', default: false },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'SolanaYieldParkPlan read-only split & APY projection without autonomous execution',
+            },
+          },
+        },
+      },
+      '/api/degen/markets': {
+        get: {
+          operationId: 'siphon_degen_markets',
+          'x-openai-isConsequential': false,
+          summary:
+            'List live trending Jupiter Prediction Markets & implied odds for AI-assisted market research (strictly read-only; never places bets autonomously)',
+          parameters: [
+            {
+              name: 'category',
+              in: 'query',
+              required: false,
+              schema: {
+                type: 'string',
+                enum: ['all', 'crypto', 'sports', 'politics', 'esports', 'culture', 'economics', 'tech'],
+                default: 'all',
+              },
+            },
+            {
+              name: 'filter',
+              in: 'query',
+              required: false,
+              schema: {
+                type: 'string',
+                enum: ['trending', 'live', 'new', 'upcoming'],
+                default: 'trending',
+              },
+            },
+            {
+              name: 'query',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', minLength: 1, maxLength: 120 },
+              description: 'Optional keyword search query',
+            },
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 25, default: 10 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'Read-only feed of trending Jupiter Prediction Markets with normalized YES/NO odds & multipliers',
+            },
+          },
+        },
+      },
       '/api/agents/mandates': {
         get: {
           operationId: 'listAgentMandates',
@@ -167,6 +381,11 @@ export function buildOpenApiSpec(baseUrl: string) {
   };
 }
 
+/**
+ * Ergonomic alias for `buildOpenApiSpec` used by ChatGPT Plugin v2 callers and tests.
+ */
+export const buildChatGptOpenApiSpec = buildOpenApiSpec;
+
 export function buildPluginSetupGuide(params: { baseUrl: string; rootDir: string }) {
   const cleanBase = params.baseUrl.replace(/\/$/, '');
   const mcpEntrypoint = path.join(params.rootDir, 'dist', 'src', 'mcp', 'server.js');
@@ -188,6 +407,6 @@ export function buildPluginSetupGuide(params: { baseUrl: string; rootDir: string
     chatgptPluginManifestUrl: `${cleanBase}/.well-known/ai-plugin.json`,
     chatgptOpenApiUrl: `${cleanBase}/openapi.json`,
     chatgptCustomGptInstructions:
-      'You are Siphon Assistant. Always scan wallets first via scanUnifiedWallets, check profitable batch dust via planDustConversion, and submit any value-moving sweep via requestSweepPermission (with authentic scanned assetIds) so the user explicitly approves in Siphon or stays strictly within their owner-created SiphonAgentVault mandate.',
+      'You are Siphon Assistant. Scan wallets via scanUnifiedWallets, audit exact capital savings via siphon_preservation_audit, inspect live Lido/Ethena/Cosmos unlocks via siphon_list_unlock_schedule, check free Solana rent recovery via siphon_solana_rent_scan, preview 90/10 yield splits via siphon_solana_yield_preview, and research Jupiter Prediction Markets read-only via siphon_degen_markets. Always submit value-moving sweeps via requestSweepPermission (with authentic scanned assetIds) and NEVER place bets or move funds autonomously without explicit user approval or an active owner-created SiphonAgentVault mandate.',
   };
 }
