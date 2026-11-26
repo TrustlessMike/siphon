@@ -544,8 +544,10 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
   if (ext === '.svg') {
     headers['Content-Security-Policy'] = 'sandbox';
   }
-  // Required by Coinbase Smart Wallet SDK popup communication
+  // Strict HTML Content-Security-Policy & COOP (required by Coinbase Smart Wallet SDK popups)
   if (ext === '.html') {
+    headers['Content-Security-Policy'] =
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
     headers['Cross-Origin-Opener-Policy'] = 'same-origin-allow-popups';
   }
   res.writeHead(200, headers);
@@ -622,7 +624,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
   });
   const agentEngine = new SiphonAgentEngine({ nowMs: opts.nowMs, stateStore });
   const degenClient = opts.degenClient ?? new JupiterMarketsClient({ nowMs: opts.nowMs });
-  const preservationAgents = new PreservationAgentStore({ nowMs: opts.nowMs });
+  const preservationAgents = new PreservationAgentStore({ nowMs: opts.nowMs, stateStore });
 
   const server = http.createServer(async (req, res) => {
     runtimeMetrics.requestsTotal += 1;
@@ -760,7 +762,11 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         rateLimiter.enabled &&
         ((pathname.startsWith('/api/') && pathname !== '/api/health') || pathname === '/mcp')
       ) {
-        const rl = rateLimiter.consumeRequest(req);
+        const authHeaderForRateLimit = req.headers.authorization;
+        const verifiedRateLimitToken = authHeaderForRateLimit
+          ? agentEngine.verifyPluginToken(authHeaderForRateLimit)
+          : null;
+        const rl = rateLimiter.consumeRequest(req, verifiedRateLimitToken?.tokenId ?? null);
         const rlHeaders = buildRateLimitHeaders(rl);
         if (!rl.allowed) {
           return sendJson(
@@ -1034,6 +1040,23 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         if (authHeader && !verifiedToken) {
           return reply(401, { error: 'Invalid or revoked Siphon AI Plugin Bearer token.' });
         }
+        if (verifiedToken && !verifiedToken.scopes.includes('agent:propose')) {
+          return reply(403, {
+            error: "Insufficient token scope: 'agent:propose' scope is required to create permission requests.",
+          });
+        }
+
+        const hasAdminAuth = Boolean(adminSessionToken && hasValidAdminSession());
+
+        // When adminSessionToken or explicit SIPHON_REQUIRE_PLUGIN_AUTH is enabled, NEVER allow
+        // unauthenticated requests (even client: 'ui' or 'smart_contract_agent') to bypass auth.
+        if ((adminSessionToken || forcePluginAuth) && !verifiedToken && !hasAdminAuth) {
+          return reply(401, {
+            error: adminSessionToken
+              ? "Authentication required: supply X-Siphon-Admin-Session or a Bearer token with 'agent:propose' scope."
+              : "Bearer token authentication with 'agent:propose' scope is required.",
+          });
+        }
 
         const body = await readJsonBody<{
           client?: PluginClientKind;
@@ -1054,8 +1077,8 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
         const isExternalPluginClient =
           resolvedClient === 'chatgpt_action' || resolvedClient === 'claude_mcp';
 
-        if (isExternalPluginClient && !verifiedToken) {
-          const allowLocalUiSimulation = !forcePluginAuth && isSameOriginLocalhostUi();
+        if (isExternalPluginClient && !verifiedToken && !hasAdminAuth) {
+          const allowLocalUiSimulation = !forcePluginAuth && !adminSessionToken && isSameOriginLocalhostUi();
           if (!allowLocalUiSimulation) {
             return reply(401, {
               error:
@@ -1064,7 +1087,12 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           }
         }
 
-        if (!body.actionType || !body.solanaDestination) {
+        if (
+          typeof body.actionType !== 'string' ||
+          !body.actionType.trim() ||
+          typeof body.solanaDestination !== 'string' ||
+          !body.solanaDestination.trim()
+        ) {
           return reply(400, { error: 'actionType and solanaDestination are required.' });
         }
         try {
@@ -1200,7 +1228,11 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           rpcReq.jsonrpc === '2.0' &&
           typeof rpcReq.method === 'string' &&
           !('id' in rpcReq);
-        const rpcRes = await handleMcpJsonRpc(rpcReq, { agentEngine, scanCache });
+        const rpcRes = await handleMcpJsonRpc(rpcReq, {
+          agentEngine,
+          scanCache,
+          tokenScopes: verifiedToken?.scopes,
+        });
         if (isNotification) {
           res.writeHead(202, {
             'Cache-Control': 'no-store',
@@ -1290,7 +1322,14 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           throw err;
         }
 
-        const solDestRaw = body.solanaDestination?.trim() ?? '';
+        if (
+          body.solanaDestination !== undefined &&
+          body.solanaDestination !== null &&
+          typeof body.solanaDestination !== 'string'
+        ) {
+          return reply(400, { error: 'solanaDestination must be a string.' });
+        }
+        const solDestRaw = typeof body.solanaDestination === 'string' ? body.solanaDestination.trim() : '';
         const isPreviewPlaceholder =
           solDestRaw === '' || solDestRaw === '11111111111111111111111111111111';
         if (!isPreviewPlaceholder) {
@@ -1348,8 +1387,24 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           skipRpc?: boolean;
         }>(req);
 
-        const cachedScan = body.scanId ? scanCache.get(body.scanId) : undefined;
-        const walletAddress = body.walletAddress?.trim() || cachedScan?.walletAddress;
+        if (
+          body.walletAddress !== undefined &&
+          body.walletAddress !== null &&
+          typeof body.walletAddress !== 'string'
+        ) {
+          return reply(400, { error: 'walletAddress must be a string.' });
+        }
+        if (body.scanId !== undefined && body.scanId !== null && typeof body.scanId !== 'string') {
+          return reply(400, { error: 'scanId must be a string.' });
+        }
+        if (body.assets !== undefined && !Array.isArray(body.assets)) {
+          return reply(400, { error: 'assets must be an array when provided.' });
+        }
+
+        const cachedScan = typeof body.scanId === 'string' ? scanCache.get(body.scanId) : undefined;
+        const walletAddress =
+          (typeof body.walletAddress === 'string' ? body.walletAddress.trim() : '') ||
+          cachedScan?.walletAddress;
         const targetAssets = body.assets
           ? body.assets
           : body.asset
@@ -1357,7 +1412,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           : cachedScan?.assets ?? [];
 
         if (!walletAddress || !targetAssets.length) {
-          return sendJson(res, 400, {
+          return reply(400, {
             error: 'walletAddress (or valid scanId) and at least one asset are required.',
           });
         }
@@ -1368,7 +1423,7 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           outputAsset: body.outputAsset ?? 'USDC',
           skipRpc: Boolean(body.skipRpc),
         });
-        return sendJson(res, 200, preflight);
+        return reply(200, preflight);
       }
 
       if (method === 'POST' && pathname === '/api/tx/prepare') {
@@ -1502,17 +1557,31 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           solanaDestination?: string;
         }>(req);
 
-        if (!body.chain || !body.txHash || !/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim())) {
+        const txHashClean = typeof body.txHash === 'string' ? body.txHash.trim() : '';
+        if (
+          typeof body.chain !== 'string' ||
+          !body.chain ||
+          !txHashClean ||
+          !/^0x[0-9a-fA-F]{64}$/.test(txHashClean)
+        ) {
           return reply(400, {
             error: 'chain and a valid 32-byte 0x txHash are required',
           });
+        }
+        if (
+          body.solanaDestination !== undefined &&
+          body.solanaDestination !== null &&
+          typeof body.solanaDestination !== 'string'
+        ) {
+          return reply(400, { error: 'solanaDestination must be a string.' });
         }
 
         try {
           const att = await fetchCctpAttestationForTx({
             chain: body.chain,
-            txHash: body.txHash.trim(),
-            solanaDestination: body.solanaDestination?.trim(),
+            txHash: txHashClean,
+            solanaDestination:
+              typeof body.solanaDestination === 'string' ? body.solanaDestination.trim() : undefined,
           });
           return reply(200, att);
         } catch (err) {
@@ -1536,16 +1605,31 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           skipBlockhashFetch?: boolean;
         }>(req);
 
-        const solanaDestination = body.solanaDestination?.trim();
+        const solanaDestination =
+          typeof body.solanaDestination === 'string' ? body.solanaDestination.trim() : '';
         if (!solanaDestination) {
           return reply(400, { error: 'solanaDestination is required.' });
         }
+        for (const [field, val] of [
+          ['messageBytesHex', body.messageBytesHex],
+          ['attestation', body.attestation],
+          ['attestationHex', body.attestationHex],
+          ['payer', body.payer],
+          ['txHash', body.txHash],
+          ['recentBlockhash', body.recentBlockhash],
+        ] as const) {
+          if (val !== undefined && val !== null && typeof val !== 'string') {
+            return reply(400, { error: `${field} must be a string.` });
+          }
+        }
 
         try {
-          let messageBytesHex = body.messageBytesHex?.trim();
-          let attestationHex = (body.attestationHex ?? body.attestation)?.trim();
+          let messageBytesHex =
+            typeof body.messageBytesHex === 'string' ? body.messageBytesHex.trim() : undefined;
+          const rawAtt = body.attestationHex ?? body.attestation;
+          let attestationHex = typeof rawAtt === 'string' ? rawAtt.trim() : undefined;
 
-          if ((!messageBytesHex || !attestationHex) && body.chain && body.txHash) {
+          if ((!messageBytesHex || !attestationHex) && typeof body.chain === 'string' && body.chain && typeof body.txHash === 'string' && body.txHash) {
             if (!/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim())) {
               return reply(400, { error: 'Valid 32-byte 0x txHash is required when resolving attestation.' });
             }
@@ -1575,14 +1659,15 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           }
 
           const recentBlockhash =
-            body.recentBlockhash?.trim() ||
+            (typeof body.recentBlockhash === 'string' ? body.recentBlockhash.trim() : '') ||
             (body.skipBlockhashFetch ? null : await fetchLatestSolanaBlockhash());
 
           const claimPlan = buildSolanaCctpClaimInstructionPlan({
             messageBytesHex,
             attestationHex,
             solanaDestination,
-            payer: body.payer?.trim() || solanaDestination,
+            payer:
+              (typeof body.payer === 'string' ? body.payer.trim() : '') || solanaDestination,
             includeCreateAta: body.includeCreateAta,
             recentBlockhash,
           });
@@ -1678,26 +1763,36 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           preSolanaSol?: number;
         }>(req);
 
-        if (!body.chain || !body.txHash?.trim() || !body.solanaDestination) {
+        const txHashClean = typeof body.txHash === 'string' ? body.txHash.trim() : '';
+        const solDestClean =
+          typeof body.solanaDestination === 'string' ? body.solanaDestination.trim() : '';
+        if (typeof body.chain !== 'string' || !body.chain || !txHashClean || !solDestClean) {
           return reply(400, {
             error: 'chain, txHash, and solanaDestination are required',
           });
+        }
+        if (
+          body.userAddress !== undefined &&
+          body.userAddress !== null &&
+          typeof body.userAddress !== 'string'
+        ) {
+          return reply(400, { error: 'userAddress must be a string.' });
         }
 
         assertNoFeeRecipientOverride(body.feeRecipientEvm);
 
         try {
           if (isEvmChain(body.chain)) {
-            if (!/^0x[0-9a-fA-F]{64}$/.test(body.txHash.trim())) {
+            if (!/^0x[0-9a-fA-F]{64}$/.test(txHashClean)) {
               return reply(400, {
                 error: 'chain, valid 32-byte txHash, and solanaDestination are required',
               });
             }
             const proof = await verifyOnchainExecutionProof({
               chain: body.chain,
-              txHash: body.txHash.trim(),
-              userAddress: body.userAddress,
-              solanaDestination: body.solanaDestination.trim(),
+              txHash: txHashClean,
+              userAddress: typeof body.userAddress === 'string' ? body.userAddress.trim() : undefined,
+              solanaDestination: solDestClean,
               requestId: body.requestId,
               provider: body.provider,
               feeRecipientEvm: undefined,
@@ -1710,9 +1805,9 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           const adapter = getAdapterForChain(body.chain);
           const result = await adapter.relayAndProve({
             chain: body.chain,
-            txHash: body.txHash.trim(),
-            userAddress: body.userAddress || '',
-            solanaDestination: body.solanaDestination.trim(),
+            txHash: txHashClean,
+            userAddress: typeof body.userAddress === 'string' ? body.userAddress.trim() : '',
+            solanaDestination: solDestClean,
             outputAsset: body.outputAsset ?? 'USDC',
             requestId: body.requestId,
             provider: body.provider,
@@ -1807,21 +1902,39 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           txCalldata?: string;
         }>(req);
 
-        if (!body.intentId || !body.chain || !body.userAddress || !body.signature || !body.deadline) {
+        const intentIdClean = typeof body.intentId === 'string' ? body.intentId.trim() : '';
+        const userAddrClean = typeof body.userAddress === 'string' ? body.userAddress.trim() : '';
+        const sigClean = typeof body.signature === 'string' ? body.signature.trim() : '';
+        if (
+          !intentIdClean ||
+          typeof body.chain !== 'string' ||
+          !body.chain ||
+          !userAddrClean ||
+          !sigClean ||
+          typeof body.deadline !== 'number' ||
+          !Number.isFinite(body.deadline)
+        ) {
           return reply(400, {
             error: 'intentId, chain, userAddress, signature, and deadline are required',
           });
+        }
+        if (
+          body.txCalldata !== undefined &&
+          body.txCalldata !== null &&
+          typeof body.txCalldata !== 'string'
+        ) {
+          return reply(400, { error: 'txCalldata must be a 0x-prefixed hex string.' });
         }
 
         try {
           if (isEvmChain(body.chain)) {
             const receipt = await submitAndBroadcastSignedGaslessIntent({
-              intentId: body.intentId,
+              intentId: intentIdClean,
               chain: body.chain,
-              userAddress: body.userAddress,
-              signature: body.signature,
+              userAddress: userAddrClean,
+              signature: sigClean,
               deadline: body.deadline,
-              txCalldata: body.txCalldata,
+              txCalldata: typeof body.txCalldata === 'string' ? body.txCalldata : undefined,
             });
             return reply(200, receipt);
           }
@@ -1829,11 +1942,12 @@ export function createSiphonServer(opts: SiphonServerOptions = {}) {
           const adapter = getAdapterForChain(body.chain);
           const result = await adapter.relayAndProve({
             chain: body.chain,
-            intentId: body.intentId,
-            userAddress: body.userAddress,
-            signature: body.signature,
+            intentId: intentIdClean,
+            userAddress: userAddrClean,
+            signature: sigClean,
             deadline: body.deadline,
-            solanaDestination: body.solanaDestination || '',
+            solanaDestination:
+              typeof body.solanaDestination === 'string' ? body.solanaDestination.trim() : '',
           });
           return reply(200, result.submitted);
         } catch (err) {

@@ -204,6 +204,17 @@ function r4(n: number): number {
   return Number(n.toFixed(4));
 }
 
+const MAX_SAFE_DATE_MS = 8_640_000_000_000_000;
+
+function clampDateMs(ms: number, fallbackMs: number): number {
+  const safeFallback =
+    Number.isFinite(fallbackMs) && fallbackMs >= 0 && fallbackMs <= MAX_SAFE_DATE_MS
+      ? Math.round(fallbackMs)
+      : Date.now();
+  if (!Number.isFinite(ms)) return safeFallback;
+  return Math.max(0, Math.min(MAX_SAFE_DATE_MS, Math.round(ms)));
+}
+
 function clamp(n: number, min: number, max: number): number {
   if (!Number.isFinite(n)) return min;
   return Math.max(min, Math.min(max, n));
@@ -747,15 +758,17 @@ export function buildUnlockSchedule(
   nowMs: number,
   liveItems?: readonly UnlockScheduleItem[]
 ): UnlockScheduleItem[] {
+  const safeNowMs = clampDateMs(nowMs, Date.now());
   const items: UnlockScheduleItem[] = [];
 
   for (const asset of scan.assets) {
     const rawUnlock = asset.defiUnlockAt ?? asset.defiExitPlan?.unlockAt;
     const hasCooldown = Boolean(asset.defiExitPlan?.cooldownDetected);
     if (rawUnlock !== undefined && Number.isFinite(rawUnlock) && rawUnlock > 0) {
-      // Normalize seconds vs milliseconds timestamps
-      const unlockAtMs = rawUnlock < 1e12 ? Math.round(rawUnlock * 1000) : Math.round(rawUnlock);
-      const secondsRemaining = Math.max(0, Math.round((unlockAtMs - nowMs) / 1000));
+      // Normalize seconds vs milliseconds timestamps and clamp to valid JS Date bounds [0, 8.64e15]
+      const normalizedMs = rawUnlock < 1e12 ? rawUnlock * 1000 : rawUnlock;
+      const unlockAtMs = clampDateMs(normalizedMs, safeNowMs);
+      const secondsRemaining = Math.max(0, Math.round((unlockAtMs - safeNowMs) / 1000));
       items.push({
         id: `unlock:${asset.id}`,
         kind: 'defi_unlock',
@@ -776,8 +789,8 @@ export function buildUnlockSchedule(
       });
     } else if (hasCooldown && asset.kind === 'defi_position') {
       // Cooldown detected without explicit timestamp: surface a 7-day standard unbonding reminder
-      const unlockAtMs = nowMs + 7 * 86_400_000;
-      const secondsRemaining = 7 * 86_400;
+      const unlockAtMs = clampDateMs(safeNowMs + 7 * 86_400_000, safeNowMs);
+      const secondsRemaining = Math.max(0, Math.round((unlockAtMs - safeNowMs) / 1000));
       items.push({
         id: `cooldown:${asset.id}`,
         kind: 'defi_unlock',
@@ -807,18 +820,19 @@ export function buildUnlockSchedule(
       ? EVM_CHAINS[leg.chain].cctpAttestationSec * 1000
       : 20_000;
     const rawReady = leg.estimatedReadyAt;
-    const unlockAtMs =
+    const rawUnlockMs =
       leg.attestationStatus === 'complete'
-        ? nowMs
+        ? safeNowMs
         : rawReady && Number.isFinite(rawReady)
         ? rawReady < 1e12
-          ? Math.round(rawReady * 1000)
-          : Math.round(rawReady)
-        : nowMs + defaultWaitMs;
+          ? rawReady * 1000
+          : rawReady
+        : safeNowMs + defaultWaitMs;
+    const unlockAtMs = clampDateMs(rawUnlockMs, safeNowMs + defaultWaitMs);
     const secondsRemaining =
       leg.attestationStatus === 'complete'
         ? 0
-        : Math.max(0, Math.round((unlockAtMs - nowMs) / 1000));
+        : Math.max(0, Math.round((unlockAtMs - safeNowMs) / 1000));
 
     items.push({
       id: `cctp:${leg.chain}:${leg.txHash ?? Math.round(leg.amountUsdc * 100)}`,
@@ -867,7 +881,7 @@ export async function evaluatePreservationPlan(
   scanReport: ScanReport,
   options: PreservationPlanOptions = {}
 ): Promise<PreservationPlanReport> {
-  const nowMs = options.nowMs ?? Date.now();
+  const nowMs = clampDateMs(options.nowMs ?? Date.now(), Date.now());
   const outputAsset: 'USDC' | 'SOL' = options.outputAsset === 'SOL' ? 'SOL' : 'USDC';
   const protocolFeeBps =
     options.protocolFeeBps !== undefined

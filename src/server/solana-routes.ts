@@ -45,9 +45,10 @@ export async function handleSolanaRoutes(ctx: SolanaRouteContext): Promise<boole
       maxAccountsPerTx?: number;
     }>(req, MAX_SOLANA_JSON_BODY_BYTES);
 
-    const ownerAddress = (body.ownerAddress ?? body.solanaAddress ?? '').trim();
+    const rawOwner = body.ownerAddress !== undefined ? body.ownerAddress : body.solanaAddress;
+    const ownerAddress = typeof rawOwner === 'string' ? rawOwner.trim() : '';
     if (!ownerAddress) {
-      reply(400, { error: 'ownerAddress is required.' });
+      reply(400, { error: 'ownerAddress must be a non-empty string.' });
       return true;
     }
 
@@ -89,11 +90,12 @@ export async function handleSolanaRoutes(ctx: SolanaRouteContext): Promise<boole
       fetchLiveApy?: boolean;
     }>(req, MAX_SOLANA_JSON_BODY_BYTES);
 
-    const ownerAddress = (body.ownerAddress ?? body.solanaAddress ?? '').trim();
+    const rawOwner = body.ownerAddress !== undefined ? body.ownerAddress : body.solanaAddress;
+    const ownerAddress = typeof rawOwner === 'string' ? rawOwner.trim() : '';
     const totalUsdcAmount = body.totalUsdcAmount ?? body.amountUsdc;
 
     if (!ownerAddress) {
-      reply(400, { error: 'ownerAddress is required.' });
+      reply(400, { error: 'ownerAddress must be a non-empty string.' });
       return true;
     }
     if (totalUsdcAmount === undefined) {

@@ -739,8 +739,16 @@ export async function scanStaleErc20Approvals(
   const warnings: string[] = [];
   let failedPairs = 0;
 
-  const chunkSize = Math.max(1, Math.min(200, Math.trunc(opts.multicallChunkSize ?? 80)));
-  const timeoutMs = Math.max(500, Math.min(30_000, Math.trunc(opts.timeoutMs ?? 4500)));
+  const rawChunk =
+    typeof opts.multicallChunkSize === 'number' && Number.isFinite(opts.multicallChunkSize)
+      ? Math.trunc(opts.multicallChunkSize)
+      : 80;
+  const chunkSize = Math.max(1, Math.min(200, rawChunk));
+  const rawTimeout =
+    typeof opts.timeoutMs === 'number' && Number.isFinite(opts.timeoutMs)
+      ? Math.trunc(opts.timeoutMs)
+      : 4500;
+  const timeoutMs = Math.max(500, Math.min(30_000, rawTimeout));
   const rpcCall = opts.rpcCall ?? evmJsonRpcCall;
   const rpcUrls = chainCfg.rpcUrls?.length ? chainCfg.rpcUrls : [chainCfg.rpcUrl];
 

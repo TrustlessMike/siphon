@@ -2,6 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import {
+  PublicKey,
+  SystemProgram,
+  TransactionMessage,
+  VersionedTransaction,
+} from '@solana/web3.js';
+import {
   buildJupiterEventUrl,
   buildSidePricingQuote,
   computeDegenSidePocket,
@@ -24,6 +30,23 @@ import {
 import { createSiphonServer } from '../src/server/app.js';
 
 const VALID_SOLANA_WALLET = '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
+const VALID_MOCK_BLOCKHASH = '11111111111111111111111111111111';
+
+function buildValidSolanaTxBase64(payerAddress: string): string {
+  const payer = new PublicKey(payerAddress);
+  const msg = new TransactionMessage({
+    payerKey: payer,
+    recentBlockhash: VALID_MOCK_BLOCKHASH,
+    instructions: [
+      SystemProgram.transfer({
+        fromPubkey: payer,
+        toPubkey: payer,
+        lamports: 0,
+      }),
+    ],
+  }).compileToV0Message();
+  return Buffer.from(new VersionedTransaction(msg).serialize()).toString('base64');
+}
 
 function makeMockJupiterEventsPayload() {
   return {
@@ -351,7 +374,7 @@ test('HTTP endpoints GET /api/degen/markets, GET /api/degen/search, and POST /ap
         return new Response(
           JSON.stringify({
             orderId: 'ord_jup_999',
-            transaction: 'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAA==',
+            transaction: buildValidSolanaTxBase64(VALID_SOLANA_WALLET),
             expiresAt: '2026-11-26T17:00:00Z',
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } }
@@ -573,7 +596,7 @@ test('order builder enforces $5.00 min, yield-funded cap, depositMint, and grace
       return new Response(
         JSON.stringify({
           orderId: 'ord_usdc_1',
-          transaction: 'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAA==',
+          transaction: buildValidSolanaTxBase64(VALID_SOLANA_WALLET),
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       );
@@ -776,7 +799,7 @@ test('positions normalization, P&L calculation, XSS sanitization, and /positions
       if (method === 'POST' && urlStr.endsWith('/positions/pos_win_claim_2/claim')) {
         return new Response(
           JSON.stringify({
-            transaction: 'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAA==',
+            transaction: buildValidSolanaTxBase64(VALID_SOLANA_WALLET),
             orderId: 'claim_tx_01',
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } }
@@ -785,7 +808,7 @@ test('positions normalization, P&L calculation, XSS sanitization, and /positions
       if (method === 'DELETE' && urlStr.endsWith('/positions/pos_open_yes_1')) {
         return new Response(
           JSON.stringify({
-            transaction: 'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAA==',
+            transaction: buildValidSolanaTxBase64(VALID_SOLANA_WALLET),
             orderId: 'close_tx_01',
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } }

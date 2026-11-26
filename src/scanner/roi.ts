@@ -550,6 +550,14 @@ export function evaluateAssetRoi(
   } = {}
 ): AssetRoiEvaluation {
   const feeCfg = getProtocolFeeConfig({ feeBps: opts.protocolFeeBps });
+  const effectiveFeeBps =
+    opts.protocolFeeBps !== undefined &&
+    typeof opts.protocolFeeBps === 'number' &&
+    Number.isFinite(opts.protocolFeeBps) &&
+    opts.protocolFeeBps >= 0 &&
+    opts.protocolFeeBps < 500
+      ? resolvePreservationFeeBps(opts.protocolFeeBps)
+      : feeCfg.feeBps;
   const isBatched = opts.isBatched ?? true;
   const grossUsd = Number.isFinite(asset.grossUsd) ? r2(Math.max(0, asset.grossUsd)) : 0;
   const soloGasUsd = Number.isFinite(asset.estimatedGasUsd) ? r4(Math.max(0, asset.estimatedGasUsd)) : 0;
@@ -641,7 +649,7 @@ export function evaluateAssetRoi(
   const protocolFeeUsd =
     opts.feeSchedule === 'tiered'
       ? computePreservationFee(netAfterSlippageUsd, opts.preservationFeeOpts).feeUsd
-      : r2((netAfterSlippageUsd * feeCfg.feeBps) / 10_000);
+      : r2((netAfterSlippageUsd * effectiveFeeBps) / 10_000);
   const bridgeShareUsd = opts.includeSingleBridgeShare
     ? r2(estimateBridgeFixedFeeUsd(asset.chain) / Math.max(1, opts.chainAssetCount ?? 1))
     : 0;

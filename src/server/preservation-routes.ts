@@ -10,7 +10,6 @@ import {
   evaluatePreservationPlan,
   fetchLiveChainGasGwei,
 } from '../execution/preservation-optimizer.js';
-import { resolveProtocolFeeBps } from '../scanner/chains.js';
 import type { AnyChainId, EvmChainId, ScanReport } from '../scanner/types.js';
 import type { BoundedTtlCache } from './cache.js';
 
@@ -140,11 +139,22 @@ export async function handlePreservationRoute(ctx: PreservationRouteContext): Pr
       minPreservationRatePct?: number;
     }>(req);
 
+    if (
+      body.walletAddress !== undefined &&
+      body.walletAddress !== null &&
+      typeof body.walletAddress !== 'string'
+    ) {
+      reply(400, { error: 'walletAddress must be a string.' });
+      return true;
+    }
+
     const rawScan =
       body.scanReport ??
       body.scan ??
-      (body.scanId ? scanCache.get(body.scanId) : undefined) ??
-      (body.walletAddress ? findCachedScanByWallet(scanCache, body.walletAddress) : undefined);
+      (typeof body.scanId === 'string' ? scanCache.get(body.scanId) : undefined) ??
+      (typeof body.walletAddress === 'string'
+        ? findCachedScanByWallet(scanCache, body.walletAddress)
+        : undefined);
 
     if (!isValidScanReportShape(rawScan)) {
       reply(400, {
@@ -192,8 +202,24 @@ export async function handlePreservationRoute(ctx: PreservationRouteContext): Pr
       }
     }
 
-    const effectiveProtocolFeeBps =
-      body.protocolFeeBps !== undefined ? resolveProtocolFeeBps(body.protocolFeeBps) : undefined;
+    let effectiveProtocolFeeBps: number | undefined;
+    const rawProtocolFeeBps: unknown = body.protocolFeeBps;
+    if (rawProtocolFeeBps !== undefined) {
+      if (
+        typeof rawProtocolFeeBps === 'boolean' ||
+        rawProtocolFeeBps === null ||
+        (typeof rawProtocolFeeBps === 'string' && rawProtocolFeeBps.trim() === '')
+      ) {
+        reply(400, { error: 'protocolFeeBps must be a finite integer between 0 and 1000.' });
+        return true;
+      }
+      const parsedFee = Number(rawProtocolFeeBps);
+      if (!Number.isFinite(parsedFee) || !Number.isInteger(parsedFee) || parsedFee < 0 || parsedFee > 1000) {
+        reply(400, { error: 'protocolFeeBps must be a finite integer between 0 and 1000.' });
+        return true;
+      }
+      effectiveProtocolFeeBps = parsedFee;
+    }
 
     const plan = await evaluatePreservationPlan(rawScan, {
       selectedAssetIds: Array.isArray(body.selectedAssetIds)

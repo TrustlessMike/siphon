@@ -61,27 +61,72 @@ export function encodeMulticall3Aggregate3(
   return '0x' + AGGREGATE3_SELECTOR + headerChunks.join('') + offsets.join('') + encodedElements.join('');
 }
 
+const MAX_MULTICALL3_ITEMS = 1000;
+
+/**
+ * Redacts an RPC URL to `scheme://host[:port]` only, stripping any userinfo,
+ * path segments, query parameters, or fragments where API keys (Alchemy/Helius/Infura) live.
+ */
+export function redactRpcUrl(rawUrl: string): string {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) return '<unknown-rpc>';
+  try {
+    const parsed = new URL(rawUrl.trim());
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return '<invalid-rpc-url>';
+  }
+}
+
+function sanitizeRpcErrorText(text: string, rawUrl: string): string {
+  const redacted = redactRpcUrl(rawUrl);
+  return rawUrl ? text.split(rawUrl).join(redacted) : text;
+}
+
 /**
  * Decodes Multicall3.aggregate3 return bytes: (bool success, bytes returnData)[]
+ * with strict hex, even-length, offset, count (<= 1000), and slice-bounds validation.
  */
 export function decodeMulticall3Aggregate3(
   hexResult: string
 ): Array<{ success: boolean; returnData: string }> {
-  const raw = strip0x(hexResult);
-  if (raw.length < 128) return [];
+  if (typeof hexResult !== 'string') return [];
+  const raw = strip0x(hexResult.trim());
+  if (raw.length < 128 || raw.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(raw)) return [];
 
-  const arrayOffset = Number(BigInt('0x' + raw.slice(0, 64))) * 2;
-  const count = Number(BigInt('0x' + raw.slice(arrayOffset, arrayOffset + 64)));
+  const totalBytes = BigInt(raw.length / 2);
+  const arrayOffsetBytes = BigInt('0x' + raw.slice(0, 64));
+  if (arrayOffsetBytes > totalBytes) return [];
+  const arrayOffset = Number(arrayOffsetBytes) * 2;
+  if (arrayOffset + 64 > raw.length) return [];
+
+  const countBig = BigInt('0x' + raw.slice(arrayOffset, arrayOffset + 64));
+  if (countBig <= 0n || countBig > BigInt(MAX_MULTICALL3_ITEMS)) return [];
+  const count = Number(countBig);
+
   const tableStart = arrayOffset + 64;
+  if (tableStart + count * 64 > raw.length) return [];
+
   const out: Array<{ success: boolean; returnData: string }> = [];
 
   for (let i = 0; i < count; i++) {
-    const relOffset = Number(BigInt('0x' + raw.slice(tableStart + i * 64, tableStart + (i + 1) * 64))) * 2;
-    const itemStart = tableStart + relOffset;
+    const slotStart = tableStart + i * 64;
+    if (slotStart + 64 > raw.length) return [];
+    const relOffsetBytes = BigInt('0x' + raw.slice(slotStart, slotStart + 64));
+    if (relOffsetBytes > totalBytes) return [];
+    const itemStart = tableStart + Number(relOffsetBytes) * 2;
+    if (itemStart < tableStart || itemStart + 128 > raw.length) return [];
+
     const success = BigInt('0x' + raw.slice(itemStart, itemStart + 64)) === 1n;
-    const bytesRel = Number(BigInt('0x' + raw.slice(itemStart + 64, itemStart + 128))) * 2;
-    const bytesStart = itemStart + bytesRel;
-    const byteLen = Number(BigInt('0x' + raw.slice(bytesStart, bytesStart + 64)));
+    const bytesRelBytes = BigInt('0x' + raw.slice(itemStart + 64, itemStart + 128));
+    if (bytesRelBytes > totalBytes) return [];
+    const bytesStart = itemStart + Number(bytesRelBytes) * 2;
+    if (bytesStart < itemStart || bytesStart + 64 > raw.length) return [];
+
+    const byteLenBig = BigInt('0x' + raw.slice(bytesStart, bytesStart + 64));
+    const remainingBytes = BigInt((raw.length - (bytesStart + 64)) / 2);
+    if (byteLenBig > remainingBytes) return [];
+    const byteLen = Number(byteLenBig);
+
     const dataHex = raw.slice(bytesStart + 64, bytesStart + 64 + byteLen * 2);
     out.push({ success, returnData: '0x' + dataHex });
   }
@@ -275,10 +320,10 @@ export function getRpcCircuitBreakerMetrics(now = circuitBreakerNowMs()): RpcCir
   for (const st of rpcCircuitStates.values()) {
     if (st.cooldownUntilMs > now) {
       openEndpoints.push({
-        url: st.url,
+        url: redactRpcUrl(st.url),
         cooldownRemainingMs: st.cooldownUntilMs - now,
         tripCount: st.tripCount,
-        lastError: st.lastError,
+        lastError: st.lastError ? sanitizeRpcErrorText(st.lastError, st.url) : undefined,
       });
     }
   }
@@ -419,7 +464,7 @@ export async function evmJsonRpcBatch(
       });
       clearTimeout(timer);
       if (!res.ok) {
-        const msg = `RPC HTTP ${res.status} (${rpcUrl})`;
+        const msg = `RPC HTTP ${res.status} (${redactRpcUrl(rpcUrl)})`;
         if (res.status === 429) {
           recordRpcRateLimitFailure(rpcUrl, msg, true, circuitOpts);
         }
@@ -484,10 +529,13 @@ export async function evmJsonRpcBatch(
           if (singleCheck.http429 || singleCheck.rateLimited) {
             recordRpcRateLimitFailure(rpcUrl, singleCheck.reason, Boolean(singleCheck.http429), circuitOpts);
           }
-          lastErr = new Error(`${singleCheck.reason} (${rpcUrl})`);
+          lastErr = new Error(`${singleCheck.reason} (${redactRpcUrl(rpcUrl)})`);
           continue;
         } catch (eFallback) {
-          lastErr = eFallback;
+          lastErr =
+            eFallback instanceof Error
+              ? new Error(sanitizeRpcErrorText(eFallback.message, rpcUrl))
+              : new Error(sanitizeRpcErrorText(String(eFallback), rpcUrl));
           continue;
         }
       }
@@ -495,11 +543,14 @@ export async function evmJsonRpcBatch(
       if (batchCheck.http429 || batchCheck.rateLimited) {
         recordRpcRateLimitFailure(rpcUrl, batchCheck.reason, Boolean(batchCheck.http429), circuitOpts);
       }
-      lastErr = new Error(`${batchCheck.reason} (${rpcUrl})`);
+      lastErr = new Error(`${batchCheck.reason} (${redactRpcUrl(rpcUrl)})`);
       continue;
     } catch (err) {
       clearTimeout(timer);
-      lastErr = err;
+      lastErr =
+        err instanceof Error
+          ? new Error(sanitizeRpcErrorText(err.message, rpcUrl))
+          : new Error(sanitizeRpcErrorText(String(err), rpcUrl));
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'All RPC endpoints failed'));
@@ -529,7 +580,7 @@ export async function evmJsonRpcCall<T = string>(
       });
       clearTimeout(timer);
       if (!res.ok) {
-        const msg = `RPC HTTP ${res.status} (${rpcUrl})`;
+        const msg = `RPC HTTP ${res.status} (${redactRpcUrl(rpcUrl)})`;
         if (res.status === 429) {
           recordRpcRateLimitFailure(rpcUrl, msg, true, circuitOpts);
         }
@@ -548,7 +599,10 @@ export async function evmJsonRpcCall<T = string>(
           recordRpcSuccess(rpcUrl);
           return json;
         }
-        const msg = json.error.message ?? `RPC error ${json.error.code ?? ''}`;
+        const msg = sanitizeRpcErrorText(
+          json.error.message ?? `RPC error ${json.error.code ?? ''}`,
+          rpcUrl
+        );
         if (isRateLimitRpcError(json.error)) {
           recordRpcRateLimitFailure(rpcUrl, msg, json.error.code === 429, circuitOpts);
         }
@@ -558,7 +612,10 @@ export async function evmJsonRpcCall<T = string>(
       lastErr = new Error('Empty JSON-RPC response');
     } catch (err) {
       clearTimeout(timer);
-      lastErr = err;
+      lastErr =
+        err instanceof Error
+          ? new Error(sanitizeRpcErrorText(err.message, rpcUrl))
+          : new Error(sanitizeRpcErrorText(String(err), rpcUrl));
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? 'All RPC endpoints failed'));

@@ -77,8 +77,17 @@ export function logJson(
   else console.log(entry);
 }
 
+export function parseServerPort(raw?: string): number {
+  if (raw === undefined || raw.trim() === '') return 4420;
+  const parsed = Number(raw.trim());
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    throw new Error(`Invalid PORT "${raw}": expected an integer in [1, 65535].`);
+  }
+  return parsed;
+}
+
 export function startSiphonProcess(env: NodeJS.ProcessEnv = process.env) {
-  const port = Number(env.PORT ?? 4420);
+  const port = parseServerPort(env.PORT);
   const host = env.HOST?.trim() || '127.0.0.1';
 
   const check = assertSafeStartupConfig({

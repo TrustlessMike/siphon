@@ -98,6 +98,56 @@ export interface Eip1559TransactionParams {
   data: string;
 }
 
+const DEFAULT_CHAIN_MAX_GAS_LIMIT = 15_000_000n;
+const HIGH_GAS_PRICE_CHAINS = new Set<EvmChainId>(['ethereum', 'polygon', 'avalanche', 'sonic']);
+const DEFAULT_HIGH_CHAIN_MAX_FEE_CAP_WEI = 500_000_000_000n; // 500 gwei
+const DEFAULT_L2_CHAIN_MAX_FEE_CAP_WEI = 50_000_000_000n; // 50 gwei
+
+export function getChainRelayerCaps(chain: EvmChainId): {
+  maxFeeCapWei: bigint;
+  maxGasLimit: bigint;
+} {
+  const maxFeeCapWei = HIGH_GAS_PRICE_CHAINS.has(chain)
+    ? DEFAULT_HIGH_CHAIN_MAX_FEE_CAP_WEI
+    : DEFAULT_L2_CHAIN_MAX_FEE_CAP_WEI;
+  return {
+    maxFeeCapWei,
+    maxGasLimit: DEFAULT_CHAIN_MAX_GAS_LIMIT,
+  };
+}
+
+// Per-(chain, relayerAddress) async mutex queue and local pending-nonce tracker
+const relayerNonceQueues = new Map<string, Promise<void>>();
+const relayerPendingNonces = new Map<string, number>();
+
+async function withRelayerNonceLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = relayerNonceQueues.get(key) ?? Promise.resolve();
+  let releaseLock!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseLock = resolve;
+  });
+  const tail = previous.then(() => current);
+  relayerNonceQueues.set(key, tail);
+
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    releaseLock();
+    if (relayerNonceQueues.get(key) === tail) {
+      relayerNonceQueues.delete(key);
+    }
+  }
+}
+
+/**
+ * Resets in-memory relayer nonce tracking state (for deterministic tests).
+ */
+export function resetRelayerNonceTrackerForTest(): void {
+  relayerPendingNonces.clear();
+  relayerNonceQueues.clear();
+}
+
 /**
  * Signs an EIP-1559 (Type-2) Ethereum transaction using `@noble/curves/secp256k1`
  * with strict EIP-2 low-`s` normalization.
@@ -115,11 +165,24 @@ export function signEip1559Transaction(
   if (!privBytes) {
     throw new Error('Invalid 32-byte secp256k1 private key.');
   }
+  if (!Number.isInteger(tx.chainId) || tx.chainId <= 0) {
+    throw new Error(`Invalid transaction chainId: ${tx.chainId}`);
+  }
   if (!/^0x[0-9a-fA-F]{40}$/.test(tx.to.trim())) {
     throw new Error(`Invalid transaction destination address: ${tx.to}`);
   }
   if (!Number.isInteger(tx.nonce) || tx.nonce < 0) {
     throw new Error(`Invalid transaction nonce: ${tx.nonce}`);
+  }
+  const valueWei = tx.valueWei ?? 0n;
+  if (valueWei < 0n) {
+    throw new Error('Transaction valueWei cannot be negative.');
+  }
+  if (tx.maxPriorityFeePerGasWei < 0n || tx.maxFeePerGasWei < 0n) {
+    throw new Error('Transaction EIP-1559 fee parameters cannot be negative.');
+  }
+  if (tx.maxPriorityFeePerGasWei > tx.maxFeePerGasWei) {
+    throw new Error('Transaction maxPriorityFeePerGasWei cannot exceed maxFeePerGasWei.');
   }
   if (tx.gasLimit <= 0n) {
     throw new Error('Transaction gasLimit must be positive.');
@@ -133,7 +196,7 @@ export function signEip1559Transaction(
     bigintToMinimalBytes(tx.maxFeePerGasWei),
     bigintToMinimalBytes(tx.gasLimit),
     hexToBytes(tx.to.trim()),
-    bigintToMinimalBytes(tx.valueWei ?? 0n),
+    bigintToMinimalBytes(valueWei),
     hexToBytes(tx.data.trim()),
     [], // accessList
   ];
@@ -164,6 +227,7 @@ export type RelayerBroadcastReasonCode =
   | 'relayer_key_invalid'
   | 'router_unconfigured'
   | 'invalid_calldata'
+  | 'invalid_tx_params'
   | 'rpc_error'
   | 'invalid_tx_hash';
 
@@ -278,175 +342,284 @@ export async function broadcastSignedRelayerTx(
   const rpcCall = req.rpcCall ?? evmJsonRpcCall;
   const timeoutMs = req.timeoutMs ?? 6000;
   const valueWei = req.valueWei ?? 0n;
+  const { maxFeeCapWei, maxGasLimit } = getChainRelayerCaps(req.chain);
 
-  try {
-    // 1. Resolve relayer pending nonce
-    let nonce = req.nonce;
-    if (nonce === undefined) {
-      const nonceRes = await rpcCall<string>(
-        rpcUrls,
-        'eth_getTransactionCount',
-        [relayerAddress, 'pending'],
-        timeoutMs
-      );
-      if (nonceRes.error || !nonceRes.result) {
-        return {
-          broadcasted: false,
-          relayerAddress,
-          reasonCode: 'rpc_error',
-          diagnostic: `Failed to fetch relayer nonce on ${cfg.name}: ${nonceRes.error?.message ?? 'empty RPC result'}.`,
-        };
-      }
-      nonce = Number(BigInt(nonceRes.result));
-    }
-
-    // 2. Resolve EIP-1559 gas pricing
-    let maxPriorityFeePerGasWei = req.maxPriorityFeePerGasWei;
-    let maxFeePerGasWei = req.maxFeePerGasWei;
-
-    if (maxFeePerGasWei === undefined || maxPriorityFeePerGasWei === undefined) {
-      const gasPriceRes = await rpcCall<string>(rpcUrls, 'eth_gasPrice', [], timeoutMs);
-      if (gasPriceRes.error || !gasPriceRes.result) {
-        return {
-          broadcasted: false,
-          relayerAddress,
-          nonce,
-          reasonCode: 'rpc_error',
-          diagnostic: `Failed to fetch gas price on ${cfg.name}: ${gasPriceRes.error?.message ?? 'empty RPC result'}.`,
-        };
-      }
-      const baseGasPrice = BigInt(gasPriceRes.result);
-      if (maxPriorityFeePerGasWei === undefined) {
-        try {
-          const prioRes = await rpcCall<string>(rpcUrls, 'eth_maxPriorityFeePerGas', [], timeoutMs);
-          maxPriorityFeePerGasWei =
-            prioRes.result && BigInt(prioRes.result) > 0n
-              ? BigInt(prioRes.result)
-              : baseGasPrice / 10n > 100_000_000n
-              ? baseGasPrice / 10n
-              : 100_000_000n;
-        } catch {
-          maxPriorityFeePerGasWei = 100_000_000n; // 0.1 gwei fallback
-        }
-      }
-      if (maxFeePerGasWei === undefined) {
-        const buffered = (baseGasPrice * 130n) / 100n + maxPriorityFeePerGasWei;
-        maxFeePerGasWei = buffered > maxPriorityFeePerGasWei ? buffered : maxPriorityFeePerGasWei;
-      }
-    }
-
-    // 3. Resolve gasLimit with 25% safety buffer
-    let gasLimit = req.gasLimit;
-    if (gasLimit === undefined) {
-      const estRes = await rpcCall<string>(
-        rpcUrls,
-        'eth_estimateGas',
-        [
-          {
-            from: relayerAddress,
-            to,
-            data,
-            value: '0x' + valueWei.toString(16),
-          },
-        ],
-        timeoutMs
-      );
-      if (estRes.error || !estRes.result) {
-        const revertNote = isEvmExecutionRevertError(estRes.error) ? ' (EVM execution reverted)' : '';
-        return {
-          broadcasted: false,
-          relayerAddress,
-          nonce,
-          reasonCode: 'rpc_error',
-          diagnostic: `Gas estimation failed on ${cfg.name}${revertNote}: ${estRes.error?.message ?? 'empty RPC result'}.`,
-        };
-      }
-      const estimated = BigInt(estRes.result);
-      gasLimit = (estimated * 125n) / 100n;
-    }
-
-    // 4. Sign EIP-1559 transaction
-    const signed = signEip1559Transaction(
-      {
-        chainId: cfg.chainId,
-        nonce,
-        maxPriorityFeePerGasWei,
-        maxFeePerGasWei,
-        gasLimit,
-        to,
-        valueWei,
-        data,
-      },
-      rawKey
-    );
-
-    // 5. Broadcast via custom hook or eth_sendRawTransaction
-    let broadcastTxHash: string | undefined;
-    if (req.sendRawTransaction) {
-      broadcastTxHash = await req.sendRawTransaction({
-        chain: req.chain,
-        chainId: cfg.chainId,
-        rawTransaction: signed.rawTransaction,
-        computedTxHash: signed.txHash,
-        from: relayerAddress,
-        to,
-        nonce,
-        gasLimit,
-        maxFeePerGasWei,
-        maxPriorityFeePerGasWei,
-        rpcUrls,
-      });
-    } else {
-      const sendRes = await rpcCall<string>(
-        rpcUrls,
-        'eth_sendRawTransaction',
-        [signed.rawTransaction],
-        timeoutMs
-      );
-      if (sendRes.error || !sendRes.result) {
-        return {
-          broadcasted: false,
-          relayerAddress,
-          nonce,
-          gasLimit: gasLimit.toString(),
-          maxFeePerGasWei: maxFeePerGasWei.toString(),
-          maxPriorityFeePerGasWei: maxPriorityFeePerGasWei.toString(),
-          reasonCode: 'rpc_error',
-          diagnostic: `eth_sendRawTransaction rejected on ${cfg.name}: ${sendRes.error?.message ?? 'empty RPC result'}.`,
-        };
-      }
-      broadcastTxHash = sendRes.result;
-    }
-
-    const cleanHash = typeof broadcastTxHash === 'string' ? broadcastTxHash.trim() : '';
-    if (!/^0x[0-9a-fA-F]{64}$/.test(cleanHash)) {
-      return {
-        broadcasted: false,
-        relayerAddress,
-        nonce,
-        reasonCode: 'invalid_tx_hash',
-        diagnostic: `Relayer RPC/broadcaster returned an invalid transaction hash ("${cleanHash}"); refusing to mark broadcast.`,
-      };
-    }
-
-    return {
-      broadcasted: true,
-      reasonCode: 'broadcasted',
-      txHash: cleanHash,
-      relayerAddress,
-      nonce,
-      gasLimit: gasLimit.toString(),
-      maxFeePerGasWei: maxFeePerGasWei.toString(),
-      maxPriorityFeePerGasWei: maxPriorityFeePerGasWei.toString(),
-      rawTransaction: signed.rawTransaction,
-      diagnostic: `Signed EIP-1559 transaction broadcast on ${cfg.name} from ${relayerAddress} (nonce ${nonce}).`,
-    };
-  } catch (err) {
+  if (!Number.isInteger(cfg.chainId) || cfg.chainId <= 0) {
     return {
       broadcasted: false,
       relayerAddress,
-      reasonCode: 'rpc_error',
-      diagnostic: `Relayer broadcast failed on ${cfg.name}: ${err instanceof Error ? err.message : String(err)}.`,
+      reasonCode: 'invalid_tx_params',
+      diagnostic: `Invalid chainId (${cfg.chainId}) configured for ${cfg.name}.`,
     };
   }
+  if (valueWei < 0n) {
+    return {
+      broadcasted: false,
+      relayerAddress,
+      reasonCode: 'invalid_tx_params',
+      diagnostic: 'Transaction valueWei cannot be negative.',
+    };
+  }
+  if (req.nonce !== undefined && (!Number.isInteger(req.nonce) || req.nonce < 0)) {
+    return {
+      broadcasted: false,
+      relayerAddress,
+      reasonCode: 'invalid_tx_params',
+      diagnostic: `Invalid explicit nonce (${String(req.nonce)}): expected a non-negative integer.`,
+    };
+  }
+  if (req.gasLimit !== undefined && (req.gasLimit <= 0n || req.gasLimit > maxGasLimit)) {
+    return {
+      broadcasted: false,
+      relayerAddress,
+      reasonCode: 'invalid_tx_params',
+      diagnostic: `Transaction gasLimit (${req.gasLimit.toString()}) out of bounds (must be in (0, ${maxGasLimit.toString()}]).`,
+    };
+  }
+  if (req.maxPriorityFeePerGasWei !== undefined && req.maxPriorityFeePerGasWei < 0n) {
+    return {
+      broadcasted: false,
+      relayerAddress,
+      reasonCode: 'invalid_tx_params',
+      diagnostic: 'maxPriorityFeePerGasWei cannot be negative.',
+    };
+  }
+  if (req.maxFeePerGasWei !== undefined) {
+    if (req.maxFeePerGasWei < 0n || req.maxFeePerGasWei > maxFeeCapWei) {
+      return {
+        broadcasted: false,
+        relayerAddress,
+        reasonCode: 'invalid_tx_params',
+        diagnostic: `maxFeePerGasWei (${req.maxFeePerGasWei.toString()}) exceeds ${cfg.name} safety cap (${maxFeeCapWei.toString()} wei).`,
+      };
+    }
+    if (req.maxPriorityFeePerGasWei !== undefined && req.maxPriorityFeePerGasWei > req.maxFeePerGasWei) {
+      return {
+        broadcasted: false,
+        relayerAddress,
+        reasonCode: 'invalid_tx_params',
+        diagnostic: 'maxPriorityFeePerGasWei cannot exceed maxFeePerGasWei.',
+      };
+    }
+  }
+
+  const lockKey = `${req.chain}:${relayerAddress.toLowerCase()}`;
+
+  return withRelayerNonceLock(lockKey, async (): Promise<RelayerBroadcastResult> => {
+    try {
+      // 1. Resolve relayer pending nonce under per-(chain, relayerAddress) lock
+      let nonce = req.nonce;
+      if (nonce === undefined) {
+        const nonceRes = await rpcCall<string>(
+          rpcUrls,
+          'eth_getTransactionCount',
+          [relayerAddress, 'pending'],
+          timeoutMs
+        );
+        if (nonceRes.error || !nonceRes.result) {
+          return {
+            broadcasted: false,
+            relayerAddress,
+            reasonCode: 'rpc_error',
+            diagnostic: `Failed to fetch relayer nonce on ${cfg.name}: ${nonceRes.error?.message ?? 'empty RPC result'}.`,
+          };
+        }
+        const rpcNonce = Number(BigInt(nonceRes.result));
+        const localNext = relayerPendingNonces.get(lockKey);
+        nonce = localNext !== undefined && localNext > rpcNonce ? localNext : rpcNonce;
+      }
+
+      // 2. Resolve EIP-1559 gas pricing with strict cap & priority invariants
+      let maxPriorityFeePerGasWei = req.maxPriorityFeePerGasWei;
+      let maxFeePerGasWei = req.maxFeePerGasWei;
+
+      if (maxFeePerGasWei === undefined || maxPriorityFeePerGasWei === undefined) {
+        const gasPriceRes = await rpcCall<string>(rpcUrls, 'eth_gasPrice', [], timeoutMs);
+        if (gasPriceRes.error || !gasPriceRes.result) {
+          return {
+            broadcasted: false,
+            relayerAddress,
+            nonce,
+            reasonCode: 'rpc_error',
+            diagnostic: `Failed to fetch gas price on ${cfg.name}: ${gasPriceRes.error?.message ?? 'empty RPC result'}.`,
+          };
+        }
+        const baseGasPrice = BigInt(gasPriceRes.result);
+        if (maxPriorityFeePerGasWei === undefined) {
+          try {
+            const prioRes = await rpcCall<string>(rpcUrls, 'eth_maxPriorityFeePerGas', [], timeoutMs);
+            maxPriorityFeePerGasWei =
+              prioRes.result && BigInt(prioRes.result) > 0n
+                ? BigInt(prioRes.result)
+                : baseGasPrice / 10n > 100_000_000n
+                ? baseGasPrice / 10n
+                : 100_000_000n;
+          } catch {
+            maxPriorityFeePerGasWei = 100_000_000n; // 0.1 gwei fallback
+          }
+        }
+        if (maxFeePerGasWei === undefined) {
+          const buffered = (baseGasPrice * 130n) / 100n + maxPriorityFeePerGasWei;
+          maxFeePerGasWei = buffered > maxPriorityFeePerGasWei ? buffered : maxPriorityFeePerGasWei;
+        }
+        // Clamp RPC-derived priority fee if it exceeds resolved/explicit maxFeePerGasWei
+        if (req.maxPriorityFeePerGasWei === undefined && maxPriorityFeePerGasWei > maxFeePerGasWei) {
+          maxPriorityFeePerGasWei = maxFeePerGasWei;
+        }
+      }
+
+      if (
+        maxPriorityFeePerGasWei < 0n ||
+        maxFeePerGasWei < 0n ||
+        maxPriorityFeePerGasWei > maxFeePerGasWei
+      ) {
+        return {
+          broadcasted: false,
+          relayerAddress,
+          nonce,
+          reasonCode: 'invalid_tx_params',
+          diagnostic: `Invalid EIP-1559 fee bounds on ${cfg.name}: priority=${maxPriorityFeePerGasWei.toString()}, maxFee=${maxFeePerGasWei.toString()}.`,
+        };
+      }
+      if (maxFeePerGasWei > maxFeeCapWei) {
+        return {
+          broadcasted: false,
+          relayerAddress,
+          nonce,
+          reasonCode: 'invalid_tx_params',
+          diagnostic: `Resolved maxFeePerGasWei (${maxFeePerGasWei.toString()}) exceeds ${cfg.name} safety cap (${maxFeeCapWei.toString()} wei).`,
+        };
+      }
+
+      // 3. Resolve gasLimit with 25% safety buffer and strict upper cap
+      let gasLimit = req.gasLimit;
+      if (gasLimit === undefined) {
+        const estRes = await rpcCall<string>(
+          rpcUrls,
+          'eth_estimateGas',
+          [
+            {
+              from: relayerAddress,
+              to,
+              data,
+              value: '0x' + valueWei.toString(16),
+            },
+          ],
+          timeoutMs
+        );
+        if (estRes.error || !estRes.result) {
+          const revertNote = isEvmExecutionRevertError(estRes.error) ? ' (EVM execution reverted)' : '';
+          return {
+            broadcasted: false,
+            relayerAddress,
+            nonce,
+            reasonCode: 'rpc_error',
+            diagnostic: `Gas estimation failed on ${cfg.name}${revertNote}: ${estRes.error?.message ?? 'empty RPC result'}.`,
+          };
+        }
+        const estimated = BigInt(estRes.result);
+        gasLimit = (estimated * 125n) / 100n;
+      }
+
+      if (gasLimit <= 0n || gasLimit > maxGasLimit) {
+        return {
+          broadcasted: false,
+          relayerAddress,
+          nonce,
+          reasonCode: 'invalid_tx_params',
+          diagnostic: `Resolved gasLimit (${gasLimit.toString()}) out of bounds (must be in (0, ${maxGasLimit.toString()}]).`,
+        };
+      }
+
+      // 4. Sign EIP-1559 transaction
+      const signed = signEip1559Transaction(
+        {
+          chainId: cfg.chainId,
+          nonce,
+          maxPriorityFeePerGasWei,
+          maxFeePerGasWei,
+          gasLimit,
+          to,
+          valueWei,
+          data,
+        },
+        rawKey
+      );
+
+      // 5. Broadcast via custom hook or eth_sendRawTransaction
+      let broadcastTxHash: string | undefined;
+      if (req.sendRawTransaction) {
+        broadcastTxHash = await req.sendRawTransaction({
+          chain: req.chain,
+          chainId: cfg.chainId,
+          rawTransaction: signed.rawTransaction,
+          computedTxHash: signed.txHash,
+          from: relayerAddress,
+          to,
+          nonce,
+          gasLimit,
+          maxFeePerGasWei,
+          maxPriorityFeePerGasWei,
+          rpcUrls,
+        });
+      } else {
+        const sendRes = await rpcCall<string>(
+          rpcUrls,
+          'eth_sendRawTransaction',
+          [signed.rawTransaction],
+          timeoutMs
+        );
+        if (sendRes.error || !sendRes.result) {
+          return {
+            broadcasted: false,
+            relayerAddress,
+            nonce,
+            gasLimit: gasLimit.toString(),
+            maxFeePerGasWei: maxFeePerGasWei.toString(),
+            maxPriorityFeePerGasWei: maxPriorityFeePerGasWei.toString(),
+            reasonCode: 'rpc_error',
+            diagnostic: `eth_sendRawTransaction rejected on ${cfg.name}: ${sendRes.error?.message ?? 'empty RPC result'}.`,
+          };
+        }
+        broadcastTxHash = sendRes.result;
+      }
+
+      const cleanHash = typeof broadcastTxHash === 'string' ? broadcastTxHash.trim() : '';
+      if (!/^0x[0-9a-fA-F]{64}$/.test(cleanHash)) {
+        return {
+          broadcasted: false,
+          relayerAddress,
+          nonce,
+          reasonCode: 'invalid_tx_hash',
+          diagnostic: `Relayer RPC/broadcaster returned an invalid transaction hash ("${cleanHash}"); refusing to mark broadcast.`,
+        };
+      }
+
+      // Advance local pending-nonce tracker strictly after broadcast succeeded
+      const prevLocal = relayerPendingNonces.get(lockKey) ?? 0;
+      if (nonce + 1 > prevLocal) {
+        relayerPendingNonces.set(lockKey, nonce + 1);
+      }
+
+      return {
+        broadcasted: true,
+        reasonCode: 'broadcasted',
+        txHash: cleanHash,
+        relayerAddress,
+        nonce,
+        gasLimit: gasLimit.toString(),
+        maxFeePerGasWei: maxFeePerGasWei.toString(),
+        maxPriorityFeePerGasWei: maxPriorityFeePerGasWei.toString(),
+        rawTransaction: signed.rawTransaction,
+        diagnostic: `Signed EIP-1559 transaction broadcast on ${cfg.name} from ${relayerAddress} (nonce ${nonce}).`,
+      };
+    } catch (err) {
+      return {
+        broadcasted: false,
+        relayerAddress,
+        reasonCode: 'rpc_error',
+        diagnostic: `Relayer broadcast failed on ${cfg.name}: ${err instanceof Error ? err.message : String(err)}.`,
+      };
+    }
+  });
 }

@@ -1,3 +1,4 @@
+import { VersionedTransaction } from '@solana/web3.js';
 import { solanaAddressToBytes32 } from '../bridge/cctp.js';
 import { BoundedTtlCache } from '../server/cache.js';
 
@@ -368,6 +369,43 @@ const GEO_BLOCK_TEXT_RE = /\b(geo|region|country|jurisdiction|restricted|not ava
 
 const CATEGORY_SET = new Set<string>(ALLOWED_JUPITER_CATEGORIES);
 const FILTER_SET = new Set<string>(ALLOWED_JUPITER_FILTERS);
+
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/**
+ * Deserializes a base64-encoded Solana transaction returned by Jupiter Prediction API
+ * and verifies that `feePayer === expectedFeePayer` (matching `yield-park.ts` security guarantees).
+ */
+export function verifyJupiterTransactionBase64(
+  rawTx: string | null,
+  expectedFeePayer: string | null
+): { ok: true; transactionBase64: string } | { ok: false; reason: string } {
+  if (typeof rawTx !== 'string') {
+    return { ok: false, reason: 'Jupiter endpoint responded without a signable transaction.' };
+  }
+  const clean = rawTx.trim();
+  if (!clean || clean.length % 4 !== 0 || !BASE64_RE.test(clean)) {
+    return { ok: false, reason: 'Jupiter returned malformed base64 transaction payload.' };
+  }
+  const txBytes = Buffer.from(clean, 'base64');
+  let parsedTx: VersionedTransaction;
+  try {
+    parsedTx = VersionedTransaction.deserialize(txBytes);
+  } catch {
+    return { ok: false, reason: 'Jupiter returned malformed Solana transaction bytes.' };
+  }
+  const feePayer = parsedTx.message.staticAccountKeys[0]?.toBase58();
+  if (!feePayer) {
+    return { ok: false, reason: 'Jupiter transaction is missing a feePayer account.' };
+  }
+  if (expectedFeePayer && feePayer !== expectedFeePayer) {
+    return {
+      ok: false,
+      reason: `Jupiter transaction feePayer mismatch: got ${feePayer}, expected ${expectedFeePayer}.`,
+    };
+  }
+  return { ok: true, transactionBase64: clean };
+}
 
 function roundTo(n: number, decimals: number): number {
   const factor = 10 ** decimals;
@@ -1465,15 +1503,18 @@ export class JupiterMarketsClient {
               : typeof obj.tx === 'string'
                 ? obj.tx
                 : null;
+          const verifiedTx = tx ? verifyJupiterTransactionBase64(tx, walletAddress) : null;
           liveOrder = {
             attempted: true,
-            available: Boolean(tx),
+            available: Boolean(verifiedTx?.ok),
             depositMint: SOLANA_USDC_MINT,
             orderId: typeof obj.orderId === 'string' ? sanitizeDegenText(obj.orderId, 80) : null,
-            transactionBase64: tx,
+            transactionBase64: verifiedTx?.ok ? verifiedTx.transactionBase64 : null,
             expiresAt: normalizeIsoCloseTime(obj.expiresAt),
-            reason: tx
-              ? undefined
+            reason: verifiedTx
+              ? verifiedTx.ok
+                ? undefined
+                : verifiedTx.reason
               : 'Jupiter order endpoint responded without a signable transaction; trade directly on Jupiter.',
           };
         }
@@ -1626,19 +1667,22 @@ export class JupiterMarketsClient {
         : typeof obj.tx === 'string'
           ? obj.tx
           : null;
+    const verifiedTx = tx ? verifyJupiterTransactionBase64(tx, cleanOwner) : null;
 
     return {
       ok: true,
       action: 'claim',
       positionId,
-      available: Boolean(tx),
-      transactionBase64: tx,
+      available: Boolean(verifiedTx?.ok),
+      transactionBase64: verifiedTx?.ok ? verifiedTx.transactionBase64 : null,
       orderId: typeof obj.orderId === 'string' ? sanitizeDegenText(obj.orderId, 80) : null,
       expiresAt: normalizeIsoCloseTime(obj.expiresAt),
       jupiterUrl: fallbackUrl,
       apiKeyConfigured: true,
-      reason: tx
-        ? undefined
+      reason: verifiedTx
+        ? verifiedTx.ok
+          ? undefined
+          : verifiedTx.reason
         : 'Jupiter claim endpoint returned no signable transaction; claim directly on Jupiter.',
     };
   }
@@ -1702,19 +1746,22 @@ export class JupiterMarketsClient {
         : typeof obj.tx === 'string'
           ? obj.tx
           : null;
+    const verifiedTx = tx ? verifyJupiterTransactionBase64(tx, cleanOwner) : null;
 
     return {
       ok: true,
       action: 'close',
       positionId,
-      available: Boolean(tx),
-      transactionBase64: tx,
+      available: Boolean(verifiedTx?.ok),
+      transactionBase64: verifiedTx?.ok ? verifiedTx.transactionBase64 : null,
       orderId: typeof obj.orderId === 'string' ? sanitizeDegenText(obj.orderId, 80) : null,
       expiresAt: normalizeIsoCloseTime(obj.expiresAt),
       jupiterUrl: fallbackUrl,
       apiKeyConfigured: true,
-      reason: tx
-        ? undefined
+      reason: verifiedTx
+        ? verifiedTx.ok
+          ? undefined
+          : verifiedTx.reason
         : 'Jupiter close endpoint returned no signable transaction; exit directly on Jupiter.',
     };
   }

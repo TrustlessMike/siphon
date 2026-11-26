@@ -18,6 +18,7 @@ export const MAX_PRESERVE_PCT = 100;
 export const MAX_TOTAL_USDC_AMOUNT = 100_000_000;
 export const DEFAULT_SLIPPAGE_BPS = 50;
 export const MAX_SLIPPAGE_BPS = 500;
+export const MAX_JUPITER_PRICE_IMPACT_PCT = 5;
 export const DEFAULT_YIELD_PARK_TIMEOUT_MS = 4_500;
 
 export type SolanaYieldStrategyId = 'jupsol' | 'jupiter_lend_usdc' | 'kamino_usdc';
@@ -350,7 +351,7 @@ export async function buildSolanaYieldParkPlan(
   }
 
   const strategyId: SolanaYieldStrategyId = params.strategy ?? 'jupsol';
-  if (!(strategyId in SOLANA_YIELD_STRATEGIES)) {
+  if (typeof strategyId !== 'string' || !Object.hasOwn(SOLANA_YIELD_STRATEGIES, strategyId)) {
     throw new Error(
       `Unsupported yield strategy "${String(params.strategy)}". Allowed: jupsol, jupiter_lend_usdc, kamino_usdc.`
     );
@@ -407,17 +408,49 @@ export async function buildSolanaYieldParkPlan(
     }
 
     const q = quoteRes.data;
+    const quotedInputMint = typeof q.inputMint === 'string' ? q.inputMint.trim() : '';
+    const quotedOutputMint = typeof q.outputMint === 'string' ? q.outputMint.trim() : '';
+    const quotedInAmount = typeof q.inAmount === 'string' ? q.inAmount.trim() : '';
+    if (quotedInputMint !== SOLANA_USDC_MINT) {
+      throw new Error(
+        `Jupiter Swap quote inputMint mismatch: got "${quotedInputMint || 'missing'}", expected ${SOLANA_USDC_MINT}.`
+      );
+    }
+    if (quotedOutputMint !== SOLANA_JUPSOL_MINT) {
+      throw new Error(
+        `Jupiter Swap quote outputMint mismatch: got "${quotedOutputMint || 'missing'}", expected ${SOLANA_JUPSOL_MINT}.`
+      );
+    }
+    if (!/^\d+$/.test(quotedInAmount) || quotedInAmount !== split.yieldUsdcRaw) {
+      throw new Error(
+        `Jupiter Swap quote inAmount mismatch: got "${quotedInAmount || 'missing'}", expected ${split.yieldUsdcRaw}.`
+      );
+    }
+
     const outAmountRaw = typeof q.outAmount === 'string' ? q.outAmount.trim() : '';
     const otherAmountThresholdRaw =
-      typeof q.otherAmountThreshold === 'string' ? q.otherAmountThreshold.trim() : outAmountRaw;
+      q.otherAmountThreshold === undefined
+        ? outAmountRaw
+        : typeof q.otherAmountThreshold === 'string'
+        ? q.otherAmountThreshold.trim()
+        : '';
     if (!/^\d+$/.test(outAmountRaw) || BigInt(outAmountRaw) <= 0n) {
       throw new Error('Jupiter Swap quote returned invalid or zero outAmount.');
     }
+    if (!/^\d+$/.test(otherAmountThresholdRaw) || BigInt(otherAmountThresholdRaw) <= 0n) {
+      throw new Error('Jupiter Swap quote returned invalid or zero otherAmountThreshold.');
+    }
 
     const rawPriceImpact = Number(q.priceImpactPct ?? 0);
-    const priceImpactPct = Number.isFinite(rawPriceImpact)
-      ? Number((rawPriceImpact * 100).toFixed(4))
-      : 0;
+    if (!Number.isFinite(rawPriceImpact) || rawPriceImpact < 0) {
+      throw new Error('Jupiter Swap quote returned invalid priceImpactPct.');
+    }
+    const priceImpactPct = Number((rawPriceImpact * 100).toFixed(4));
+    if (priceImpactPct > MAX_JUPITER_PRICE_IMPACT_PCT) {
+      throw new Error(
+        `Jupiter Swap quote price impact (${priceImpactPct}%) exceeds maximum safe limit (${MAX_JUPITER_PRICE_IMPACT_PCT}%).`
+      );
+    }
     const routePlan = Array.isArray(q.routePlan) ? q.routePlan : [];
     const routeLabels = routePlan
       .map((hop) => {

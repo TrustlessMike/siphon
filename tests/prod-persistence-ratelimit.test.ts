@@ -17,6 +17,7 @@ import {
   buildGaslessSweepIntent,
   clearTrackedGaslessIntentsForTest,
   configureGaslessIntentStore,
+  encodePermit2SweepCalldata,
   isGaslessDigestConsumed,
   submitAndBroadcastSignedGaslessIntent,
   submitSignedGaslessIntent,
@@ -522,6 +523,11 @@ test('Relayer Broadcaster: real EIP-1559 signing, custom & RPC broadcast, and ho
     });
     assert.ok(intent.eip712Digest);
     const sig = signDigestLowS(intent.eip712Digest, user.privKeyHex);
+    const boundCalldata = encodePermit2SweepCalldata({
+      plan: intent,
+      signature: sig,
+      gasReimbursementUsdc: 0n,
+    });
 
     let capturedRawTx = '';
     const broadcastReceipt = await submitAndBroadcastSignedGaslessIntent({
@@ -530,7 +536,7 @@ test('Relayer Broadcaster: real EIP-1559 signing, custom & RPC broadcast, and ho
       userAddress: user.address,
       signature: sig,
       deadline: intent.deadline,
-      txCalldata: calldata,
+      txCalldata: boundCalldata,
       nonce: 9,
       gasLimit: 300_000n,
       maxFeePerGasWei: 3_000_000_000n,
@@ -608,7 +614,7 @@ test('Rate limiter: sliding-window unit checks & HTTP 429 with Retry-After heade
   assert.equal(limiter.consume('ip:1.2.3.4').allowed, true);
 
   // 2. Live HTTP server returns 429 + Retry-After when limit exceeded, while /api/health remains exempt
-  const { server } = createSiphonServer({
+  const { server, agentEngine } = createSiphonServer({
     rateLimit: { maxRequests: 3, windowMs: 30_000 },
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -636,9 +642,19 @@ test('Rate limiter: sliding-window unit checks & HTTP 429 with Retry-After heade
     const health = await fetch(`${baseUrl}/api/health`);
     assert.equal(health.status, 200);
 
-    // Different Bearer token gets its own isolated quota bucket
+    // Unverified random Bearer token CANNOT bypass IP rate limit!
+    const fakeTokenRes = await fetch(`${baseUrl}/api/config`, {
+      headers: { Authorization: 'Bearer siphon_mcp_unverified_random_token' },
+    });
+    assert.equal(fakeTokenRes.status, 429);
+
+    // Verified plugin Bearer token gets its own isolated quota bucket
+    const issued = agentEngine.issuePluginToken({
+      label: 'RateLimit Isolated Bucket Test',
+      client: 'claude_mcp',
+    });
     const withToken = await fetch(`${baseUrl}/api/config`, {
-      headers: { Authorization: 'Bearer siphon_mcp_isolated_bucket_test_token' },
+      headers: { Authorization: `Bearer ${issued.token}` },
     });
     assert.equal(withToken.status, 200);
   } finally {

@@ -7,6 +7,7 @@ export interface RateLimiterOptions {
   windowMs?: number;
   maxKeys?: number;
   trustProxy?: boolean;
+  trustFlyClientIp?: boolean;
   nowMs?: () => number;
 }
 
@@ -57,31 +58,45 @@ function normalizeClientIp(raw: string | undefined): string {
 }
 
 /**
- * Extracts a stable per-token or per-IP rate-limit bucket key.
- * Bearer tokens are hashed with SHA-256 (16-hex prefix) so raw secrets are never retained.
+ * Extracts a stable per-verified-token or per-IP rate-limit bucket key.
+ *
+ * Security invariants:
+ *   - NEVER keys on unverified `Authorization: Bearer <random>` headers (prevents trivial quota bypass).
+ *   - Only uses `token:<id>` when the caller supplies an already-verified plugin `verifiedTokenId`.
+ *   - Only trusts `Fly-Client-IP` when `trustFlyClientIp` is true (i.e. `FLY_APP_NAME` is set).
+ *   - Under `trustProxy: true`, reads the rightmost untrusted IP in `X-Forwarded-For` rather than
+ *     the client-spoofable leftmost entry.
  */
-export function extractRateLimitKey(req: IncomingMessage, trustProxy = false): string {
-  const auth = req.headers.authorization;
-  const authValue = Array.isArray(auth) ? auth[0] : auth;
-  if (typeof authValue === 'string') {
-    const match = /^Bearer\s+(\S+)$/i.exec(authValue.trim());
-    if (match?.[1]) {
-      const digest = crypto.createHash('sha256').update(match[1]).digest('hex').slice(0, 16);
-      return `token:${digest}`;
-    }
+export function extractRateLimitKey(
+  req: IncomingMessage,
+  trustProxy = false,
+  opts: { verifiedTokenId?: string | null; trustFlyClientIp?: boolean } = {}
+): string {
+  const verifiedTokenId =
+    typeof opts.verifiedTokenId === 'string' ? opts.verifiedTokenId.trim() : '';
+  if (verifiedTokenId) {
+    const digest = crypto.createHash('sha256').update(verifiedTokenId).digest('hex').slice(0, 16);
+    return `token:${digest}`;
   }
 
   if (trustProxy) {
-    const flyIp = req.headers['fly-client-ip'];
-    const flyIpVal = Array.isArray(flyIp) ? flyIp[0] : flyIp;
-    if (typeof flyIpVal === 'string' && flyIpVal.trim()) {
-      return `ip:${normalizeClientIp(flyIpVal)}`;
+    const allowFlyClientIp = opts.trustFlyClientIp ?? Boolean(process.env.FLY_APP_NAME?.trim());
+    if (allowFlyClientIp) {
+      const flyIp = req.headers['fly-client-ip'];
+      const flyIpVal = Array.isArray(flyIp) ? flyIp[0] : flyIp;
+      if (typeof flyIpVal === 'string' && flyIpVal.trim()) {
+        return `ip:${normalizeClientIp(flyIpVal)}`;
+      }
     }
     const xff = req.headers['x-forwarded-for'];
-    const xffVal = Array.isArray(xff) ? xff[0] : xff;
+    const xffVal = Array.isArray(xff) ? xff.join(',') : xff;
     if (typeof xffVal === 'string' && xffVal.trim()) {
-      const first = xffVal.split(',')[0]?.trim();
-      if (first) return `ip:${normalizeClientIp(first)}`;
+      const parts = xffVal
+        .split(',')
+        .map((p) => p.trim())
+        .filter(Boolean);
+      const rightmost = parts[parts.length - 1];
+      if (rightmost) return `ip:${normalizeClientIp(rightmost)}`;
     }
   }
 
@@ -96,6 +111,7 @@ export class SlidingWindowRateLimiter {
   readonly maxRequests: number;
   readonly windowMs: number;
   readonly trustProxy: boolean;
+  readonly trustFlyClientIp: boolean;
   private readonly maxKeys: number;
   private readonly nowMs: () => number;
   private readonly buckets = new Map<string, number[]>();
@@ -115,7 +131,8 @@ export class SlidingWindowRateLimiter {
     );
     this.maxKeys = Math.max(100, Math.floor(opts.maxKeys ?? DEFAULT_MAX_KEYS));
     const envTrustProxy = parseBoolEnv(env.SIPHON_TRUST_PROXY);
-    this.trustProxy = opts.trustProxy ?? (envTrustProxy ?? Boolean(env.FLY_APP_NAME?.trim()));
+    this.trustFlyClientIp = opts.trustFlyClientIp ?? Boolean(env.FLY_APP_NAME?.trim());
+    this.trustProxy = opts.trustProxy ?? (envTrustProxy ?? this.trustFlyClientIp);
     this.nowMs = opts.nowMs ?? (() => Date.now());
   }
 
@@ -172,8 +189,11 @@ export class SlidingWindowRateLimiter {
     };
   }
 
-  consumeRequest(req: IncomingMessage): RateLimitDecision {
-    const key = extractRateLimitKey(req, this.trustProxy);
+  consumeRequest(req: IncomingMessage, verifiedTokenId?: string | null): RateLimitDecision {
+    const key = extractRateLimitKey(req, this.trustProxy, {
+      verifiedTokenId,
+      trustFlyClientIp: this.trustFlyClientIp,
+    });
     return this.consume(key);
   }
 

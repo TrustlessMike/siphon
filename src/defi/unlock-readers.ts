@@ -210,6 +210,18 @@ function r6(n: number): number {
   return Number(n.toFixed(6));
 }
 
+const MAX_SAFE_DATE_MS = 8_640_000_000_000_000;
+const MAX_SAFE_DATE_SEC = Math.floor(MAX_SAFE_DATE_MS / 1000);
+
+function clampDateMs(ms: number, fallbackMs: number): number {
+  const safeFallback =
+    Number.isFinite(fallbackMs) && fallbackMs >= 0 && fallbackMs <= MAX_SAFE_DATE_MS
+      ? Math.round(fallbackMs)
+      : Date.now();
+  if (!Number.isFinite(ms)) return safeFallback;
+  return Math.max(0, Math.min(MAX_SAFE_DATE_MS, Math.round(ms)));
+}
+
 function strip0x(hex: string): string {
   return hex.startsWith('0x') || hex.startsWith('0X') ? hex.slice(2) : hex;
 }
@@ -322,7 +334,7 @@ export function encodeLidoGetWithdrawalRequestsCall(ownerAddress: string): strin
 export function decodeLidoWithdrawalRequestIds(hexResult: string): bigint[] {
   if (typeof hexResult !== 'string') return [];
   const raw = strip0x(hexResult.trim());
-  if (!raw || raw.length < 128 || !/^[0-9a-fA-F]+$/.test(raw)) return [];
+  if (!raw || raw.length < 128 || raw.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(raw)) return [];
 
   const offsetBytes = BigInt('0x' + raw.slice(0, 64));
   if (offsetBytes > BigInt(raw.length / 2)) return [];
@@ -373,9 +385,9 @@ export function decodeLidoWithdrawalStatuses(
 ): LidoWithdrawalRequest[] {
   if (typeof hexResult !== 'string' || requestIds.length === 0) return [];
   const raw = strip0x(hexResult.trim());
-  if (!raw || raw.length < 128 || !/^[0-9a-fA-F]+$/.test(raw)) return [];
+  if (!raw || raw.length < 128 || raw.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(raw)) return [];
 
-  const nowMs = options.nowMs ?? Date.now();
+  const nowMs = clampDateMs(options.nowMs ?? Date.now(), Date.now());
   const ethPriceUsd =
     typeof options.ethPriceUsd === 'number' && Number.isFinite(options.ethPriceUsd) && options.ethPriceUsd > 0
       ? options.ethPriceUsd
@@ -414,17 +426,20 @@ export function decodeLidoWithdrawalStatuses(
     const owner = '0x' + w2.slice(24).toLowerCase();
     const requestedAtSecBig = BigInt('0x' + w3);
     const requestedAtSec =
-      requestedAtSecBig > BigInt(Number.MAX_SAFE_INTEGER) ? 0 : Number(requestedAtSecBig);
+      requestedAtSecBig > BigInt(MAX_SAFE_DATE_SEC) ? MAX_SAFE_DATE_SEC : Number(requestedAtSecBig);
     const isFinalized = BigInt('0x' + w4) !== 0n;
     const isClaimed = BigInt('0x' + w5) !== 0n;
     const readyToClaim = isFinalized && !isClaimed;
 
     const amountOfStETH = r6(formatUnits(amountOfStETHRaw, 18));
     const estimatedUsd = r2(amountOfStETH * ethPriceUsd);
-    const requestedAtMs = requestedAtSec * 1000;
+    const requestedAtMs = clampDateMs(requestedAtSec * 1000, nowMs);
     const estimatedUnlockAtMs = readyToClaim
       ? nowMs
-      : Math.max(nowMs + 3600_000, requestedAtMs + LIDO_DEFAULT_FINALIZATION_WINDOW_SEC * 1000);
+      : clampDateMs(
+          Math.max(nowMs + 3600_000, requestedAtMs + LIDO_DEFAULT_FINALIZATION_WINDOW_SEC * 1000),
+          nowMs + 3600_000
+        );
 
     out.push({
       requestId: requestIds[i].toString(),
@@ -625,9 +640,9 @@ export function decodeEthenaCooldown(
 ): EthenaCooldownStatus | null {
   if (typeof hexResult !== 'string') return null;
   const raw = strip0x(hexResult.trim());
-  if (!raw || raw.length < 128 || !/^[0-9a-fA-F]+$/.test(raw)) return null;
+  if (!raw || raw.length < 128 || raw.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(raw)) return null;
 
-  const nowMs = options.nowMs ?? Date.now();
+  const nowMs = clampDateMs(options.nowMs ?? Date.now(), Date.now());
   const usdePriceUsd =
     typeof options.usdePriceUsd === 'number' && Number.isFinite(options.usdePriceUsd) && options.usdePriceUsd > 0
       ? options.usdePriceUsd
@@ -642,8 +657,8 @@ export function decodeEthenaCooldown(
   }
 
   const cooldownEndSec =
-    cooldownEndBig > BigInt(Number.MAX_SAFE_INTEGER) ? 0 : Number(cooldownEndBig);
-  const cooldownEndMs = cooldownEndSec * 1000;
+    cooldownEndBig > BigInt(MAX_SAFE_DATE_SEC) ? MAX_SAFE_DATE_SEC : Number(cooldownEndBig);
+  const cooldownEndMs = clampDateMs(cooldownEndSec * 1000, nowMs);
   const active = underlyingAmountRaw > 0n;
   const underlyingAmountUsde = r6(formatUnits(underlyingAmountRaw, 18));
   const estimatedUsd = r2(underlyingAmountUsde * usdePriceUsd);
@@ -831,8 +846,9 @@ export function parseCosmosUnbondingDelegations(
       if (balanceRaw <= 0n) continue;
 
       const rawCompletion = typeof entry.completion_time === 'string' ? entry.completion_time.trim() : '';
-      const completionTimeMs = Date.parse(rawCompletion);
-      if (!Number.isFinite(completionTimeMs) || completionTimeMs <= 0) continue;
+      const parsedCompletionMs = Date.parse(rawCompletion);
+      if (!Number.isFinite(parsedCompletionMs) || parsedCompletionMs <= 0) continue;
+      const completionTimeMs = clampDateMs(parsedCompletionMs, nowMs);
 
       const uiAmount = r6(formatUnits(balanceRaw, cfg.decimals));
       const estimatedUsd = r2(uiAmount * tokenPriceUsd);
