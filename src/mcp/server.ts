@@ -163,7 +163,7 @@ export const SIPHON_MCP_TOOLS = [
   {
     name: 'siphon_list_agent_mandates',
     description:
-      'Inspect active SiphonAgentVault policy-bounded smart-contract agent mandates, locked Solana destinations, and remaining daily USD caps. Mandates are owner-created only in the Siphon UI or on-chain.',
+      'Inspect active SiphonAgentVault policy-bounded smart-contract agent mandates, locked Solana destinations, and remaining daily USD caps. Mandates are owner-created only in the Turgalium UI or on-chain.',
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -218,7 +218,7 @@ export const SIPHON_MCP_TOOLS = [
   },
   {
     name: 'siphon_list_pending_approvals',
-    description: 'Check pending, approved, or rejected AI permission requests in the Siphon Permission Gate.',
+    description: 'Check pending, approved, or rejected AI permission requests in the Turgalium Permission Gate.',
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -234,7 +234,7 @@ export const SIPHON_MCP_TOOLS = [
   {
     name: 'siphon_preservation_audit',
     description:
-      'Run Siphon Capital-Preservation Route Auction (evaluatePreservationPlan) for a cached scanId or walletAddress, returning exact dollars saved (gas batching, Permit2/EIP-2612 approvals, negative-ROI pruning, route auction), best bridge route per chain, and Ethereum L1 gas-timing advice. Read-only.',
+      'Run Turgalium Capital-Preservation Route Auction (evaluatePreservationPlan) for a cached scanId or walletAddress, returning exact dollars saved (gas batching, Permit2/EIP-2612 approvals, negative-ROI pruning, route auction), best bridge route per chain, and Ethereum L1 gas-timing advice. Read-only.',
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -343,7 +343,7 @@ export const SIPHON_MCP_TOOLS = [
   {
     name: 'siphon_solana_yield_preview',
     description:
-      'Compute Siphon Preservation-First Solana post-arrival split: default 90% Preserved Yield (JupSOL, Jupiter Lend jlUSDC, or Kamino USDC) + 10% Degen Side-Pocket with exact micro-USDC accounting and projected APY. Read-only preview; never signs or swaps autonomously.',
+      'Compute Turgalium Preservation-First Solana post-arrival split: default 90% Preserved Yield (JupSOL, Jupiter Lend jlUSDC, or Kamino USDC) + 10% Degen Side-Pocket with exact micro-USDC accounting and projected APY. Read-only preview; never signs or swaps autonomously.',
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -384,7 +384,7 @@ export const SIPHON_MCP_TOOLS = [
   {
     name: 'siphon_degen_markets',
     description:
-      'List live trending Jupiter Prediction Markets & implied odds for AI-assisted market research. Strictly read-only: NEVER places bets, builds signed orders, or moves funds autonomously without explicit user approval in Siphon.',
+      'List live trending Jupiter Prediction Markets & implied odds for AI-assisted market research. Strictly read-only: NEVER places bets, builds signed orders, or moves funds autonomously without explicit user approval in Turgalium.',
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -1246,7 +1246,7 @@ export async function handleMcpJsonRpc(
           readOnly: true,
           autonomousBettingAllowed: false,
           safetyNotice:
-            'Strictly read-only Jupiter Prediction Market research feed. Never places bets autonomously; user must explicitly review side-pocket caps and sign in the Siphon Degen tab.',
+            'Strictly read-only Jupiter Prediction Market research feed. Never places bets autonomously; user must explicitly review side-pocket caps and sign in the Turgalium Degen tab.',
           ok: feed.ok,
           live: feed.live,
           source: feed.source,

@@ -1125,7 +1125,7 @@ function formatRoiTooltip(a) {
     `Slippage $${(bd.slippageUsd || 0).toFixed(2)}`,
     bd.bridgeFeeUsd > 0 ? `Bridge $${bd.bridgeFeeUsd.toFixed(2)}` : null,
     bd.solanaAtaRentUsd > 0 ? `Solana ATA rent $${bd.solanaAtaRentUsd.toFixed(2)}` : null,
-    `Siphon fee $${(bd.protocolFeeUsd || 0).toFixed(2)}`,
+    `Turgalium fee $${(bd.protocolFeeUsd || 0).toFixed(2)}`,
   ].filter(Boolean);
   return `${parts.join(' + ')} = $${(bd.totalCostUsd || 0).toFixed(2)} total cost`;
 }
@@ -1441,7 +1441,7 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
     warningReason =
       planReason ||
       (safePartialReady
-        ? `Active borrow of ${debtStr}${hfStr}. Siphon withdraws only the safe excess collateral.`
+        ? `Active borrow of ${debtStr}${hfStr}. Turgalium withdraws only the safe excess collateral.`
         : `Active borrow of ${debtStr}${hfStr}. Repay borrow before full withdrawal to protect your position.`);
   } else if (asset?.roiVerdict === 'negative_roi') {
     preflightLevel = 'blocked';
@@ -2420,7 +2420,7 @@ function renderBackgroundAgentUI() {
       const done = legs.filter(
         (l) => l.status === 'landed' || l.status === 'attested'
       ).length;
-      dockText.textContent = `Siphon Agent · ${done}/${legs.length} chains settled`;
+      dockText.textContent = `Turgalium Agent · ${done}/${legs.length} chains settled`;
     }
   }
 
@@ -3537,7 +3537,7 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
       );
     }
 
-    showToast(`${batch.chainName} submitted — Siphon Background Agent is tracking Solana settlement.`);
+    showToast(`${batch.chainName} submitted — Turgalium Background Agent is tracking Solana settlement.`);
     syncBackgroundJobs();
     return { userRejected: false, failed: false };
   } catch (err) {
