@@ -16,7 +16,23 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: node --check public/app.js && node --check public/wallets.js
+      - run: node --check public/app.js && node --check public/wallets.js && node --check public/degen.js && node --check public/preservation.js
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+
+  foundry-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+      - name: Build Solidity contracts & verify bytecode sizes
+        run: forge build --sizes
+      - name: Run Foundry unit & fuzz tests
+        run: forge test --no-match-contract SiphonMainnetFork -vv
+      - name: Run Ethereum Mainnet fork tests (when MAINNET_RPC_URL is configured)
+        if: ${{ secrets.MAINNET_RPC_URL != '' }}
+        env:
+          MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+        run: forge test --match-contract SiphonMainnetFork -vv

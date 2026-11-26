@@ -3,8 +3,9 @@ pragma solidity 0.8.24;
 
 /**
  * @title SiphonFeeVault
- * @notice Auditable protocol treasury vault receiving 5-10% migration fees from SiphonRouter,
- *         Relay appFees, LI.FI integrator fees, and EIP-5792 atomic batch splits.
+ * @notice Auditable protocol treasury vault receiving 0-10% tiered migration fees (with optional whale
+ *         USDC caps) from SiphonRouter, SiphonSweepDelegate, Relay appFees, LI.FI integrator fees,
+ *         and EIP-5792 atomic batch splits.
  *
  * Security properties:
  *   1. Accepts both native gas coins (ETH/POL/AVAX) and any ERC-20 token (USDC, WETH, etc.)
