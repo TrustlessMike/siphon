@@ -17,7 +17,7 @@
     />
     <link rel="stylesheet" href="/styles.css?v=8" />
     <link rel="stylesheet" href="/degen.css?v=1" />
-    <link rel="stylesheet" href="/preservation.css?v=1" />
+    <link rel="stylesheet" href="/preservation.css?v=2" />
   </head>
   <body>
     <!-- =============================================================== -->
@@ -427,6 +427,10 @@
                       <span class="muted-xs">▾</span>
                     </button>
                   </div>
+                  <div class="receipt-row pro-only hidden" id="preservationFeeRouteRow">
+                    <span>Preservation Tier</span>
+                    <span class="mono preservation-tier-note" id="preservationFeeRouteText">—</span>
+                  </div>
                 </div>
 
                 <!-- Collapsible Fee, Treasury & Options Drawer (Pro Mode Only) -->
@@ -510,6 +514,115 @@
               </div>
             </aside>
           </div>
+
+          <!-- Capital-Preservation & Post-Arrival Solana Tools (Rent Vacuum · Yield Park · Approval Revoker) -->
+          <section class="card preservation-tools-section" id="preservationToolsSection" aria-label="Capital Preservation and Solana Tools">
+            <div class="ptools-header">
+              <div class="ptools-title-group">
+                <div class="ptools-title-row">
+                  <h2>Preservation &amp; Solana Tools</h2>
+                  <div class="ptools-summary-chips" aria-label="Preservation tool status">
+                    <span class="ptools-chip mono" id="toolsSummaryRentBadge">Rent Vacuum</span>
+                    <span class="ptools-chip mono" id="toolsSummaryYieldBadge">90% Safe Compound</span>
+                    <span class="ptools-chip mono" id="toolsSummaryApprovalsBadge">Approval Hygiene</span>
+                  </div>
+                </div>
+                <p class="ptools-sub">Reclaim locked SOL rent, auto-compound arrived USDC on Solana, and revoke stale EVM approvals in 1 click.</p>
+              </div>
+              <button type="button" class="btn-outline-sm ptools-toggle-btn" id="togglePreservationToolsBtn" aria-expanded="true" aria-controls="preservationToolsGrid">
+                Hide Tools ▴
+              </button>
+            </div>
+
+            <div class="ptools-grid" id="preservationToolsGrid">
+              <!-- Card 1: 1-Click Reclaim Free SOL (Empty-ATA Rent Vacuum) -->
+              <article class="ptool-card" id="rentVacuumCard">
+                <div class="ptool-card-head">
+                  <div>
+                    <h3>Reclaim Free SOL</h3>
+                    <p class="ptool-card-sub">Close zero-balance SPL &amp; Token-2022 accounts</p>
+                  </div>
+                  <span class="ptool-badge mono" id="rentCountBadge">0.00203928 SOL / ATA</span>
+                </div>
+                <form class="ptool-control-row" id="rentScanForm">
+                  <input
+                    type="text"
+                    id="rentOwnerInput"
+                    class="ptool-input mono"
+                    placeholder="Solana wallet address…"
+                    aria-label="Solana wallet address for empty ATA rent scan"
+                  />
+                  <button type="submit" class="btn-outline-sm ptool-inline-btn" id="scanSolanaRentBtn">Scan Empty ATAs</button>
+                </form>
+                <div class="ptool-card-body" id="rentVacuumBody" aria-live="polite"></div>
+              </article>
+
+              <!-- Card 2: 1-Click Post-Arrival Solana Yield Park (90% Safe Compound) -->
+              <article class="ptool-card" id="yieldParkCard">
+                <div class="ptool-card-head">
+                  <div>
+                    <h3>Solana Yield Park</h3>
+                    <p class="ptool-card-sub">Park arrived USDC into safe compounding yield</p>
+                  </div>
+                  <span class="ptool-badge is-emerald mono" id="yieldApyBadge">~7.1% Est. APY</span>
+                </div>
+                <div class="ptool-yield-controls">
+                  <div class="ptool-field-row">
+                    <label class="ptool-field">
+                      <span class="ptool-label">Strategy</span>
+                      <select id="yieldStrategySelect" class="ptool-select mono" aria-label="Solana yield strategy">
+                        <option value="jupsol" selected>Jupiter Staked SOL (JupSOL)</option>
+                        <option value="jupiter_lend_usdc">Jupiter Lend USDC (jlUSDC)</option>
+                        <option value="kamino_usdc">Kamino USDC Lending Vault</option>
+                      </select>
+                    </label>
+                    <label class="ptool-field ptool-field-amount">
+                      <span class="ptool-label">Amount (USDC)</span>
+                      <input
+                        type="number"
+                        id="yieldAmountInput"
+                        class="ptool-input mono"
+                        value="100"
+                        min="1"
+                        step="1"
+                        aria-label="Total USDC amount for yield split"
+                      />
+                    </label>
+                  </div>
+                  <div class="ptool-split-row" role="group" aria-label="Preservation yield split">
+                    <button type="button" class="ptool-split-btn active" data-yield-split="90">90% Yield / 10% Degen</button>
+                    <button type="button" class="ptool-split-btn" data-yield-split="100">100% Principal Safe</button>
+                    <button type="button" class="btn-outline-sm ptool-inline-btn" id="previewYieldBtn">Preview Quote</button>
+                  </div>
+                </div>
+                <div class="ptool-card-body" id="yieldParkBody" aria-live="polite"></div>
+              </article>
+
+              <!-- Card 3: 1-Click Stale ERC-20 Approval Revoker -->
+              <article class="ptool-card" id="approvalRevokerCard">
+                <div class="ptool-card-head">
+                  <div>
+                    <h3>Stale Approval Revoker</h3>
+                    <p class="ptool-card-sub">Revoke lingering unlimited ERC-20 allowances</p>
+                  </div>
+                  <span class="ptool-badge mono" id="approvalRiskBadge">Multicall3 Scan</span>
+                </div>
+                <div class="ptool-control-row">
+                  <select id="approvalChainSelect" class="ptool-select mono" aria-label="EVM chain for approval scan">
+                    <option value="ethereum" selected>Ethereum</option>
+                    <option value="base">Base</option>
+                    <option value="arbitrum">Arbitrum</option>
+                    <option value="optimism">Optimism</option>
+                    <option value="polygon">Polygon</option>
+                    <option value="avalanche">Avalanche</option>
+                    <option value="bnb">BNB Chain</option>
+                  </select>
+                  <button type="button" class="btn-outline-sm ptool-inline-btn" id="scanApprovalsBtn">Scan Approvals</button>
+                </div>
+                <div class="ptool-card-body" id="approvalRevokerBody" aria-live="polite"></div>
+              </article>
+            </div>
+          </section>
         </section>
 
         <!-- ======================================================= -->
@@ -875,6 +988,7 @@
 
     <script type="module" src="/app.js?v=8"></script>
     <script type="module" src="/degen.js?v=1"></script>
-    <script type="module" src="/preservation.js?v=1"></script>
+    <script type="module" src="/preservation.js?v=2"></script>
+    <script type="module" src="/preservation-tools.js?v=1"></script>
   </body>
 </html>

@@ -92,6 +92,28 @@
   color: var(--ink-1, #27272a);
 }
 
+.preservation-pill-fee {
+  background: var(--bg-paper, #fcfcfc);
+  border: 1px solid var(--border-strong, #d1d5db);
+  color: var(--ink-0, #0a0a0a);
+}
+
+.preservation-clarity-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.preservation-tier-note {
+  font-size: 11.5px;
+  color: var(--allow, #059669);
+  text-align: right;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 .preservation-actions {
   display: flex;
   flex-wrap: wrap;
@@ -347,5 +369,502 @@
   }
   .gas-watch-list {
     padding: 12px 14px 14px;
+  }
+}
+
+/* =====================================================================
+   PRESERVATION & POST-ARRIVAL SOLANA TOOLS (RENT · YIELD · APPROVALS)
+   ===================================================================== */
+
+.preservation-tools-section {
+  margin-top: 18px;
+  padding: 18px;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.ptools-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.ptools-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  flex: 1 1 320px;
+}
+
+.ptools-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-width: 0;
+}
+
+.ptools-title-row h2 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--ink-0, #0a0a0a);
+}
+
+.ptools-sub {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-2, #52525b);
+}
+
+.ptools-summary-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ptools-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--bg-well, #f4f5f7);
+  border: 1px solid var(--border, #e4e6eb);
+  color: var(--ink-2, #52525b);
+  max-width: 100%;
+}
+
+.ptools-chip.is-active {
+  background: var(--allow-bg, #ecfdf5);
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+
+.ptools-chip.is-warn {
+  background: var(--hold-bg, #fffbeb);
+  border-color: #fcd34d;
+  color: #92400e;
+}
+
+.ptools-toggle-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.ptools-grid {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  min-width: 0;
+}
+
+.ptool-card {
+  background: var(--bg-paper, #fcfcfc);
+  border: 1px solid var(--border, #e4e6eb);
+  border-radius: 12px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.ptool-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ptool-card-head h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  color: var(--ink-0, #0a0a0a);
+}
+
+.ptool-card-sub {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--ink-3, #71717a);
+}
+
+.ptool-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--bg-surface, #ffffff);
+  border: 1px solid var(--border, #e4e6eb);
+  color: var(--ink-1, #27272a);
+  max-width: 100%;
+}
+
+.ptool-badge.is-emerald {
+  background: var(--allow-bg, #ecfdf5);
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+
+.ptool-badge.is-warn {
+  background: var(--hold-bg, #fffbeb);
+  border-color: #fcd34d;
+  color: #92400e;
+}
+
+.ptool-control-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.ptool-input,
+.ptool-select {
+  flex: 1 1 0;
+  min-width: 0;
+  width: 100%;
+  background: var(--bg-surface, #ffffff);
+  border: 1px solid var(--border, #e4e6eb);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--ink-0, #0a0a0a);
+}
+
+.ptool-input:focus,
+.ptool-select:focus {
+  outline: none;
+  border-color: var(--ink-0, #0a0a0a);
+}
+
+.ptool-inline-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+  padding: 6px 11px;
+  font-size: 12px;
+}
+
+.ptool-yield-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ptool-field-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+.ptool-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ptool-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-2, #52525b);
+  letter-spacing: 0.01em;
+}
+
+.ptool-split-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+
+.ptool-split-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border, #e4e6eb);
+  background: var(--bg-surface, #ffffff);
+  color: var(--ink-1, #27272a);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.ptool-split-btn:hover {
+  border-color: var(--border-strong, #d1d5db);
+}
+
+.ptool-split-btn.active {
+  background: var(--ice-soft, #e8faff);
+  border-color: var(--ice-border, #7dd3fc);
+  color: var(--ink-0, #0a0a0a);
+  font-weight: 600;
+}
+
+.ptool-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.ptool-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-3, #71717a);
+  line-height: 1.45;
+}
+
+.ptool-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
+}
+
+.ptool-kpi {
+  background: var(--bg-surface, #ffffff);
+  border: 1px solid var(--border, #e4e6eb);
+  border-radius: 8px;
+  padding: 7px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ptool-kpi-label {
+  font-size: 10.5px;
+  color: var(--ink-3, #71717a);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ptool-kpi-val {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink-0, #0a0a0a);
+  overflow-wrap: anywhere;
+}
+
+.ptool-kpi-val.is-emerald {
+  color: var(--allow, #059669);
+}
+
+.ptool-meta-line {
+  font-size: 11.5px;
+  color: var(--ink-2, #52525b);
+  overflow-wrap: anywhere;
+}
+
+.ptool-quote-box {
+  background: var(--bg-surface, #ffffff);
+  border: 1px solid var(--border, #e4e6eb);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 11.5px;
+  color: var(--ink-1, #27272a);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow-wrap: anywhere;
+}
+
+.ptool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ptool-list-row {
+  background: var(--bg-surface, #ffffff);
+  border: 1px solid var(--border, #e4e6eb);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ptool-list-row.is-revoked {
+  opacity: 0.68;
+  background: var(--bg-well, #f4f5f7);
+}
+
+.ptool-list-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.ptool-finding-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ptool-list-primary {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-0, #0a0a0a);
+  overflow-wrap: anywhere;
+}
+
+.ptool-list-sub {
+  font-size: 11px;
+  color: var(--ink-2, #52525b);
+  overflow-wrap: anywhere;
+}
+
+.ptool-list-note {
+  font-size: 11px;
+  color: var(--ink-3, #71717a);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.ptool-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.ptool-pill.is-emerald {
+  background: var(--allow-bg, #ecfdf5);
+  border: 1px solid #a7f3d0;
+  color: #065f46;
+}
+
+.ptool-pill.is-warn {
+  background: var(--hold-bg, #fffbeb);
+  border: 1px solid #fcd34d;
+  color: #92400e;
+}
+
+.ptool-pill.is-danger {
+  background: var(--block-bg, #fef2f2);
+  border: 1px solid #fecaca;
+  color: #991b1b;
+}
+
+.ptool-alert {
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.ptool-alert.is-success {
+  background: var(--allow-bg, #ecfdf5);
+  border: 1px solid #a7f3d0;
+  color: #065f46;
+}
+
+.ptool-alert.is-error {
+  background: var(--block-bg, #fef2f2);
+  border: 1px solid #fecaca;
+  color: #991b1b;
+}
+
+.ptool-alert.is-info {
+  background: var(--ice-soft, #e8faff);
+  border: 1px solid var(--ice-border, #7dd3fc);
+  color: #0c4a6e;
+}
+
+.ptool-link {
+  color: inherit;
+  text-decoration: underline;
+  font-weight: 600;
+}
+
+.ptool-row-btn {
+  flex-shrink: 0;
+}
+
+.ptool-row-btn.is-done {
+  background: var(--allow-bg, #ecfdf5);
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+
+.ptool-primary-btn {
+  width: 100%;
+  justify-content: center;
+  margin-top: auto;
+}
+
+@media (max-width: 1120px) {
+  .ptools-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .ptools-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 560px) {
+  .preservation-tools-section {
+    padding: 13px;
+  }
+  .ptool-control-row {
+    flex-direction: column;
+  }
+  .ptool-field-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ptool-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .ptool-kpi:last-child {
+    grid-column: 1 / -1;
+  }
+  .ptool-inline-btn,
+  .ptools-toggle-btn {
+    width: 100%;
+    justify-content: center;
   }
 }

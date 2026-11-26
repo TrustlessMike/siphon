@@ -1,28 +1,33 @@
 /**
- * Siphon Capital-Preservation Optimizer & Gas-Window Watchdog UI Module.
+ * Siphon Capital-Preservation Optimizer, Tiered Fee Clarity, Route Auction Winner
+ * & Gas-Window Watchdog UI Module.
  * Self-contained browser module cleanly integrated without bloating public/app.js.
  */
 
 let latestScanReport = null;
 let latestPreservation = null;
+let latestRouteAuction = null;
 let appliedRouteSignature = null;
 let activeGasTriggers = [];
 let latestEthGwei = null;
 let optimizeSeq = 0;
 
-function esc(str) {
-  return String(str ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
+const ROUTE_PROVIDER_LABELS = {
+  circle_cctp: 'CCTP V2 Fast',
+  cctp: 'CCTP V2 Fast',
+  mayan_swift: 'Mayan Swift',
+  mayan: 'Mayan Swift',
+  debridge_dln: 'deBridge DLN',
+  debridge: 'deBridge DLN',
+  relay: 'Relay',
+  lifi: 'LI.FI',
+  direct_swap_only: 'Direct Swap',
+};
 
 function fmtUsd(val) {
   const n = Number(val);
   if (!Number.isFinite(n)) return '$0.00';
-  return `$${n.toFixed(2)}`;
+  return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function isValidEvmAddr(addr) {
@@ -40,6 +45,147 @@ function shortAddr(addr) {
   const s = String(addr || '').trim();
   if (s.length <= 12) return s || '—';
   return `${s.slice(0, 6)}…${s.slice(-4)}`;
+}
+
+function formatProviderName(raw) {
+  const key = String(raw || '').trim().toLowerCase();
+  if (ROUTE_PROVIDER_LABELS[key]) return ROUTE_PROVIDER_LABELS[key];
+  return String(raw || 'Auto Optimal').trim() || 'Auto Optimal';
+}
+
+/**
+ * Mirrors src/scanner/chains.ts `computePreservationFee` progressive tier table
+ * so the UI surfaces exact active bps, hard USD cap, and savings vs legacy 7% flat fee.
+ */
+function computeTieredPreservationFee(grossUsdInput) {
+  const grossUsd = Math.max(0, Number(grossUsdInput) || 0);
+  if (grossUsd <= 0) {
+    return {
+      grossUsd: 0,
+      feeBps: 0,
+      feePercentLabel: '0.00%',
+      feeUsd: 0,
+      capUsd: null,
+      capApplied: false,
+      legacy7PctUsd: 0,
+      savedVs7PctUsd: 0,
+      tierLabel: 'Zero',
+    };
+  }
+
+  let feeBps = 10;
+  let capUsd = 50;
+  let tierLabel = 'Principal ($5k+)';
+  if (grossUsd < 50) {
+    feeBps = 500;
+    capUsd = null;
+    tierLabel = 'Micro-Dust (<$50)';
+  } else if (grossUsd < 500) {
+    feeBps = 100;
+    capUsd = null;
+    tierLabel = 'Small ($50–$500)';
+  } else if (grossUsd < 5000) {
+    feeBps = 25;
+    capUsd = null;
+    tierLabel = 'Mid ($500–$5k)';
+  }
+
+  const uncappedFeeUsd = Number(((grossUsd * feeBps) / 10_000).toFixed(2));
+  const capApplied = capUsd !== null && uncappedFeeUsd > capUsd;
+  const feeUsd = capApplied ? capUsd : uncappedFeeUsd;
+  const legacy7PctUsd = Number(((grossUsd * 700) / 10_000).toFixed(2));
+  const savedVs7PctUsd = Number(Math.max(0, legacy7PctUsd - feeUsd).toFixed(2));
+  const feePercentLabel = `${(feeBps / 100).toFixed(2)}%`;
+
+  return {
+    grossUsd,
+    feeBps,
+    feePercentLabel,
+    feeUsd,
+    capUsd,
+    capApplied,
+    legacy7PctUsd,
+    savedVs7PctUsd,
+    tierLabel,
+  };
+}
+
+/**
+ * Derives winning cross-chain route + runner-up savings from either live `/api/tx/prepare-chain-batch`
+ * route auction metadata OR `/api/optimize/preservation` per-chain candidate audits.
+ */
+function resolveRouteAuctionSummary() {
+  if (latestRouteAuction && latestRouteAuction.winnerProvider) {
+    const winnerLabel = formatProviderName(latestRouteAuction.winnerProvider);
+    const runnerUpLabel = latestRouteAuction.runnerUpProvider
+      ? formatProviderName(latestRouteAuction.runnerUpProvider)
+      : null;
+    const savedUsd = Math.max(0, Number(latestRouteAuction.dollarsSavedOverRunnerUp) || 0);
+    const savedBps = Math.max(0, Number(latestRouteAuction.bpsSavedOverRunnerUp) || 0);
+    return {
+      source: 'live_auction',
+      winnerLabel,
+      runnerUpLabel,
+      savedOverRunnerUpUsd: savedUsd,
+      savedOverRunnerUpBps: savedBps,
+      providersSucceeded: Number(latestRouteAuction.providersSucceeded) || 0,
+      providersQueried: Array.isArray(latestRouteAuction.providersQueried)
+        ? latestRouteAuction.providersQueried.length
+        : 0,
+    };
+  }
+
+  if (!latestPreservation) return null;
+
+  const recLabel = formatProviderName(
+    latestPreservation.recommendedBridgePreference &&
+      latestPreservation.recommendedBridgePreference !== 'auto'
+      ? latestPreservation.recommendedBridgePreference
+      : latestPreservation.recommendedRouteLabel || 'Relay'
+  );
+
+  // Compute exact runner-up delta across chain candidate quotes if present
+  let runnerUpLabel = null;
+  let runnerUpDeltaUsd = 0;
+  const chains = Array.isArray(latestPreservation.chains) ? latestPreservation.chains : [];
+  let topChain = null;
+  for (const ch of chains) {
+    if (!topChain || (Number(ch.grossUsd) || 0) > (Number(topChain.grossUsd) || 0)) {
+      topChain = ch;
+    }
+    const eligible = (Array.isArray(ch.candidates) ? ch.candidates : [])
+      .filter((c) => c && c.eligible && c.settlesOnSolana)
+      .sort((a, b) => (Number(b.netUsdPreserved) || 0) - (Number(a.netUsdPreserved) || 0));
+    if (eligible.length >= 2) {
+      const delta = Math.max(
+        0,
+        (Number(eligible[0].netUsdPreserved) || 0) - (Number(eligible[1].netUsdPreserved) || 0)
+      );
+      runnerUpDeltaUsd += delta;
+      if (!runnerUpLabel) {
+        runnerUpLabel = formatProviderName(eligible[1].route || eligible[1].label);
+      }
+    }
+  }
+
+  const winnerLabel = topChain?.bestRoute
+    ? formatProviderName(topChain.bestRoute)
+    : latestPreservation.recommendedRouteLabel || recLabel;
+
+  const auctionSavedTotal = Math.max(
+    runnerUpDeltaUsd,
+    Number(latestPreservation.totals?.dollarsSavedRouteAuctionUsd) || 0
+  );
+
+  return {
+    source: 'optimizer',
+    winnerLabel,
+    runnerUpLabel,
+    savedOverRunnerUpUsd: Number(auctionSavedTotal.toFixed(2)),
+    savedOverRunnerUpBps: 0,
+    providersSucceeded: 0,
+    providersQueried: 0,
+  };
 }
 
 function showPreservationToast(msg) {
@@ -96,21 +242,48 @@ async function fetchJsonSilent(rawFetch, url, opts = {}) {
 
 const nativeFetch = window.fetch.bind(window);
 
+function updateSummaryProClarity(feeInfo, routeSummary) {
+  const row = document.getElementById('preservationFeeRouteRow');
+  const valEl = document.getElementById('preservationFeeRouteText');
+  if (!row || !valEl) return;
+
+  if (!feeInfo || feeInfo.grossUsd <= 0) {
+    row.classList.add('hidden');
+    valEl.textContent = '—';
+    return;
+  }
+
+  row.classList.remove('hidden');
+  const capPart = feeInfo.capUsd !== null ? ` cap ${fmtUsd(feeInfo.capUsd)}` : '';
+  const routePart = routeSummary?.winnerLabel ? ` · ${routeSummary.winnerLabel}` : '';
+  valEl.textContent = `${feeInfo.feePercentLabel}${capPart} (save +${fmtUsd(feeInfo.savedVs7PctUsd)} vs 7%)${routePart}`;
+}
+
+function createEl(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  if (text !== undefined && text !== null) el.textContent = String(text);
+  return el;
+}
+
 function renderPreservationStrip() {
   const host = document.getElementById('preservationStripHost');
   if (!host) return;
 
   if (!latestPreservation || !latestPreservation.totals) {
     host.classList.add('hidden');
-    host.innerHTML = '';
+    host.replaceChildren();
+    updateSummaryProClarity(null, null);
     return;
   }
 
   const t = latestPreservation.totals;
-  const hasSweepable = Number(t.grossSweepableUsd) > 0;
+  const grossSweepable = Math.max(0, Number(t.grossSweepableUsd) || 0);
+  const hasSweepable = grossSweepable > 0;
   if (!hasSweepable && !latestPreservation.gasTiming?.primary?.shouldWait) {
     host.classList.add('hidden');
-    host.innerHTML = '';
+    host.replaceChildren();
+    updateSummaryProClarity(null, null);
     return;
   }
 
@@ -132,6 +305,10 @@ function renderPreservationStrip() {
   const popupsNaive = Math.max(0, Number(t.popupsNaive) || 0);
   const popupsOpt = Math.max(0, Number(t.popupsOptimized) || 0);
 
+  const feeInfo = computeTieredPreservationFee(grossSweepable);
+  const routeSummary = resolveRouteAuctionSummary();
+  updateSummaryProClarity(feeInfo, routeSummary);
+
   const primaryGas = latestPreservation.gasTiming?.primary;
   const showGasPill = Boolean(
     primaryGas &&
@@ -148,66 +325,138 @@ function renderPreservationStrip() {
     : [];
   const nextUnlock = unlocks[0] || null;
 
-  const gasPillHtml = showGasPill
-    ? `<button type="button" class="preservation-gas-pill ${ethWatching ? 'is-watching' : ''}" id="gasWatchQuickPill" data-target-gwei="${esc(primaryGas.targetMaxGwei)}" data-est-savings="${esc(primaryGas.estimatedWaitSavingsUsd)}">
-        <span class="preservation-gas-dot"></span>
-        <span>${
+  const card = createEl('div', 'preservation-strip');
+  card.id = 'preservationStripCard';
+
+  // Row 1: Primary metrics + Apply Optimal Route CTA
+  const mainRow = createEl('div', 'preservation-main-row');
+  const metrics = createEl('div', 'preservation-metrics');
+
+  const scoreBadge = createEl('span', 'preservation-score-badge');
+  scoreBadge.title = 'Net capital preserved after gas, slippage, bridge & protocol fees';
+  scoreBadge.appendChild(createEl('span', 'preservation-score-dot'));
+  scoreBadge.appendChild(createEl('span', '', `Keeping ${pctNum.toFixed(1)}% of your value`));
+  metrics.appendChild(scoreBadge);
+
+  metrics.appendChild(
+    createEl(
+      'span',
+      'preservation-pill preservation-pill-saved mono',
+      `+${fmtUsd(savedNum)} saved vs manual swaps`
+    )
+  );
+
+  if (popupsNaive > 0) {
+    metrics.appendChild(
+      createEl(
+        'span',
+        'preservation-pill preservation-pill-popups mono',
+        `${popupsNaive} → ${popupsOpt} popups`
+      )
+    );
+  }
+
+  const actions = createEl('div', 'preservation-actions');
+  const applyBtn = createEl(
+    'button',
+    `btn-pill-dark btn-sm preservation-apply-btn${isApplied ? ' is-applied' : ''}`,
+    isApplied ? 'Optimal Route Applied ✓' : 'Apply Optimal Route'
+  );
+  applyBtn.type = 'button';
+  applyBtn.id = 'applyOptimalRouteBtn';
+  applyBtn.addEventListener('click', handleApplyOptimalRoute);
+  actions.appendChild(applyBtn);
+
+  mainRow.appendChild(metrics);
+  mainRow.appendChild(actions);
+  card.appendChild(mainRow);
+
+  // Row 2: Tiered Preservation Fee + Winning Cross-Chain Route Auction Clarity
+  if (hasSweepable) {
+    const clarityRow = createEl('div', 'preservation-clarity-row');
+
+    const feePill = createEl('span', 'preservation-pill preservation-pill-fee mono');
+    feePill.id = 'preservationTieredFeePill';
+    const capPart = feeInfo.capUsd !== null ? ` cap ${fmtUsd(feeInfo.capUsd)}` : '';
+    const savePart =
+      feeInfo.savedVs7PctUsd > 0
+        ? ` · Saving +${fmtUsd(feeInfo.savedVs7PctUsd)} vs 7%`
+        : ` (${feeInfo.feeBps} bps)`;
+    feePill.textContent = `Tiered Fee: ${feeInfo.feePercentLabel}${capPart}${savePart}`;
+    clarityRow.appendChild(feePill);
+
+    if (routeSummary?.winnerLabel) {
+      const routePill = createEl('span', 'preservation-pill preservation-pill-route mono');
+      routePill.id = 'preservationRouteWinnerPill';
+      let routeText = `Route Winner: ${routeSummary.winnerLabel}`;
+      if (routeSummary.savedOverRunnerUpUsd > 0) {
+        const vsWho = routeSummary.runnerUpLabel ? ` vs ${routeSummary.runnerUpLabel}` : ' vs runner-up';
+        routeText += ` · +${fmtUsd(routeSummary.savedOverRunnerUpUsd)}${vsWho}`;
+      }
+      routePill.textContent = routeText;
+      clarityRow.appendChild(routePill);
+    }
+
+    card.appendChild(clarityRow);
+  }
+
+  // Row 3: Pro-only granular savings breakdown
+  if (savedNum > 0) {
+    const breakdown = createEl('div', 'preservation-breakdown mono pro-only');
+    breakdown.appendChild(createEl('span', '', `Route: ${recLabel}`));
+    breakdown.appendChild(createEl('span', '', `Gas ${fmtUsd(t.dollarsSavedGasUsd)}`));
+    breakdown.appendChild(createEl('span', '', `Approvals ${fmtUsd(t.dollarsSavedApprovalsUsd)}`));
+    breakdown.appendChild(
+      createEl('span', '', `Route Auction ${fmtUsd(t.dollarsSavedRouteAuctionUsd)}`)
+    );
+    breakdown.appendChild(
+      createEl('span', '', `Neg-ROI Pruned ${fmtUsd(t.dollarsSavedNegativeRoiPrunedUsd)}`)
+    );
+    breakdown.appendChild(createEl('span', '', `Execution Eff. ${effNum.toFixed(1)}%`));
+    card.appendChild(breakdown);
+  }
+
+  // Row 4: Gas-Window Watchdog quick pill + Unlock schedule chip
+  if (showGasPill || nextUnlock) {
+    const subRow = createEl('div', 'preservation-sub-row');
+
+    if (showGasPill) {
+      const gasBtn = createEl(
+        'button',
+        `preservation-gas-pill${ethWatching ? ' is-watching' : ''}`
+      );
+      gasBtn.type = 'button';
+      gasBtn.id = 'gasWatchQuickPill';
+      gasBtn.dataset.targetGwei = String(primaryGas.targetMaxGwei);
+      gasBtn.dataset.estSavings = String(primaryGas.estimatedWaitSavingsUsd);
+      gasBtn.appendChild(createEl('span', 'preservation-gas-dot'));
+      gasBtn.appendChild(
+        createEl(
+          'span',
+          '',
           ethWatching
-            ? `Gas Watchdog active · waiting for ≤ ${esc(primaryGas.targetMaxGwei)} gwei`
-            : `Save ~${esc(fmtUsd(primaryGas.estimatedWaitSavingsUsd))} by waiting for ≤ ${esc(primaryGas.targetMaxGwei)} gwei · Watch &amp; Notify`
-        }</span>
-      </button>`
-    : '';
+            ? `Gas Watchdog active · waiting for ≤ ${primaryGas.targetMaxGwei} gwei`
+            : `Save ~${fmtUsd(primaryGas.estimatedWaitSavingsUsd)} by waiting for ≤ ${primaryGas.targetMaxGwei} gwei · Watch & Notify`
+        )
+      );
+      gasBtn.addEventListener('click', handleQuickGasWatchClick);
+      subRow.appendChild(gasBtn);
+    }
 
-  const unlockHtml = nextUnlock
-    ? `<span class="preservation-unlock-chip mono">${esc(unlocks.length)} scheduled · ${esc(nextUnlock.symbol)} (${esc(nextUnlock.actionLabel)})</span>`
-    : '';
+    if (nextUnlock) {
+      subRow.appendChild(
+        createEl(
+          'span',
+          'preservation-unlock-chip mono',
+          `${unlocks.length} scheduled · ${nextUnlock.symbol} (${nextUnlock.actionLabel})`
+        )
+      );
+    }
 
-  const subRowHtml =
-    gasPillHtml || unlockHtml
-      ? `<div class="preservation-sub-row">${gasPillHtml}${unlockHtml}</div>`
-      : '';
+    card.appendChild(subRow);
+  }
 
-  const breakdownHtml =
-    savedNum > 0
-      ? `<div class="preservation-breakdown mono pro-only">
-          <span>Route: ${esc(recLabel)}</span>
-          <span>Gas ${esc(fmtUsd(t.dollarsSavedGasUsd))}</span>
-          <span>Approvals ${esc(fmtUsd(t.dollarsSavedApprovalsUsd))}</span>
-          <span>Route Auction ${esc(fmtUsd(t.dollarsSavedRouteAuctionUsd))}</span>
-          <span>Neg-ROI Pruned ${esc(fmtUsd(t.dollarsSavedNegativeRoiPrunedUsd))}</span>
-          <span>Execution Eff. ${esc(effNum.toFixed(1))}%</span>
-        </div>`
-      : '';
-
-  host.innerHTML = `
-    <div class="preservation-strip" id="preservationStripCard">
-      <div class="preservation-main-row">
-        <div class="preservation-metrics">
-          <span class="preservation-score-badge" title="Net capital preserved after gas, slippage, bridge &amp; protocol fees">
-            <span class="preservation-score-dot"></span>
-            <span>Keeping ${esc(pctNum.toFixed(1))}% of your value</span>
-          </span>
-          <span class="preservation-pill preservation-pill-saved mono">+${esc(fmtUsd(savedNum))} saved vs manual swaps</span>
-          ${
-            popupsNaive > 0
-              ? `<span class="preservation-pill preservation-pill-popups mono">${esc(popupsNaive)} → ${esc(popupsOpt)} popups</span>`
-              : ''
-          }
-        </div>
-        <div class="preservation-actions">
-          <button type="button" class="btn-pill-dark btn-sm preservation-apply-btn ${isApplied ? 'is-applied' : ''}" id="applyOptimalRouteBtn">
-            ${isApplied ? 'Optimal Route Applied ✓' : 'Apply Optimal Route'}
-          </button>
-        </div>
-      </div>
-      ${breakdownHtml}
-      ${subRowHtml}
-    </div>
-  `;
-
-  document.getElementById('applyOptimalRouteBtn')?.addEventListener('click', handleApplyOptimalRoute);
-  document.getElementById('gasWatchQuickPill')?.addEventListener('click', handleQuickGasWatchClick);
+  host.replaceChildren(card);
 }
 
 function handleApplyOptimalRoute() {
@@ -308,70 +557,87 @@ function renderGasWatchAgentsPanel() {
   if (!listHost) return;
 
   if (!activeGasTriggers.length) {
-    listHost.innerHTML =
-      '<div class="muted-xs" style="padding:4px 0;">No gas-window triggers active yet. Set a target gwei threshold above or click the inline Watch &amp; Notify pill in the Sweep view.</div>';
+    const empty = createEl(
+      'div',
+      'muted-xs',
+      'No gas-window triggers active yet. Set a target gwei threshold above or click the inline Watch & Notify pill in the Sweep view.'
+    );
+    empty.style.padding = '4px 0';
+    listHost.replaceChildren(empty);
     return;
   }
 
-  listHost.innerHTML = activeGasTriggers
-    .map((tr) => {
-      const canCancel = tr.status === 'watching' || tr.status === 'ready';
-      const statusClass =
-        tr.status === 'ready'
-          ? 'is-ready'
-          : tr.status === 'watching'
-          ? 'is-watching'
-          : tr.status === 'cancelled'
-          ? 'is-cancelled'
-          : 'is-expired';
-      return `
-        <div class="gas-watch-item" data-gas-watch-id="${esc(tr.id)}">
-          <div class="gas-watch-item-top">
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0;">
-              <strong class="mono">${esc(tr.chain.toUpperCase())} ≤ ${esc(tr.maxBaseFeeGwei)} gwei</strong>
-              <span class="gas-watch-status ${statusClass} mono">${esc(tr.status)}</span>
-              ${
-                Number(tr.estimatedSavingsUsd) > 0
-                  ? `<span class="preservation-pill preservation-pill-saved mono">~${esc(fmtUsd(tr.estimatedSavingsUsd))} est. save</span>`
-                  : ''
-              }
-            </div>
-            ${
-              canCancel
-                ? `<button type="button" class="btn-row-exec" data-cancel-gas-watch="${esc(tr.id)}">Cancel</button>`
-                : ''
-            }
-          </div>
-          <div class="gas-watch-meta mono">
-            ${esc(shortAddr(tr.sourceWallet))} → ${esc(shortAddr(tr.solanaDestination))}${
-              typeof tr.lastObservedGwei === 'number'
-                ? ` · Last observed: ${esc(tr.lastObservedGwei.toFixed(1))} gwei`
-                : ''
-            }
-          </div>
-          <div class="gas-watch-safety">${esc(tr.safetyNote)}</div>
-        </div>
-      `;
-    })
-    .join('');
+  const frag = document.createDocumentFragment();
+  for (const tr of activeGasTriggers) {
+    const canCancel = tr.status === 'watching' || tr.status === 'ready';
+    const statusClass =
+      tr.status === 'ready'
+        ? 'is-ready'
+        : tr.status === 'watching'
+        ? 'is-watching'
+        : tr.status === 'cancelled'
+        ? 'is-cancelled'
+        : 'is-expired';
 
-  listHost.querySelectorAll('[data-cancel-gas-watch]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const id = btn.getAttribute('data-cancel-gas-watch');
-      if (!id) return;
-      try {
-        await fetchJsonSilent(nativeFetch, `/api/agents/gas-watch/${encodeURIComponent(id)}/cancel`, {
-          method: 'POST',
-          body: JSON.stringify({}),
-        });
-        await refreshGasWatchAgents();
-        renderPreservationStrip();
-        showPreservationToast('Gas-window watchdog trigger cancelled.');
-      } catch (err) {
-        showPreservationToast(err instanceof Error ? err.message : 'Failed to cancel trigger.');
-      }
-    });
-  });
+    const item = createEl('div', 'gas-watch-item');
+    item.dataset.gasWatchId = String(tr.id || '');
+
+    const top = createEl('div', 'gas-watch-item-top');
+    const left = createEl('div');
+    left.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0;';
+    left.appendChild(
+      createEl('strong', 'mono', `${String(tr.chain || '').toUpperCase()} ≤ ${tr.maxBaseFeeGwei} gwei`)
+    );
+    left.appendChild(createEl('span', `gas-watch-status ${statusClass} mono`, String(tr.status || '')));
+
+    if (Number(tr.estimatedSavingsUsd) > 0) {
+      left.appendChild(
+        createEl(
+          'span',
+          'preservation-pill preservation-pill-saved mono',
+          `~${fmtUsd(tr.estimatedSavingsUsd)} est. save`
+        )
+      );
+    }
+    top.appendChild(left);
+
+    if (canCancel) {
+      const cancelBtn = createEl('button', 'btn-row-exec', 'Cancel');
+      cancelBtn.type = 'button';
+      cancelBtn.setAttribute('data-cancel-gas-watch', String(tr.id || ''));
+      cancelBtn.addEventListener('click', async () => {
+        const id = String(tr.id || '');
+        if (!id) return;
+        try {
+          await fetchJsonSilent(nativeFetch, `/api/agents/gas-watch/${encodeURIComponent(id)}/cancel`, {
+            method: 'POST',
+            body: JSON.stringify({}),
+          });
+          await refreshGasWatchAgents();
+          renderPreservationStrip();
+          showPreservationToast('Gas-window watchdog trigger cancelled.');
+        } catch (err) {
+          showPreservationToast(err instanceof Error ? err.message : 'Failed to cancel trigger.');
+        }
+      });
+      top.appendChild(cancelBtn);
+    }
+
+    const metaText = `${shortAddr(tr.sourceWallet)} → ${shortAddr(tr.solanaDestination)}${
+      typeof tr.lastObservedGwei === 'number'
+        ? ` · Last observed: ${tr.lastObservedGwei.toFixed(1)} gwei`
+        : ''
+    }`;
+    const meta = createEl('div', 'gas-watch-meta mono', metaText);
+    const safety = createEl('div', 'gas-watch-safety', tr.safetyNote || '');
+
+    item.appendChild(top);
+    item.appendChild(meta);
+    item.appendChild(safety);
+    frag.appendChild(item);
+  }
+
+  listHost.replaceChildren(frag);
 }
 
 async function refreshGasWatchAgents() {
@@ -398,6 +664,7 @@ async function runPreservationOptimization(scanReport) {
   }
 
   latestScanReport = scanReport;
+  window.dispatchEvent(new CustomEvent('siphon:scan-updated', { detail: { scanReport } }));
   const seq = ++optimizeSeq;
 
   try {
@@ -428,8 +695,14 @@ function installScanObserver() {
   window.fetch = async function wrappedFetch(input, init) {
     const response = await nativeFetch(input, init);
     try {
-      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input?.url || '';
-      const method = (init?.method || (typeof input !== 'string' && input?.method) || 'GET').toUpperCase();
+      const url =
+        typeof input === 'string' ? input : input instanceof URL ? input.href : input?.url || '';
+      const method = (
+        init?.method ||
+        (typeof input !== 'string' && input?.method) ||
+        'GET'
+      ).toUpperCase();
+
       if (
         response.ok &&
         method === 'POST' &&
@@ -442,7 +715,28 @@ function installScanObserver() {
           .json()
           .then((scanData) => {
             if (scanData && Array.isArray(scanData.assets)) {
+              latestRouteAuction = null;
               runPreservationOptimization(scanData);
+            }
+          })
+          .catch(() => {});
+      } else if (
+        response.ok &&
+        method === 'POST' &&
+        (url.endsWith('/api/tx/prepare-chain-batch') || url.includes('/api/tx/prepare-chain-batch?'))
+      ) {
+        response
+          .clone()
+          .json()
+          .then((batchData) => {
+            const auction =
+              batchData?.routeAuction ||
+              (Array.isArray(batchData?.bridgeTrackers)
+                ? batchData.bridgeTrackers.find((b) => b?.routeAuction)?.routeAuction
+                : null);
+            if (auction && auction.winnerProvider) {
+              latestRouteAuction = auction;
+              renderPreservationStrip();
             }
           })
           .catch(() => {});
@@ -488,7 +782,9 @@ function bindPreservationEvents() {
     const chain = document.getElementById('gasWatchChainSelect')?.value || 'ethereum';
     const maxGwei = Number(document.getElementById('gasWatchMaxGweiInput')?.value || 15);
     const estSavings =
-      chain === 'ethereum' ? Number(latestPreservation?.gasTiming?.primary?.estimatedWaitSavingsUsd || 0) : 0;
+      chain === 'ethereum'
+        ? Number(latestPreservation?.gasTiming?.primary?.estimatedWaitSavingsUsd || 0)
+        : 0;
     await registerGasWatchTrigger({
       chain,
       maxBaseFeeGwei: maxGwei,
@@ -507,6 +803,8 @@ if (document.readyState === 'loading') {
 
 window.__siphonPreservation = {
   getLatest: () => latestPreservation,
+  getLatestRouteAuction: () => latestRouteAuction,
+  computeTieredPreservationFee,
   refreshGasWatchAgents,
   runPreservationOptimization,
 };
