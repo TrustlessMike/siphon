@@ -9,6 +9,7 @@ export type StateNamespace =
   | 'plugin_tokens'
   | 'gasless_intents'
   | 'preservation_agents'
+  | 'unlock_harvester'
   | (string & {});
 
 export interface TurgaliumStateStore {

@@ -58,7 +58,17 @@ import {
   type AgentActionType,
   type PluginClientKind,
 } from '../agent/mandate-engine.js';
-import { PreservationAgentStore } from '../agent/preservation-agents.js';
+import {
+  PreservationAgentStore,
+  type GasWatchEvaluationResult,
+  type GasWatchTrigger,
+} from '../agent/preservation-agents.js';
+import {
+  UnlockHarvesterStore,
+  type UnlockHarvestAlert,
+  type UnlockQueuesReaderFn,
+  type UnlockWatchEntry,
+} from '../agent/unlock-harvester.js';
 import {
   buildAiPluginManifest,
   buildOpenApiSpec,
@@ -124,6 +134,15 @@ export interface TurgaliumServerOptions {
   degenClient?: JupiterMarketsClient;
   nowMs?: () => number;
   liveGasFetcher?: (chain: EvmChainId) => Promise<number | null>;
+  unlockQueuesReader?: UnlockQueuesReaderFn;
+  enableBackgroundPollers?: boolean;
+  gasPollIntervalMs?: number;
+  unlockPollIntervalMs?: number;
+  onGasWindowTriggered?: (
+    trigger: GasWatchTrigger,
+    evalResult: GasWatchEvaluationResult
+  ) => void | Promise<void>;
+  onUnlockReady?: (alert: UnlockHarvestAlert, watch: UnlockWatchEntry) => void | Promise<void>;
   stateStore?: TurgaliumStateStore;
   dataDir?: string | null;
   rateLimit?: RateLimiterOptions;
@@ -337,6 +356,9 @@ function isAdminMutationRoute(pathname: string, method: string): boolean {
   if (method === 'GET' && (pathname === '/api/plugin/setup' || pathname === '/api/jobs' || pathname.startsWith('/api/jobs/'))) {
     return true;
   }
+  if (method === 'DELETE') {
+    return pathname.startsWith('/api/agents/unlock-watch/');
+  }
   if (method !== 'POST') return false;
   return (
     pathname === '/api/agents/mandates' ||
@@ -344,6 +366,8 @@ function isAdminMutationRoute(pathname: string, method: string): boolean {
     (pathname.startsWith('/api/agents/approvals/') && pathname.endsWith('/decide')) ||
     pathname === '/api/agents/gas-watch' ||
     (pathname.startsWith('/api/agents/gas-watch/') && pathname.endsWith('/cancel')) ||
+    pathname === '/api/agents/unlock-watch' ||
+    pathname === '/api/agents/unlock-watch/check' ||
     pathname === '/api/plugin/tokens' ||
     (pathname.startsWith('/api/plugin/tokens/') && pathname.endsWith('/revoke')) ||
     pathname === '/api/jobs' ||
@@ -356,7 +380,8 @@ function isAgentReadRoute(pathname: string, method: string): boolean {
     method === 'GET' &&
     (pathname === '/api/agents/mandates' ||
       pathname === '/api/agents/approvals' ||
-      pathname === '/api/agents/gas-watch')
+      pathname === '/api/agents/gas-watch' ||
+      pathname === '/api/agents/unlock-watch')
   );
 }
 
@@ -419,7 +444,7 @@ function buildCorsHeaders(params: {
 }): Record<string, string> {
   const headers: Record<string, string> = {
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Turgalium-Admin-Session, Mcp-Session-Id, MCP-Protocol-Version',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
   };
   if (!params.restricted) {
     headers['Access-Control-Allow-Origin'] = '*';
@@ -625,6 +650,74 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
   const agentEngine = new TurgaliumAgentEngine({ nowMs: opts.nowMs, stateStore });
   const degenClient = opts.degenClient ?? new JupiterMarketsClient({ nowMs: opts.nowMs });
   const preservationAgents = new PreservationAgentStore({ nowMs: opts.nowMs, stateStore });
+  const unlockHarvester = new UnlockHarvesterStore({
+    nowMs: opts.nowMs,
+    stateStore,
+    readUnlockQueues: opts.unlockQueuesReader,
+  });
+
+  const nowFn = opts.nowMs ?? (() => Date.now());
+  if (opts.enableBackgroundPollers === true) {
+    preservationAgents.startPoller({
+      intervalMs: opts.gasPollIntervalMs,
+      fetchGasGwei: opts.liveGasFetcher,
+      mandateValidator: (mandateId, trigger) => {
+        const mandate = agentEngine.getMandate(mandateId);
+        if (!mandate || !mandate.active) return false;
+        if (Date.parse(mandate.expiresAt) <= nowFn()) return false;
+        if (mandate.lockedSolanaRecipient !== trigger.solanaDestination) return false;
+        return true;
+      },
+      onTriggered: async (trigger, evalResult) => {
+        // Human-permissioned proposal hook: queue a non-custodial approval request when gas window opens
+        try {
+          const proposalUsd = Math.max(1, trigger.estimatedSavingsUsd || 1);
+          agentEngine.requestPermission({
+            client: 'smart_contract_agent',
+            mandateId: trigger.autoExecuteAllowed ? trigger.mandateId : undefined,
+            actionType: 'bridge_solana',
+            summary: `Gas window met on ${trigger.chain} (${trigger.lastObservedGwei ?? trigger.maxBaseFeeGwei} <= ${trigger.maxBaseFeeGwei} gwei) for trigger ${trigger.id}`,
+            sourceWallets: [trigger.sourceWallet],
+            chains: [trigger.chain],
+            solanaDestination: trigger.solanaDestination,
+            grossUsd: proposalUsd,
+            estimatedNetUsdc: Number((proposalUsd * 0.95).toFixed(2)),
+          });
+        } catch {
+          // Proposal queuing is best-effort and must never crash the poller
+        }
+        if (opts.onGasWindowTriggered) {
+          await opts.onGasWindowTriggered(trigger, evalResult);
+        }
+      },
+    });
+
+    unlockHarvester.startPoller({
+      intervalMs: opts.unlockPollIntervalMs,
+      readUnlockQueues: opts.unlockQueuesReader,
+      onReadyUnlock: async (alert, watch) => {
+        if (watch.solanaDestination && alert.estimatedUsd > 0) {
+          try {
+            agentEngine.requestPermission({
+              client: 'smart_contract_agent',
+              actionType: 'defi_withdraw',
+              summary: `Unlock ready to harvest: ${alert.actionLabel}`,
+              sourceWallets: [watch.walletAddress],
+              chains: [alert.chain],
+              solanaDestination: watch.solanaDestination,
+              grossUsd: alert.estimatedUsd,
+              estimatedNetUsdc: Number((alert.estimatedUsd * 0.97).toFixed(2)),
+            });
+          } catch {
+            // Proposal queuing is best-effort and must never crash the poller
+          }
+        }
+        if (opts.onUnlockReady) {
+          await opts.onUnlockReady(alert, watch);
+        }
+      },
+    });
+  }
 
   const server = http.createServer(async (req, res) => {
     runtimeMetrics.requestsTotal += 1;
@@ -843,6 +936,12 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
             approvalsTotal: agentEngine.listApprovals().length,
             pluginTokensTotal: agentEngine.listPluginTokens().length,
             scanCacheEntries: scanCache.size,
+            gasWatchTriggersTotal: preservationAgents.size,
+            unlockWatchesTotal: unlockHarvester.size,
+          },
+          pollers: {
+            gasWatch: preservationAgents.getPollerStatus(),
+            unlockHarvester: unlockHarvester.getPollerStatus(),
           },
         });
       }
@@ -2169,6 +2268,8 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           scanCache,
           agentEngine,
           preservationAgents,
+          unlockHarvester,
+          unlockQueuesReader: opts.unlockQueuesReader,
           maxPrivilegedBodyBytes: MAX_PRIVILEGED_JSON_BODY_BYTES,
           nowMs: opts.nowMs,
           liveGasFetcher: opts.liveGasFetcher,
@@ -2206,7 +2307,18 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
 
   server.on('close', () => {
     jobStore.dispose();
+    preservationAgents.stopPoller();
+    unlockHarvester.stopPoller();
   });
 
-  return { server, scanCache, jobStore, agentEngine, preservationAgents, stateStore, rateLimiter };
+  return {
+    server,
+    scanCache,
+    jobStore,
+    agentEngine,
+    preservationAgents,
+    unlockHarvester,
+    stateStore,
+    rateLimiter,
+  };
 }
