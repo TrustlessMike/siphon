@@ -855,12 +855,15 @@ def main():
             pgS.route("**/api/solana/balance*", route_sol_balance)
 
             pgS.goto(BASE, wait_until="networkidle")
-            pgS.wait_for_timeout(350)
+            pgS.wait_for_function(
+                "() => (document.getElementById('liveExecLogBody')?.textContent || '').includes('(0 assets)')",
+                timeout=8000,
+            )
 
             # 2A. Stored XSS Backtest: leg.assetCount coerced to 0 assets & 0 script execution!
             xss_check = pgS.evaluate("""() => ({
               xssFired: Boolean(window.__xssFired),
-              tableText: document.getElementById('liveExecLogBody')?.innerText || '',
+              tableText: document.getElementById('liveExecLogBody')?.textContent || '',
               injectedImgs: document.querySelectorAll('#liveExecLogBody img[src="x"]').length,
             })""")
             assert not xss_check["xssFired"], f"Stored XSS executed! {xss_check}"
