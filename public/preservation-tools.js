@@ -14,7 +14,7 @@ import {
   isValidSolanaBase58,
   sendEvmRevokeCalls,
   signAndSendSolanaVersionedTx,
-} from './wallets.js?v=8';
+} from './wallets.js?v=11';
 
 const SUPPORTED_APPROVAL_CHAINS = [
   { id: 'ethereum', label: 'Ethereum', explorer: 'https://etherscan.io/tx/' },

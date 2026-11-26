@@ -1,8 +1,10 @@
 # Turgalium — Zero-Fee Open-Source Multi-Chain Solana Migrator
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-0a0a0a.svg)](LICENSE)
+[![CI](https://github.com/TrustlessMike/turgalium/actions/workflows/ci.yml/badge.svg)](https://github.com/TrustlessMike/turgalium/actions/workflows/ci.yml)
 [![Protocol Fee: 0%](https://img.shields.io/badge/Protocol%20Fee-0%25%20Free-059669.svg)](#)
 [![Live App](https://img.shields.io/badge/Live%20App-turgalium.vercel.app-0369a1.svg)](https://turgalium.vercel.app)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FTrustlessMike%2Fturgalium)
 
 **Bring every chain home to Solana — 0% protocol fees, 100% open source (MIT).**
 *Named after Turgalium — the ancient homeland of Maximus Decimus Meridius.*

@@ -1,4 +1,3 @@
-import { mountTurgaliumFunnelScene } from './turgalium-3d.js?v=3';
 import { renderConvergenceSvg } from './turgalium-svg.js?v=4';
 import {
   claimCctpOnSolana,
@@ -40,7 +39,7 @@ import {
   signGaslessTypedData,
   subscribeWalletDiscovery,
   waitForEip5792Batch,
-} from './wallets.js?v=8';
+} from './wallets.js?v=11';
 
 let currentScan = null;
 let currentPlan = null;
@@ -752,10 +751,68 @@ function setUiMode(mode, { persist = true, silent = false } = {}) {
   }
 }
 
+let heroScenePromise = null;
+let preservationToolsPromise = null;
+let degenModulePromise = null;
+
+function ensureHeroScene() {
+  if (heroScene) return Promise.resolve(heroScene);
+  if (heroScenePromise) return heroScenePromise;
+  const canvas = document.getElementById('turgaliumHeroCanvas');
+  if (!canvas) return Promise.resolve(null);
+  heroScenePromise = import('./turgalium-3d.js?v=3')
+    .then(({ mountTurgaliumFunnelScene }) => {
+      if (!heroScene) {
+        heroScene = mountTurgaliumFunnelScene(canvas);
+        window.__turgaliumHeroScene = heroScene;
+        if (document.getElementById('siteShell')?.classList.contains('hidden')) {
+          heroScene?.setPaused(true);
+        }
+      }
+      return heroScene;
+    })
+    .catch(() => {
+      heroScenePromise = null;
+      return null;
+    });
+  return heroScenePromise;
+}
+
+function ensurePreservationToolsLoaded() {
+  if (preservationToolsPromise) return preservationToolsPromise;
+  preservationToolsPromise = import('./preservation-tools.js?v=3')
+    .then((mod) => {
+      if (currentScan) {
+        window.dispatchEvent(new CustomEvent('turgalium:scan-updated', { detail: { scan: currentScan } }));
+      }
+      dispatchTurgaliumBalanceUpdated();
+      return mod;
+    })
+    .catch((err) => {
+      preservationToolsPromise = null;
+      throw err;
+    });
+  return preservationToolsPromise;
+}
+
+function ensureDegenLoaded() {
+  if (degenModulePromise) return degenModulePromise;
+  degenModulePromise = import('./degen.js?v=3')
+    .then((mod) => {
+      dispatchTurgaliumBalanceUpdated();
+      return mod;
+    })
+    .catch((err) => {
+      degenModulePromise = null;
+      throw err;
+    });
+  return degenModulePromise;
+}
+
 function showWebsite() {
   document.getElementById('siteShell').classList.remove('hidden');
   document.getElementById('appShell').classList.add('hidden');
-  heroScene?.setPaused(false);
+  ensureHeroScene().then((scene) => scene?.setPaused(false));
   window.scrollTo({ top: 0, behavior: 'instant' });
   window.dispatchEvent(new Event('resize'));
   renderBackgroundAgentUI();
@@ -769,6 +826,7 @@ function openApp(viewName = 'scanner') {
   document.getElementById('siteShell').classList.add('hidden');
   document.getElementById('appShell').classList.remove('hidden');
   heroScene?.setPaused(true);
+  ensurePreservationToolsLoaded().catch(() => {});
   switchView(mapped);
   window.scrollTo({ top: 0, behavior: 'instant' });
 }
@@ -781,6 +839,7 @@ function switchView(viewName) {
   document.querySelectorAll('.view-pane').forEach((pane) => {
     pane.classList.toggle('active', pane.id === `view-${viewName}`);
   });
+  if (viewName === 'degen') ensureDegenLoaded().catch(() => {});
   if (viewName === 'contract' && !contractData) loadContract();
   if (viewName === 'agents') loadAgentsAndPlugins();
   renderBackgroundAgentUI();
@@ -1165,10 +1224,58 @@ async function runScan({ address = null, family = null, autoOpen = false } = {})
   }
   try {
     const payload = { address: cleanAddr, family: family || activeFamily };
-    const scan = await api('/api/scan', {
+    const badge = document.getElementById('scanModeBadge');
+    const res = await fetch('/api/scan', {
       method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/x-ndjson, application/json',
+      },
       body: JSON.stringify(payload),
     });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || `HTTP ${res.status}`);
+    }
+    let scan = null;
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (ct.includes('application/x-ndjson') && res.body && typeof res.body.getReader === 'function') {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          let ev = null;
+          try {
+            ev = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (seq !== scanSeq) {
+            reader.cancel().catch(() => {});
+            return;
+          }
+          if (ev.type === 'chain' && scanBtn) {
+            scanBtn.textContent = `Scanning ${ev.completed}/${ev.total}…`;
+            if (badge) badge.textContent = `Scanning ${ev.completed}/${ev.total} chains…`;
+          } else if (ev.type === 'done' && ev.report) {
+            scan = ev.report;
+          } else if (ev.type === 'error') {
+            throw new Error(ev.error || 'Wallet scan failed.');
+          }
+        }
+      }
+      if (!scan) throw new Error('Scan stream ended before completing.');
+    } else {
+      scan = await res.json();
+    }
     if (seq !== scanSeq) return;
     currentScan = scan;
     batchRescuedDustIds.clear();
@@ -1193,7 +1300,6 @@ async function runScan({ address = null, family = null, autoOpen = false } = {})
       if (heroIn) heroIn.value = currentScan.walletAddress;
     }
 
-    const badge = document.getElementById('scanModeBadge');
     if (badge) {
       badge.textContent = `Live · ${currentScan.scanDurationMs}ms`;
       badge.classList.toggle('is-live', currentScan.mode === 'live_rpc');
@@ -5450,8 +5556,16 @@ loadWalletConnectorConfig().then((cfg) => {
     renderAgentsLockedState();
   }
 });
-heroScene = mountTurgaliumFunnelScene(document.getElementById('turgaliumHeroCanvas'));
-window.__turgaliumHeroScene = heroScene;
+const scheduleHeroScene = () => {
+  if (!document.getElementById('siteShell')?.classList.contains('hidden')) {
+    ensureHeroScene();
+  }
+};
+if (typeof window.requestIdleCallback === 'function') {
+  window.requestIdleCallback(scheduleHeroScene, { timeout: 250 });
+} else {
+  setTimeout(scheduleHeroScene, 60);
+}
 renderEmptyScanState();
 
 async function runUnifiedScan() {
