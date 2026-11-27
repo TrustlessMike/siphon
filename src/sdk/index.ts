@@ -235,16 +235,25 @@ export {
   MAX_PRESERVE_PCT,
   MAX_TOTAL_USDC_AMOUNT,
   listSolanaYieldStrategies,
+  fetchLiveSavingsApy,
+  fetchSolanaYieldStrategiesWithLiveApy,
   calculateYieldPreservationSplit,
   buildSolanaYieldParkPlan,
   type SolanaYieldStrategyId,
   type SolanaYieldStrategyMeta,
+  type SolanaYieldStrategyWithApy,
   type YieldPreservationSplit,
   type JupiterSwapQuoteSummary,
   type YieldParkTransactionPayload,
   type BuildSolanaYieldParkParams,
   type SolanaYieldParkPlan,
 } from '../solana/yield-park.js';
+
+export {
+  fetchSolanaOverview,
+  type SolanaOverviewParams,
+  type SolanaOverviewResult,
+} from '../solana/overview.js';
 
 // --- DeFi Protocol Extractors & Live Unlock-Queue Readers ---
 export {
@@ -338,3 +347,16 @@ export {
   type DefiDisplayCategory,
   type DefiDisplayMetadata,
 } from '../scanner/defi-display.js';
+export {
+  prepareBatchExecutions,
+  MAX_PREPARE_BATCH_ASSETS,
+  DEFAULT_PREPARE_BATCH_CONCURRENCY,
+  type PrepareBatchRequest,
+  type PrepareBatchItemResult,
+  type PrepareBatchResponse,
+} from '../execution/prepare-batch.js';
+export {
+  BoundedTtlCache,
+  InFlightCoalescer,
+  type BoundedTtlCacheOptions,
+} from '../server/cache.js';

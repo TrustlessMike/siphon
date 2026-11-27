@@ -1233,15 +1233,6 @@ export const TOKEN_REGISTRY: TokenDescriptor[] = [
   },
   {
     chain: 'base',
-    address: '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed',
-    symbol: 'DEGEN',
-    name: 'Degen (Base)',
-    decimals: 18,
-    kind: 'erc20',
-    llamaKey: 'base:0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed',
-  },
-  {
-    chain: 'base',
     address: '0x532f27101965dd16442E59d40670FaF5eBB142E4',
     symbol: 'BRETT',
     name: 'Brett',

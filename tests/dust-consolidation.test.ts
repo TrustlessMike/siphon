@@ -109,8 +109,8 @@ test('Two-Lane Dust Planner partitions Permit2/EIP-2612 instant 1-sig vs legacy 
   const assets: ScannedAsset[] = [
     makeBaseDustAsset({
       id: 'base:p2_a',
-      symbol: 'DEGEN',
-      address: '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed',
+      symbol: 'WELL',
+      address: '0xA88594D404727625A9437C3f886C7643872296AE',
       grossUsd: 8,
       permit2Approved: true,
     }),
@@ -409,8 +409,8 @@ test('buildGaslessSweepIntent surfaces instantSingleSigBreakdown and supports fi
   const assets: ScannedAsset[] = [
     makeBaseDustAsset({
       id: 'base:p2',
-      symbol: 'DEGEN',
-      address: '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed',
+      symbol: 'BRETT',
+      address: '0x532f27101965dd16442E59d40670FaF5eBB142E4',
       grossUsd: 12,
       permit2Approved: true,
     }),
@@ -467,8 +467,8 @@ test('HTTP /api/dust/plan exposes two-lane signature optimization metrics', asyn
     const scan = makeScanReport([
       makeBaseDustAsset({
         id: 'base:p2',
-        symbol: 'DEGEN',
-        address: '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed',
+        symbol: 'BRETT',
+        address: '0x532f27101965dd16442E59d40670FaF5eBB142E4',
         grossUsd: 10,
         permit2Approved: true,
       }),

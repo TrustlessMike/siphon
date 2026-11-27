@@ -738,23 +738,31 @@ test('buildCloseEmptyAtasVersionedTx FAILS CLOSED on non-zero balance, frozen ac
 // 3. SOLANA YIELD PARKING (JupSOL + Jupiter Lend jlUSDC + Kamino USDC)
 // ============================================================================
 
-test('calculateYieldPreservationSplit enforces exact 90/10 BigInt micro-USDC split and rejects invalid bounds', () => {
+test('calculateYieldPreservationSplit enforces exact 100% default & custom BigInt micro-USDC split and rejects invalid bounds', () => {
+  const splitDefault = calculateYieldPreservationSplit(1000);
+  assert.equal(splitDefault.preservePct, 100);
+  assert.equal(splitDefault.liquidReservePct, 0);
+  assert.equal(splitDefault.yieldUsdc, 1000);
+  assert.equal(splitDefault.yieldUsdcRaw, '1000000000');
+  assert.equal(splitDefault.liquidReserveUsdc, 0);
+  assert.equal(splitDefault.liquidReserveRaw, '0');
+
   const split90 = calculateYieldPreservationSplit(1000, 90);
   assert.equal(split90.preservePct, 90);
-  assert.equal(split90.degenPct, 10);
+  assert.equal(split90.liquidReservePct, 10);
   assert.equal(split90.yieldUsdc, 900);
   assert.equal(split90.yieldUsdcRaw, '900000000');
-  assert.equal(split90.degenSidePocketUsdc, 100);
-  assert.equal(split90.degenSidePocketRaw, '100000000');
+  assert.equal(split90.liquidReserveUsdc, 100);
+  assert.equal(split90.liquidReserveRaw, '100000000');
   assert.equal(
-    BigInt(split90.yieldUsdcRaw) + BigInt(split90.degenSidePocketRaw),
+    BigInt(split90.yieldUsdcRaw) + BigInt(split90.liquidReserveRaw),
     BigInt(split90.totalUsdcRaw)
   );
 
   // Tricky fractional amount preserves exact micro-USDC conservation
   const splitFractional = calculateYieldPreservationSplit(333.333333, 90);
   assert.equal(
-    BigInt(splitFractional.yieldUsdcRaw) + BigInt(splitFractional.degenSidePocketRaw),
+    BigInt(splitFractional.yieldUsdcRaw) + BigInt(splitFractional.liquidReserveRaw),
     BigInt(splitFractional.totalUsdcRaw)
   );
 
@@ -821,7 +829,7 @@ test('buildSolanaYieldParkPlan quotes JupSOL via Jupiter Swap API, builds verifi
       assert.ok(seenQuoteUrl.includes(`outputMint=${SOLANA_JUPSOL_MINT}`));
       assert.ok(seenQuoteUrl.includes('amount=900000000'));
       assert.equal(jupPlan.split.yieldUsdc, 900);
-      assert.equal(jupPlan.split.degenSidePocketUsdc, 100);
+      assert.equal(jupPlan.split.liquidReserveUsdc, 100);
       assert.ok(jupPlan.jupiterQuote);
       assert.equal(jupPlan.jupiterQuote.estimatedOutputUi, 5.42);
       assert.deepEqual(jupPlan.jupiterQuote.routeLabels, ['Whirlpool', 'Sanctum']);
@@ -847,7 +855,7 @@ test('buildSolanaYieldParkPlan quotes JupSOL via Jupiter Swap API, builds verifi
         strategy: 'jupiter_lend_usdc',
       });
       assert.equal(jupLendPlan.split.yieldUsdc, 22_500);
-      assert.equal(jupLendPlan.split.degenSidePocketUsdc, 2_500);
+      assert.equal(jupLendPlan.split.liquidReserveUsdc, 2_500);
       assert.equal(jupLendPlan.apy.source, 'live');
       assert.equal(jupLendPlan.apy.estimatedApyPct, 8.15);
       assert.equal(jupLendPlan.projections.projectedAnnualYieldUsd, 1833.75);
@@ -872,7 +880,7 @@ test('buildSolanaYieldParkPlan quotes JupSOL via Jupiter Swap API, builds verifi
       if (url.includes('/swap/v1/quote')) {
         return jsonResponse({
           inputMint: SOLANA_USDC_MINT,
-          inAmount: '900000000',
+          inAmount: '1000000000',
           outputMint: SOLANA_JUPSOL_MINT,
           outAmount: '5420000000',
           otherAmountThreshold: '5392900000',
@@ -1060,12 +1068,12 @@ test('HTTP routes POST /api/solana/rent-scan, POST /api/solana/yield-park, and G
     });
     assert.equal(parkRes.status, 200);
     const parkJson = (await parkRes.json()) as {
-      split: { yieldUsdc: number; degenSidePocketUsdc: number };
+      split: { yieldUsdc: number; liquidReserveUsdc: number };
       jupiterQuote: { estimatedOutputUi: number } | null;
       transaction: { version: number; feePayer: string; swapTransactionBase64: string } | null;
     };
     assert.equal(parkJson.split.yieldUsdc, 900);
-    assert.equal(parkJson.split.degenSidePocketUsdc, 100);
+    assert.equal(parkJson.split.liquidReserveUsdc, 100);
     assert.equal(parkJson.jupiterQuote?.estimatedOutputUi, 5);
     assert.equal(parkJson.transaction?.version, 0);
     assert.equal(parkJson.transaction?.feePayer, SOL_USER_A);

@@ -501,61 +501,73 @@ async function fetchSplPricesUsd(
   const { priceUrl, headers } = getJupiterSwapEndpoint(opts.jupiterApiKey);
   const priceTimeout = Math.min(opts.timeoutMs, 3_000);
 
-  // 1. Primary: Jupiter Price API v2 (batched in chunks of 50)
+  // 1. Primary: Jupiter Price API v2 (batched in chunks of 50 in parallel)
+  const jupChunks: string[][] = [];
   for (let i = 0; i < queryMints.length; i += 50) {
-    const chunk = queryMints.slice(i, i + 50);
-    const url = `${priceUrl}?ids=${encodeURIComponent(chunk.join(','))}`;
-    const res = await fetchJsonWithTimeout<{
-      data?: Record<string, { price?: string | number; mintSymbol?: string } | null>;
-    }>(url, { method: 'GET', headers }, priceTimeout);
-    if (res.ok && res.data?.data && typeof res.data.data === 'object') {
-      const dataObj = res.data.data;
-      for (const mint of chunk) {
-        if (!Object.hasOwn(dataObj, mint)) continue;
-        const entry = dataObj[mint];
-        const p = Number(entry?.price ?? NaN);
-        if (Number.isFinite(p) && p > 0) {
-          const sym =
-            typeof entry?.mintSymbol === 'string' && entry.mintSymbol.trim()
-              ? entry.mintSymbol.trim().slice(0, 16)
-              : undefined;
-          prices.set(mint, { priceUsd: p, source: 'jupiter', symbol: sym });
+    jupChunks.push(queryMints.slice(i, i + 50));
+  }
+  await Promise.all(
+    jupChunks.map(async (chunk) => {
+      const url = `${priceUrl}?ids=${encodeURIComponent(chunk.join(','))}`;
+      const res = await fetchJsonWithTimeout<{
+        data?: Record<string, { price?: string | number; mintSymbol?: string } | null>;
+      }>(url, { method: 'GET', headers }, priceTimeout);
+      if (res.ok && res.data?.data && typeof res.data.data === 'object') {
+        const dataObj = res.data.data;
+        for (const mint of chunk) {
+          if (!Object.hasOwn(dataObj, mint)) continue;
+          const entry = dataObj[mint];
+          const p = Number(entry?.price ?? NaN);
+          if (Number.isFinite(p) && p > 0) {
+            const sym =
+              typeof entry?.mintSymbol === 'string' && entry.mintSymbol.trim()
+                ? entry.mintSymbol.trim().slice(0, 16)
+                : undefined;
+            prices.set(mint, { priceUsd: p, source: 'jupiter', symbol: sym });
+          }
         }
       }
-    }
-  }
+    })
+  );
 
-  // 2. Fallback: DeFiLlama coins API for any missing mints + SOL
+  // 2. Fallback: DeFiLlama coins API for any missing mints + SOL (parallel chunks of 40)
   const missing = queryMints.filter((m) => !prices.has(m));
   if (missing.length > 0) {
     const llamaKeys = missing.map((m) =>
       m === SOLANA_WSOL_MINT ? 'coingecko:solana' : `solana:${m}`
     );
+    const llamaChunks: Array<{ keys: string[]; mints: string[] }> = [];
     for (let i = 0; i < llamaKeys.length; i += 40) {
-      const chunkKeys = llamaKeys.slice(i, i + 40);
-      const chunkMints = missing.slice(i, i + 40);
-      const url = `https://coins.llama.fi/prices/current/${chunkKeys.map(encodeURIComponent).join(',')}`;
-      const res = await fetchJsonWithTimeout<{
-        coins?: Record<string, { price?: number; symbol?: string }>;
-      }>(url, { method: 'GET', headers: { Accept: 'application/json' } }, priceTimeout);
-      if (res.ok && res.data?.coins && typeof res.data.coins === 'object') {
-        const coinsObj = res.data.coins;
-        for (let j = 0; j < chunkKeys.length; j += 1) {
-          const k = chunkKeys[j];
-          const mint = chunkMints[j];
-          if (!Object.hasOwn(coinsObj, k)) continue;
-          const entry = coinsObj[k];
-          const p = Number(entry?.price ?? NaN);
-          if (Number.isFinite(p) && p > 0) {
-            const sym =
-              typeof entry?.symbol === 'string' && entry.symbol.trim()
-                ? entry.symbol.trim().slice(0, 16)
-                : undefined;
-            prices.set(mint, { priceUsd: p, source: 'defillama', symbol: sym });
+      llamaChunks.push({
+        keys: llamaKeys.slice(i, i + 40),
+        mints: missing.slice(i, i + 40),
+      });
+    }
+    await Promise.all(
+      llamaChunks.map(async ({ keys: chunkKeys, mints: chunkMints }) => {
+        const url = `https://coins.llama.fi/prices/current/${chunkKeys.map(encodeURIComponent).join(',')}`;
+        const res = await fetchJsonWithTimeout<{
+          coins?: Record<string, { price?: number; symbol?: string }>;
+        }>(url, { method: 'GET', headers: { Accept: 'application/json' } }, priceTimeout);
+        if (res.ok && res.data?.coins && typeof res.data.coins === 'object') {
+          const coinsObj = res.data.coins;
+          for (let j = 0; j < chunkKeys.length; j += 1) {
+            const k = chunkKeys[j];
+            const mint = chunkMints[j];
+            if (!Object.hasOwn(coinsObj, k)) continue;
+            const entry = coinsObj[k];
+            const p = Number(entry?.price ?? NaN);
+            if (Number.isFinite(p) && p > 0) {
+              const sym =
+                typeof entry?.symbol === 'string' && entry.symbol.trim()
+                  ? entry.symbol.trim().slice(0, 16)
+                  : undefined;
+              prices.set(mint, { priceUsd: p, source: 'defillama', symbol: sym });
+            }
           }
         }
-      }
-    }
+      })
+    );
   }
 
   const solEntry = prices.get(SOLANA_WSOL_MINT);

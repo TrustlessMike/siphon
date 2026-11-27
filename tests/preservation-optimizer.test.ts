@@ -605,7 +605,7 @@ test('Dust Auto-Harvest Evaluator blocks tiny $1 dust and approves efficient bat
     makeAsset({
       id: 'base:d1',
       chain: 'base',
-      symbol: 'DEGEN',
+      symbol: 'BRETT',
       grossUsd: 8.5,
       estimatedGasUsd: 0.04,
       batchedGasUsd: 0.015,
