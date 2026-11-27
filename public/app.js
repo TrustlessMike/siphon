@@ -88,6 +88,8 @@ let adminSessionToken = (() => {
 const ADMIN_SESSION_STORAGE_KEY = 'turgalium_admin_session';
 const FEE_RECIPIENT_STORAGE_KEY = 'turgalium_fee_recipient_evm';
 const INFLIGHT_BRIDGES_STORAGE_KEY = 'turgalium_inflight_bridges_v1';
+const LOCAL_SWEEP_JOBS_STORAGE_KEY = 'turgalium_local_jobs_v1';
+const LOCAL_SWEEP_JOBS_MAX_ITEMS = 20;
 const INFLIGHT_BRIDGE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const INFLIGHT_BRIDGE_MAX_ITEMS = 25;
 
@@ -1765,6 +1767,9 @@ function renderRoiVerdictBadge(a) {
     return `<span class="roi-pill roi-worth" title="${tip}">Worth It</span>`;
   }
   if (v === 'low_efficiency') {
+    if (typeof a.effectiveCostPct === 'number' && a.effectiveCostPct < 15) {
+      return `<span class="roi-pill roi-low" title="${tip}">Small Balance</span>`;
+    }
     return `<span class="roi-pill roi-low" title="${tip}">High Cost (${pct ?? '—'}% fees)</span>`;
   }
   if (v === 'negative_roi' || a.action === 'SKIP_GAS_NEGATIVE' || a.action === 'SKIP_NEGATIVE_ROI') {
@@ -2077,9 +2082,15 @@ function normalizeDefiPosition(asset, targetOut = outputAsset) {
   } else if (asset?.roiVerdict === 'low_efficiency') {
     preflightLevel = 'warn';
     preflightIcon = 'alert-triangle';
-    preflightLabel = 'High network cost';
-    const pct = typeof asset?.effectiveCostPct === 'number' ? `${asset.effectiveCostPct.toFixed(0)}%` : 'elevated';
-    warningReason = `Verified withdrawable, though total fees are ${pct} of position value.`;
+    if (typeof asset?.effectiveCostPct === 'number' && asset.effectiveCostPct < 15) {
+      preflightLabel = 'Small balance';
+      const valUsd = safeNum(asset?.grossUsd).toFixed(2);
+      warningReason = `Verified withdrawable ($${valUsd}). Small balance — best swept together with other assets on this chain.`;
+    } else {
+      preflightLabel = 'High network cost';
+      const pct = typeof asset?.effectiveCostPct === 'number' ? `${asset.effectiveCostPct.toFixed(0)}%` : 'elevated';
+      warningReason = `Verified withdrawable, though total fees are ${pct} of position value.`;
+    }
   } else if (statusRaw === 'warn' || statusRaw === 'warning' || statusRaw === 'caution') {
     preflightLevel = 'warn';
     preflightIcon = 'alert-triangle';
@@ -2565,35 +2576,33 @@ async function extractDefiAssets(assetsToExtract, scopeTitle = 'DeFi Positions')
   isSweepQueueRunning = true;
   updateWalletButtons();
   try {
-    const job = await api('/api/jobs', {
-      method: 'POST',
-      body: JSON.stringify({
-        sourceWallet: connectedSrc,
-        solanaDestination: solDest,
-        outputAsset,
-        bridgePreference: getActiveBridgePreference(),
-        protocolFeeBps: getActiveProtocolFeeBps(),
-        feeRecipientEvm: getActiveFeeRecipientEvm(),
-        legs: chains.map((c) => {
-          const list = byChain.get(c);
-          const gross = list.reduce((s, x) => s + safeNum(x.grossUsd), 0);
-          const explicitBps = getActiveProtocolFeeBps();
-          const legFeeUsd =
-            explicitBps !== undefined
-              ? Number(((gross * explicitBps) / 10_000).toFixed(2))
-              : computeTieredPreservationFee(gross).feeUsd;
-          return {
-            chain: c,
-            chainName: list[0]?.chainName || c,
-            assetCount: list.length,
-            estimatedNetUsd: Math.max(0, Number((gross - legFeeUsd).toFixed(2))),
-            estimatedFeeUsd: legFeeUsd,
-          };
-        }),
+    const job = await createSweepJob({
+      sourceWallet: connectedSrc,
+      solanaDestination: solDest,
+      outputAsset,
+      bridgePreference: getActiveBridgePreference(),
+      protocolFeeBps: getActiveProtocolFeeBps(),
+      feeRecipientEvm: getActiveFeeRecipientEvm(),
+      legs: chains.map((c) => {
+        const list = byChain.get(c);
+        const gross = list.reduce((s, x) => s + safeNum(x.grossUsd), 0);
+        const explicitBps = getActiveProtocolFeeBps();
+        const legFeeUsd =
+          explicitBps !== undefined
+            ? Number(((gross * explicitBps) / 10_000).toFixed(2))
+            : computeTieredPreservationFee(gross).feeUsd;
+        return {
+          chain: c,
+          chainName: list[0]?.chainName || c,
+          assetCount: list.length,
+          estimatedNetUsd: Math.max(0, Number((gross - legFeeUsd).toFixed(2))),
+          estimatedFeeUsd: legFeeUsd,
+        };
       }),
     });
     activeJobId = job.jobId;
     backgroundJobs.unshift(job);
+    saveLocalSweepJobs();
     renderBackgroundAgentUI();
 
     initDefiStepper({
@@ -3222,14 +3231,10 @@ function renderBackgroundAgentUI() {
                   solanaDestination: job.solanaDestination,
                 }),
               });
-              await api(`/api/jobs/${encodeURIComponent(job.jobId)}/leg`, {
-                method: 'POST',
-                body: JSON.stringify({
-                  chain: leg.chain,
-                  status: att.attestationStatus === 'complete' ? 'attested' : 'relaying',
-                  statusText: att.nextStep,
-                  attestationStatus: att.attestationStatus,
-                }),
+              await patchJobLeg(job.jobId, leg.chain, {
+                status: att.attestationStatus === 'complete' ? 'attested' : 'relaying',
+                statusText: att.nextStep,
+                attestationStatus: att.attestationStatus,
               });
               await syncBackgroundJobs();
               showToast(att.nextStep);
@@ -3287,54 +3292,164 @@ function renderBackgroundAgentUI() {
   }
 }
 
-async function syncBackgroundJobs() {
-  if (!canAccessAdminRoutes()) return;
+function loadLocalSweepJobs() {
   try {
-    const res = await api('/api/jobs');
-    backgroundJobs = Array.isArray(res.jobs) ? res.jobs : [];
+    const raw = window.localStorage?.getItem(LOCAL_SWEEP_JOBS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((j) => j && typeof j.jobId === 'string' && Array.isArray(j.legs))
+      .slice(0, LOCAL_SWEEP_JOBS_MAX_ITEMS);
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalSweepJobs() {
+  try {
+    const localJobs = backgroundJobs
+      .filter((j) => j && typeof j.jobId === 'string' && j.jobId.startsWith('local_'))
+      .slice(0, LOCAL_SWEEP_JOBS_MAX_ITEMS);
+    window.localStorage?.setItem(LOCAL_SWEEP_JOBS_STORAGE_KEY, JSON.stringify(localJobs));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function buildLocalSweepJob(payload) {
+  const now = new Date().toISOString();
+  const rand =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID().slice(0, 12)
+      : `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const legs = (Array.isArray(payload?.legs) ? payload.legs : []).map((l, idx) => ({
+    legId: l.legId || `${l.chain || 'chain'}_${idx}`,
+    chain: l.chain,
+    chainName: l.chainName || l.chain,
+    assetCount: safeInt(l.assetCount),
+    estimatedNetUsd: safeNum(l.estimatedNetUsd),
+    estimatedFeeUsd: safeNum(l.estimatedFeeUsd),
+    status: 'queued',
+    statusText: 'Ready for wallet signature',
+    updatedAt: now,
+  }));
+  return {
+    jobId: `local_${rand}`,
+    localOnly: true,
+    status: legs.length ? 'active' : 'completed',
+    createdAt: now,
+    updatedAt: now,
+    sourceWallet: payload?.sourceWallet || '',
+    solanaDestination: payload?.solanaDestination || '',
+    outputAsset: payload?.outputAsset || 'USDC',
+    bridgePreference: payload?.bridgePreference || 'auto',
+    protocolFeeBps: safeInt(payload?.protocolFeeBps ?? 0),
+    legs,
+  };
+}
+
+async function createSweepJob(payload) {
+  if (canAccessAdminRoutes()) {
+    try {
+      const serverJob = await api('/api/jobs', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (serverJob && serverJob.jobId) return serverJob;
+    } catch {
+      // Fall back to non-custodial local browser tracking if server job store is locked/unavailable
+    }
+  }
+  const localJob = buildLocalSweepJob(payload);
+  return localJob;
+}
+
+function checkJobCompletionAndUi(jobsList) {
+  for (const job of jobsList) {
+    if (!job?.jobId) continue;
+    if (job.status === 'active') {
+      observedActiveJobIds.add(job.jobId);
+    } else if (
+      job.status === 'completed' &&
+      observedActiveJobIds.has(job.jobId) &&
+      !shownReceiptJobIds.has(job.jobId) &&
+      Array.isArray(job.legs) &&
+      job.legs.some((l) => l.status === 'landed' || l.status === 'attested')
+    ) {
+      shownReceiptJobIds.add(job.jobId);
+      openReceiptModal(job);
+    }
+  }
+
+  if (defiStepperState?.jobId) {
+    const tracked = jobsList.find((j) => j.jobId === defiStepperState.jobId);
+    if (tracked) {
+      const allSettled =
+        tracked.legs.length > 0 &&
+        tracked.legs.every((l) => l.status === 'landed' || l.status === 'attested');
+      const anyFailed = tracked.legs.some((l) => l.status === 'failed');
+      const solLeg = tracked.legs.find((l) => l.solanaTxHash);
+      if (allSettled) {
+        updateDefiStepperStep(
+          'confirm',
+          {
+            status: 'done',
+            detail: `Settled on Solana (${tracked.legs.length}/${tracked.legs.length} chains confirmed)`,
+            txUrl: safeExplorerTxUrl('https://solscan.io', solLeg?.solanaTxHash) || undefined,
+            txLabel: 'Solscan ↗',
+          },
+          { active: false, dismissible: true }
+        );
+      } else if (anyFailed && !defiStepperState.dismissible) {
+        updateDefiStepperStep('confirm', { status: 'failed', detail: 'Check Activity for leg status' }, { active: false, dismissible: true });
+      }
+    }
+  }
+}
+
+function applyLocalJobLegPatch(jobId, chain, patch) {
+  const job = backgroundJobs.find((j) => j && j.jobId === jobId);
+  if (!job || !Array.isArray(job.legs)) return null;
+  const now = new Date().toISOString();
+  const leg = job.legs.find((l) => l.chain === chain || (patch?.legId && l.legId === patch.legId));
+  if (leg) {
+    Object.assign(leg, patch, { updatedAt: now });
+  }
+  const terminal = new Set(['landed', 'attested', 'failed']);
+  const allDone = job.legs.length > 0 && job.legs.every((l) => terminal.has(l.status));
+  job.status = allDone ? 'completed' : 'active';
+  job.updatedAt = now;
+  saveLocalSweepJobs();
+  renderBackgroundAgentUI();
+  if (patch && (patch.evmTxHash || patch.status === 'landed' || patch.status === 'attested' || patch.status === 'failed')) {
+    reconcileJobsIntoInflightBridges(backgroundJobs);
+  }
+  checkJobCompletionAndUi(backgroundJobs);
+  return job;
+}
+
+async function syncBackgroundJobs() {
+  if (!canAccessAdminRoutes()) {
+    if (!backgroundJobs.length) {
+      const persisted = loadLocalSweepJobs();
+      if (persisted.length) {
+        backgroundJobs = persisted;
+      }
+    }
     renderBackgroundAgentUI();
     reconcileJobsIntoInflightBridges(backgroundJobs);
-
-    for (const job of backgroundJobs) {
-      if (!job?.jobId) continue;
-      if (job.status === 'active') {
-        observedActiveJobIds.add(job.jobId);
-      } else if (
-        job.status === 'completed' &&
-        observedActiveJobIds.has(job.jobId) &&
-        !shownReceiptJobIds.has(job.jobId) &&
-        Array.isArray(job.legs) &&
-        job.legs.some((l) => l.status === 'landed' || l.status === 'attested')
-      ) {
-        shownReceiptJobIds.add(job.jobId);
-        openReceiptModal(job);
-      }
-    }
-
-    if (defiStepperState?.jobId) {
-      const tracked = backgroundJobs.find((j) => j.jobId === defiStepperState.jobId);
-      if (tracked) {
-        const allSettled =
-          tracked.legs.length > 0 &&
-          tracked.legs.every((l) => l.status === 'landed' || l.status === 'attested');
-        const anyFailed = tracked.legs.some((l) => l.status === 'failed');
-        const solLeg = tracked.legs.find((l) => l.solanaTxHash);
-        if (allSettled) {
-          updateDefiStepperStep(
-            'confirm',
-            {
-              status: 'done',
-              detail: `Settled on Solana (${tracked.legs.length}/${tracked.legs.length} chains confirmed)`,
-              txUrl: safeExplorerTxUrl('https://solscan.io', solLeg?.solanaTxHash) || undefined,
-              txLabel: 'Solscan ↗',
-            },
-            { active: false, dismissible: true }
-          );
-        } else if (anyFailed && !defiStepperState.dismissible) {
-          updateDefiStepperStep('confirm', { status: 'failed', detail: 'Check Background Agent for leg status' }, { active: false, dismissible: true });
-        }
-      }
-    }
+    checkJobCompletionAndUi(backgroundJobs);
+    return;
+  }
+  try {
+    const res = await api('/api/jobs');
+    const serverJobs = Array.isArray(res.jobs) ? res.jobs : [];
+    const localOnly = backgroundJobs.filter((j) => j?.jobId?.startsWith('local_'));
+    backgroundJobs = [...localOnly, ...serverJobs];
+    renderBackgroundAgentUI();
+    reconcileJobsIntoInflightBridges(backgroundJobs);
+    checkJobCompletionAndUi(backgroundJobs);
 
     const hasActive = backgroundJobs.some((j) => j.status === 'active');
     if (hasActive && !bgPollTimer) {
@@ -3351,6 +3466,10 @@ async function syncBackgroundJobs() {
 
 async function patchJobLeg(jobId, chain, patch) {
   if (!jobId) return;
+  applyLocalJobLegPatch(jobId, chain, patch);
+  if (!canAccessAdminRoutes() || String(jobId).startsWith('local_')) {
+    return;
+  }
   try {
     const updated = await api(`/api/jobs/${encodeURIComponent(jobId)}/leg`, {
       method: 'POST',
@@ -3360,8 +3479,9 @@ async function patchJobLeg(jobId, chain, patch) {
     if (idx >= 0) backgroundJobs[idx] = updated;
     else backgroundJobs.unshift(updated);
     renderBackgroundAgentUI();
+    checkJobCompletionAndUi(backgroundJobs);
   } catch {
-    // ignore transient job patch errors
+    // ignore transient job patch errors (local state already updated)
   }
 }
 
@@ -3775,29 +3895,27 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
   let jobId = existingJobId;
   try {
     if (!jobId) {
-      const job = await api('/api/jobs', {
-        method: 'POST',
-        body: JSON.stringify({
-          sourceWallet: userAddress,
-          solanaDestination: solDest,
-          outputAsset,
-          bridgePreference,
-          protocolFeeBps,
-          feeRecipientEvm,
-          legs: [
-            {
-              chain,
-              chainName: legSummary?.chainName || chainAssets[0]?.chainName || chain,
-              assetCount: chainAssets.length,
-              estimatedNetUsd: legSummary?.bridgedUsdc ?? 0,
-              estimatedFeeUsd: legSummary?.feeUsdc ?? 0,
-            },
-          ],
-        }),
+      const job = await createSweepJob({
+        sourceWallet: userAddress,
+        solanaDestination: solDest,
+        outputAsset,
+        bridgePreference,
+        protocolFeeBps,
+        feeRecipientEvm,
+        legs: [
+          {
+            chain,
+            chainName: legSummary?.chainName || chainAssets[0]?.chainName || chain,
+            assetCount: chainAssets.length,
+            estimatedNetUsd: legSummary?.bridgedUsdc ?? 0,
+            estimatedFeeUsd: legSummary?.feeUsdc ?? 0,
+          },
+        ],
       });
       jobId = job.jobId;
       activeJobId = jobId;
       backgroundJobs.unshift(job);
+      saveLocalSweepJobs();
       renderBackgroundAgentUI();
     }
 
@@ -4693,26 +4811,24 @@ async function runPreparedSweepQueue(summary) {
   let prequoter = null;
   try {
     const legsToRun = currentPlan.legs.filter((l) => activeChains.includes(l.chain));
-    const job = await api('/api/jobs', {
-      method: 'POST',
-      body: JSON.stringify({
-        sourceWallet: snapshotSourceAddress,
-        solanaDestination: snapshotSolDest,
-        outputAsset: snapshotOutputAsset,
-        bridgePreference: snapshotBridgePreference,
-        protocolFeeBps: snapshotProtocolFeeBps,
-        feeRecipientEvm: snapshotFeeRecipientEvm,
-        legs: legsToRun.map((l) => ({
-          chain: l.chain,
-          chainName: l.chainName,
-          assetCount: safeInt(l.defiExits) + safeInt(l.swaps) + safeInt(l.burns),
-          estimatedNetUsd: l.bridgedUsdc,
-          estimatedFeeUsd: l.feeUsdc,
-        })),
-      }),
+    const job = await createSweepJob({
+      sourceWallet: snapshotSourceAddress,
+      solanaDestination: snapshotSolDest,
+      outputAsset: snapshotOutputAsset,
+      bridgePreference: snapshotBridgePreference,
+      protocolFeeBps: snapshotProtocolFeeBps,
+      feeRecipientEvm: snapshotFeeRecipientEvm,
+      legs: legsToRun.map((l) => ({
+        chain: l.chain,
+        chainName: l.chainName,
+        assetCount: safeInt(l.defiExits) + safeInt(l.swaps) + safeInt(l.burns),
+        estimatedNetUsd: l.bridgedUsdc,
+        estimatedFeeUsd: l.feeUsdc,
+      })),
     });
     activeJobId = job.jobId;
     backgroundJobs.unshift(job);
+    saveLocalSweepJobs();
     renderBackgroundAgentUI();
 
     // Parallel chain pre-quoting (bounded concurrency <= 3) using upfront immutable snapshot + fingerprint

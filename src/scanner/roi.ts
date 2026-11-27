@@ -693,7 +693,9 @@ export function evaluateAssetRoi(
     roiVerdict === 'worth_it'
       ? `Worth it: ${fmtSigned(netRoiUsd)} net (${effectiveCostPct.toFixed(1)}% total cost).`
       : roiVerdict === 'low_efficiency'
-      ? `High cost (${effectiveCostPct.toFixed(1)}% fees, ${fmtSigned(netRoiUsd)} net) — unchecked by default (opt-in).`
+      ? effectiveCostPct < 15
+        ? `Small balance (${fmtSigned(netRoiUsd)} net, ${effectiveCostPct.toFixed(1)}% fees) — best batched with other assets.`
+        : `High cost (${effectiveCostPct.toFixed(1)}% fees, ${fmtSigned(netRoiUsd)} net) — unchecked by default (opt-in).`
       : `Negative ROI (${fmtSigned(netRoiUsd)} net, ${effectiveCostPct.toFixed(1)}% total cost) — auto-skipped.`;
 
   return {
