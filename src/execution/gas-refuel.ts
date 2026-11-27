@@ -1,7 +1,9 @@
+import { PublicKey, TransactionInstruction, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import { EVM_CHAINS } from '../scanner/chains.js';
 import type { EvmChainId } from '../scanner/types.js';
 import { evmJsonRpcCall, formatUnits } from '../scanner/rpc.js';
 import { FALLBACK_PRICES, fetchLiveUsdPrices } from '../scanner/prices.js';
+import { fetchLatestSolanaBlockhash } from '../bridge/solana-claim.js';
 import { validateRouterCallTarget, type RouteAuctionFetcher } from './route-auction.js';
 
 function getFallbackNativePriceUsd(llamaId: string, symbol: string): number {
@@ -15,6 +17,13 @@ function getFallbackNativePriceUsd(llamaId: string, symbol: string): number {
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const RELAY_SOLANA_CHAIN_ID = 792703809;
+const SOLANA_NATIVE_MINT = '11111111111111111111111111111111';
+const ALLOWED_RELAY_SOLANA_GAS_PROGRAMS = new Set([
+  '11111111111111111111111111111111', // System Program
+  'ComputeBudget111111111111111111111111111111', // Compute Budget
+  '99vQwtBwYtrqqD9YSXbdum3KBdxPAVxYTaQ3cfnJSrN2', // Relay Solana Depository
+]);
 
 export interface ChainNativeGasStatus {
   chain: EvmChainId;
@@ -33,14 +42,20 @@ export interface ChainNativeGasStatus {
   reason?: string;
 }
 
+export type GasRefuelSourceChain = EvmChainId | 'solana';
+
 export interface GasRefuelQuoteRequest {
-  fromChain: EvmChainId;
+  fromChain: GasRefuelSourceChain;
   toChain: EvmChainId;
+  /** Source wallet paying gas (0x EVM address for EVM source chains; Solana Base58 pubkey when fromChain === 'solana') */
   userAddress: string;
+  /** Optional destination EVM wallet receiving refueled native gas (defaults to userAddress for EVM->EVM; required when fromChain === 'solana') */
+  recipientAddress?: string;
   amountUsd?: number;
   timeoutMs?: number;
   fetcher?: RouteAuctionFetcher;
   nativePrices?: Record<string, number>;
+  solanaBlockhashFn?: () => Promise<string | null>;
 }
 
 export interface GasRefuelTransaction {
@@ -56,10 +71,20 @@ export interface GasRefuelTransaction {
   label: string;
 }
 
+export interface GasRefuelSolanaTransaction {
+  chain: 'solana';
+  chainId: number;
+  chainName: 'Solana';
+  feePayer: string;
+  serializedTransactionBase64: string;
+  allowedProgramIds: string[];
+  label: string;
+}
+
 export interface GasRefuelQuoteResult {
   provider: 'relay';
   requestId?: string;
-  fromChain: EvmChainId;
+  fromChain: GasRefuelSourceChain;
   fromChainId: number;
   fromChainName: string;
   fromNativeSymbol: string;
@@ -67,13 +92,15 @@ export interface GasRefuelQuoteResult {
   toChainId: number;
   toChainName: string;
   toNativeSymbol: string;
+  recipientAddress: string;
   amountInWei: string;
   amountInUi: number;
   amountInUsd: number;
   estimatedOutFormatted: string;
   estimatedOutUsd: number;
   estimatedSeconds: number;
-  transaction: GasRefuelTransaction;
+  transaction?: GasRefuelTransaction;
+  solanaTransaction?: GasRefuelSolanaTransaction;
 }
 
 function round2(n: number): number {
@@ -226,27 +253,56 @@ export function evaluateChainNativeGasStatus(params: {
 }
 
 /**
- * Builds a 1-click Relay cross-chain native gas drop (e.g. $1 ETH on Base/Arbitrum/Optimism/Ethereum -> POL on Polygon)
- * so users with $0.00 gas on a target chain can unlock their sweep in one signature without leaving Turgalium.
+ * Builds a 1-click Relay cross-chain native gas drop from ANY funded EVM chain OR connected Solana wallet
+ * (e.g. $0.75 ETH on Base -> MON on Monad, or 0.01 SOL on Solana -> ETH on Base/Arbitrum/Monad)
+ * supporting cross-wallet refueling (`recipientAddress`) so users with $0.00 gas on a target chain
+ * can automatically unify gas in 1–4 seconds without leaving Turgalium.
  */
 export async function buildGasRefuelQuote(
   params: GasRefuelQuoteRequest
 ): Promise<GasRefuelQuoteResult> {
-  const fromCfg = EVM_CHAINS[params.fromChain];
-  const toCfg = EVM_CHAINS[params.toChain];
-  if (!fromCfg) {
+  const isSolanaSource = params.fromChain === 'solana';
+  const fromCfg =
+    params.fromChain === 'solana'
+      ? null
+      : Object.hasOwn(EVM_CHAINS, params.fromChain)
+      ? EVM_CHAINS[params.fromChain]
+      : null;
+  const toCfg = Object.hasOwn(EVM_CHAINS, params.toChain) ? EVM_CHAINS[params.toChain] : null;
+  if (!isSolanaSource && !fromCfg) {
     throw new Error(`Unsupported source chain for gas refuel: ${String(params.fromChain)}`);
   }
   if (!toCfg) {
     throw new Error(`Unsupported destination chain for gas refuel: ${String(params.toChain)}`);
   }
-  if (params.fromChain === params.toChain) {
+  if (!isSolanaSource && params.fromChain === params.toChain) {
     throw new Error('Source and destination chains for gas refuel must be different.');
   }
 
   const userAddress = typeof params.userAddress === 'string' ? params.userAddress.trim() : '';
-  if (!EVM_ADDRESS_RE.test(userAddress) || userAddress.toLowerCase() === ZERO_ADDRESS) {
-    throw new Error('userAddress must be a valid non-zero EVM address.');
+  let recipientAddress =
+    typeof params.recipientAddress === 'string' && params.recipientAddress.trim()
+      ? params.recipientAddress.trim()
+      : '';
+
+  if (isSolanaSource) {
+    try {
+      new PublicKey(userAddress);
+    } catch {
+      throw new Error('userAddress must be a valid Solana Base58 pubkey when fromChain is solana.');
+    }
+    if (!EVM_ADDRESS_RE.test(recipientAddress) || recipientAddress.toLowerCase() === ZERO_ADDRESS) {
+      throw new Error('recipientAddress must be a valid non-zero EVM address when refueling from Solana.');
+    }
+  } else {
+    if (!EVM_ADDRESS_RE.test(userAddress) || userAddress.toLowerCase() === ZERO_ADDRESS) {
+      throw new Error('userAddress must be a valid non-zero EVM address.');
+    }
+    if (!recipientAddress) {
+      recipientAddress = userAddress;
+    } else if (!EVM_ADDRESS_RE.test(recipientAddress) || recipientAddress.toLowerCase() === ZERO_ADDRESS) {
+      throw new Error('recipientAddress must be a valid non-zero EVM address.');
+    }
   }
 
   const requestedUsd =
@@ -255,19 +311,25 @@ export async function buildGasRefuelQuote(
       : 1.0;
   const amountUsd = Math.min(25, Math.max(0.25, round2(requestedUsd)));
 
+  const fromLlamaId = isSolanaSource ? 'coingecko:solana' : fromCfg!.nativeLlamaId;
+  const fromSymbol = isSolanaSource ? 'SOL' : fromCfg!.nativeSymbol;
+  const fromChainName = isSolanaSource ? 'Solana' : fromCfg!.name;
+  const fromChainId = isSolanaSource ? RELAY_SOLANA_CHAIN_ID : fromCfg!.chainId;
+  const fromDecimals = isSolanaSource ? 9 : 18;
+
   const livePriceMap = params.nativePrices
     ? null
-    : await fetchLiveUsdPrices([fromCfg.nativeLlamaId, toCfg.nativeLlamaId]).catch(() => null);
+    : await fetchLiveUsdPrices([fromLlamaId, toCfg.nativeLlamaId]).catch(() => null);
   const fromPriceUsd =
-    params.nativePrices?.[fromCfg.nativeLlamaId] ||
-    params.nativePrices?.[fromCfg.nativeSymbol] ||
-    livePriceMap?.get(fromCfg.nativeLlamaId) ||
-    getFallbackNativePriceUsd(fromCfg.nativeLlamaId, fromCfg.nativeSymbol);
+    params.nativePrices?.[fromLlamaId] ||
+    params.nativePrices?.[fromSymbol] ||
+    livePriceMap?.get(fromLlamaId) ||
+    getFallbackNativePriceUsd(fromLlamaId, fromSymbol);
   if (!Number.isFinite(fromPriceUsd) || fromPriceUsd <= 0) {
-    throw new Error(`Unable to price ${fromCfg.nativeSymbol} safely for gas refuel.`);
+    throw new Error(`Unable to price ${fromSymbol} safely for gas refuel.`);
   }
   const amountInUi = round6(amountUsd / fromPriceUsd);
-  const amountInWei = BigInt(Math.max(1, Math.floor(amountInUi * 1e18)));
+  const amountInUnits = BigInt(Math.max(1, Math.floor(amountInUi * 10 ** fromDecimals)));
 
   const fetcher = params.fetcher ?? globalThis.fetch.bind(globalThis);
   const timeoutMs = params.timeoutMs ?? 6_500;
@@ -281,12 +343,12 @@ export async function buildGasRefuelQuote(
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({
         user: userAddress,
-        originChainId: fromCfg.chainId,
+        originChainId: fromChainId,
         destinationChainId: toCfg.chainId,
-        originCurrency: ZERO_ADDRESS,
+        originCurrency: isSolanaSource ? SOLANA_NATIVE_MINT : ZERO_ADDRESS,
         destinationCurrency: ZERO_ADDRESS,
-        recipient: userAddress,
-        amount: amountInWei.toString(),
+        recipient: recipientAddress,
+        amount: amountInUnits.toString(),
         tradeType: 'EXACT_INPUT',
       }),
       signal: ctrl.signal,
@@ -328,15 +390,131 @@ export async function buildGasRefuelQuote(
           value?: string;
           gas?: string;
           chainId?: number;
+          instructions?: Array<{
+            programId: string;
+            keys: Array<{ pubkey: string; isSigner: boolean; isWritable: boolean }>;
+            data: string;
+          }>;
         };
       }>;
     }>;
   };
 
+  const outFormatted =
+    json.details?.currencyOut?.amountFormatted && json.details.currencyOut.currency?.symbol
+      ? `${Number(json.details.currencyOut.amountFormatted).toFixed(4)} ${json.details.currencyOut.currency.symbol}`
+      : `~$${amountUsd.toFixed(2)} ${toCfg.nativeSymbol}`;
+  const outUsd = Number(json.details?.currencyOut?.amountUsd ?? amountUsd);
+  if (Number.isFinite(outUsd) && outUsd > Math.max(amountUsd * 3, amountUsd + 5)) {
+    throw new Error(
+      `Gas refuel safety cap tripped: quoted $${outUsd.toFixed(2)} exceeds requested $${amountUsd.toFixed(2)}.`
+    );
+  }
+
+  let stepRequestId = json.requestId;
+
+  if (isSolanaSource) {
+    let rawInstructions:
+      | Array<{
+          programId: string;
+          keys: Array<{ pubkey: string; isSigner: boolean; isWritable: boolean }>;
+          data: string;
+        }>
+      | undefined;
+
+    for (const step of json.steps ?? []) {
+      if (step.kind !== 'transaction') continue;
+      const item = step.items?.[0];
+      if (Array.isArray(item?.data?.instructions) && item.data.instructions.length > 0) {
+        rawInstructions = item.data.instructions;
+        if (!stepRequestId && step.requestId) stepRequestId = step.requestId;
+        break;
+      }
+    }
+
+    if (!rawInstructions || rawInstructions.length === 0) {
+      throw new Error(`Relay returned no executable Solana gas refuel instructions (Solana -> ${toCfg.name}).`);
+    }
+
+    const compiledIxs: TransactionInstruction[] = [];
+    const seenPrograms = new Set<string>();
+    const RELAY_DEPOSITORY_SOLANA = '99vQwtBwYtrqqD9YSXbdum3KBdxPAVxYTaQ3cfnJSrN2';
+    for (const ix of rawInstructions) {
+      const progId = String(ix.programId || '').trim();
+      if (!ALLOWED_RELAY_SOLANA_GAS_PROGRAMS.has(progId)) {
+        throw new Error(`Gas refuel security validation failed: unexpected Solana program ${progId}.`);
+      }
+      seenPrograms.add(progId);
+      const dataHex = String(ix.data || '').replace(/^0x/i, '');
+      if (dataHex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(dataHex)) {
+        throw new Error('Gas refuel security validation failed: malformed hex instruction data.');
+      }
+      const dataBuf = dataHex.length > 0 ? Buffer.from(dataHex, 'hex') : Buffer.alloc(0);
+      compiledIxs.push(
+        new TransactionInstruction({
+          programId: new PublicKey(progId),
+          keys: (ix.keys ?? []).map((k) => ({
+            pubkey: new PublicKey(k.pubkey),
+            isSigner: Boolean(k.isSigner),
+            isWritable: Boolean(k.isWritable),
+          })),
+          data: dataBuf,
+        })
+      );
+    }
+    if (!seenPrograms.has(RELAY_DEPOSITORY_SOLANA)) {
+      throw new Error(
+        'Gas refuel security validation failed: Solana refuel transaction must invoke Relay depository.'
+      );
+    }
+
+    const blockhashFn = params.solanaBlockhashFn ?? fetchLatestSolanaBlockhash;
+    const recentBlockhash = await blockhashFn();
+    if (!recentBlockhash) {
+      throw new Error('Could not fetch latest Solana blockhash to build SOL gas refuel transaction.');
+    }
+    const feePayerKey = new PublicKey(userAddress);
+    const msgV0 = new TransactionMessage({
+      payerKey: feePayerKey,
+      recentBlockhash,
+      instructions: compiledIxs,
+    }).compileToV0Message();
+    const versionedTx = new VersionedTransaction(msgV0);
+    const serializedTransactionBase64 = Buffer.from(versionedTx.serialize()).toString('base64');
+
+    return {
+      provider: 'relay',
+      requestId: stepRequestId,
+      fromChain: 'solana',
+      fromChainId: RELAY_SOLANA_CHAIN_ID,
+      fromChainName: 'Solana',
+      fromNativeSymbol: 'SOL',
+      toChain: params.toChain,
+      toChainId: toCfg.chainId,
+      toChainName: toCfg.name,
+      toNativeSymbol: toCfg.nativeSymbol,
+      recipientAddress,
+      amountInWei: amountInUnits.toString(),
+      amountInUi,
+      amountInUsd: amountUsd,
+      estimatedOutFormatted: outFormatted,
+      estimatedOutUsd: round2(Number.isFinite(outUsd) ? outUsd : amountUsd),
+      estimatedSeconds: Math.max(2, Math.round(json.details?.timeEstimate ?? 4)),
+      solanaTransaction: {
+        chain: 'solana',
+        chainId: RELAY_SOLANA_CHAIN_ID,
+        chainName: 'Solana',
+        feePayer: userAddress,
+        serializedTransactionBase64,
+        allowedProgramIds: Array.from(seenPrograms),
+        label: `Refuel ${toCfg.name} gas (${outFormatted}) from Solana`,
+      },
+    };
+  }
+
   let txData:
     | { from?: string; to?: string; data?: string; value?: string; gas?: string; chainId?: number }
     | undefined;
-  let stepRequestId = json.requestId;
 
   for (const step of json.steps ?? []) {
     if (step.kind !== 'transaction') continue;
@@ -349,7 +527,19 @@ export async function buildGasRefuelQuote(
   }
 
   if (!txData?.to) {
-    throw new Error(`Relay returned no executable gas refuel transaction (${fromCfg.name} -> ${toCfg.name}).`);
+    throw new Error(`Relay returned no executable gas refuel transaction (${fromChainName} -> ${toCfg.name}).`);
+  }
+  if (txData.chainId !== undefined && Number(txData.chainId) !== fromChainId) {
+    throw new Error(
+      `Gas refuel security validation failed: tx chainId (${txData.chainId}) !== expected source chainId (${fromChainId}).`
+    );
+  }
+  const txValueWei = txData.value !== undefined ? parseHexOrDecWei(String(txData.value)) : amountInUnits;
+  const maxAllowedValueWei = amountInUnits * 2n + 1_000_000_000_000_000n;
+  if (txValueWei > maxAllowedValueWei) {
+    throw new Error(
+      `Gas refuel safety cap tripped: tx msg.value (${txValueWei.toString()}) exceeds requested input budget.`
+    );
   }
 
   const targetCheck = validateRouterCallTarget({
@@ -363,45 +553,35 @@ export async function buildGasRefuelQuote(
     throw new Error(`Gas refuel security validation failed: ${targetCheck.reason}`);
   }
 
-  const outFormatted =
-    json.details?.currencyOut?.amountFormatted && json.details.currencyOut.currency?.symbol
-      ? `${Number(json.details.currencyOut.amountFormatted).toFixed(4)} ${json.details.currencyOut.currency.symbol}`
-      : `~$${amountUsd.toFixed(2)} ${toCfg.nativeSymbol}`;
-  const outUsd = Number(json.details?.currencyOut?.amountUsd ?? amountUsd);
-  if (Number.isFinite(outUsd) && outUsd > Math.max(amountUsd * 3, amountUsd + 5)) {
-    throw new Error(
-      `Gas refuel safety cap tripped: quoted $${outUsd.toFixed(2)} exceeds requested $${amountUsd.toFixed(2)}.`
-    );
-  }
-
   return {
     provider: 'relay',
     requestId: stepRequestId,
     fromChain: params.fromChain,
-    fromChainId: fromCfg.chainId,
-    fromChainName: fromCfg.name,
-    fromNativeSymbol: fromCfg.nativeSymbol,
+    fromChainId,
+    fromChainName,
+    fromNativeSymbol: fromSymbol,
     toChain: params.toChain,
     toChainId: toCfg.chainId,
     toChainName: toCfg.name,
     toNativeSymbol: toCfg.nativeSymbol,
-    amountInWei: amountInWei.toString(),
+    recipientAddress,
+    amountInWei: amountInUnits.toString(),
     amountInUi,
     amountInUsd: amountUsd,
     estimatedOutFormatted: outFormatted,
     estimatedOutUsd: round2(Number.isFinite(outUsd) ? outUsd : amountUsd),
     estimatedSeconds: Math.max(2, Math.round(json.details?.timeEstimate ?? 6)),
     transaction: {
-      chain: params.fromChain,
-      chainId: fromCfg.chainId,
-      chainName: fromCfg.name,
-      explorerUrl: fromCfg.explorerUrl,
+      chain: params.fromChain as EvmChainId,
+      chainId: fromChainId,
+      chainName: fromChainName,
+      explorerUrl: fromCfg!.explorerUrl,
       from: userAddress,
       to: txData.to.trim(),
       data: (txData.data ?? '0x').trim() || '0x',
-      value: toHexWei(txData.value ?? amountInWei),
+      value: toHexWei(txData.value ?? amountInUnits),
       gas: txData.gas ? toHexWei(txData.gas) : undefined,
-      label: `Refuel ${toCfg.name} gas (${outFormatted}) from ${fromCfg.name}`,
+      label: `Refuel ${toCfg.name} gas (${outFormatted}) from ${fromChainName}`,
     },
   };
 }
