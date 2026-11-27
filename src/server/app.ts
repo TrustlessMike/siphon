@@ -84,7 +84,9 @@ import {
   buildOpenApiSpec,
   buildPluginSetupGuide,
 } from '../agent/plugin-spec.js';
-import { buildAgentReviewLink } from '../agent/review-link.js';
+import { buildAgentHandoffKit, buildAgentReviewLink } from '../agent/review-link.js';
+import { pollBridgeStatusesBatch } from '../execution/bridge-status-batch.js';
+import { evaluatePreservationPlan } from '../execution/preservation-optimizer.js';
 import { handleMcpJsonRpc } from '../mcp/server.js';
 import { planDustConversion } from '../scanner/dust.js';
 import { scanUnifiedWallets, type UnifiedWalletInput } from '../scanner/unify.js';
@@ -2585,6 +2587,172 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
             error: err instanceof Error ? err.message : 'Invalid tax CSV export payload.',
           });
         }
+      }
+
+      if (method === 'POST' && pathname === '/api/bridge/status-batch') {
+        const body = await readJsonBody<{
+          bridges?: Array<{
+            id?: string;
+            chain: AnyChainId;
+            chainName?: string;
+            txHash: string;
+            provider?: string;
+            requestId?: string;
+            solanaDestination?: string;
+            status?: string;
+          }>;
+        }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
+        try {
+          const batch = await pollBridgeStatusesBatch(body.bridges ?? []);
+          return reply(200, batch);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Invalid bridge status batch payload.',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/agent/handoff') {
+        const body = await readJsonBody<{
+          wallet?: string;
+          family?: ChainFamily;
+          solanaDestination?: string;
+          outputAsset?: 'USDC' | 'SOL';
+          agentName?: string;
+          note?: string;
+        }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
+        try {
+          const kit = buildAgentHandoffKit({
+            baseUrl,
+            wallet: body.wallet,
+            family: body.family,
+            solanaDestination: body.solanaDestination,
+            outputAsset: body.outputAsset,
+            agentName: body.agentName,
+            note: body.note,
+          });
+          return reply(200, kit);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Invalid agent handoff parameters.',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/workspace/hydrate') {
+        const body = await readJsonBody<{
+          address?: string;
+          family?: ChainFamily;
+          presetId?: string;
+          chains?: string[];
+          solanaDestination?: string;
+          outputAsset?: 'USDC' | 'SOL';
+          bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+          usePermit2Batch?: boolean;
+          includeBurns?: boolean;
+          includePreservation?: boolean;
+          refresh?: boolean;
+        }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
+
+        const outputAsset: 'USDC' | 'SOL' = body.outputAsset === 'SOL' ? 'SOL' : 'USDC';
+        const solDestClean =
+          typeof body.solanaDestination === 'string' && body.solanaDestination.trim()
+            ? body.solanaDestination.trim()
+            : '';
+
+        let requestedEvmChains: EvmChainId[] | undefined;
+        if (Array.isArray(body.chains) && body.chains.length > 0) {
+          const validIds = new Set(CHAIN_LIST.map((c) => c.id));
+          const filtered = Array.from(
+            new Set(
+              body.chains
+                .filter((c): c is string => typeof c === 'string')
+                .map((c) => c.trim().toLowerCase())
+                .filter((c): c is EvmChainId => validIds.has(c as EvmChainId))
+            )
+          );
+          if (filtered.length === 0) {
+            return reply(400, { error: 'No valid EVM chain IDs in chains filter.' });
+          }
+          requestedEvmChains = filtered;
+        }
+
+        let scan: ScanReport;
+        let cached = false;
+        try {
+          if (body.presetId) {
+            scan = await scanPresetWallet(body.presetId);
+            scan.family = 'evm';
+          } else if (body.address) {
+            const detected = detectAddress(body.address, body.family);
+            if (!detected) {
+              return reply(400, {
+                error:
+                  'Invalid wallet address or checksum. Supported: EVM (0x… / .eth), Cosmos, Sui, Aptos, TON, Tron, Bitcoin.',
+              });
+            }
+            const cacheKey = `${detected.family}:${detected.normalized.toLowerCase()}:${
+              requestedEvmChains ? requestedEvmChains.slice().sort().join(',') : 'all'
+            }`;
+            const hit = !body.refresh ? liveScanCache.get(cacheKey) : undefined;
+            if (hit) {
+              scan = hit;
+              cached = true;
+            } else {
+              if (detected.family === 'evm') {
+                scan = await scanEvmWalletWithOptions(body.address, undefined, {
+                  chains: requestedEvmChains,
+                });
+                scan.family = 'evm';
+              } else {
+                scan = await getAdapterForFamily(detected.family).scanWallet(detected.normalized);
+              }
+              liveScanCache.set(cacheKey, scan);
+            }
+          } else {
+            return reply(400, { error: 'address or presetId is required.' });
+          }
+        } catch (err) {
+          if (err instanceof EnsResolutionError) {
+            return reply(err.code === 'RPC_ERROR' ? 503 : 400, { error: err.message });
+          }
+          const msg = err instanceof Error ? err.message : 'Wallet scan failed';
+          return reply(msg.toLowerCase().includes('invalid') ? 400 : 500, { error: msg });
+        }
+
+        scanCache.set(scan.scanId, scan);
+
+        const defaultSelectedIds = scan.assets
+          .filter((a) => a.selectedByDefault)
+          .map((a) => a.id);
+
+        const [solBalances, preservation] = await Promise.all([
+          solDestClean ? fetchSolanaWalletBalances(solDestClean).catch(() => null) : Promise.resolve(null),
+          body.includePreservation !== false
+            ? evaluatePreservationPlan(scan, {
+                outputAsset,
+              }).catch(() => null)
+            : Promise.resolve(null),
+        ]);
+
+        const plan = buildMigrationPlan({
+          scan,
+          selectedAssetIds: defaultSelectedIds,
+          solanaDestination: solDestClean || '11111111111111111111111111111111',
+          usePermit2Batch: body.usePermit2Batch !== false,
+          includeBurns: Boolean(body.includeBurns),
+          outputAsset,
+          bridgePreference: body.bridgePreference ?? 'auto',
+          hasSolanaUsdcAta: solBalances ? Boolean(solBalances.hasUsdcAta) : undefined,
+        });
+
+        return reply(200, {
+          cached,
+          scan,
+          plan,
+          preservation,
+          solanaBalances: solBalances,
+        });
       }
 
       if (method === 'POST' && pathname === '/api/agent/review-link') {

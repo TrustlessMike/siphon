@@ -53,16 +53,8 @@ function formatProviderName(raw) {
   return String(raw || 'Auto Optimal').trim() || 'Auto Optimal';
 }
 
-const PRESERVATION_FEE_BRACKETS = [
-  { minGrossUsd: 0, maxGrossUsd: 50, feeBps: 500, capUsd: null, tierLabel: 'Micro-Dust (<$50)' },
-  { minGrossUsd: 50, maxGrossUsd: 500, feeBps: 100, capUsd: null, tierLabel: 'Small ($50–$500)' },
-  { minGrossUsd: 500, maxGrossUsd: 5000, feeBps: 25, capUsd: null, tierLabel: 'Mid ($500–$5k)' },
-  { minGrossUsd: 5000, maxGrossUsd: null, feeBps: 10, capUsd: 50, tierLabel: 'Principal ($5k+)' },
-];
-
 /**
- * Mirrors src/scanner/chains.ts `computePreservationFee` continuous progressive marginal brackets
- * so the UI matches backend tiered fees to the penny across every sweep size.
+ * Zero-fee open-source protocol fee info (mirrors src/scanner/chains.ts default 0 bps).
  */
 function computeTieredPreservationFee(grossUsdInput) {
   const raw = Number(grossUsdInput);

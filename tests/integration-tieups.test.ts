@@ -24,10 +24,10 @@ function extractFrontendFeeFn(filePath: string): (grossUsd: number) => {
   savedVs7PctUsd: number;
 } {
   const src = fs.readFileSync(filePath, 'utf8');
-  const start = src.indexOf('const PRESERVATION_FEE_BRACKETS');
-  assert.ok(start >= 0, `PRESERVATION_FEE_BRACKETS not found in ${filePath}`);
-  const fnStart = src.indexOf('function computeTieredPreservationFee(', start);
+  const fnStart = src.indexOf('function computeTieredPreservationFee(');
   assert.ok(fnStart >= 0, `computeTieredPreservationFee not found in ${filePath}`);
+  const bracketsStart = src.indexOf('const PRESERVATION_FEE_BRACKETS');
+  const start = bracketsStart >= 0 && bracketsStart < fnStart ? bracketsStart : fnStart;
   // Find matching closing brace for computeTieredPreservationFee
   let depth = 0;
   let started = false;

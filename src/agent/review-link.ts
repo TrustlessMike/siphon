@@ -142,3 +142,118 @@ export function buildAgentReviewLink(input: BuildAgentReviewLinkInput): AgentRev
       'Non-custodial review link: Turgalium scans read-only and you inspect & sign every transaction locally in your own wallet. Never share a private key or seed phrase with an AI.',
   };
 }
+
+export interface AgentHandoffKitInput {
+  baseUrl: string;
+  wallet?: string;
+  family?: ChainFamily;
+  solanaDestination?: string;
+  outputAsset?: 'USDC' | 'SOL';
+  agentName?: string;
+  note?: string;
+}
+
+export interface AgentHandoffKitResult {
+  agentName: string;
+  outputAsset: 'USDC' | 'SOL';
+  prompt: string;
+  chatgptUrl: string;
+  claudeUrl: string;
+  reviewUrl: string | null;
+  endpoints: {
+    openApi: string;
+    mcpHttp: string;
+    mcpCli: string;
+    reviewLinkApi: string;
+    workspaceHydrateApi: string;
+  };
+  nonCustodial: true;
+  privateKeyRequired: false;
+}
+
+/**
+ * Generates canonical zero-key AI assistant prompts, ChatGPT/Claude launcher URLs,
+ * and optional non-custodial review links on the backend for Web UI, SDK, and MCP parity.
+ */
+export function buildAgentHandoffKit(input: AgentHandoffKitInput): AgentHandoffKitResult {
+  const rawBase = typeof input.baseUrl === 'string' ? input.baseUrl.trim() : '';
+  let parsedBase: URL;
+  try {
+    parsedBase = new URL(rawBase || 'https://turgalium.vercel.app');
+  } catch {
+    parsedBase = new URL('https://turgalium.vercel.app');
+  }
+  const origin = parsedBase.origin.replace(/\/$/, '');
+  const agentName = cleanShortText(input.agentName, 40) ?? 'ChatGPT';
+  const outputAsset: 'USDC' | 'SOL' =
+    typeof input.outputAsset === 'string' && input.outputAsset.trim().toUpperCase() === 'SOL'
+      ? 'SOL'
+      : 'USDC';
+
+  let reviewUrl: string | null = null;
+  let walletDisplay = '<MY_PUBLIC_WALLET_ADDRESS>';
+  let destDisplay: string | null = null;
+
+  if (typeof input.wallet === 'string' && input.wallet.trim()) {
+    const built = buildAgentReviewLink({
+      baseUrl: origin,
+      wallet: input.wallet,
+      family: input.family,
+      solanaDestination: input.solanaDestination,
+      outputAsset,
+      agentName,
+      note: input.note,
+    });
+    reviewUrl = built.reviewUrl;
+    walletDisplay = built.wallet;
+    destDisplay = built.solanaDestination;
+  } else if (typeof input.solanaDestination === 'string' && input.solanaDestination.trim()) {
+    const trimmedDest = input.solanaDestination.trim();
+    if (trimmedDest.length >= 32 && trimmedDest.length <= 64 && !CONTROL_CHAR_RE.test(trimmedDest)) {
+      try {
+        solanaAddressToBytes32(trimmedDest);
+        destDisplay = trimmedDest;
+      } catch {
+        // ignore invalid optional dest when wallet is blank
+      }
+    }
+  }
+
+  const destClause = destDisplay
+    ? `Target Solana destination: ${destDisplay} (receive ${outputAsset}).`
+    : `Receive ${outputAsset} on Solana.`;
+  const toolHint =
+    agentName === 'Claude' || agentName === 'Cursor / OpenClaw'
+      ? `Connect via Turgalium MCP (${origin}/mcp or \`npx turgalium-mcp\`) or REST API (${origin}/openapi.json).`
+      : `Use Turgalium's public OpenAPI (${origin}/openapi.json) or live endpoints at ${origin}.`;
+
+  const prompt = [
+    `Use Turgalium (0% protocol fee, MIT open-source) to audit my public wallet across 30 chains and prepare a sweep to Solana.`,
+    toolHint,
+    `Public source wallet: ${walletDisplay}`,
+    destClause,
+    `Steps:`,
+    `1. Scan my public address via POST /api/workspace/hydrate (or POST /api/scan / turgalium_scan_wallets) to identify DeFi deposits, liquid tokens, profitable dust, and traps to skip.`,
+    `2. Summarize the highest-net bridge route and any free Solana ATA rent or SPL dust I can reclaim.`,
+    `3. Call POST /api/agent/review-link (or turgalium_build_review_link) and return the clickable Turgalium Review & Sign Link so I can inspect and sign locally in my own wallet.`,
+    `Security rule: NEVER ask me for a private key, seed phrase, or wallet signature.`,
+  ].join('\n');
+
+  return {
+    agentName,
+    outputAsset,
+    prompt,
+    chatgptUrl: `https://chatgpt.com/?q=${encodeURIComponent(prompt)}`,
+    claudeUrl: `https://claude.ai/new?q=${encodeURIComponent(prompt)}`,
+    reviewUrl,
+    endpoints: {
+      openApi: `${origin}/openapi.json`,
+      mcpHttp: `${origin}/mcp`,
+      mcpCli: 'npx turgalium-mcp',
+      reviewLinkApi: `${origin}/api/agent/review-link`,
+      workspaceHydrateApi: `${origin}/api/workspace/hydrate`,
+    },
+    nonCustodial: true,
+    privateKeyRequired: false,
+  };
+}

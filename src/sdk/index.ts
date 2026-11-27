@@ -316,3 +316,25 @@ export {
   type PluginApiTokenRecord,
   type TurgaliumAgentEngineOptions,
 } from '../agent/mandate-engine.js';
+
+// Wave 21–22: Non-custodial AI handoff, batch bridge polling & canonical DeFi display metadata
+export {
+  buildAgentHandoffKit,
+  buildAgentReviewLink,
+  type AgentHandoffKitInput,
+  type AgentHandoffKitResult,
+  type AgentReviewLinkResult,
+  type BuildAgentReviewLinkInput,
+} from '../agent/review-link.js';
+export {
+  pollBridgeStatusesBatch,
+  MAX_BRIDGE_STATUS_BATCH,
+  type BridgeStatusBatchEntry,
+  type BridgeStatusBatchResponse,
+  type BridgeStatusBatchResultItem,
+} from '../execution/bridge-status-batch.js';
+export {
+  computeDefiDisplayMetadata,
+  type DefiDisplayCategory,
+  type DefiDisplayMetadata,
+} from '../scanner/defi-display.js';

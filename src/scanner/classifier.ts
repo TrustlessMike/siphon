@@ -34,6 +34,7 @@ import {
   simulateBurnTransferOnchain,
 } from './discovery.js';
 import { formatUnits, isValidEvmAddress, scanSingleEvmChain } from './rpc.js';
+import { computeDefiDisplayMetadata } from './defi-display.js';
 import { applyTwoLevelRoiToReport, estimateLiquidityScaledSlippageUsd } from './roi.js';
 import type {
   AssetAction,
@@ -420,6 +421,22 @@ function classifyAndBuildReport(params: {
       defiUnlockAt: item.defiUnlockAt,
       defiNetUsd: item.defiNetUsd,
       defiDebtSummary: item.defiDebtSummary,
+      defiDisplay:
+        item.kind === 'defi_position'
+          ? computeDefiDisplayMetadata({
+              chain: item.chain,
+              family: 'evm',
+              symbol: item.symbol,
+              name: item.name,
+              uiBalance,
+              protocol: item.protocol,
+              underlyingSymbol: item.underlyingSymbol,
+              aaveDebtUsd: item.aaveDebtUsd,
+              defiDebtUsd: item.defiDebtUsd,
+              defiUnlockAt: item.defiUnlockAt,
+              defiExitPlan,
+            })
+          : undefined,
     };
   });
 
