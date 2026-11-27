@@ -764,7 +764,9 @@ function setUiMode(mode, { persist = true, silent = false } = {}) {
 
 let heroScenePromise = null;
 let preservationToolsPromise = null;
-let degenModulePromise = null;
+let latestSolanaOverview = null;
+let pendingBatchSummary = null;
+let isPreparingOneClickBatch = false;
 
 function ensureHeroScene() {
   if (heroScene) return Promise.resolve(heroScene);
@@ -791,10 +793,17 @@ function ensureHeroScene() {
 
 function ensurePreservationToolsLoaded() {
   if (preservationToolsPromise) return preservationToolsPromise;
-  preservationToolsPromise = import('./preservation-tools.js?v=3')
+  preservationToolsPromise = import('./preservation-tools.js?v=4')
     .then((mod) => {
       if (currentScan) {
-        window.dispatchEvent(new CustomEvent('turgalium:scan-updated', { detail: { scan: currentScan } }));
+        window.dispatchEvent(
+          new CustomEvent('turgalium:scan-updated', { detail: { scanReport: currentScan, scan: currentScan } })
+        );
+      }
+      if (latestSolanaOverview) {
+        window.dispatchEvent(
+          new CustomEvent('turgalium:solana-overview', { detail: latestSolanaOverview })
+        );
       }
       dispatchTurgaliumBalanceUpdated();
       return mod;
@@ -804,20 +813,6 @@ function ensurePreservationToolsLoaded() {
       throw err;
     });
   return preservationToolsPromise;
-}
-
-function ensureDegenLoaded() {
-  if (degenModulePromise) return degenModulePromise;
-  degenModulePromise = import('./degen.js?v=3')
-    .then((mod) => {
-      dispatchTurgaliumBalanceUpdated();
-      return mod;
-    })
-    .catch((err) => {
-      degenModulePromise = null;
-      throw err;
-    });
-  return degenModulePromise;
 }
 
 function showWebsite() {
@@ -852,7 +847,6 @@ function switchView(viewName) {
   document.querySelectorAll('.view-pane').forEach((pane) => {
     pane.classList.toggle('active', pane.id === `view-${viewName}`);
   });
-  if (viewName === 'degen') ensureDegenLoaded().catch(() => {});
   if (viewName === 'ai') syncZeroKeyAiFromAppState();
   if (viewName === 'contract' && !contractData) loadContract();
   if (viewName === 'agents') loadAgentsAndPlugins();
@@ -917,6 +911,33 @@ function dispatchTurgaliumBalanceUpdated() {
   );
 }
 
+function applySolanaOverviewPayload(overview, solDest) {
+  const badge = document.getElementById('solanaLiveBalanceBadge');
+  if (!overview || typeof overview !== 'object') return;
+  latestSolanaOverview = overview;
+  const bal = overview.balances || overview;
+  if (bal && (bal.usdcBalance !== undefined || bal.solBalance !== undefined)) {
+    solanaBalances = bal;
+  }
+  if (badge) {
+    if (overview.rpcUnavailable && !solanaBalances) {
+      badge.textContent = 'Valid Solana destination (RPC busy)';
+    } else if (solanaBalances) {
+      const dustCount = Array.isArray(overview.dust?.dustAccounts)
+        ? overview.dust.dustAccounts.length
+        : 0;
+      const dustNote = dustCount > 0 ? ` · ${dustCount} SPL dust` : '';
+      badge.textContent = `${safeNum(solanaBalances.usdcBalance).toFixed(2)} USDC · ${safeNum(solanaBalances.solBalance).toFixed(3)} SOL on Solana${dustNote}`;
+    } else if (solDest) {
+      badge.textContent = 'Valid Solana destination';
+    }
+  }
+  if (typeof window !== 'undefined' && typeof CustomEvent === 'function') {
+    window.dispatchEvent(new CustomEvent('turgalium:solana-overview', { detail: overview }));
+  }
+  dispatchTurgaliumBalanceUpdated();
+}
+
 async function refreshSolanaBalance() {
   const seq = ++solBalSeq;
   const solDest = document.getElementById('solanaDestInput')?.value.trim() || '';
@@ -925,34 +946,59 @@ async function refreshSolanaBalance() {
 
   if (!solDest) {
     solanaBalances = null;
+    latestSolanaOverview = null;
     if (badge) badge.textContent = 'Connect a Solana wallet or enter a destination address';
     dispatchTurgaliumBalanceUpdated();
     return;
   }
   if (!isValidSolanaBase58(solDest)) {
     solanaBalances = null;
+    latestSolanaOverview = null;
     if (badge) badge.textContent = 'Invalid Solana address';
     dispatchTurgaliumBalanceUpdated();
     return;
   }
 
   try {
-    const res = await api(`/api/solana/balance?address=${encodeURIComponent(solDest)}`);
+    const overview = await api('/api/solana/overview', {
+      method: 'POST',
+      body: JSON.stringify({
+        address: solDest,
+        dustMaxUsd: 50,
+        dustOutputAsset: outputAsset,
+      }),
+    });
     if (seq !== solBalSeq) return;
-    solanaBalances = res;
-    if (badge) {
-      badge.textContent = `${safeNum(solanaBalances.usdcBalance).toFixed(2)} USDC · ${safeNum(solanaBalances.solBalance).toFixed(3)} SOL on Solana`;
-    }
-    dispatchTurgaliumBalanceUpdated();
-  } catch (err) {
+    applySolanaOverviewPayload(overview, solDest);
+    return;
+  } catch (overviewErr) {
     if (seq !== solBalSeq) return;
-    const isInvalid = String(err?.message || '').toLowerCase().includes('invalid');
-    if (badge) {
-      badge.textContent = isInvalid
-        ? 'Invalid Solana address'
-        : 'Valid Solana destination (RPC busy)';
+    const isInvalid = String(overviewErr?.message || '').toLowerCase().includes('invalid');
+    if (isInvalid) {
+      solanaBalances = null;
+      if (badge) badge.textContent = 'Invalid Solana address';
+      dispatchTurgaliumBalanceUpdated();
+      return;
     }
-    dispatchTurgaliumBalanceUpdated();
+    // Graceful fallback to lightweight balance endpoint
+    try {
+      const res = await api(`/api/solana/balance?address=${encodeURIComponent(solDest)}`);
+      if (seq !== solBalSeq) return;
+      solanaBalances = res;
+      if (badge) {
+        badge.textContent = `${safeNum(solanaBalances.usdcBalance).toFixed(2)} USDC · ${safeNum(solanaBalances.solBalance).toFixed(3)} SOL on Solana`;
+      }
+      dispatchTurgaliumBalanceUpdated();
+    } catch (err) {
+      if (seq !== solBalSeq) return;
+      const isBadAddr = String(err?.message || '').toLowerCase().includes('invalid');
+      if (badge) {
+        badge.textContent = isBadAddr
+          ? 'Invalid Solana address'
+          : 'Valid Solana destination (RPC busy)';
+      }
+      dispatchTurgaliumBalanceUpdated();
+    }
   }
 }
 
@@ -1186,6 +1232,9 @@ function updateWalletButtons() {
     if (n === 0) {
       ctaBtn.textContent = 'Select assets to sweep';
       ctaBtn.disabled = true;
+    } else if (isPreparingOneClickBatch) {
+      ctaBtn.textContent = 'Preparing 1-Click Sweep…';
+      ctaBtn.disabled = true;
     } else if (isSweepQueueRunning) {
       ctaBtn.textContent = 'Sweep in progress…';
       ctaBtn.disabled = true;
@@ -1194,14 +1243,18 @@ function updateWalletButtons() {
         ? `Connect ${famShort} Wallet to Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`
         : `Connect ${famShort} Wallet to Sweep`;
       ctaBtn.disabled = false;
+    } else if (pendingBatchSummary) {
+      const sigs = Math.max(1, safeInt(pendingBatchSummary.batch?.totalSignatures || n));
+      ctaBtn.textContent = `Confirm & Sign Sweep (${sigs} ${sigs === 1 ? 'sig' : 'sigs'})`;
+      ctaBtn.disabled = false;
     } else if (!isProMode()) {
-      ctaBtn.textContent = 'Sweep to Solana';
+      ctaBtn.textContent = '1-Click Sweep to Solana';
       ctaBtn.disabled = false;
     } else if (executionMode === 'gasless') {
-      ctaBtn.textContent = `Gasless 1-Sig Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`;
+      ctaBtn.textContent = `1-Click Gasless Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`;
       ctaBtn.disabled = false;
     } else {
-      ctaBtn.textContent = `Sweep ${n} ${n === 1 ? 'Chain' : 'Chains'} to Solana`;
+      ctaBtn.textContent = `1-Click Sweep (${n} ${n === 1 ? 'Chain' : 'Chains'})`;
       ctaBtn.disabled = false;
     }
   }
@@ -1248,27 +1301,147 @@ function syncMobileStickySweepBar() {
     subEl.textContent = `${assetCount} ${assetCount === 1 ? 'asset' : 'assets'} · ${legs.length} ${legs.length === 1 ? 'chain' : 'chains'} · 0% fee`;
   }
   if (btnEl && ctaBtn) {
-    btnEl.textContent = isSweepQueueRunning ? 'Sweeping…' : `Sweep (${legs.length})`;
+    btnEl.textContent = isPreparingOneClickBatch
+      ? 'Preparing…'
+      : isSweepQueueRunning
+      ? 'Sweeping…'
+      : pendingBatchSummary
+      ? 'Confirm Sweep'
+      : `1-Click Sweep (${legs.length})`;
     btnEl.disabled = Boolean(ctaBtn.disabled);
   }
 }
 
-async function runScan({ address = null, family = null, autoOpen = false } = {}) {
+async function runScan({
+  address = null,
+  presetId = null,
+  family = null,
+  chains = null,
+  refresh = false,
+  autoOpen = false,
+} = {}) {
   const cleanAddr = String(address || '').trim();
-  if (!cleanAddr) {
+  const cleanPreset = String(presetId || '').trim();
+  if (!cleanAddr && !cleanPreset) {
     showToast('Enter a wallet address to scan.');
     return;
   }
   const seq = ++scanSeq;
   heroScene?.setActive(true);
+  clearOneClickSweepSummary();
   const scanBtn = document.getElementById('appScanBtn');
   if (scanBtn) {
     scanBtn.disabled = true;
     scanBtn.textContent = 'Scanning…';
   }
+  const badge = document.getElementById('scanModeBadge');
+  const rawSolDest = document.getElementById('solanaDestInput')?.value.trim() || '';
+  const hasValidDest = Boolean(rawSolDest && isValidSolanaBase58(rawSolDest));
+  const usePermit2Batch = Boolean(document.getElementById('permit2Toggle')?.checked ?? true);
+  const includeBurns = Boolean(document.getElementById('burnToggle')?.checked ?? false);
+  const bridgePreference = getActiveBridgePreference();
+
+  const applyScannedReport = (scan) => {
+    currentScan = scan;
+    batchRescuedDustIds.clear();
+    lastDustPlan = null;
+    renderDustStrategyBanner();
+    if (scan.family && scan.family !== activeFamily) {
+      activeFamily = scan.family;
+    }
+    updateFamilyChrome();
+    activeChainFilter = 'all';
+    defiStepperState = null;
+    renderPreSignProofCard(null);
+    clearOneClickSweepSummary();
+
+    selectedAssetIds = new Set(
+      currentScan.assets.filter((a) => a.selectedByDefault).map((a) => a.id)
+    );
+
+    const appIn = document.getElementById('appEvmInput');
+    if (appIn) appIn.value = currentScan.walletAddress;
+    if (cleanAddr || cleanPreset) {
+      const heroIn = document.getElementById('heroWalletInput');
+      if (heroIn) heroIn.value = currentScan.walletAddress;
+    }
+  };
+
   try {
+    // 1-round-trip hydration via POST /api/workspace/hydrate (scan + plan + preservation + Solana overview)
+    let hydrated = null;
+    let fallbackToScan = false;
+    try {
+      const hydrateBody = {
+        ...(cleanPreset ? { presetId: cleanPreset } : { address: cleanAddr }),
+        family: family || activeFamily,
+        ...(Array.isArray(chains) && chains.length ? { chains } : {}),
+        ...(refresh ? { refresh: true } : {}),
+        ...(hasValidDest ? { solanaDestination: rawSolDest } : {}),
+        outputAsset,
+        bridgePreference,
+        usePermit2Batch,
+        includeBurns,
+        includePreservation: true,
+        includeSolanaOverview: hasValidDest,
+      };
+      const hydrateRes = await fetch('/api/workspace/hydrate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(hydrateBody),
+      });
+      if (hydrateRes.ok) {
+        hydrated = await hydrateRes.json();
+      } else if (hydrateRes.status === 404 || hydrateRes.status === 405 || hydrateRes.status === 501) {
+        fallbackToScan = true;
+      } else {
+        const errData = await hydrateRes.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${hydrateRes.status}`);
+      }
+    } catch (hydrateErr) {
+      if (!fallbackToScan && !(hydrateErr instanceof TypeError)) {
+        throw hydrateErr;
+      }
+      fallbackToScan = true;
+    }
+
+    if (seq !== scanSeq) return;
+
+    if (hydrated && hydrated.scan && hydrated.plan) {
+      applyScannedReport(hydrated.scan);
+
+      if (hydrated.solanaOverview) {
+        applySolanaOverviewPayload(hydrated.solanaOverview, rawSolDest);
+      } else if (hydrated.solanaBalances) {
+        solanaBalances = hydrated.solanaBalances;
+        const solBadge = document.getElementById('solanaLiveBalanceBadge');
+        if (solBadge) {
+          solBadge.textContent = `${safeNum(solanaBalances.usdcBalance).toFixed(2)} USDC · ${safeNum(solanaBalances.solBalance).toFixed(3)} SOL on Solana`;
+        }
+      }
+
+      if (badge) {
+        const totalMs =
+          typeof hydrated.timingMs === 'number'
+            ? hydrated.timingMs
+            : typeof hydrated.timingMs?.total === 'number'
+            ? hydrated.timingMs.total
+            : currentScan.scanDurationMs;
+        badge.textContent = `${hydrated.cached ? 'Instant' : 'Live'} · ${Math.round(safeNum(totalMs))}ms`;
+        badge.classList.toggle('is-live', currentScan.mode === 'live_rpc');
+      }
+
+      currentPlan = {
+        ...hydrated.plan,
+        solanaDestination: hasValidDest ? rawSolDest : '',
+      };
+      renderAll();
+      if (autoOpen) openApp('scanner');
+      return;
+    }
+
+    // Graceful NDJSON streaming fallback to POST /api/scan
     const payload = { address: cleanAddr, family: family || activeFamily };
-    const badge = document.getElementById('scanModeBadge');
     const res = await fetch('/api/scan', {
       method: 'POST',
       headers: {
@@ -1321,28 +1494,7 @@ async function runScan({ address = null, family = null, autoOpen = false } = {})
       scan = await res.json();
     }
     if (seq !== scanSeq) return;
-    currentScan = scan;
-    batchRescuedDustIds.clear();
-    lastDustPlan = null;
-    renderDustStrategyBanner();
-    if (scan.family && scan.family !== activeFamily) {
-      activeFamily = scan.family;
-    }
-    updateFamilyChrome();
-    activeChainFilter = 'all';
-    defiStepperState = null;
-    renderPreSignProofCard(null);
-
-    selectedAssetIds = new Set(
-      currentScan.assets.filter((a) => a.selectedByDefault).map((a) => a.id)
-    );
-
-    const appIn = document.getElementById('appEvmInput');
-    if (appIn) appIn.value = currentScan.walletAddress;
-    if (cleanAddr) {
-      const heroIn = document.getElementById('heroWalletInput');
-      if (heroIn) heroIn.value = currentScan.walletAddress;
-    }
+    applyScannedReport(scan);
 
     if (badge) {
       badge.textContent = `Live · ${currentScan.scanDurationMs}ms`;
@@ -1378,6 +1530,7 @@ function getActiveBridgePreference() {
 
 async function recomputePlan() {
   if (!currentScan) return;
+  clearOneClickSweepSummary();
   const seq = ++planSeq;
   const rawSolDest = document.getElementById('solanaDestInput')?.value.trim() || '';
   const hasValidDest = Boolean(rawSolDest && isValidSolanaBase58(rawSolDest));
@@ -1422,7 +1575,7 @@ function renderAll() {
 
   const t = currentPlan.totals;
   const pref = currentPlan.bridgePreference || getActiveBridgePreference();
-  const feePct = currentPlan.protocolFeePercent ?? (getActiveProtocolFeeBps() ?? 700) / 100;
+  const feePct = currentPlan.protocolFeePercent ?? (getActiveProtocolFeeBps() ?? 0) / 100;
   const stats = estimateChainCallCounts();
 
   // Topbar counters
@@ -4249,10 +4402,136 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
   }
 }
 
+function buildOneClickFingerprint({ activeChains, solDest, sourceAddress, bridgePreference, selectedIds }) {
+  return [
+    String(sourceAddress || '').toLowerCase(),
+    String(solDest || ''),
+    outputAsset,
+    String(bridgePreference || 'auto'),
+    executionMode,
+    Array.from(activeChains || []).sort().join(','),
+    Array.from(selectedIds || []).sort().join(','),
+  ].join('|');
+}
+
+function clearOneClickSweepSummary() {
+  pendingBatchSummary = null;
+  const card = document.getElementById('oneClickSweepSummaryCard');
+  if (card) {
+    card.classList.add('hidden');
+    card.classList.remove('is-ready', 'is-warn');
+    card.innerHTML = '';
+  }
+}
+
+function renderOneClickSweepSummary() {
+  const card = document.getElementById('oneClickSweepSummaryCard');
+  if (!card) return;
+  if (!pendingBatchSummary || !pendingBatchSummary.batch) {
+    clearOneClickSweepSummary();
+    return;
+  }
+
+  const { batch, activeChains, outputAsset: snapOut } = pendingBatchSummary;
+  const items = Array.isArray(batch.items) ? batch.items : [];
+  const failedItems = items.filter((it) => it && it.ok === false);
+  const readyCount = safeInt(batch.readyCount);
+  const totalCount = Math.max(readyCount + safeInt(batch.failedCount), safeInt(batch.count));
+  const totalNetUsd = safeNum(batch.totalNetUsd);
+  const totalGasUsd = safeNum(batch.totalGasUsd);
+  const totalSignatures = Math.max(1, safeInt(batch.totalSignatures || activeChains.length));
+  const durationMs = Math.max(0, Math.round(safeNum(batch.durationMs)));
+
+  const chainsCovered = Array.from(
+    new Set(
+      items.filter((it) => it && it.ok !== false && it.chain).map((it) => it.chain)
+    )
+  );
+  const displayChains = chainsCovered.length ? chainsCovered : activeChains;
+
+  const hasFailures = failedItems.length > 0;
+  const canProceed = readyCount > 0 || (items.length === 0 && displayChains.length > 0);
+
+  card.classList.remove('hidden');
+  card.classList.toggle('is-ready', !hasFailures && canProceed);
+  card.classList.toggle('is-warn', hasFailures || !canProceed);
+
+  const chainChipsHtml = displayChains
+    .slice(0, 8)
+    .map((ch) => {
+      const logo = getChainLogoPath(ch);
+      const darkCls = needsDarkLogoBacking(ch) ? ' logo-dark-backing' : '';
+      return `<span class="one-click-chain-chip"><img src="${escapeHtml(logo)}" width="13" height="13" alt="" class="chain-logo-xs${darkCls}" />${escapeHtml(ch)}</span>`;
+    })
+    .join('');
+
+  const warnHtml = hasFailures
+    ? `<div class="one-click-warn-box">${escapeHtml(
+        `${failedItems.length} asset(s) skipped (${failedItems
+          .slice(0, 3)
+          .map((f) => `${f.symbol || f.assetId}: ${f.error || 'unavailable'}`)
+          .join(' · ')}). ${
+          canProceed
+            ? `Remaining ${readyCount} ready asset(s) can still sweep cleanly.`
+            : 'Adjust selection or retry.'
+        }`
+      )}</div>`
+    : '';
+
+  const badgeText = batch.fallbackSummary
+    ? `${displayChains.length} ${displayChains.length === 1 ? 'chain' : 'chains'} ready`
+    : `${readyCount}/${totalCount} ready${durationMs > 0 ? ` · ${durationMs}ms` : ''}`;
+
+  card.innerHTML = `
+    <div class="one-click-summary-head">
+      <span class="one-click-summary-title">${uiIcon(canProceed ? 'check-circle' : 'alert-triangle', 14)}<span>Pre-Sign Sweep Summary</span></span>
+      <span class="one-click-summary-badge mono">${escapeHtml(badgeText)}</span>
+    </div>
+    <div class="one-click-summary-grid">
+      <div class="one-click-metric">
+        <span class="one-click-metric-label">Arriving on Solana (${escapeHtml(snapOut || outputAsset)})</span>
+        <strong class="one-click-metric-val mono is-emerald">${escapeHtml(fmtUsd(totalNetUsd))}</strong>
+      </div>
+      <div class="one-click-metric">
+        <span class="one-click-metric-label">Turgalium Fee</span>
+        <strong class="one-click-metric-val mono">0% ($0.00)</strong>
+      </div>
+      <div class="one-click-metric">
+        <span class="one-click-metric-label">Signatures</span>
+        <strong class="one-click-metric-val mono">${totalSignatures} ${totalSignatures === 1 ? 'sig' : 'sigs'} · ${displayChains.length} ${displayChains.length === 1 ? 'chain' : 'chains'}</strong>
+      </div>
+      <div class="one-click-metric">
+        <span class="one-click-metric-label">Est. Network Gas</span>
+        <strong class="one-click-metric-val mono">~${escapeHtml(fmtUsd(totalGasUsd))}</strong>
+      </div>
+    </div>
+    ${chainChipsHtml ? `<div class="one-click-chains-row">${chainChipsHtml}</div>` : ''}
+    ${warnHtml}
+    <div class="one-click-summary-actions">
+      ${
+        canProceed
+          ? `<button type="button" class="btn-pill-dark one-click-confirm-btn" id="confirmOneClickSweepBtn">Confirm &amp; Sign Sweep (${totalSignatures} ${totalSignatures === 1 ? 'sig' : 'sigs'})</button>`
+          : ''
+      }
+      <button type="button" class="btn-outline-sm one-click-cancel-btn" id="cancelOneClickSweepBtn">Cancel</button>
+    </div>
+  `;
+
+  document.getElementById('confirmOneClickSweepBtn')?.addEventListener('click', () => {
+    const snap = pendingBatchSummary;
+    if (!snap) return;
+    runPreparedSweepQueue(snap);
+  });
+  document.getElementById('cancelOneClickSweepBtn')?.addEventListener('click', () => {
+    clearOneClickSweepSummary();
+    updateWalletButtons();
+  });
+}
+
 async function executeSelectedLiveQueue() {
   if (!currentScan || !currentPlan) return;
-  if (isSweepQueueRunning) {
-    showToast('A sweep queue is already running.');
+  if (isSweepQueueRunning || isPreparingOneClickBatch) {
+    showToast(isPreparingOneClickBatch ? 'Preparing your 1-Click Sweep batch…' : 'A sweep queue is already running.');
     return;
   }
   const activeChains = currentPlan.legs.map((l) => l.chain);
@@ -4271,29 +4550,149 @@ async function executeSelectedLiveQueue() {
   const solDest = requireVerifiedSolanaDestination('sweep to Solana');
   if (!solDest) return;
 
+  const snapshotBridgePreference = getActiveBridgePreference();
+  const snapshotProtocolFeeBps = getActiveProtocolFeeBps();
+  const snapshotFeeRecipientEvm = getActiveFeeRecipientEvm();
+  const snapshotOutputAsset = outputAsset;
+  const effectiveScan = buildEffectiveScanForPlan();
+  const snapshotChainAssetsMap = new Map();
+  const allSelectedAssets = [];
+
+  for (const ch of activeChains) {
+    const assetsForChain = (effectiveScan?.assets || []).filter(
+      (a) =>
+        a.chain === ch &&
+        selectedAssetIds.has(a.id) &&
+        a.action !== 'SKIP_HONEYPOT' &&
+        a.action !== 'SKIP_UNPRICED'
+    );
+    snapshotChainAssetsMap.set(ch, assetsForChain);
+    for (const a of assetsForChain) allSelectedAssets.push(a);
+  }
+
+  const fp = buildOneClickFingerprint({
+    activeChains,
+    solDest,
+    sourceAddress: connectedSrc,
+    bridgePreference: snapshotBridgePreference,
+    selectedIds: selectedAssetIds,
+  });
+
+  // If pre-sign summary is already prepared & matches, confirm immediately on second CTA click
+  if (pendingBatchSummary && pendingBatchSummary.fingerprint === fp) {
+    await runPreparedSweepQueue(pendingBatchSummary);
+    return;
+  }
+
+  isPreparingOneClickBatch = true;
+  updateWalletButtons();
+
+  try {
+    let batchRes = null;
+    try {
+      batchRes = await api('/api/tx/prepare-batch', {
+        method: 'POST',
+        body: JSON.stringify({
+          assets: allSelectedAssets.slice(0, 12),
+          userAddress: connectedSrc,
+          solanaDestination: solDest,
+          outputAsset: snapshotOutputAsset,
+          bridgePreference: snapshotBridgePreference,
+          hasSolanaUsdcAta: solanaBalances ? Boolean(solanaBalances.hasUsdcAta) : undefined,
+          includePreflight: true,
+        }),
+      });
+    } catch {
+      // Graceful fallback summary derived from live plan if prepare-batch is unavailable
+      const fin = getEffectivePlanFinancials();
+      batchRes = {
+        fallbackSummary: true,
+        preparedAt: new Date().toISOString(),
+        durationMs: 0,
+        count: allSelectedAssets.length,
+        readyCount: allSelectedAssets.length,
+        failedCount: 0,
+        totalNetUsd: fin.effectiveNetUsdc,
+        totalGasUsd: safeNum(currentPlan?.totals?.totalGasUsd),
+        totalProtocolFeeUsd: 0,
+        totalSignatures: activeChains.length,
+        items: [],
+      };
+    }
+
+    pendingBatchSummary = {
+      fingerprint: fp,
+      batch: batchRes,
+      activeChains,
+      solDest,
+      sourceAddress: connectedSrc,
+      outputAsset: snapshotOutputAsset,
+      bridgePreference: snapshotBridgePreference,
+      protocolFeeBps: snapshotProtocolFeeBps,
+      feeRecipientEvm: snapshotFeeRecipientEvm,
+      snapshotChainAssetsMap,
+      preparedAt: Date.now(),
+    };
+    renderOneClickSweepSummary();
+    document.getElementById('oneClickSweepSummaryCard')?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'nearest',
+    });
+  } catch (err) {
+    showToast(err?.message || 'Failed to prepare 1-Click Sweep batch.');
+  } finally {
+    isPreparingOneClickBatch = false;
+    updateWalletButtons();
+  }
+}
+
+async function runPreparedSweepQueue(summary) {
+  if (!currentScan || !currentPlan || !summary) return;
+  if (isSweepQueueRunning) {
+    showToast('A sweep queue is already running.');
+    return;
+  }
+
+  const {
+    batch,
+    activeChains: rawChains,
+    solDest: snapshotSolDest,
+    sourceAddress: snapshotSourceAddress,
+    outputAsset: snapshotOutputAsset,
+    bridgePreference: snapshotBridgePreference,
+    protocolFeeBps: snapshotProtocolFeeBps,
+    feeRecipientEvm: snapshotFeeRecipientEvm,
+    snapshotChainAssetsMap,
+  } = summary;
+
+  // Gracefully exclude individual assets that failed inside prepare-batch while keeping ready assets
+  const failedAssetIds = new Set(
+    (Array.isArray(batch?.items) ? batch.items : [])
+      .filter((it) => it && it.ok === false && it.assetId)
+      .map((it) => it.assetId)
+  );
+  const filteredChainAssetsMap = new Map();
+  const activeChains = [];
+  for (const ch of rawChains) {
+    const rawList = snapshotChainAssetsMap.get(ch) || [];
+    const usable =
+      failedAssetIds.size > 0 ? rawList.filter((a) => !failedAssetIds.has(a.id)) : rawList;
+    if (usable.length > 0) {
+      filteredChainAssetsMap.set(ch, usable);
+      activeChains.push(ch);
+    }
+  }
+  if (!activeChains.length) {
+    showToast('No ready assets left to sweep. Adjust selection and try again.');
+    return;
+  }
+
+  clearOneClickSweepSummary();
   isSweepQueueRunning = true;
   updateWalletButtons();
   let prequoter = null;
   try {
-    const snapshotBridgePreference = getActiveBridgePreference();
-    const snapshotProtocolFeeBps = getActiveProtocolFeeBps();
-    const snapshotFeeRecipientEvm = getActiveFeeRecipientEvm();
-    const snapshotOutputAsset = outputAsset;
-    const snapshotSolDest = solDest;
-    const snapshotSourceAddress = connectedSrc;
-    const effectiveScan = buildEffectiveScanForPlan();
-    const snapshotChainAssetsMap = new Map();
-    for (const ch of activeChains) {
-      const assetsForChain = (effectiveScan?.assets || []).filter(
-        (a) =>
-          a.chain === ch &&
-          selectedAssetIds.has(a.id) &&
-          a.action !== 'SKIP_HONEYPOT' &&
-          a.action !== 'SKIP_UNPRICED'
-      );
-      snapshotChainAssetsMap.set(ch, assetsForChain);
-    }
-
+    const legsToRun = currentPlan.legs.filter((l) => activeChains.includes(l.chain));
     const job = await api('/api/jobs', {
       method: 'POST',
       body: JSON.stringify({
@@ -4303,7 +4702,7 @@ async function executeSelectedLiveQueue() {
         bridgePreference: snapshotBridgePreference,
         protocolFeeBps: snapshotProtocolFeeBps,
         feeRecipientEvm: snapshotFeeRecipientEvm,
-        legs: currentPlan.legs.map((l) => ({
+        legs: legsToRun.map((l) => ({
           chain: l.chain,
           chainName: l.chainName,
           assetCount: safeInt(l.defiExits) + safeInt(l.swaps) + safeInt(l.burns),
@@ -4324,7 +4723,7 @@ async function executeSelectedLiveQueue() {
       prequoter = createChainBatchPrequoter(
         activeChains,
         async (chain) => {
-          const chainAssets = snapshotChainAssetsMap.get(chain) || [];
+          const chainAssets = filteredChainAssetsMap.get(chain) || [];
           if (!chainAssets.length) return null;
           const legFamily = chainAssets[0]?.family || snapshotScanFamily;
           if (legFamily !== 'evm') {
@@ -4411,6 +4810,9 @@ async function executeSelectedLiveQueue() {
         queueCompletedChains += 1;
       }
     }
+    if (!queueAborted && queueCompletedChains > 0) {
+      pollInflightBridgesFinality({ manual: false });
+    }
     if (!queueAborted && queueCompletedChains > 0 && !shownReceiptJobIds.has(job.jobId)) {
       const latestJob = backgroundJobs.find((j) => j.jobId === job.jobId) || job;
       const allLegsDone =
@@ -4473,9 +4875,9 @@ function renderActiveContract() {
   const fileEl = document.getElementById('contractFileLabel');
   if (fileEl) fileEl.textContent = chosen.filename;
   const lines = src.split('\n').length;
-  const feePct = ((contractData.protocolFeeBps ?? 700) / 100).toFixed(1);
+  const feePct = ((contractData.protocolFeeBps ?? 0) / 100).toFixed(1);
   document.getElementById('contractStats').textContent =
-    `Solidity ${contractData.solidityVersion} · ${lines} lines · ${feePct}% Fee (5–10%) · Domain ${contractData.solanaCctpDomain} → Solana`;
+    `Solidity ${contractData.solidityVersion} · ${lines} lines · ${feePct}% Fee (MIT) · Domain ${contractData.solanaCctpDomain} → Solana`;
   document.querySelectorAll('.contract-tab').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.contractId === activeContractId);
   });
@@ -4561,7 +4963,7 @@ async function handleEvmConnected({ address, walletName, capabilities, solana })
     showToast(
       `Connected ${walletName} (EVM + Solana): ${shortAddr(address)} → ${shortAddr(solana.address)}`
     );
-    await Promise.all([runScan({ address, autoOpen: true }), refreshSolanaBalance()]);
+    await runScan({ address, autoOpen: true });
     return;
   }
   showToast(
@@ -4580,6 +4982,7 @@ function resetEvmScanState() {
   lastDustPlan = null;
   latestPreSignProof = null;
   defiStepperState = null;
+  clearOneClickSweepSummary();
   renderDefiGuidedStepper();
   renderEmptyScanState();
 }
@@ -7449,7 +7852,7 @@ function buildZeroKeyAgentPrompt() {
     `Public source wallet: ${walletVal}`,
     destClause,
     `Steps:`,
-    `1. Scan my public address via POST /api/scan (or turgalium_scan_wallets) and identify DeFi deposits, liquid tokens, profitable dust, and traps to skip.`,
+    `1. Scan & hydrate my public address via POST /api/workspace/hydrate (or turgalium_scan_wallets) to identify DeFi deposits, liquid tokens, profitable dust, and traps to skip.`,
     `2. Summarize the highest-net bridge route and any free Solana ATA rent or SPL dust I can reclaim.`,
     `3. Call POST /api/agent/review-link (or turgalium_build_review_link) and return the clickable Turgalium Review & Sign Link so I can inspect and sign locally in my own wallet.`,
     `Security rule: NEVER ask me for a private key, seed phrase, or wallet signature.`,
