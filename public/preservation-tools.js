@@ -37,6 +37,7 @@ const SUPPORTED_APPROVAL_CHAINS = [
   { id: 'zksync', label: 'zkSync Era', explorer: 'https://explorer.zksync.io/tx/' },
   { id: 'ink', label: 'Ink', explorer: 'https://explorer.inkonchain.com/tx/' },
   { id: 'gnosis', label: 'Gnosis', explorer: 'https://gnosisscan.io/tx/' },
+  { id: 'monad', label: 'Monad', explorer: 'https://monadvision.com/tx/' },
 ];
 
 const SOLSCAN_ALLOWED_HOSTS = ['solscan.io'];
@@ -67,6 +68,8 @@ const EVM_EXPLORER_ALLOWED_HOSTS = [
   'explorer.zksync.io',
   'explorer.inkonchain.com',
   'gnosisscan.io',
+  'monadvision.com',
+  'monadscan.com',
 ];
 
 const state = {

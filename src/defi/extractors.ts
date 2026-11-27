@@ -110,6 +110,21 @@ export const AUDITED_AAVE_V3_POOLS: Partial<Record<EvmChainId, string[]>> = {
   ethereum: [
     '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2', // Aave v3 Ethereum Core
     '0x4e033931ad43597d96D6bcc25c280717730B58B1', // Aave v3 Ethereum Prime (Lido)
+    '0xC13e21B648A5Ee794902342038FF3aDAB66BE987', // SparkLend Ethereum
+  ],
+  base: [
+    '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5', // Aave v3 Base
+    '0x8F44Fd754285aa6A2b8B9B97739B79746e0475a7', // Seamless Protocol Base
+  ],
+  mantle: [
+    '0xCFa5aE7c2CE8Fadc6426C1ff872cA45378Fb7cF3', // Lendle Mantle
+  ],
+  gnosis: [
+    '0xb50201558B00496A145fE76f7424749556E326D8', // Aave v3 Gnosis
+    '0x2Dae5307c5E3FD1CF5A72Cb6F698f915860607e0', // SparkLend Gnosis
+  ],
+  monad: [
+    '0x80F00661b13CC5F6ccd3885bE7b4C9c67545D585', // Neverland Money Main Pool (Monad)
   ],
 };
 
@@ -2105,7 +2120,17 @@ export function identifyProtocolExtractorId(asset: Pick<
   }
   if (proto.includes('yearn v2') || proto.includes('yearn2')) return 'yearn_v2';
   if (proto.includes('aave v2')) return 'aave_v2';
-  if (proto.includes('aave') || proto.includes('hyperlend')) return 'aave_v3';
+  if (
+    proto.includes('aave') ||
+    proto.includes('neverland') ||
+    proto.includes('hyperlend') ||
+    proto.includes('sparklend') ||
+    proto.includes('seamless') ||
+    proto.includes('lendle') ||
+    proto.includes('zerolend')
+  ) {
+    return 'aave_v3';
+  }
   if (
     proto.includes('compound v2') ||
     proto.includes('venus') ||

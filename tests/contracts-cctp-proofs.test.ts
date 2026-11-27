@@ -221,7 +221,7 @@ test('CRIT-05 Backtest: All 19 EVM chains route CCTP V2 (with V1 backward-compat
   ];
   const expectedNone: EvmChainId[] = ['bnb', 'scroll', 'mantle', 'blast', 'berachain', 'zksync', 'gnosis'];
 
-  assert.equal(CHAIN_LIST.length, 19);
+  assert.equal(CHAIN_LIST.length, 20);
   const ataBytes32 = solanaOwnerToUsdcAtaBytes32(SAMPLE_SOLANA_WALLETS[0]);
 
   // Verify V1 backwards-compatible encoder, Iris V1 URL, and Solana V1 programs still work when explicitly requested

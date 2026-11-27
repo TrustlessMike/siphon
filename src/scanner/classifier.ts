@@ -52,6 +52,7 @@ export const DEFILLAMA_CHAIN_SLUGS: Partial<Record<EvmChainId, string>> = {
   gnosis: 'xdai',
   berachain: 'berachain',
   ink: 'ink',
+  monad: 'monad',
 };
 
 export interface WalletPreset {

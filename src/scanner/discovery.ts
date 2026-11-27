@@ -47,6 +47,7 @@ const DEXSCREENER_CHAIN_SLUGS: Record<EvmChainId, string> = {
   zksync: 'zksync',
   ink: 'ink',
   gnosis: 'gnosischain',
+  monad: 'monad',
 };
 
 export const ALCHEMY_NETWORK_SUBDOMAINS: Partial<Record<EvmChainId, string>> = {
@@ -67,6 +68,7 @@ export const ALCHEMY_NETWORK_SUBDOMAINS: Partial<Record<EvmChainId, string>> = {
   zksync: 'zksync-mainnet',
   ink: 'ink-mainnet',
   gnosis: 'gnosis-mainnet',
+  monad: 'monad-mainnet',
 };
 
 const MORALIS_CHAIN_HEX: Partial<Record<EvmChainId, string>> = {
@@ -80,6 +82,7 @@ const MORALIS_CHAIN_HEX: Partial<Record<EvmChainId, string>> = {
   linea: '0xe708',
   blast: '0x13e31',
   gnosis: '0x64',
+  monad: '0x8f',
 };
 
 export const MIN_VERIFIED_DEX_LIQUIDITY_USD = 2_500;
@@ -1587,6 +1590,7 @@ const RABBY_CHAIN_TO_EVM: Record<string, EvmChainId> = {
   ink: 'ink',
   xdai: 'gnosis',
   gnosis: 'gnosis',
+  monad: 'monad',
 };
 
 function sanitizeHttpsUrl(raw?: string | null): string | undefined {

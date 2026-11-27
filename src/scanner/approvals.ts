@@ -499,6 +499,22 @@ const CHAIN_SPECIFIC_SPENDERS: Partial<Record<EvmChainId, readonly KnownApproval
       riskLevel: 'medium',
     },
   ],
+  monad: [
+    {
+      address: '0x80F00661b13CC5F6ccd3885bE7b4C9c67545D585',
+      label: 'Neverland Money Lending Pool (Monad)',
+      protocol: 'Neverland',
+      category: 'defi_lending',
+      riskLevel: 'low',
+    },
+    {
+      address: '0x4cd00e387622c35bddb9b4c962c136462338bc31',
+      label: 'Relay Protocol Settlement (Monad)',
+      protocol: 'Relay',
+      category: 'bridge',
+      riskLevel: 'low',
+    },
+  ],
 };
 
 /**

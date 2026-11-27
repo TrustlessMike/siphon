@@ -121,13 +121,14 @@ test('All 19 EVM chains define safe positive gasReserveNative reserves (includin
     'zksync',
     'ink',
     'gnosis',
+    'monad',
   ];
 
-  assert.equal(CHAIN_LIST.length, 19, `Expected 19 EVM chains, got ${CHAIN_LIST.length}`);
+  assert.equal(CHAIN_LIST.length, 20, `Expected 20 EVM chains, got ${CHAIN_LIST.length}`);
   assert.deepEqual(
     new Set(CHAIN_LIST.map((c) => c.id)),
     new Set(expectedChains),
-    'EVM_CHAINS keys must match all 19 supported EVM chains'
+    'EVM_CHAINS keys must match all 20 supported EVM chains'
   );
 
   for (const chain of CHAIN_LIST) {

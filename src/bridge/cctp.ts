@@ -865,6 +865,7 @@ export function buildMigrationPlan(input: BuildPlanInput): MigrationPlan {
     'zksync',
     'ink',
     'gnosis',
+    'monad',
     'ethereum',
     'noble',
     'osmosis',

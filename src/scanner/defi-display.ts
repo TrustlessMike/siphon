@@ -32,6 +32,11 @@ function deriveProtocolGroup(
   if (low.includes('curve')) return 'Curve';
   if (low.includes('spark')) return 'Spark Vaults';
   if (low.includes('sky')) return 'Sky Vaults';
+  if (low.includes('neverland')) return 'Neverland';
+  if (low.includes('hyperlend')) return 'Hyperlend';
+  if (low.includes('sparklend')) return 'SparkLend';
+  if (low.includes('seamless')) return 'Seamless';
+  if (low.includes('lendle')) return 'Lendle';
   if (low.includes('ethena')) return 'Ethena Vaults';
   if (low.includes('erc-4626') || low.includes('erc4626') || low === 'vault') return 'Morpho / Vaults';
   if (low.includes('pendle')) return 'Pendle';

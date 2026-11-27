@@ -28,7 +28,8 @@ export type EvmChainId =
   | 'berachain'
   | 'zksync'
   | 'ink'
-  | 'gnosis';
+  | 'gnosis'
+  | 'monad';
 
 export type CosmosChainId =
   | 'cosmoshub'

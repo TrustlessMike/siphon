@@ -7,6 +7,11 @@ import {
   solanaOwnerToUsdcAtaBytes32,
 } from '../bridge/cctp.js';
 import {
+  buildAaveRepayPreSteps,
+  inspectAavePoolActiveDebts,
+  type AaveRepayStepTx,
+} from '../defi/aave-unwind.js';
+import {
   AAVE_V2_LENDING_POOLS,
   checkCompoundAccountSafety,
   COMPOUND_V3_COMETS,
@@ -421,6 +426,7 @@ async function buildDefiWithdrawExecution(params: {
   feeConfig: ProtocolFeeConfig;
   followUpQuoteFn?: FollowUpQuoteFn;
   aaveSafetyCheckFn?: AaveSafetyCheckFn;
+  aaveDebtInspectorFn?: typeof inspectAavePoolActiveDebts;
   compoundSafetyCheckFn?: CompoundSafetyCheckFn;
   routeAuctionOptions?: RouteAuctionExecutionOptions;
   allowanceCheckFn?: Erc20AllowanceCheckFn;
@@ -434,6 +440,7 @@ async function buildDefiWithdrawExecution(params: {
     feeConfig,
     followUpQuoteFn,
     aaveSafetyCheckFn = checkAaveV3AccountSafety,
+    aaveDebtInspectorFn,
     compoundSafetyCheckFn = checkCompoundAccountSafety,
     routeAuctionOptions,
     allowanceCheckFn,
@@ -538,8 +545,11 @@ async function buildDefiWithdrawExecution(params: {
     }
   }
 
-  // 2. Aave v3 & Aave v2 live FAIL-CLOSED debt guard + Safe Partial Exit calculator (HF >= 1.6)
+  // 2. Aave v3 / Neverland / SparkLend / Seamless / Hyperlend / Lendle & Aave v2
+  //    live FAIL-CLOSED debt guard + 1-Click Repay-Then-Withdraw + Safe Partial Exit (HF >= 1.6)
   let resolvedExitPlan = asset.defiExitPlan;
+  let aaveRepayPreSteps: AaveRepayStepTx[] = [];
+  let aaveRepayNote: string | null = null;
   if (protocolId === 'aave_v3' || protocolId === 'aave_v2') {
     const poolTarget =
       asset.protocolAddress ||
@@ -565,34 +575,84 @@ async function buildDefiWithdrawExecution(params: {
     }
 
     if (debtUsd > 0) {
-      const partial = computeAaveSafePartialWithdrawal({
-        totalCollateralUsd,
-        totalDebtUsd: debtUsd,
-        liquidationThresholdBps: ltBps,
-        currentHealthFactor: healthFactor,
-        positionUsd: asset.grossUsd,
-        positionRawBalance: BigInt(asset.rawBalance),
-        positionDecimals: asset.decimals,
-        positionPriceUsd: asset.priceUsd,
-        minSafeHealthFactor: MIN_SAFE_HEALTH_FACTOR,
-      });
+      // Universal 1-Click Repay + Full Withdraw check across all Aave V3 / fork pools:
+      // If the user's wallet already holds the borrowed debt asset(s), prepend Approve + Pool.repay
+      // so the full collateral position unlocks cleanly in one guided flow.
+      const debtInspector =
+        aaveDebtInspectorFn ?? (params.aaveSafetyCheckFn ? undefined : inspectAavePoolActiveDebts);
+      const debtInspection =
+        protocolId === 'aave_v3' && poolTarget && debtInspector
+          ? await debtInspector({
+              chain: evmChain,
+              poolAddress: poolTarget,
+              userAddress,
+              timeoutMs: 3_500,
+            }).catch(() => null)
+          : null;
 
-      if (!partial.canWithdrawAny) {
-        throw new Error(
-          `Aave v3 safety guard: wallet has $${debtUsd.toFixed(2)} active debt (HF ${partial.currentHealthFactor.toFixed(2)}). ${partial.reason}`
-        );
+      if (
+        debtInspection?.checked &&
+        debtInspection.activeDebts.length > 0 &&
+        debtInspection.canRepayAllFromWallet &&
+        poolTarget
+      ) {
+        const protocolName = asset.protocol || (evmChain === 'monad' ? 'Neverland' : 'Aave v3');
+        aaveRepayPreSteps = buildAaveRepayPreSteps({
+          chain: evmChain,
+          poolAddress: poolTarget,
+          protocolName,
+          userAddress,
+          activeDebts: debtInspection.activeDebts,
+        });
+        const debtSummary = debtInspection.activeDebts
+          .map((d) => `${d.debtUi} ${d.symbol}`)
+          .join(' + ');
+        aaveRepayNote = `1-Click Repay + Full Withdraw: repaying ${debtSummary} on ${protocolName} (${cfg.name}) from wallet balance before unlocking 100% collateral.`;
+        resolvedExitPlan = resolveDefiExitPlan({
+          asset: {
+            ...asset,
+            aaveDebtUsd: 0,
+            defiDebtUsd: 0,
+          },
+          outputAsset,
+        });
+      } else {
+        const partial = computeAaveSafePartialWithdrawal({
+          totalCollateralUsd,
+          totalDebtUsd: debtUsd,
+          liquidationThresholdBps: ltBps,
+          currentHealthFactor: healthFactor,
+          positionUsd: asset.grossUsd,
+          positionRawBalance: BigInt(asset.rawBalance),
+          positionDecimals: asset.decimals,
+          positionPriceUsd: asset.priceUsd,
+          minSafeHealthFactor: MIN_SAFE_HEALTH_FACTOR,
+        });
+
+        if (!partial.canWithdrawAny) {
+          const shortfallHint =
+            debtInspection?.checked && debtInspection.activeDebts.length > 0
+              ? ` Hold ${debtInspection.activeDebts
+                  .filter((d) => !d.canRepayFull)
+                  .map((d) => `${d.shortfallUi} ${d.symbol}`)
+                  .join(' + ')} on ${cfg.name} to unlock 1-Click Repay + Full Withdraw.`
+              : '';
+          throw new Error(
+            `Aave v3 safety guard: wallet has $${debtUsd.toFixed(2)} active debt (HF ${partial.currentHealthFactor.toFixed(2)}). ${partial.reason}${shortfallHint}`
+          );
+        }
+
+        resolvedExitPlan = resolveDefiExitPlan({
+          asset: {
+            ...asset,
+            aaveDebtUsd: debtUsd,
+            aaveHealthFactor: partial.currentHealthFactor,
+            aaveTotalCollateralUsd: totalCollateralUsd,
+            aaveLiquidationThresholdBps: ltBps,
+          },
+          outputAsset,
+        });
       }
-
-      resolvedExitPlan = resolveDefiExitPlan({
-        asset: {
-          ...asset,
-          aaveDebtUsd: debtUsd,
-          aaveHealthFactor: partial.currentHealthFactor,
-          aaveTotalCollateralUsd: totalCollateralUsd,
-          aaveLiquidationThresholdBps: ltBps,
-        },
-        outputAsset,
-      });
     }
   }
 
@@ -678,19 +738,22 @@ async function buildDefiWithdrawExecution(params: {
     };
   }
 
-  const transactions: ExecutableEvmTx[] = built.transactions.map((t) => ({
-    stepId: t.stepId,
-    label: t.label,
-    description: t.description,
-    chain: evmChain,
-    chainId: cfg.chainId,
-    chainName: cfg.name,
-    explorerUrl: cfg.explorerUrl,
-    from: userAddress,
-    to: t.to,
-    data: t.data,
-    value: t.value,
-  }));
+  const transactions: ExecutableEvmTx[] = [
+    ...aaveRepayPreSteps,
+    ...built.transactions.map((t) => ({
+      stepId: t.stepId,
+      label: t.label,
+      description: t.description,
+      chain: evmChain,
+      chainId: cfg.chainId,
+      chainName: cfg.name,
+      explorerUrl: cfg.explorerUrl,
+      from: userAddress,
+      to: t.to,
+      data: t.data,
+      value: t.value,
+    })),
+  ];
 
   const chainedFollowUpPlan: ChainedFollowUpPlan | undefined = built.unlockedAssets.length
     ? {
@@ -728,7 +791,7 @@ async function buildDefiWithdrawExecution(params: {
     defiExitPlan: resolvedExitPlan,
     chainedFollowUpPlan,
     transactions,
-    notes: built.notes,
+    notes: aaveRepayNote ? [aaveRepayNote, ...built.notes] : built.notes,
   };
 }
 
@@ -1708,6 +1771,7 @@ export async function prepareRealExecution(params: {
   feeRecipientEvm?: string | null;
   followUpQuoteFn?: FollowUpQuoteFn;
   aaveSafetyCheckFn?: AaveSafetyCheckFn;
+  aaveDebtInspectorFn?: typeof inspectAavePoolActiveDebts;
   compoundSafetyCheckFn?: CompoundSafetyCheckFn;
   allowanceCheckFn?: Erc20AllowanceCheckFn;
   routeAuctionOptions?: RouteAuctionExecutionOptions;
@@ -1723,6 +1787,7 @@ export async function prepareRealExecution(params: {
     feeRecipientEvm,
     followUpQuoteFn,
     aaveSafetyCheckFn,
+    aaveDebtInspectorFn,
     compoundSafetyCheckFn,
     allowanceCheckFn,
     routeAuctionOptions,
@@ -1806,6 +1871,7 @@ export async function prepareRealExecution(params: {
       feeConfig,
       followUpQuoteFn,
       aaveSafetyCheckFn,
+      aaveDebtInspectorFn,
       compoundSafetyCheckFn,
       routeAuctionOptions,
       allowanceCheckFn,
@@ -1971,6 +2037,7 @@ export async function prepareChainBatchExecution(params: {
   multiInputSwapQuoteFn?: MultiInputSwapQuoteFn;
   allowanceCheckFn?: Erc20AllowanceCheckFn;
   aaveSafetyCheckFn?: AaveSafetyCheckFn;
+  aaveDebtInspectorFn?: typeof inspectAavePoolActiveDebts;
   compoundSafetyCheckFn?: CompoundSafetyCheckFn;
   routeAuctionOptions?: RouteAuctionExecutionOptions;
   liveGasPriceWei?: bigint;
@@ -1994,6 +2061,7 @@ export async function prepareChainBatchExecution(params: {
     multiInputSwapQuoteFn,
     allowanceCheckFn,
     aaveSafetyCheckFn,
+    aaveDebtInspectorFn,
     compoundSafetyCheckFn,
     routeAuctionOptions,
     liveGasPriceWei,
@@ -2333,6 +2401,7 @@ export async function prepareChainBatchExecution(params: {
       feeRecipientEvm: feeConfig.feeRecipientEvm,
       followUpQuoteFn,
       aaveSafetyCheckFn,
+      aaveDebtInspectorFn,
       compoundSafetyCheckFn,
       allowanceCheckFn,
       routeAuctionOptions: effectiveAuctionOptions,

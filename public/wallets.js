@@ -138,10 +138,17 @@ const CHAIN_ADD_PARAMS = {
     rpcUrls: ['https://gnosis-rpc.publicnode.com'],
     blockExplorerUrls: ['https://gnosisscan.io'],
   },
+  143: {
+    chainId: '0x8f',
+    chainName: 'Monad',
+    nativeCurrency: { name: 'MON', symbol: 'MON', decimals: 18 },
+    rpcUrls: ['https://rpc.monad.xyz'],
+    blockExplorerUrls: ['https://monadvision.com'],
+  },
 };
 
 const SUPPORTED_CHAIN_IDS = [
-  1, 8453, 42161, 10, 137, 43114, 56, 146, 130, 59144, 534352, 5000, 81457, 480, 999, 80094, 324, 57073, 100,
+  1, 8453, 42161, 10, 137, 43114, 56, 146, 130, 59144, 534352, 5000, 81457, 480, 999, 80094, 324, 57073, 100, 143,
 ];
 
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
