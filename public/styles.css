@@ -4822,6 +4822,38 @@ label {
   color: var(--ink-1);
 }
 
+.one-click-chain-chip.is-no-gas {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #b91c1c;
+}
+
+.one-click-gas-rescue {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.one-click-gas-rescue-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.one-click-gas-rescue-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
 .one-click-warn-box {
   padding: 7px 9px;
   border-radius: 9px;

@@ -90,7 +90,15 @@ export type AuctionProviderFn = (ctx: {
 export interface RouteAuctionCandidateSummary {
   provider: AuctionBridgeProvider;
   label: string;
-  status: 'ok' | 'rejected_security' | 'rejected_haircut' | 'timeout' | 'error' | 'ineligible';
+  status:
+    | 'ok'
+    | 'rejected_security'
+    | 'rejected_haircut'
+    | 'rejected_insufficient_gas'
+    | 'rejected_simulation'
+    | 'timeout'
+    | 'error'
+    | 'ineligible';
   quotedOutUsd: number;
   gasUsd: number;
   bridgeFeeUsd: number;
@@ -1517,7 +1525,10 @@ export async function fetchDeBridgeDlnQuote(params: {
   url.searchParams.set('dstChainTokenOutRecipient', solanaDestination);
   url.searchParams.set('srcChainOrderAuthorityAddress', userAddress);
   url.searchParams.set('dstChainOrderAuthorityAddress', solanaDestination);
-  url.searchParams.set('prependOperatingExpenses', 'true');
+  // Deduct operating expenses from inside srcChainTokenInAmount rather than prepending on top:
+  // when sweeping 100% of a wallet's ERC-20 balance, prependOperatingExpenses=true tries to
+  // transferFrom > 100% of the balance and reverts with "ERC20: transfer amount exceeds balance".
+  url.searchParams.set('prependOperatingExpenses', 'false');
 
   const res = await fetchWithStrictTimeout(
     url.toString(),
@@ -1700,6 +1711,19 @@ export interface RunLiveParallelRouteAuctionParams {
   hasSolanaUsdcAta?: boolean;
   solPriceUsd?: number;
   slippageBps?: number;
+  /**
+   * Optional wallet native gas balance (wei) on the source EVM chain.
+   * When provided, any route whose transactions require msg.value > nativeBalanceWei
+   * (e.g. deBridge DLN's 0.5 POL native fixFee when wallet has < 0.5 POL) is disqualified
+   * so $0-msg.value routes (Relay / LI.FI / Mayan Swift) win instead.
+   */
+  nativeBalanceWei?: bigint;
+  /**
+   * Optional live eth_call simulator for the winning bridge tx.
+   * If the top-ranked route reverts in simulation (e.g. balance/router revert) and a
+   * runner-up route exists, the auction automatically promotes the runner-up.
+   */
+  simulateTxFn?: (tx: AuctionExecutableTx) => Promise<{ ok: boolean; reason?: string }>;
   fetcher?: RouteAuctionFetcher;
   allowanceCheckFn?: RouteAuctionAllowanceCheckFn;
   /**
@@ -1733,6 +1757,8 @@ export async function runLiveParallelRouteAuction(
     allowHighCost = false,
     hasSolanaUsdcAta = true,
     solPriceUsd = DEFAULT_SOL_PRICE_USD,
+    nativeBalanceWei,
+    simulateTxFn,
     fetcher = globalThis.fetch.bind(globalThis),
     allowanceCheckFn = checkErc20Allowance,
     providers = {},
@@ -1916,6 +1942,46 @@ export async function runLiveParallelRouteAuction(
       continue;
     }
 
+    // 1b. Native msg.value affordability gate: disqualify routes (e.g. deBridge 0.5 POL fixFee)
+    // whose required msg.value exceeds the user's live native balance on this chain.
+    if (nativeBalanceWei !== undefined) {
+      let totalMsgValueWei = 0n;
+      for (const tx of quote.transactions) {
+        if (tx?.value) {
+          try {
+            const v = BigInt(tx.value);
+            if (v > 0n) totalMsgValueWei += v;
+          } catch {
+            // ignore unparseable value
+          }
+        }
+      }
+      if (totalMsgValueWei > 0n && totalMsgValueWei > nativeBalanceWei) {
+        const reqUi = Number(totalMsgValueWei) / 1e18;
+        const haveUi = Number(nativeBalanceWei) / 1e18;
+        candidateSummaries.push({
+          provider,
+          label: quote.label || PROVIDER_LABELS[provider],
+          status: 'rejected_insufficient_gas',
+          quotedOutUsd: r2(quote.quotedOutUsd),
+          gasUsd: r4(quote.estimatedGasUsd),
+          bridgeFeeUsd: r4(quote.bridgeFeeUsd ?? quote.extraBridgeFeeUsd ?? 0),
+          slippageUsd: r4(quote.slippageUsd ?? quote.extraSlippageUsd ?? 0),
+          ataRentUsd: 0,
+          netUsd: 0,
+          liveNetUsd: 0,
+          liveHaircutPct: 100,
+          etaSeconds: Number.isFinite(quote.estimatedSeconds)
+            ? Math.max(1, Math.round(quote.estimatedSeconds))
+            : 15,
+          latencyMs,
+          requestId: quote.requestId,
+          reason: `Requires ${reqUi.toFixed(4)} ${cfg.nativeSymbol} in msg.value, but wallet holds ${haveUi.toFixed(4)} ${cfg.nativeSymbol}.`,
+        });
+        continue;
+      }
+    }
+
     // 2. Exact net output calculation + Live Quote Haircut Gate
     const gasUsd = Number.isFinite(quote.estimatedGasUsd) ? Math.max(0, quote.estimatedGasUsd) : 0;
     const extraBridgeFeeUsd =
@@ -1971,6 +2037,37 @@ export async function runLiveParallelRouteAuction(
     }
     return PROVIDER_TIE_BREAK_ORDER[a.summary.provider] - PROVIDER_TIE_BREAK_ORDER[b.summary.provider];
   });
+
+  // Optional live eth_call simulation gate with automatic runner-up fallback:
+  // If the winning route's executable bridge tx reverts in simulation, mark it
+  // `rejected_simulation` and automatically promote the runner-up route instead of
+  // handing the user a doomed wallet popup.
+  if (simulateTxFn && validWinners.length > 0) {
+    const survivingWinners: typeof validWinners = [];
+    for (const candidate of validWinners) {
+      const hasPriorApprove = candidate.quote.transactions.some((tx) =>
+        /^approve_/i.test(tx.stepId || '')
+      );
+      const bridgeTx = candidate.quote.transactions[candidate.quote.transactions.length - 1];
+      if (!bridgeTx || hasPriorApprove) {
+        survivingWinners.push(candidate);
+        continue;
+      }
+      try {
+        const sim = await simulateTxFn(bridgeTx);
+        if (sim && sim.ok === false) {
+          candidate.summary.status = 'rejected_simulation';
+          candidate.summary.reason =
+            sim.reason || 'Transaction reverted during eth_call pre-flight simulation.';
+          continue;
+        }
+      } catch {
+        // Simulation RPC error should not falsely block otherwise valid quotes
+      }
+      survivingWinners.push(candidate);
+    }
+    validWinners.splice(0, validWinners.length, ...survivingWinners);
+  }
 
   // Sort candidateSummaries so passing candidates appear first (best-to-worst), then rejected/timed-out
   const sortedCandidates = [...candidateSummaries].sort((a, b) => {
