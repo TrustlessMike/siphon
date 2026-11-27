@@ -2069,18 +2069,20 @@ export async function discoverUniswapV3NftPositions(
 
 // ========================== SMART EXIT ROUTER ==========================
 
-export function identifyProtocolExtractorId(asset: Pick<
-  ScannedAsset,
-  | 'protocol'
-  | 'symbol'
-  | 'address'
-  | 'nftTokenId'
-  | 'balancerPoolId'
-  | 'lpToken0Address'
-  | 'lpToken1Address'
-  | 'defiPositionType'
-  | 'defiExitPlan'
->): DefiProtocolExtractorId {
+export function identifyProtocolExtractorId(
+  asset: Pick<
+    ScannedAsset,
+    | 'protocol'
+    | 'symbol'
+    | 'address'
+    | 'nftTokenId'
+    | 'balancerPoolId'
+    | 'lpToken0Address'
+    | 'lpToken1Address'
+    | 'defiPositionType'
+    | 'defiExitPlan'
+  > & { chain?: string; protocolAddress?: string }
+): DefiProtocolExtractorId {
   if (asset.defiExitPlan?.protocolId === 'external_protocol') {
     return 'external_protocol';
   }
@@ -2119,7 +2121,15 @@ export function identifyProtocolExtractorId(asset: Pick<
     return 'uniswap_v2_lp';
   }
   if (proto.includes('yearn v2') || proto.includes('yearn2')) return 'yearn_v2';
-  if (proto.includes('aave v2')) return 'aave_v2';
+  const assetChain = asset.chain as EvmChainId;
+  const v2Pool = AAVE_V2_LENDING_POOLS[assetChain];
+  const protoAddrLow = (asset.protocolAddress || '').toLowerCase();
+  if (
+    proto.includes('aave v2') ||
+    (v2Pool && protoAddrLow && protoAddrLow === v2Pool.toLowerCase())
+  ) {
+    return 'aave_v2';
+  }
   if (
     proto.includes('aave') ||
     proto.includes('neverland') ||
@@ -2129,6 +2139,19 @@ export function identifyProtocolExtractorId(asset: Pick<
     proto.includes('lendle') ||
     proto.includes('zerolend')
   ) {
+    // Governance locks / staking / rewards contracts (e.g. Neverland veDUST, HyperLend Staked HPL,
+    // ZeroLend Locked ZERO) are NOT Aave v3 lending pools — route them to external_protocol cleanly
+    // instead of triggering "Blocked untrusted Aave v3 Pool address".
+    const posTypeLow = (asset.defiPositionType || '').toLowerCase();
+    const isNonLendingType =
+      posTypeLow.includes('lock') ||
+      posTypeLow.includes('stak') ||
+      posTypeLow.includes('reward') ||
+      posTypeLow.includes('vest') ||
+      posTypeLow.includes('vote');
+    if (isNonLendingType && (!protoAddrLow || !isAllowedAaveV3Pool(assetChain, protoAddrLow))) {
+      return 'external_protocol';
+    }
     return 'aave_v3';
   }
   if (
