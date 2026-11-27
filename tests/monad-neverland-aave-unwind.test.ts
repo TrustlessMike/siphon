@@ -70,6 +70,44 @@ test('Wave 25: Monad Mainnet (143) & all 14 Neverland reserves + cross-chain Aav
   assert.equal(isAllowedAaveV3Pool('gnosis', '0x2Dae5307c5E3FD1CF5A72Cb6F698f915860607e0'), true); // SparkLend Gnosis
   assert.equal(isAllowedAaveV3Pool('hyperevm', '0x00A89d7a5A02160f20150EbEA7a2b5E4879A1A8b'), true); // Hyperlend
   assert.equal(isAllowedAaveV3Pool('monad', '0x1111111111111111111111111111111111111111'), false); // Spoofed rejected
+
+  // Non-lending governance lock/staking contracts on Aave forks must classify as external_protocol,
+  // never falsely triggering "Blocked untrusted Aave v3 Pool address"
+  assert.equal(
+    identifyProtocolExtractorId({
+      ...NEVERLAND_DEFI_ASSET,
+      symbol: 'DUST',
+      address: '0xbb4738d05ad1b3da57a4881bae62ce9bb1eeed6c',
+      protocolAddress: '0xbb4738d05ad1b3da57a4881bae62ce9bb1eeed6c',
+      defiPositionType: 'Locked',
+    }),
+    'external_protocol'
+  );
+  assert.equal(
+    identifyProtocolExtractorId({
+      ...NEVERLAND_DEFI_ASSET,
+      chain: 'hyperevm',
+      protocol: 'HyperLend',
+      symbol: 'HPL',
+      address: '0x09b2236327d76fcd9e4b72db70a6608c21a94292',
+      protocolAddress: '0x09b2236327d76fcd9e4b72db70a6608c21a94292',
+      defiPositionType: 'Staked',
+    }),
+    'external_protocol'
+  );
+  // Polygon Aave v2 pool matches aave_v2 by address even when indexer names protocol "Aave"
+  assert.equal(
+    identifyProtocolExtractorId({
+      ...NEVERLAND_DEFI_ASSET,
+      chain: 'polygon',
+      protocol: 'Aave',
+      symbol: 'DAI',
+      address: '0x8dff5e27ea6b7ac08ebfdf9eb090f32ee9a30fcf',
+      protocolAddress: '0x8dff5e27ea6b7ac08ebfdf9eb090f32ee9a30fcf',
+      defiPositionType: 'Lending',
+    }),
+    'aave_v2'
+  );
 });
 
 test('Wave 25: Universal Aave V3 / Neverland 1-Click Repay + Full Withdraw prepends Approve + Pool.repay before Pool.withdraw', async () => {

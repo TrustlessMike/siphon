@@ -1181,8 +1181,9 @@ export async function scanLiveWallet(
       list.push(a);
       erc4626ByChain.set(a.chain, list);
     }
-    if (a.kind === 'defi_position' && (a.protocol ?? '').toLowerCase().includes('aave')) {
-      const isV2 = (a.protocol ?? '').toLowerCase().includes('aave v2');
+    const aavePid = a.kind === 'defi_position' ? identifyProtocolExtractorId(a) : null;
+    if (aavePid === 'aave_v3' || aavePid === 'aave_v2') {
+      const isV2 = aavePid === 'aave_v2';
       const poolAddress =
         a.protocolAddress || (isV2 ? AAVE_V2_LENDING_POOLS[a.chain] : EVM_CHAINS[a.chain].aaveV3Pool);
       const key = `${a.chain}:${(poolAddress ?? '').toLowerCase()}`;
@@ -1273,8 +1274,9 @@ export async function scanLiveWallet(
   if (aaveChecks.length > 0) {
     const aaveMap = new Map(aaveChecks);
     for (const a of rawAssets) {
-      if (a.kind === 'defi_position' && (a.protocol ?? '').toLowerCase().includes('aave')) {
-        const isV2 = (a.protocol ?? '').toLowerCase().includes('aave v2');
+      const aavePid = a.kind === 'defi_position' ? identifyProtocolExtractorId(a) : null;
+      if (aavePid === 'aave_v3' || aavePid === 'aave_v2') {
+        const isV2 = aavePid === 'aave_v2';
         const poolAddress =
           a.protocolAddress || (isV2 ? AAVE_V2_LENDING_POOLS[a.chain] : EVM_CHAINS[a.chain].aaveV3Pool);
         const key = `${a.chain}:${(poolAddress ?? '').toLowerCase()}`;
