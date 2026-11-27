@@ -48,6 +48,7 @@ import type {
 } from '../scanner/types.js';
 import {
   type AuctionBridgeProvider,
+  type AuctionExecutableTx,
   type AuctionProviderFn,
   type AuctionProviderQuote,
   computeDynamicGasReserveSummary,
@@ -76,6 +77,8 @@ export interface RouteAuctionExecutionOptions {
   solPriceUsd?: number;
   allowHighCost?: boolean;
   slippageBps?: number;
+  nativeBalanceWei?: bigint;
+  simulateTxFn?: (tx: AuctionExecutableTx) => Promise<{ ok: boolean; reason?: string }>;
 }
 
 const RELAY_SOLANA_CHAIN_ID = 792703809;
@@ -1489,6 +1492,8 @@ async function buildBridgeExecution(
     hasSolanaUsdcAta: auctionOpts?.hasSolanaUsdcAta ?? true,
     solPriceUsd: auctionOpts?.solPriceUsd,
     slippageBps: auctionOpts?.slippageBps,
+    nativeBalanceWei: auctionOpts?.nativeBalanceWei,
+    simulateTxFn: auctionOpts?.simulateTxFn,
     fetcher: auctionOpts?.fetcher,
     allowanceCheckFn,
     providers: auctionProviders,
@@ -1995,11 +2000,42 @@ export async function prepareChainBatchExecution(params: {
     gasSponsored = false,
     nativePriceUsd,
   } = params;
-  const effectiveAuctionOptions: RouteAuctionExecutionOptions | undefined = routeAuctionOptions
-    ? { ...routeAuctionOptions, allowHighCost: routeAuctionOptions.allowHighCost ?? allowHighCost }
-    : allowHighCost
-    ? { allowHighCost }
-    : undefined;
+  const cfg = EVM_CHAINS[chain];
+  if (!cfg) throw new Error(`Unsupported chain: ${chain}`);
+
+  let liveChainNativeBalanceWei = routeAuctionOptions?.nativeBalanceWei;
+  if (
+    liveChainNativeBalanceWei === undefined &&
+    !routeAuctionOptions?.providers &&
+    !routeAuctionOptions?.fetcher
+  ) {
+    try {
+      const balRes = await evmJsonRpcCall<string>(
+        cfg.rpcUrls,
+        'eth_getBalance',
+        [userAddress, 'latest'],
+        2_200
+      );
+      if (typeof balRes.result === 'string' && /^0x[0-9a-fA-F]+$/.test(balRes.result)) {
+        liveChainNativeBalanceWei = BigInt(balRes.result);
+      }
+    } catch {
+      // Non-fatal: leave undefined if RPC is degraded
+    }
+  }
+
+  const effectiveAuctionOptions: RouteAuctionExecutionOptions | undefined =
+    routeAuctionOptions || allowHighCost || liveChainNativeBalanceWei !== undefined
+      ? {
+          ...(routeAuctionOptions ?? {}),
+          ...(allowHighCost || routeAuctionOptions?.allowHighCost !== undefined
+            ? { allowHighCost: routeAuctionOptions?.allowHighCost ?? allowHighCost }
+            : {}),
+          ...(liveChainNativeBalanceWei !== undefined
+            ? { nativeBalanceWei: liveChainNativeBalanceWei }
+            : {}),
+        }
+      : undefined;
   const preBatchGrossUsd = assets
     .filter(
       (a) =>
@@ -2014,9 +2050,6 @@ export async function prepareChainBatchExecution(params: {
     feeRecipientEvm,
     grossUsd: preBatchGrossUsd,
   });
-
-  const cfg = EVM_CHAINS[chain];
-  if (!cfg) throw new Error(`Unsupported chain: ${chain}`);
 
   assertEvmAddress(userAddress, 'userAddress');
   const mintRecipientBytes32 = solanaOwnerToUsdcAtaBytes32(solanaDestination);

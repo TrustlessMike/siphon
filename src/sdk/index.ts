@@ -355,6 +355,16 @@ export {
   type PrepareBatchItemResult,
   type PrepareBatchResponse,
 } from '../execution/prepare-batch.js';
+
+export {
+  buildGasRefuelQuote,
+  fetchChainNativeBalancesWei,
+  evaluateChainNativeGasStatus,
+  type ChainNativeGasStatus,
+  type GasRefuelQuoteRequest,
+  type GasRefuelQuoteResult,
+  type GasRefuelTransaction,
+} from '../execution/gas-refuel.js';
 export {
   BoundedTtlCache,
   InFlightCoalescer,

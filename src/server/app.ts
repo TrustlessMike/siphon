@@ -34,6 +34,7 @@ import {
   prepareChainBatchExecution,
   prepareRealExecution,
 } from '../execution/tx-builder.js';
+import { buildGasRefuelQuote } from '../execution/gas-refuel.js';
 import {
   buildGaslessSweepIntent,
   configureGaslessIntentStore,
@@ -1874,6 +1875,39 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         } catch (err) {
           return reply(400, {
             error: err instanceof Error ? err.message : 'Could not prepare batch transactions',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/gas/refuel-quote') {
+        const body = await readJsonBody<{
+          fromChain?: string;
+          toChain?: string;
+          userAddress?: string;
+          amountUsd?: number;
+        }>(req);
+
+        const fromChain = typeof body.fromChain === 'string' ? body.fromChain.trim().toLowerCase() : '';
+        const toChain = typeof body.toChain === 'string' ? body.toChain.trim().toLowerCase() : '';
+        if (!isEvmChain(fromChain) || !isEvmChain(toChain)) {
+          return reply(400, {
+            error: 'Valid EVM fromChain and toChain are required for gas refuel.',
+          });
+        }
+        if (!body.userAddress || typeof body.userAddress !== 'string') {
+          return reply(400, { error: 'userAddress is required.' });
+        }
+        try {
+          const quote = await buildGasRefuelQuote({
+            fromChain,
+            toChain,
+            userAddress: body.userAddress,
+            amountUsd: typeof body.amountUsd === 'number' ? body.amountUsd : 1.0,
+          });
+          return reply(200, quote);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Could not build gas refuel quote',
           });
         }
       }

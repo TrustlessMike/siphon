@@ -4,7 +4,15 @@ import {
   type DefiPreflightResult,
 } from '../defi/preflight.js';
 import { EVM_CHAINS } from '../scanner/chains.js';
-import type { ScannedAsset } from '../scanner/types.js';
+import { evmJsonRpcCall } from '../scanner/rpc.js';
+import type { EvmChainId, ScannedAsset } from '../scanner/types.js';
+import {
+  evaluateChainNativeGasStatus,
+  fetchChainNativeBalancesWei,
+  parseHexOrDecWei,
+  type ChainNativeGasStatus,
+} from './gas-refuel.js';
+import type { AuctionExecutableTx } from './route-auction.js';
 import {
   prepareRealExecution,
   type PreparedExecution,
@@ -23,9 +31,12 @@ export interface PrepareBatchRequest {
   bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
   hasSolanaUsdcAta?: boolean;
   includePreflight?: boolean;
+  includeGasCheck?: boolean;
   concurrency?: number;
   prepareAssetFn?: typeof prepareRealExecution;
   preflightAssetFn?: typeof preflightDefiAsset;
+  fetchChainBalancesFn?: typeof fetchChainNativeBalancesWei;
+  simulateTxFn?: (tx: AuctionExecutableTx) => Promise<{ ok: boolean; reason?: string }>;
 }
 
 export interface PrepareBatchItemResult {
@@ -48,6 +59,8 @@ export interface PrepareBatchResponse {
   totalGasUsd: number;
   totalProtocolFeeUsd: 0;
   totalSignatures: number;
+  chainGasStatus: Record<string, ChainNativeGasStatus>;
+  zeroGasChains: string[];
   items: PrepareBatchItemResult[];
 }
 
@@ -145,6 +158,60 @@ export async function prepareBatchExecutions(
 
   const prepareFn = params.prepareAssetFn ?? prepareRealExecution;
   const preflightFn = params.preflightAssetFn ?? preflightDefiAsset;
+  const shouldCheckGas = params.includeGasCheck !== false && !params.prepareAssetFn;
+  const fetchBalancesFn = params.fetchChainBalancesFn ?? fetchChainNativeBalancesWei;
+
+  const uniqueEvmChains = Array.from(
+    new Set(
+      clampedAssets
+        .map((a) => a?.chain)
+        .filter((c): c is EvmChainId => typeof c === 'string' && Object.hasOwn(EVM_CHAINS, c))
+    )
+  );
+
+  // Fetch live native balances across unique EVM chains once in parallel (~80ms)
+  // so route auctions disqualify routes whose msg.value (e.g. deBridge 0.5 POL fixFee) exceeds balance
+  // and the UI can flag zero-gas chains BEFORE opening the user's wallet.
+  const nativeBalancesByChain =
+    shouldCheckGas || params.fetchChainBalancesFn
+      ? await fetchBalancesFn({
+          chains: uniqueEvmChains,
+          userAddress,
+          timeoutMs: 2_500,
+        }).catch(() => ({} as Partial<Record<EvmChainId, bigint>>))
+      : ({} as Partial<Record<EvmChainId, bigint>>);
+
+  const defaultSimulateTxFn:
+    | ((tx: AuctionExecutableTx) => Promise<{ ok: boolean; reason?: string }>)
+    | undefined =
+    params.simulateTxFn ??
+    (shouldCheckGas
+      ? async (tx: AuctionExecutableTx) => {
+          const cfg = EVM_CHAINS[tx.chain];
+          if (!cfg) return { ok: true };
+          const res = await evmJsonRpcCall<string>(
+            cfg.rpcUrls,
+            'eth_call',
+            [
+              {
+                from: tx.from,
+                to: tx.to,
+                data: tx.data,
+                ...(tx.value && tx.value !== '0x0' ? { value: tx.value } : {}),
+              },
+              'latest',
+            ],
+            2_200
+          ).catch(() => null);
+          if (res?.error) {
+            const msg = String(res.error.message || 'execution reverted');
+            if (/revert|exceeds balance|insufficient|execution reverted/i.test(msg)) {
+              return { ok: false, reason: msg.slice(0, 140) };
+            }
+          }
+          return { ok: true };
+        }
+      : undefined);
 
   const items = await mapWithConcurrency(
     clampedAssets,
@@ -155,6 +222,9 @@ export async function prepareBatchExecutions(
       const symbol = typeof asset?.symbol === 'string' ? asset.symbol : 'UNKNOWN';
 
       const shouldPreflight = includePreflight && isDefiEvmAsset(asset);
+      const chainNativeBal = Object.hasOwn(EVM_CHAINS, chain)
+        ? nativeBalancesByChain[chain as EvmChainId]
+        : undefined;
 
       const [prepSettled, preflightSettled] = await Promise.allSettled([
         prepareFn({
@@ -165,10 +235,13 @@ export async function prepareBatchExecutions(
           bridgePreference,
           protocolFeeBps: 0,
           feeRecipientEvm: undefined,
-          routeAuctionOptions:
-            params.hasSolanaUsdcAta !== undefined
+          routeAuctionOptions: {
+            ...(params.hasSolanaUsdcAta !== undefined
               ? { hasSolanaUsdcAta: params.hasSolanaUsdcAta }
-              : undefined,
+              : {}),
+            ...(chainNativeBal !== undefined ? { nativeBalanceWei: chainNativeBal } : {}),
+            ...(defaultSimulateTxFn ? { simulateTxFn: defaultSimulateTxFn } : {}),
+          },
         }),
         shouldPreflight
           ? preflightFn({
@@ -213,6 +286,9 @@ export async function prepareBatchExecutions(
   let totalGasUsd = 0;
   let totalSignatures = 0;
 
+  const msgValueByChain = new Map<EvmChainId, bigint>();
+  const estGasByChain = new Map<EvmChainId, number>();
+
   for (let i = 0; i < items.length; i += 1) {
     const item = items[i];
     const srcAsset = clampedAssets[i];
@@ -239,8 +315,33 @@ export async function prepareBatchExecutions(
       totalSignatures += Array.isArray(item.prepared.transactions)
         ? item.prepared.transactions.length
         : 0;
+
+      if (Object.hasOwn(EVM_CHAINS, item.chain)) {
+        const evmChain = item.chain as EvmChainId;
+        estGasByChain.set(evmChain, (estGasByChain.get(evmChain) ?? 0) + Math.max(0, gasUsd));
+        let itemMsgVal = 0n;
+        for (const tx of item.prepared.transactions ?? []) {
+          itemMsgVal += parseHexOrDecWei(tx?.value);
+        }
+        msgValueByChain.set(evmChain, (msgValueByChain.get(evmChain) ?? 0n) + itemMsgVal);
+      }
     } else {
       failedCount += 1;
+    }
+  }
+
+  const chainGasStatus: Record<string, ChainNativeGasStatus> = {};
+  const zeroGasChains: string[] = [];
+  for (const chain of uniqueEvmChains) {
+    const status = evaluateChainNativeGasStatus({
+      chain,
+      nativeBalanceWei: nativeBalancesByChain[chain],
+      requiredMsgValueWei: msgValueByChain.get(chain) ?? 0n,
+      estimatedGasUsd: estGasByChain.get(chain) ?? 0.02,
+    });
+    chainGasStatus[chain] = status;
+    if (!status.hasEnoughGas) {
+      zeroGasChains.push(chain);
     }
   }
 
@@ -254,6 +355,8 @@ export async function prepareBatchExecutions(
     totalGasUsd: round4(totalGasUsd),
     totalProtocolFeeUsd: 0,
     totalSignatures,
+    chainGasStatus,
+    zeroGasChains,
     items,
   };
 }

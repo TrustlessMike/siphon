@@ -4191,6 +4191,30 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
       });
     }
 
+    // Zero-gas pre-sign guard: never open a doomed wallet popup when live native balance is 0
+    const liveChainMeta = currentScan.chains.find((c) => c.chain === chain);
+    const liveNativeBal = safeNum(liveChainMeta?.nativeBalance);
+    const liveRpcMode = String(liveChainMeta?.rpcStatus || '').toLowerCase();
+    if (
+      liveChainMeta &&
+      liveRpcMode &&
+      liveRpcMode !== 'preset' &&
+      liveRpcMode !== 'error' &&
+      liveNativeBal <= 0
+    ) {
+      const sym = liveChainMeta.nativeSymbol || 'gas';
+      const noGasMsg = `${batch.chainName} has 0 ${sym} ($0.00) for gas — refuel ~$1 ${sym} from a funded chain first.`;
+      await patchJobLeg(jobId, chain, {
+        status: 'failed',
+        statusText: noGasMsg,
+      });
+      if (isDefiGuided) {
+        updateDefiStepperStep('withdraw', { status: 'failed', detail: noGasMsg }, { active: false, dismissible: true });
+      }
+      showToast(noGasMsg);
+      return { userRejected: false, failed: true, zeroGas: true };
+    }
+
     const stage1 = await sendCallsWithFallback({
       chainId: batch.chainId,
       chain,
@@ -4542,6 +4566,92 @@ function clearOneClickSweepSummary() {
   }
 }
 
+function findBestGasRefuelSourceChain(targetChain) {
+  const chains = Array.isArray(currentScan?.chains) ? currentScan.chains : [];
+  const preferredOrder = ['base', 'arbitrum', 'optimism', 'avalanche', 'polygon', 'ethereum'];
+  const candidates = chains
+    .filter((c) => {
+      if (!c || !c.chain || c.chain === targetChain) return false;
+      const usd = safeNum(c.nativeBalance) * safeNum(c.nativePriceUsd);
+      return usd >= 1.35 && c.rpcStatus !== 'error';
+    })
+    .sort((a, b) => {
+      const ia = preferredOrder.indexOf(a.chain);
+      const ib = preferredOrder.indexOf(b.chain);
+      const pa = ia >= 0 ? ia : 99;
+      const pb = ib >= 0 ? ib : 99;
+      if (pa !== pb) return pa - pb;
+      return safeNum(b.nativeBalance) * safeNum(b.nativePriceUsd) - safeNum(a.nativeBalance) * safeNum(a.nativePriceUsd);
+    });
+  return candidates[0] || null;
+}
+
+async function executeOneClickGasRefuel(fromChain, toChain, triggerBtn) {
+  const connectedEvm = getConnectedEvmAddress();
+  if (!connectedEvm) {
+    showToast('Connect your EVM wallet first to refuel gas.');
+    openWalletModal('evm');
+    return;
+  }
+  const origText = triggerBtn?.textContent || '';
+  if (triggerBtn) {
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = 'Building 1-Click Refuel…';
+  }
+  try {
+    const quote = await api('/api/gas/refuel-quote', {
+      method: 'POST',
+      body: JSON.stringify({
+        fromChain,
+        toChain,
+        userAddress: connectedEvm,
+        amountUsd: 1.0,
+      }),
+    });
+    const tx = quote?.transaction;
+    if (!tx?.to || !tx?.chainId) {
+      throw new Error('Could not build gas refuel transaction.');
+    }
+    if (triggerBtn) triggerBtn.textContent = `Confirm in Wallet (${quote.fromChainName})…`;
+    const sendRes = await sendCallsWithFallback({
+      chainId: tx.chainId,
+      chain: tx.chain,
+      chainName: quote.fromChainName,
+      calls: [
+        {
+          to: tx.to,
+          data: tx.data || '0x',
+          value: tx.value || '0x0',
+          gas: tx.gas || undefined,
+          stepId: 'gas_refuel',
+          label: tx.label || `Refuel ${quote.toChainName} gas`,
+        },
+      ],
+      primaryProvider: 'relay',
+      expectedFrom: connectedEvm,
+    });
+    if (sendRes?.failed) {
+      throw new Error(sendRes.failedReason || 'Gas refuel transaction failed.');
+    }
+    showToast(
+      `Gas refuel sent: ${quote.estimatedOutFormatted} arriving on ${quote.toChainName} in ~${quote.estimatedSeconds}s. Refreshing balances…`
+    );
+    clearOneClickSweepSummary();
+    setTimeout(() => {
+      if (connectedEvm) {
+        runScan({ address: connectedEvm, refresh: true, autoOpen: true }).catch(() => {});
+      }
+    }, Math.min(8000, Math.max(3500, safeInt(quote.estimatedSeconds) * 1000)));
+  } catch (err) {
+    showToast(err?.message || 'Gas refuel failed.');
+  } finally {
+    if (triggerBtn) {
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = origText;
+    }
+  }
+}
+
 function renderOneClickSweepSummary() {
   const card = document.getElementById('oneClickSweepSummaryCard');
   if (!card) return;
@@ -4567,8 +4677,35 @@ function renderOneClickSweepSummary() {
   );
   const displayChains = chainsCovered.length ? chainsCovered : activeChains;
 
-  const hasFailures = failedItems.length > 0;
-  const canProceed = readyCount > 0 || (items.length === 0 && displayChains.length > 0);
+  // Detect zero-gas chains from live RPC chainGasStatus OR live scan nativeBalance === 0
+  const batchZeroGas = Array.isArray(batch.zeroGasChains) ? batch.zeroGasChains : [];
+  const gasStatusMap = batch.chainGasStatus && typeof batch.chainGasStatus === 'object' ? batch.chainGasStatus : {};
+  const zeroGasSet = new Set(batchZeroGas);
+  for (const ch of displayChains) {
+    const sc = currentScan?.chains?.find((c) => c.chain === ch);
+    if (
+      sc &&
+      sc.rpcStatus &&
+      sc.rpcStatus !== 'preset' &&
+      sc.rpcStatus !== 'error' &&
+      safeNum(sc.nativeBalance) <= 0
+    ) {
+      zeroGasSet.add(ch);
+    }
+  }
+  const zeroGasChains = displayChains.filter((ch) => zeroGasSet.has(ch));
+  const fundedChains = displayChains.filter((ch) => !zeroGasSet.has(ch));
+  const hasZeroGas = zeroGasChains.length > 0 && executionMode !== 'gasless';
+  const primaryZeroGasChain = zeroGasChains[0] || null;
+  const primaryZeroGasInfo = primaryZeroGasChain
+    ? gasStatusMap[primaryZeroGasChain] || currentScan?.chains?.find((c) => c.chain === primaryZeroGasChain)
+    : null;
+  const refuelSource = primaryZeroGasChain ? findBestGasRefuelSourceChain(primaryZeroGasChain) : null;
+
+  const hasFailures = failedItems.length > 0 || hasZeroGas;
+  const canProceed =
+    (!hasZeroGas || fundedChains.length > 0) &&
+    (readyCount > 0 || (items.length === 0 && displayChains.length > 0));
 
   card.classList.remove('hidden');
   card.classList.toggle('is-ready', !hasFailures && canProceed);
@@ -4579,30 +4716,71 @@ function renderOneClickSweepSummary() {
     .map((ch) => {
       const logo = getChainLogoPath(ch);
       const darkCls = needsDarkLogoBacking(ch) ? ' logo-dark-backing' : '';
-      return `<span class="one-click-chain-chip"><img src="${escapeHtml(logo)}" width="13" height="13" alt="" class="chain-logo-xs${darkCls}" />${escapeHtml(ch)}</span>`;
+      const noGasCls = zeroGasSet.has(ch) ? ' is-no-gas' : '';
+      const noGasTag = zeroGasSet.has(ch) ? ' · No Gas' : '';
+      return `<span class="one-click-chain-chip${noGasCls}"><img src="${escapeHtml(logo)}" width="13" height="13" alt="" class="chain-logo-xs${darkCls}" />${escapeHtml(ch)}${escapeHtml(noGasTag)}</span>`;
     })
     .join('');
 
-  const warnHtml = hasFailures
-    ? `<div class="one-click-warn-box">${escapeHtml(
-        `${failedItems.length} asset(s) skipped (${failedItems
-          .slice(0, 3)
-          .map((f) => `${f.symbol || f.assetId}: ${f.error || 'unavailable'}`)
-          .join(' · ')}). ${
-          canProceed
-            ? `Remaining ${readyCount} ready asset(s) can still sweep cleanly.`
-            : 'Adjust selection or retry.'
-        }`
-      )}</div>`
+  const zeroGasHtml = hasZeroGas
+    ? (() => {
+        const names = zeroGasChains
+          .map((ch) => {
+            const st = gasStatusMap[ch] || currentScan?.chains?.find((c) => c.chain === ch);
+            const sym = st?.nativeSymbol || 'gas';
+            const bal = safeNum(st?.nativeBalanceUi ?? st?.nativeBalance ?? 0).toFixed(4);
+            return `${st?.chainName || ch} (${bal} ${sym})`;
+          })
+          .join(', ');
+        const targetSym = primaryZeroGasInfo?.nativeSymbol || 'gas';
+        const targetName = primaryZeroGasInfo?.chainName || primaryZeroGasChain;
+        const refuelBtnHtml = refuelSource
+          ? `<button type="button" class="btn-pill-dark btn-sm" id="oneClickRefuelGasBtn">Refuel $1 ${escapeHtml(targetSym)} from ${escapeHtml(refuelSource.chainName || refuelSource.chain)}</button>`
+          : '';
+        const skipBtnHtml =
+          fundedChains.length > 0
+            ? `<button type="button" class="btn-outline-sm" id="oneClickSkipZeroGasBtn">Skip ${escapeHtml(zeroGasChains.length === 1 ? targetName : `${zeroGasChains.length} Zero-Gas`)} &amp; Sweep Funded (${fundedChains.length})</button>`
+            : '';
+        return `
+          <div class="one-click-gas-rescue" id="oneClickGasRescueBox">
+            <div class="one-click-gas-rescue-text">
+              <strong>Not enough gas on ${escapeHtml(names)}.</strong>
+              <span>Deposit ~$0.50 ${escapeHtml(targetSym)} or refuel in 1 click from a funded chain before signing.</span>
+            </div>
+            ${
+              refuelBtnHtml || skipBtnHtml
+                ? `<div class="one-click-gas-rescue-actions">${refuelBtnHtml}${skipBtnHtml}</div>`
+                : ''
+            }
+          </div>`;
+      })()
     : '';
+
+  const warnHtml =
+    failedItems.length > 0
+      ? `<div class="one-click-warn-box">${escapeHtml(
+          `${failedItems.length} asset(s) skipped (${failedItems
+            .slice(0, 3)
+            .map((f) => `${f.symbol || f.assetId}: ${f.error || 'unavailable'}`)
+            .join(' · ')}). ${
+            canProceed
+              ? `Remaining ${readyCount} ready asset(s) can still sweep cleanly.`
+              : 'Adjust selection or retry.'
+          }`
+        )}</div>`
+      : '';
 
   const badgeText = batch.fallbackSummary
     ? `${displayChains.length} ${displayChains.length === 1 ? 'chain' : 'chains'} ready`
     : `${readyCount}/${totalCount} ready${durationMs > 0 ? ` · ${durationMs}ms` : ''}`;
 
+  const confirmLabel = hasZeroGas
+    ? `Sweep ${fundedChains.length} Funded ${fundedChains.length === 1 ? 'Chain' : 'Chains'} Only`
+    : `Confirm & Sign Sweep (${totalSignatures} ${totalSignatures === 1 ? 'sig' : 'sigs'})`;
+
   card.innerHTML = `
     <div class="one-click-summary-head">
-      <span class="one-click-summary-title">${uiIcon(canProceed ? 'check-circle' : 'alert-triangle', 14)}<span>Pre-Sign Sweep Summary</span></span>
+      <span class="one-click-summary-title">${uiIcon(canProceed && !hasZeroGas ? 'check-circle' : 'alert-triangle', 14)}<span>Pre-Sign Sweep Summary</span></span>
       <span class="one-click-summary-badge mono">${escapeHtml(badgeText)}</span>
     </div>
     <div class="one-click-summary-grid">
@@ -4624,22 +4802,40 @@ function renderOneClickSweepSummary() {
       </div>
     </div>
     ${chainChipsHtml ? `<div class="one-click-chains-row">${chainChipsHtml}</div>` : ''}
+    ${zeroGasHtml}
     ${warnHtml}
     <div class="one-click-summary-actions">
       ${
         canProceed
-          ? `<button type="button" class="btn-pill-dark one-click-confirm-btn" id="confirmOneClickSweepBtn">Confirm &amp; Sign Sweep (${totalSignatures} ${totalSignatures === 1 ? 'sig' : 'sigs'})</button>`
+          ? `<button type="button" class="btn-pill-dark one-click-confirm-btn" id="confirmOneClickSweepBtn">${escapeHtml(confirmLabel)}</button>`
           : ''
       }
       <button type="button" class="btn-outline-sm one-click-cancel-btn" id="cancelOneClickSweepBtn">Cancel</button>
     </div>
   `;
 
-  document.getElementById('confirmOneClickSweepBtn')?.addEventListener('click', () => {
+  document.getElementById('oneClickRefuelGasBtn')?.addEventListener('click', (ev) => {
+    if (!refuelSource || !primaryZeroGasChain) return;
+    executeOneClickGasRefuel(refuelSource.chain, primaryZeroGasChain, ev.currentTarget);
+  });
+
+  const runFilteredFundedSweep = () => {
     const snap = pendingBatchSummary;
     if (!snap) return;
+    if (hasZeroGas && fundedChains.length > 0) {
+      const fundedSet = new Set(fundedChains);
+      const filteredSnap = {
+        ...snap,
+        activeChains: snap.activeChains.filter((ch) => fundedSet.has(ch)),
+      };
+      runPreparedSweepQueue(filteredSnap);
+      return;
+    }
     runPreparedSweepQueue(snap);
-  });
+  };
+
+  document.getElementById('oneClickSkipZeroGasBtn')?.addEventListener('click', runFilteredFundedSweep);
+  document.getElementById('confirmOneClickSweepBtn')?.addEventListener('click', runFilteredFundedSweep);
   document.getElementById('cancelOneClickSweepBtn')?.addEventListener('click', () => {
     clearOneClickSweepSummary();
     updateWalletButtons();
