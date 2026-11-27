@@ -29,6 +29,8 @@ interface IVmFlashScript {
  *             Gnosis, Avalanche
  */
 contract DeployTurgaliumFlashUnwind {
+    bool public constant IS_SCRIPT = true;
+
     IVmFlashScript private constant vm =
         IVmFlashScript(address(uint160(uint256(keccak256("hevm cheat code")))));
 
