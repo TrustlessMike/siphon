@@ -23,7 +23,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: node --check public/app.js && node --check public/wallets.js && node --check public/degen.js && node --check public/preservation.js && node --check public/preservation-tools.js && node --check public/turgalium-3d.js && node --check public/turgalium-svg.js
+      - run: node --check public/app.js && node --check public/wallets.js && node --check public/preservation.js && node --check public/preservation-tools.js && node --check public/turgalium-3d.js && node --check public/turgalium-svg.js && node --check public/sw.js
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
