@@ -414,7 +414,7 @@ export function renderConvergenceSvg(plan, scan) {
 
   const feePctLabel = plan?.effectiveFeeLabel
     ? String(plan.effectiveFeeLabel)
-    : `${Number.isFinite(Number(plan?.protocolFeePercent)) ? Number(plan.protocolFeePercent) : 7}%`;
+    : `${Number.isFinite(Number(plan?.protocolFeePercent)) ? Number(plan.protocolFeePercent) : 0}%`;
   const feeUsd = effectiveFeeRaw.toLocaleString(undefined, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,

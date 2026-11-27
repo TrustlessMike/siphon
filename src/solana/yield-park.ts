@@ -13,7 +13,7 @@ export const KAMINO_MAIN_MARKET_RESERVES_URL =
   'https://api.kamino.finance/kamino-market/7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF/reserves/metrics';
 
 export const MIN_PRESERVE_PCT = 50;
-export const DEFAULT_PRESERVE_PCT = 90;
+export const DEFAULT_PRESERVE_PCT = 100;
 export const MAX_PRESERVE_PCT = 100;
 export const MAX_TOTAL_USDC_AMOUNT = 100_000_000;
 export const DEFAULT_SLIPPAGE_BPS = 50;
@@ -38,6 +38,11 @@ export interface SolanaYieldStrategyMeta {
   preservesUsdPeg: boolean;
   description: string;
   appUrl: string;
+}
+
+export interface SolanaYieldStrategyWithApy extends SolanaYieldStrategyMeta {
+  estimatedApyPct: number;
+  apySource: 'live' | 'baseline_estimate';
 }
 
 export const SOLANA_YIELD_STRATEGIES: Readonly<Record<SolanaYieldStrategyId, SolanaYieldStrategyMeta>> =
@@ -99,11 +104,11 @@ export interface YieldPreservationSplit {
   totalUsdcAmount: number;
   totalUsdcRaw: string;
   preservePct: number;
-  degenPct: number;
+  liquidReservePct: number;
   yieldUsdc: number;
   yieldUsdcRaw: string;
-  degenSidePocketUsdc: number;
-  degenSidePocketRaw: string;
+  liquidReserveUsdc: number;
+  liquidReserveRaw: string;
 }
 
 export interface JupiterSwapQuoteSummary {
@@ -157,7 +162,6 @@ export interface SolanaYieldParkPlan {
     projectedAnnualYieldUsd: number;
     projectedMonthlyYieldUsd: number;
     projectedDailyYieldUsd: number;
-    yieldFundedDegenMonthlyBudgetUsd: number;
   };
   jupiterQuote: JupiterSwapQuoteSummary | null;
   transaction: YieldParkTransactionPayload | null;
@@ -169,8 +173,8 @@ export function listSolanaYieldStrategies(): SolanaYieldStrategyMeta[] {
 }
 
 /**
- * Computes exact integer micro-USDC preservation split so `yieldUsdcRaw + degenSidePocketRaw === totalUsdcRaw`
- * with zero floating-point drift. Enforces Turgalium's preservation-first guard: `50 <= preservePct <= 100`.
+ * Computes exact integer micro-USDC preservation allocation so `yieldUsdcRaw + liquidReserveRaw === totalUsdcRaw`
+ * with zero floating-point drift. Defaults to 100% principal-safe yield parking (`50 <= preservePct <= 100`).
  */
 export function calculateYieldPreservationSplit(
   totalUsdcAmount: number,
@@ -198,26 +202,26 @@ export function calculateYieldPreservationSplit(
     throw new Error('totalUsdcAmount is too small (must be at least 0.000001 USDC).');
   }
 
-  // Basis-points precision for preservePct (e.g., 90 -> 9000 bps, 92.5 -> 9250 bps)
+  // Basis-points precision for preservePct (e.g., 100 -> 10000 bps, 92.5 -> 9250 bps)
   const preserveBps = BigInt(Math.round(preservePct * 100));
   const yieldRaw = (totalRaw * preserveBps) / 10_000n;
   if (yieldRaw <= 0n) {
     throw new Error('Preserved yield allocation rounds to 0 micro-USDC; increase totalUsdcAmount.');
   }
-  const degenRaw = totalRaw - yieldRaw;
+  const reserveRaw = totalRaw - yieldRaw;
 
   const normalizedPreservePct = Number(preservePct.toFixed(2));
-  const degenPct = Number((100 - normalizedPreservePct).toFixed(2));
+  const liquidReservePct = Number((100 - normalizedPreservePct).toFixed(2));
 
   return {
     totalUsdcAmount: Number((Number(totalRaw) / 1_000_000).toFixed(6)),
     totalUsdcRaw: totalRaw.toString(),
     preservePct: normalizedPreservePct,
-    degenPct,
+    liquidReservePct,
     yieldUsdc: Number((Number(yieldRaw) / 1_000_000).toFixed(6)),
     yieldUsdcRaw: yieldRaw.toString(),
-    degenSidePocketUsdc: Number((Number(degenRaw) / 1_000_000).toFixed(6)),
-    degenSidePocketRaw: degenRaw.toString(),
+    liquidReserveUsdc: Number((Number(reserveRaw) / 1_000_000).toFixed(6)),
+    liquidReserveRaw: reserveRaw.toString(),
   };
 }
 
@@ -276,63 +280,107 @@ async function fetchJsonWithTimeout<T>(
   }
 }
 
-async function fetchLiveSavingsApy(
+const inFlightLiveApy = new Map<'jupiter_lend_usdc' | 'kamino_usdc', Promise<number | null>>();
+
+export async function fetchLiveSavingsApy(
   strategyId: 'jupiter_lend_usdc' | 'kamino_usdc',
   timeoutMs: number
 ): Promise<number | null> {
-  if (strategyId === 'jupiter_lend_usdc') {
+  const existing = inFlightLiveApy.get(strategyId);
+  if (existing) return existing;
+
+  const task = (async (): Promise<number | null> => {
+    if (strategyId === 'jupiter_lend_usdc') {
+      const res = await fetchJsonWithTimeout<Array<Record<string, unknown>>>(
+        JUPITER_LEND_EARN_TOKENS_URL,
+        { method: 'GET', headers: { Accept: 'application/json' } },
+        Math.min(timeoutMs, 2_500)
+      );
+      if (!res.ok || !Array.isArray(res.data)) return null;
+      for (const item of res.data) {
+        const symbol = String(item?.symbol ?? item?.asset?.toString() ?? '').toUpperCase();
+        const assetObj = item?.asset as Record<string, unknown> | undefined;
+        const underlyingAddress = String(assetObj?.address ?? item?.assetAddress ?? '');
+        if (
+          underlyingAddress === SOLANA_USDC_MINT ||
+          symbol === 'JLUSDC' ||
+          symbol === 'USDC'
+        ) {
+          const rawRate = Number(item?.totalRate ?? item?.supplyRate ?? item?.apy ?? NaN);
+          if (Number.isFinite(rawRate) && rawRate > 0) {
+            // Jupiter Lend rates may be returned in bps (e.g. 740 -> 7.4%) or percentage (7.4) or decimal (0.074)
+            const pct = rawRate > 100 ? rawRate / 100 : rawRate < 1 ? rawRate * 100 : rawRate;
+            if (pct > 0 && pct <= 50) return Number(pct.toFixed(2));
+          }
+        }
+      }
+      return null;
+    }
+
     const res = await fetchJsonWithTimeout<Array<Record<string, unknown>>>(
-      JUPITER_LEND_EARN_TOKENS_URL,
+      KAMINO_MAIN_MARKET_RESERVES_URL,
       { method: 'GET', headers: { Accept: 'application/json' } },
       Math.min(timeoutMs, 2_500)
     );
     if (!res.ok || !Array.isArray(res.data)) return null;
-    for (const item of res.data) {
-      const symbol = String(item?.symbol ?? item?.asset?.toString() ?? '').toUpperCase();
-      const assetObj = item?.asset as Record<string, unknown> | undefined;
-      const underlyingAddress = String(assetObj?.address ?? item?.assetAddress ?? '');
-      if (
-        underlyingAddress === SOLANA_USDC_MINT ||
-        symbol === 'JLUSDC' ||
-        symbol === 'USDC'
-      ) {
-        const rawRate = Number(item?.totalRate ?? item?.supplyRate ?? item?.apy ?? NaN);
-        if (Number.isFinite(rawRate) && rawRate > 0) {
-          // Jupiter Lend rates may be returned in bps (e.g. 740 -> 7.4%) or percentage (7.4) or decimal (0.074)
-          const pct = rawRate > 100 ? rawRate / 100 : rawRate < 1 ? rawRate * 100 : rawRate;
+    for (const reserve of res.data) {
+      const tokenSym = String(reserve?.liquidityToken ?? reserve?.symbol ?? '').toUpperCase();
+      const mint = String(reserve?.liquidityTokenMint ?? '');
+      if (mint === SOLANA_USDC_MINT || tokenSym === 'USDC') {
+        const rawApy = Number(reserve?.supplyApy ?? reserve?.apy ?? NaN);
+        if (Number.isFinite(rawApy) && rawApy > 0) {
+          const pct = rawApy < 1 ? rawApy * 100 : rawApy;
           if (pct > 0 && pct <= 50) return Number(pct.toFixed(2));
         }
       }
     }
     return null;
-  }
+  })().finally(() => {
+    inFlightLiveApy.delete(strategyId);
+  });
 
-  const res = await fetchJsonWithTimeout<Array<Record<string, unknown>>>(
-    KAMINO_MAIN_MARKET_RESERVES_URL,
-    { method: 'GET', headers: { Accept: 'application/json' } },
-    Math.min(timeoutMs, 2_500)
-  );
-  if (!res.ok || !Array.isArray(res.data)) return null;
-  for (const reserve of res.data) {
-    const tokenSym = String(reserve?.liquidityToken ?? reserve?.symbol ?? '').toUpperCase();
-    const mint = String(reserve?.liquidityTokenMint ?? '');
-    if (mint === SOLANA_USDC_MINT || tokenSym === 'USDC') {
-      const rawApy = Number(reserve?.supplyApy ?? reserve?.apy ?? NaN);
-      if (Number.isFinite(rawApy) && rawApy > 0) {
-        const pct = rawApy < 1 ? rawApy * 100 : rawApy;
-        if (pct > 0 && pct <= 50) return Number(pct.toFixed(2));
-      }
-    }
-  }
-  return null;
+  inFlightLiveApy.set(strategyId, task);
+  return task;
 }
 
 /**
- * Builds a 1-click Post-Arrival Solana Yield Parking plan with strict preservation-first
- * split math (default 90% Yield / 10% Degen Side-Pocket):
+ * Returns all principal-safe Solana yield strategies enriched with live APY lookups
+ * fetched in parallel (with graceful fallback to baseline estimates).
+ */
+export async function fetchSolanaYieldStrategiesWithLiveApy(opts?: {
+  timeoutMs?: number;
+  fetchLiveApy?: boolean;
+}): Promise<SolanaYieldStrategyWithApy[]> {
+  const timeoutMs = opts?.timeoutMs ?? 2_500;
+  const fetchLive = opts?.fetchLiveApy !== false;
+  const [jupLendLive, kaminoLive] = fetchLive
+    ? await Promise.all([
+        fetchLiveSavingsApy('jupiter_lend_usdc', timeoutMs).catch(() => null),
+        fetchLiveSavingsApy('kamino_usdc', timeoutMs).catch(() => null),
+      ])
+    : [null, null];
+
+  return listSolanaYieldStrategies().map((meta) => {
+    if (meta.id === 'jupiter_lend_usdc' && jupLendLive !== null) {
+      return { ...meta, estimatedApyPct: jupLendLive, apySource: 'live' as const };
+    }
+    if (meta.id === 'kamino_usdc' && kaminoLive !== null) {
+      return { ...meta, estimatedApyPct: kaminoLive, apySource: 'live' as const };
+    }
+    return {
+      ...meta,
+      estimatedApyPct: meta.baselineApyPct,
+      apySource: 'baseline_estimate' as const,
+    };
+  });
+}
+
+/**
+ * Builds a 1-click Post-Arrival Solana Yield Parking plan with strict principal-safe
+ * allocation math (default 100% Preserved Yield, configurable 50–100%):
  *  - `jupsol`: fetches live Jupiter Swap API quote (`USDC -> JupSOL`) and optionally builds &
  *    verifies an unsigned `VersionedTransaction` (V0) via Jupiter `/swap`.
- *  - `jupiter_lend_usdc` / `kamino_usdc`: computes exact split + live/baseline APY & yield projections.
+ *  - `jupiter_lend_usdc` / `kamino_usdc`: computes exact allocation + live/baseline APY & yield projections.
  */
 export async function buildSolanaYieldParkPlan(
   params: BuildSolanaYieldParkParams
@@ -558,7 +606,7 @@ export async function buildSolanaYieldParkPlan(
     }
     if (params.buildTransaction) {
       warnings.push(
-        `${strategy.name} currently returns a live APY & split quote preview; deposit directly via ${strategy.appUrl} or select 'jupsol' for an instant Jupiter Swap V0 transaction.`
+        `${strategy.name} currently returns a live APY & allocation preview; deposit directly via ${strategy.appUrl} or select 'jupsol' for an instant Jupiter Swap V0 transaction.`
       );
     }
   }
@@ -581,7 +629,6 @@ export async function buildSolanaYieldParkPlan(
       projectedAnnualYieldUsd,
       projectedMonthlyYieldUsd,
       projectedDailyYieldUsd,
-      yieldFundedDegenMonthlyBudgetUsd: projectedMonthlyYieldUsd,
     },
     jupiterQuote,
     transaction,

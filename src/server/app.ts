@@ -62,7 +62,11 @@ import {
 } from '../scanner/chains.js';
 import { scanPresetWallet, WALLET_PRESETS } from '../scanner/classifier.js';
 import { scanEvmWalletWithOptions } from '../adapters/evm.js';
-import { fetchSolanaWalletBalances, getL2IndexerProvider } from '../scanner/discovery.js';
+import {
+  fetchSolanaWalletBalances,
+  getL2IndexerProvider,
+  type SolanaWalletBalance,
+} from '../scanner/discovery.js';
 import {
   TurgaliumAgentEngine,
   type AgentActionType,
@@ -86,15 +90,18 @@ import {
 } from '../agent/plugin-spec.js';
 import { buildAgentHandoffKit, buildAgentReviewLink } from '../agent/review-link.js';
 import { pollBridgeStatusesBatch } from '../execution/bridge-status-batch.js';
+import {
+  prepareBatchExecutions,
+  type PrepareBatchResponse,
+} from '../execution/prepare-batch.js';
 import { evaluatePreservationPlan } from '../execution/preservation-optimizer.js';
 import { handleMcpJsonRpc } from '../mcp/server.js';
 import { planDustConversion } from '../scanner/dust.js';
 import { scanUnifiedWallets, type UnifiedWalletInput } from '../scanner/unify.js';
 import { evaluatePortfolioRoi } from '../scanner/roi.js';
 import type { AnyChainId, ChainFamily, EvmChainId, ScannedAsset, ScanReport } from '../scanner/types.js';
-import { BoundedTtlCache } from './cache.js';
-import { JupiterMarketsClient } from '../degen/jupiter-markets.js';
-import { handleDegenRoutes } from './degen-routes.js';
+import { fetchSolanaOverview, type SolanaOverviewResult } from '../solana/overview.js';
+import { BoundedTtlCache, InFlightCoalescer } from './cache.js';
 import { BackgroundJobStore, type JobLegStatus } from './jobs.js';
 import { handlePreservationRoute } from './preservation-routes.js';
 import { handleSolanaRoutes } from './solana-routes.js';
@@ -148,7 +155,6 @@ export interface TurgaliumServerOptions {
   scanCacheTtlMs?: number;
   jobStoreMaxJobs?: number;
   jobStoreTtlMs?: number;
-  degenClient?: JupiterMarketsClient;
   nowMs?: () => number;
   liveGasFetcher?: (chain: EvmChainId) => Promise<number | null>;
   unlockQueuesReader?: UnlockQueuesReaderFn;
@@ -372,7 +378,6 @@ function isPublicOpenCorsPath(pathname: string): boolean {
     pathname === '/api/contract' ||
     pathname === '/openapi.json' ||
     pathname === '/.well-known/ai-plugin.json' ||
-    pathname.startsWith('/api/degen/') ||
     pathname.startsWith('/api/solana/') ||
     pathname.startsWith('/api/approvals/')
   );
@@ -722,6 +727,31 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
     ttlMs: 45_000,
     nowMs: opts.nowMs,
   });
+  const liveScanCoalescer = new InFlightCoalescer<string, ScanReport>(liveScanCache);
+  const solanaBalanceCache = new BoundedTtlCache<string, SolanaWalletBalance>({
+    maxEntries: 128,
+    ttlMs: 15_000,
+    nowMs: opts.nowMs,
+  });
+  const solanaBalanceCoalescer = new InFlightCoalescer<string, SolanaWalletBalance>(
+    solanaBalanceCache
+  );
+  const solanaOverviewCache = new BoundedTtlCache<string, SolanaOverviewResult>({
+    maxEntries: 64,
+    ttlMs: 15_000,
+    nowMs: opts.nowMs,
+  });
+  const solanaOverviewCoalescer = new InFlightCoalescer<string, SolanaOverviewResult>(
+    solanaOverviewCache
+  );
+  const prepareBatchCache = new BoundedTtlCache<string, PrepareBatchResponse>({
+    maxEntries: 64,
+    ttlMs: 10_000,
+    nowMs: opts.nowMs,
+  });
+  const prepareBatchCoalescer = new InFlightCoalescer<string, PrepareBatchResponse>(
+    prepareBatchCache
+  );
   const jobPollersEnabled = opts.enableBackgroundPollers ?? !isVercelRuntime;
   const jobStore = new BackgroundJobStore({
     maxJobs: opts.jobStoreMaxJobs,
@@ -732,7 +762,6 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
     resumePollersOnLoad: jobPollersEnabled && stateStore.persistent,
   });
   const agentEngine = new TurgaliumAgentEngine({ nowMs: opts.nowMs, stateStore });
-  const degenClient = opts.degenClient ?? new JupiterMarketsClient({ nowMs: opts.nowMs });
   const preservationAgents = new PreservationAgentStore({ nowMs: opts.nowMs, stateStore });
   const unlockHarvester = new UnlockHarvesterStore({
     nowMs: opts.nowMs,
@@ -1546,7 +1575,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           }
 
           try {
-            if (detected.family === 'evm') {
+            if (detected.family === 'evm' && wantsStream) {
               let streamStarted = false;
               const startStreamHeaders = () => {
                 if (streamStarted || res.headersSent) return;
@@ -1565,19 +1594,33 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
               };
               report = await scanEvmWalletWithOptions(body.address, undefined, {
                 chains: requestedEvmChains,
-                onChainProgress: wantsStream
-                  ? (info) => {
-                      if (res.writableEnded) return;
-                      startStreamHeaders();
-                      res.write(`${JSON.stringify({ type: 'chain', ...info })}\n`);
-                    }
-                  : undefined,
+                onChainProgress: (info) => {
+                  if (res.writableEnded) return;
+                  startStreamHeaders();
+                  res.write(`${JSON.stringify({ type: 'chain', ...info })}\n`);
+                },
               });
               report.family = 'evm';
-            } else {
-              report = await getAdapterForFamily(detected.family).scanWallet(detected.normalized);
+              liveScanCache.set(cacheKey, report);
+              return sendScanResult(report, false);
             }
-            liveScanCache.set(cacheKey, report);
+
+            const scanOutcome = await liveScanCoalescer.run(
+              cacheKey,
+              async () => {
+                if (detected.family === 'evm') {
+                  const evmReport = await scanEvmWalletWithOptions(body.address!, undefined, {
+                    chains: requestedEvmChains,
+                  });
+                  evmReport.family = 'evm';
+                  return evmReport;
+                }
+                return getAdapterForFamily(detected.family).scanWallet(detected.normalized);
+              },
+              { refresh: Boolean(body.refresh) }
+            );
+            report = scanOutcome.value;
+            return sendScanResult(report, scanOutcome.cached);
           } catch (err) {
             if (res.headersSent) {
               const msg = err instanceof Error ? err.message : 'Wallet scan failed';
@@ -1593,7 +1636,6 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
             }
             throw err;
           }
-          return sendScanResult(report, false);
         } else {
           report = await scanPresetWallet('veteran_defi');
           report.family = 'evm';
@@ -1675,8 +1717,14 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         } catch {
           return reply(400, { error: 'Invalid Solana address' });
         }
+        const refreshParam = (url.searchParams.get('refresh') ?? '').trim().toLowerCase();
+        const refresh = refreshParam === '1' || refreshParam === 'true';
         try {
-          const balances = await fetchSolanaWalletBalances(address);
+          const { value: balances } = await solanaBalanceCoalescer.run(
+            address,
+            () => fetchSolanaWalletBalances(address),
+            { refresh }
+          );
           return reply(200, balances);
         } catch (err) {
           return reply(503, {
@@ -1769,6 +1817,63 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         } catch (err) {
           return reply(400, {
             error: err instanceof Error ? err.message : 'Could not prepare real transaction',
+          });
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/tx/prepare-batch') {
+        const body = await readJsonBody<{
+          assets?: ScannedAsset[];
+          userAddress?: string;
+          solanaDestination?: string;
+          outputAsset?: 'USDC' | 'SOL';
+          bridgePreference?: 'auto' | 'relay' | 'lifi' | 'cctp';
+          hasSolanaUsdcAta?: boolean;
+          includePreflight?: boolean;
+          refresh?: boolean;
+          feeRecipientEvm?: string | null;
+        }>(req);
+
+        if (!Array.isArray(body.assets) || body.assets.length === 0 || !body.userAddress || !body.solanaDestination) {
+          return reply(400, {
+            error: 'assets[], userAddress, and solanaDestination are required',
+          });
+        }
+
+        assertNoFeeRecipientOverride(body.feeRecipientEvm);
+
+        const refresh = body.refresh === true;
+        const outputAsset = body.outputAsset ?? 'USDC';
+        const bridgePreference = body.bridgePreference ?? 'auto';
+        const includePreflight = body.includePreflight !== false;
+        const batchSig = body.assets
+          .slice(0, 12)
+          .map((a) => `${a?.chain ?? ''}:${a?.address ?? ''}:${a?.rawBalance ?? ''}:${a?.action ?? ''}`)
+          .join('|');
+        const cacheKey = `${body.userAddress.trim().toLowerCase()}:${body.solanaDestination.trim()}:${outputAsset}:${bridgePreference}:${String(body.hasSolanaUsdcAta)}:${String(includePreflight)}:${batchSig}`;
+
+        try {
+          const { value: result } = await prepareBatchCoalescer.run(
+            cacheKey,
+            () =>
+              prepareBatchExecutions({
+                assets: body.assets!,
+                userAddress: body.userAddress!,
+                solanaDestination: body.solanaDestination!,
+                outputAsset,
+                bridgePreference,
+                hasSolanaUsdcAta: body.hasSolanaUsdcAta,
+                includePreflight,
+              }),
+            {
+              refresh,
+              cachePredicate: (res) => res.readyCount > 0 && res.failedCount === 0,
+            }
+          );
+          return reply(200, result);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Could not prepare batch transactions',
           });
         }
       }
@@ -2481,21 +2586,6 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
       }
 
       if (
-        pathname.startsWith('/api/degen/') &&
-        (await handleDegenRoutes({
-          method,
-          pathname,
-          url,
-          req,
-          reply,
-          readJsonBody,
-          client: degenClient,
-        }))
-      ) {
-        return;
-      }
-
-      if (
         await handlePreservationRoute({
           req,
           method,
@@ -2640,6 +2730,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
       }
 
       if (method === 'POST' && pathname === '/api/workspace/hydrate') {
+        const hydrateStart = performance.now();
         const body = await readJsonBody<{
           address?: string;
           family?: ChainFamily;
@@ -2651,6 +2742,9 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           usePermit2Batch?: boolean;
           includeBurns?: boolean;
           includePreservation?: boolean;
+          includeSolanaOverview?: boolean;
+          dustMaxUsd?: number;
+          dustOutputAsset?: 'USDC' | 'SOL';
           refresh?: boolean;
         }>(req, MAX_PRIVILEGED_JSON_BODY_BYTES);
 
@@ -2659,6 +2753,16 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           typeof body.solanaDestination === 'string' && body.solanaDestination.trim()
             ? body.solanaDestination.trim()
             : '';
+
+        let isValidSolDest = false;
+        if (solDestClean && solDestClean !== '11111111111111111111111111111111') {
+          try {
+            solanaAddressToBytes32(solDestClean);
+            isValidSolDest = true;
+          } catch {
+            isValidSolDest = false;
+          }
+        }
 
         let requestedEvmChains: EvmChainId[] | undefined;
         if (Array.isArray(body.chains) && body.chains.length > 0) {
@@ -2677,6 +2781,53 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           requestedEvmChains = filtered;
         }
 
+        const refresh = body.refresh === true;
+        const includeSolanaOverview = body.includeSolanaOverview === true;
+
+        // Kick off Solana balance / overview fetch AT t=0 in parallel with wallet scan!
+        const solanaStart = performance.now();
+        let solanaMs = 0;
+        const solanaWorkPromise: Promise<{
+          balances: SolanaWalletBalance | null;
+          overview: SolanaOverviewResult | null;
+        }> = isValidSolDest
+          ? includeSolanaOverview
+            ? (async () => {
+                const dustMaxUsd =
+                  typeof body.dustMaxUsd === 'number' && Number.isFinite(body.dustMaxUsd)
+                    ? body.dustMaxUsd
+                    : undefined;
+                const dustOutputAsset: 'USDC' | 'SOL' =
+                  body.dustOutputAsset === 'SOL' ? 'SOL' : 'USDC';
+                const ovKey = `${solDestClean}:${dustMaxUsd ?? 50}:${dustOutputAsset}`;
+                const overview = await solanaOverviewCoalescer
+                  .run(
+                    ovKey,
+                    () =>
+                      fetchSolanaOverview({
+                        address: solDestClean,
+                        dustMaxUsd,
+                        dustOutputAsset,
+                        refresh,
+                      }),
+                    { refresh, cachePredicate: (res) => !res.rpcUnavailable }
+                  )
+                  .then((r) => r.value)
+                  .catch(() => null);
+                solanaMs = Math.max(0, Math.round(performance.now() - solanaStart));
+                return { balances: overview?.balances ?? null, overview };
+              })()
+            : (async () => {
+                const balances = await solanaBalanceCoalescer
+                  .run(solDestClean, () => fetchSolanaWalletBalances(solDestClean), { refresh })
+                  .then((r) => r.value)
+                  .catch(() => null);
+                solanaMs = Math.max(0, Math.round(performance.now() - solanaStart));
+                return { balances, overview: null };
+              })()
+          : Promise.resolve({ balances: null, overview: null });
+
+        const scanStart = performance.now();
         let scan: ScanReport;
         let cached = false;
         try {
@@ -2694,21 +2845,22 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
             const cacheKey = `${detected.family}:${detected.normalized.toLowerCase()}:${
               requestedEvmChains ? requestedEvmChains.slice().sort().join(',') : 'all'
             }`;
-            const hit = !body.refresh ? liveScanCache.get(cacheKey) : undefined;
-            if (hit) {
-              scan = hit;
-              cached = true;
-            } else {
-              if (detected.family === 'evm') {
-                scan = await scanEvmWalletWithOptions(body.address, undefined, {
-                  chains: requestedEvmChains,
-                });
-                scan.family = 'evm';
-              } else {
-                scan = await getAdapterForFamily(detected.family).scanWallet(detected.normalized);
-              }
-              liveScanCache.set(cacheKey, scan);
-            }
+            const outcome = await liveScanCoalescer.run(
+              cacheKey,
+              async () => {
+                if (detected.family === 'evm') {
+                  const evmScan = await scanEvmWalletWithOptions(body.address!, undefined, {
+                    chains: requestedEvmChains,
+                  });
+                  evmScan.family = 'evm';
+                  return evmScan;
+                }
+                return getAdapterForFamily(detected.family).scanWallet(detected.normalized);
+              },
+              { refresh }
+            );
+            scan = outcome.value;
+            cached = outcome.cached;
           } else {
             return reply(400, { error: 'address or presetId is required.' });
           }
@@ -2719,6 +2871,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           const msg = err instanceof Error ? err.message : 'Wallet scan failed';
           return reply(msg.toLowerCase().includes('invalid') ? 400 : 500, { error: msg });
         }
+        const scanMs = Math.max(0, Math.round(performance.now() - scanStart));
 
         scanCache.set(scan.scanId, scan);
 
@@ -2726,8 +2879,9 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           .filter((a) => a.selectedByDefault)
           .map((a) => a.id);
 
-        const [solBalances, preservation] = await Promise.all([
-          solDestClean ? fetchSolanaWalletBalances(solDestClean).catch(() => null) : Promise.resolve(null),
+        const planStart = performance.now();
+        const [solanaWork, preservation] = await Promise.all([
+          solanaWorkPromise,
           body.includePreservation !== false
             ? evaluatePreservationPlan(scan, {
                 outputAsset,
@@ -2735,6 +2889,7 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
             : Promise.resolve(null),
         ]);
 
+        const solBalances = solanaWork.balances;
         const plan = buildMigrationPlan({
           scan,
           selectedAssetIds: defaultSelectedIds,
@@ -2745,13 +2900,22 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           bridgePreference: body.bridgePreference ?? 'auto',
           hasSolanaUsdcAta: solBalances ? Boolean(solBalances.hasUsdcAta) : undefined,
         });
+        const planMs = Math.max(0, Math.round(performance.now() - planStart));
+        const totalMs = Math.max(1, Math.round(performance.now() - hydrateStart));
 
         return reply(200, {
           cached,
+          timingMs: {
+            total: totalMs,
+            scan: scanMs,
+            plan: planMs,
+            solana: solanaMs,
+          },
           scan,
           plan,
           preservation,
           solanaBalances: solBalances,
+          ...(includeSolanaOverview ? { solanaOverview: solanaWork.overview } : {}),
         });
       }
 
@@ -2784,7 +2948,18 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         }
       }
 
-      if (pathname.startsWith('/api/solana/') && (await handleSolanaRoutes({ method, pathname, url, req, reply, readJsonBody }))) {
+      if (
+        pathname.startsWith('/api/solana/') &&
+        (await handleSolanaRoutes({
+          method,
+          pathname,
+          url,
+          req,
+          reply,
+          readJsonBody,
+          overviewCoalescer: solanaOverviewCoalescer,
+        }))
+      ) {
         return;
       }
 

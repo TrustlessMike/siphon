@@ -12,13 +12,6 @@ import {
   type ReadLiveUnlockQueuesOptions,
 } from '../defi/unlock-readers.js';
 import {
-  ALLOWED_JUPITER_CATEGORIES,
-  ALLOWED_JUPITER_FILTERS,
-  JupiterMarketsClient,
-  type JupiterCategory,
-  type JupiterFilter,
-} from '../degen/jupiter-markets.js';
-import {
   buildUnlockSchedule,
   evaluatePreservationPlan,
   extractScanWalletAddresses,
@@ -60,7 +53,6 @@ export interface McpToolContext {
   /** Optional verified Bearer token scopes; when provided, enforces per-tool scope checks */
   tokenScopes?: string[];
   /** Optional injectable clients/hooks for deterministic unit tests and custom RPC routing */
-  jupiterMarketsClient?: JupiterMarketsClient;
   unlockReaderOptions?: Omit<ReadLiveUnlockQueuesOptions, 'evmAddresses' | 'cosmosAddresses'>;
   gasPriceFetcher?: (chain: EvmChainId) => Promise<number | null>;
   solanaRentScanner?: typeof scanReclaimableSolanaRent;
@@ -80,7 +72,6 @@ const MCP_TOOL_REQUIRED_SCOPE: Record<string, string> = {
   turgalium_list_unlock_schedule: 'scan:read',
   turgalium_solana_rent_scan: 'scan:read',
   turgalium_solana_yield_preview: 'scan:read',
-  turgalium_degen_markets: 'scan:read',
   turgalium_build_review_link: 'scan:read',
 };
 
@@ -98,11 +89,7 @@ const ZERO_EVM_ADDRESS = '0x0000000000000000000000000000000000000000';
 const VALID_FAMILIES = new Set<string>(['evm', 'cosmos', 'sui', 'aptos', 'ton', 'tron', 'btc']);
 const VALID_ACTIONS = new Set<string>(['dust_convert', 'defi_withdraw', 'bridge_solana', 'burn_zero_liq']);
 const VALID_YIELD_STRATEGIES = new Set<string>(Object.keys(SOLANA_YIELD_STRATEGIES));
-const VALID_JUPITER_CATEGORIES = new Set<string>(ALLOWED_JUPITER_CATEGORIES);
-const VALID_JUPITER_FILTERS = new Set<string>(ALLOWED_JUPITER_FILTERS);
 const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F-\u009F]/;
-
-const defaultMcpJupiterClient = new JupiterMarketsClient();
 
 export const TURGALIUM_MCP_TOOLS = [
   {
@@ -347,7 +334,7 @@ export const TURGALIUM_MCP_TOOLS = [
   {
     name: 'turgalium_solana_yield_preview',
     description:
-      'Compute Turgalium Preservation-First Solana post-arrival split: default 90% Preserved Yield (JupSOL, Jupiter Lend jlUSDC, or Kamino USDC) + 10% Degen Side-Pocket with exact micro-USDC accounting and projected APY. Read-only preview; never signs or swaps autonomously.',
+      'Compute Turgalium 100% principal-safe Solana post-arrival yield parking (JupSOL, Jupiter Lend jlUSDC, or Kamino USDC) with exact micro-USDC accounting and projected APY. Read-only preview; never signs or swaps autonomously.',
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -382,45 +369,6 @@ export const TURGALIUM_MCP_TOOLS = [
           default: 'jupiter_lend_usdc',
         },
         fetchLiveQuote: { type: 'boolean', default: false },
-      },
-    },
-  },
-  {
-    name: 'turgalium_degen_markets',
-    description:
-      'List live trending Jupiter Prediction Markets & implied odds for AI-assisted market research. Strictly read-only: NEVER places bets, builds signed orders, or moves funds autonomously without explicit user approval in Turgalium.',
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: true,
-    },
-    inputSchema: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        category: {
-          type: 'string',
-          enum: [...ALLOWED_JUPITER_CATEGORIES],
-          default: 'all',
-        },
-        filter: {
-          type: 'string',
-          enum: [...ALLOWED_JUPITER_FILTERS],
-          default: 'trending',
-        },
-        query: {
-          type: 'string',
-          minLength: 1,
-          maxLength: 120,
-          description: 'Optional keyword search across live Jupiter Prediction events',
-        },
-        limit: {
-          type: 'integer',
-          minimum: 1,
-          maximum: 25,
-          default: 10,
-        },
       },
     },
   },
@@ -1238,106 +1186,12 @@ export async function handleMcpJsonRpc(
               projectedAnnualYieldUsd,
               projectedMonthlyYieldUsd,
               projectedDailyYieldUsd,
-              yieldFundedDegenMonthlyBudgetUsd: projectedMonthlyYieldUsd,
             },
             jupiterQuote: null,
             transaction: null,
             warnings: [],
           };
         }
-      } else if (toolName === 'turgalium_degen_markets') {
-        let category: JupiterCategory = 'all';
-        if (args.category !== undefined) {
-          if (typeof args.category !== 'string' || !VALID_JUPITER_CATEGORIES.has(args.category.trim().toLowerCase())) {
-            return jsonRpcError(
-              id,
-              -32602,
-              `Invalid params: category must be one of ${ALLOWED_JUPITER_CATEGORIES.join(', ')}.`
-            );
-          }
-          category = args.category.trim().toLowerCase() as JupiterCategory;
-        }
-
-        let filter: JupiterFilter = 'trending';
-        if (args.filter !== undefined) {
-          if (typeof args.filter !== 'string' || !VALID_JUPITER_FILTERS.has(args.filter.trim().toLowerCase())) {
-            return jsonRpcError(
-              id,
-              -32602,
-              `Invalid params: filter must be one of ${ALLOWED_JUPITER_FILTERS.join(', ')}.`
-            );
-          }
-          filter = args.filter.trim().toLowerCase() as JupiterFilter;
-        }
-
-        let query: string | undefined;
-        if (args.query !== undefined) {
-          if (
-            typeof args.query !== 'string' ||
-            !args.query.trim() ||
-            args.query.trim().length > 120 ||
-            CONTROL_CHAR_RE.test(args.query)
-          ) {
-            return jsonRpcError(id, -32602, 'Invalid params: query must be a non-empty string <= 120 chars without control characters.');
-          }
-          query = sanitizeFreeText(args.query, 120);
-          if (!query) {
-            return jsonRpcError(id, -32602, 'Invalid params: query cannot be blank.');
-          }
-        }
-
-        let limit = 10;
-        if (args.limit !== undefined) {
-          const parsed = parseStrictFiniteNumber(args.limit);
-          if (parsed === null || !Number.isInteger(parsed) || parsed < 1 || parsed > 25) {
-            return jsonRpcError(id, -32602, 'Invalid params: limit must be an integer in [1, 25].');
-          }
-          limit = parsed;
-        }
-
-        const jupClient = ctx.jupiterMarketsClient ?? defaultMcpJupiterClient;
-        const feed = query
-          ? await jupClient.searchEvents({ query, limit })
-          : await jupClient.fetchEvents({ category, filter, limit });
-
-        result = {
-          readOnly: true,
-          autonomousBettingAllowed: false,
-          safetyNotice:
-            'Strictly read-only Jupiter Prediction Market research feed. Never places bets autonomously; user must explicitly review side-pocket caps and sign in the Turgalium Degen tab.',
-          ok: feed.ok,
-          live: feed.live,
-          source: feed.source,
-          fetchedAt: feed.fetchedAt,
-          category: feed.category,
-          filter: feed.filter,
-          query: feed.query,
-          geoBlocked: feed.geoBlocked ?? false,
-          totalReturned: feed.events.length,
-          events: feed.events.map((ev) => ({
-            eventId: ev.eventId,
-            slug: ev.slug,
-            jupiterUrl: ev.jupiterUrl,
-            title: sanitizeFreeText(ev.title, 160),
-            subtitle: sanitizeFreeText(ev.subtitle, 160),
-            category: ev.category,
-            isActive: ev.isActive,
-            isLive: ev.isLive,
-            closeTime: ev.closeTime,
-            volumeUsd: ev.volumeUsd,
-            volume24hrUsd: ev.volume24hrUsd,
-            markets: ev.markets.slice(0, 6).map((m) => ({
-              marketId: m.marketId,
-              title: sanitizeFreeText(m.title, 140),
-              status: m.status,
-              closeTime: m.closeTime,
-              volumeUsd: m.volumeUsd,
-              yes: m.yes,
-              no: m.no,
-            })),
-          })),
-          error: feed.error ? sanitizeFreeText(feed.error, 200) : undefined,
-        };
       } else if (toolName === 'turgalium_build_review_link') {
         const baseUrl =
           ctx.publicBaseUrl ||

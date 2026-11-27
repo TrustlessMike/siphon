@@ -7,9 +7,9 @@ export function buildAiPluginManifest(baseUrl: string) {
     name_for_human: 'Turgalium Multi-Chain Sweep & Preservation Agent',
     name_for_model: 'turgalium_migrator',
     description_for_human:
-      'Scan unified wallets across 30 chains, run capital-preservation route audits, track live Lido/Ethena/Cosmos unlocks, reclaim Solana empty-ATA rent, preview 90/10 Solana yield splits, research Jupiter Prediction Markets, and propose permission-gated sweeps to Solana.',
+      'Scan unified wallets across 30 chains, run capital-preservation route audits, track live Lido/Ethena/Cosmos unlocks, reclaim Solana empty-ATA rent, preview 100% principal-safe Solana yield parking, and propose permission-gated sweeps to Solana.',
     description_for_model:
-      'Use Turgalium to inspect unified multi-chain wallets across 30 chains, run capital-preservation audits, inspect live Lido/Ethena/Cosmos unlock queues and CCTP claims, scan Solana empty-ATA rent recovery, preview 90% yield + 10% Degen side-pocket splits, research trending Jupiter Prediction Markets (read-only), and submit permission-gated sweep requests. NEVER assume funds move or bets are placed without explicit user approval or an active TurgaliumAgentVault mandate.',
+      'Use Turgalium to inspect unified multi-chain wallets across 30 chains, run capital-preservation audits, inspect live Lido/Ethena/Cosmos unlock queues and CCTP claims, scan Solana empty-ATA rent recovery, preview 100% principal-safe Solana yield parking, and submit permission-gated sweep requests. NEVER assume funds move without explicit user approval or an active TurgaliumAgentVault mandate.',
     auth: {
       type: 'user_http',
       authorization_type: 'bearer',
@@ -33,7 +33,7 @@ export function buildOpenApiSpec(baseUrl: string) {
       title: 'Turgalium Multi-Chain Migrator & Preservation Agent API',
       version: '2.0.0',
       description:
-        'ChatGPT Action & AI Agent API (v2) for Turgalium — unifying multi-chain wallets across 30 chains, running capital-preservation route audits, reading live on-chain Lido/Ethena/Cosmos unlock queues, scanning Solana empty-ATA rent, previewing 90/10 Solana yield splits, researching Jupiter Prediction Markets (read-only), and submitting human-permissioned sweep requests to Solana.',
+        'ChatGPT Action & AI Agent API (v2) for Turgalium — unifying multi-chain wallets across 30 chains, running capital-preservation route audits, reading live on-chain Lido/Ethena/Cosmos unlock queues, scanning Solana empty-ATA rent, previewing 100% principal-safe Solana yield parking, and submitting human-permissioned sweep requests to Solana.',
     },
     servers: [{ url: cleanBase, description: 'Turgalium Local / Hosted Server' }],
     components: {
@@ -238,7 +238,7 @@ export function buildOpenApiSpec(baseUrl: string) {
           operationId: 'turgalium_solana_yield_preview',
           'x-openai-isConsequential': false,
           summary:
-            'Preview the 90% Preserved Yield (JupSOL, Jupiter Lend jlUSDC, or Kamino USDC) + 10% Degen Side-Pocket split with exact micro-USDC accounting and projected APY (read-only)',
+            'Preview 100% principal-safe Solana yield parking (JupSOL, Jupiter Lend jlUSDC, or Kamino USDC) with exact micro-USDC accounting and projected APY (read-only)',
           requestBody: {
             required: true,
             content: {
@@ -254,7 +254,7 @@ export function buildOpenApiSpec(baseUrl: string) {
                       description: 'Optional Solana base58 public key',
                     },
                     totalUsdcAmount: { type: 'number', exclusiveMinimum: 0, maximum: 100_000_000 },
-                    preservePct: { type: 'number', minimum: 50, maximum: 100, default: 90 },
+                    preservePct: { type: 'number', minimum: 50, maximum: 100, default: 100 },
                     strategy: {
                       type: 'string',
                       enum: ['jupsol', 'jupiter_lend_usdc', 'kamino_usdc'],
@@ -268,55 +268,7 @@ export function buildOpenApiSpec(baseUrl: string) {
           },
           responses: {
             '200': {
-              description: 'SolanaYieldParkPlan read-only split & APY projection without autonomous execution',
-            },
-          },
-        },
-      },
-      '/api/degen/markets': {
-        get: {
-          operationId: 'turgalium_degen_markets',
-          'x-openai-isConsequential': false,
-          summary:
-            'List live trending Jupiter Prediction Markets & implied odds for AI-assisted market research (strictly read-only; never places bets autonomously)',
-          parameters: [
-            {
-              name: 'category',
-              in: 'query',
-              required: false,
-              schema: {
-                type: 'string',
-                enum: ['all', 'crypto', 'sports', 'politics', 'esports', 'culture', 'economics', 'tech'],
-                default: 'all',
-              },
-            },
-            {
-              name: 'filter',
-              in: 'query',
-              required: false,
-              schema: {
-                type: 'string',
-                enum: ['trending', 'live', 'new', 'upcoming'],
-                default: 'trending',
-              },
-            },
-            {
-              name: 'query',
-              in: 'query',
-              required: false,
-              schema: { type: 'string', minLength: 1, maxLength: 120 },
-              description: 'Optional keyword search query',
-            },
-            {
-              name: 'limit',
-              in: 'query',
-              required: false,
-              schema: { type: 'integer', minimum: 1, maximum: 25, default: 10 },
-            },
-          ],
-          responses: {
-            '200': {
-              description: 'Read-only feed of trending Jupiter Prediction Markets with normalized YES/NO odds & multipliers',
+              description: 'SolanaYieldParkPlan read-only allocation & APY projection without autonomous execution',
             },
           },
         },
@@ -452,6 +404,6 @@ export function buildPluginSetupGuide(params: { baseUrl: string; rootDir: string
     chatgptPluginManifestUrl: `${cleanBase}/.well-known/ai-plugin.json`,
     chatgptOpenApiUrl: `${cleanBase}/openapi.json`,
     chatgptCustomGptInstructions:
-      'You are Turgalium Assistant (0% protocol fee, MIT open-source). NEVER ask the user for a private key, seed phrase, or wallet signature. Scan public wallets via scanUnifiedWallets, audit exact capital savings via turgalium_preservation_audit, inspect live Lido/Ethena/Cosmos unlocks via turgalium_list_unlock_schedule, check free Solana rent recovery via turgalium_solana_rent_scan, preview 90/10 yield splits via turgalium_solana_yield_preview, and research Jupiter Prediction Markets read-only via turgalium_degen_markets. Always finish by calling buildReviewLink so the user gets a 1-click non-custodial Turgalium Review & Sign URL to inspect and sign locally in their own wallet.',
+      'You are Turgalium Assistant (0% protocol fee, MIT open-source). NEVER ask the user for a private key, seed phrase, or wallet signature. Scan public wallets via scanUnifiedWallets, audit exact capital savings via turgalium_preservation_audit, inspect live Lido/Ethena/Cosmos unlocks via turgalium_list_unlock_schedule, check free Solana rent recovery via turgalium_solana_rent_scan, and preview 100% principal-safe Solana yield parking via turgalium_solana_yield_preview. Always finish by calling buildReviewLink so the user gets a 1-click non-custodial Turgalium Review & Sign URL to inspect and sign locally in their own wallet.',
   };
 }

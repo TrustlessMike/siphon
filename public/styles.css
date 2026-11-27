@@ -3771,8 +3771,6 @@ html[data-ui-mode="pro"] .lite-only {
   .field-select,
   .pres-input,
   .pres-select,
-  .degen-balance-input,
-  .degen-cap-input,
   input[type="text"],
   input[type="number"],
   input[type="search"],
@@ -4714,5 +4712,146 @@ label {
   }
   .ai-out-btn {
     min-height: 40px;
+  }
+}
+
+/* =====================================================================
+   1-CLICK BATCH PRE-SIGN SUMMARY CARD (DAYLIGHT PORCELAIN)
+   ===================================================================== */
+.one-click-summary-card {
+  margin: 2px 0 10px;
+  padding: 12px 13px;
+  border-radius: 14px;
+  background: var(--bg-well);
+  border: 1px solid var(--border-strong);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.one-click-summary-card.is-ready {
+  border-color: var(--ice-border, #7dd3fc);
+  background: linear-gradient(180deg, #ffffff 0%, #f5fbff 100%);
+}
+
+.one-click-summary-card.is-warn {
+  border-color: #fcd34d;
+  background: #fffbeb;
+}
+
+.one-click-summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.one-click-summary-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink-0);
+}
+
+.one-click-summary-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--allow-bg, #ecfdf5);
+  color: var(--allow, #059669);
+  border: 1px solid var(--allow-border, #a7f3d0);
+  white-space: nowrap;
+}
+
+.one-click-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.one-click-metric {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 7px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.one-click-metric-label {
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+
+.one-click-metric-val {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink-0);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.one-click-metric-val.is-emerald {
+  color: var(--allow, #059669);
+}
+
+.one-click-chains-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.one-click-chain-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-1);
+}
+
+.one-click-warn-box {
+  padding: 7px 9px;
+  border-radius: 9px;
+  background: #fef3c7;
+  border: 1px solid #fde68a;
+  color: #92400e;
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.one-click-summary-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.one-click-confirm-btn {
+  flex: 1 1 auto;
+  min-height: 44px;
+  justify-content: center;
+}
+
+.one-click-cancel-btn {
+  min-height: 44px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 480px) {
+  .one-click-summary-actions {
+    flex-direction: column;
+    align-items: stretch;
   }
 }

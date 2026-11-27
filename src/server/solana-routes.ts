@@ -13,6 +13,11 @@ import {
   listSolanaYieldStrategies,
   type SolanaYieldStrategyId,
 } from '../solana/yield-park.js';
+import {
+  fetchSolanaOverview,
+  type SolanaOverviewResult,
+} from '../solana/overview.js';
+import type { InFlightCoalescer } from './cache.js';
 
 const MAX_SOLANA_JSON_BODY_BYTES = 32_768; // 32 KiB strict cap for Solana rent/yield/dust endpoints
 
@@ -27,23 +32,101 @@ export interface SolanaRouteContext {
   req: IncomingMessage;
   reply: (status: number, payload: unknown) => void;
   readJsonBody: <T>(req: IncomingMessage, maxBytes?: number) => Promise<T>;
+  overviewCoalescer?: InFlightCoalescer<string, SolanaOverviewResult>;
 }
 
 /**
  * Modular HTTP routes for Solana post-arrival capital efficiency:
  *  - GET  /api/solana/yield-strategies
+ *  - POST /api/solana/overview
  *  - POST /api/solana/rent-scan
  *  - POST /api/solana/yield-park
  *  - POST /api/solana/dust-scan
  *  - POST /api/solana/dust-sweep
  */
 export async function handleSolanaRoutes(ctx: SolanaRouteContext): Promise<boolean> {
-  const { method, pathname, req, reply, readJsonBody } = ctx;
+  const { method, pathname, req, reply, readJsonBody, overviewCoalescer } = ctx;
 
   if (method === 'GET' && pathname === '/api/solana/yield-strategies') {
     reply(200, {
       strategies: listSolanaYieldStrategies(),
     });
+    return true;
+  }
+
+  if (method === 'POST' && pathname === '/api/solana/overview') {
+    const rawBody = await readJsonBody<unknown>(req, MAX_SOLANA_JSON_BODY_BYTES);
+    if (!isPlainRecord(rawBody)) {
+      reply(400, { error: 'Request body must be a JSON object.' });
+      return true;
+    }
+
+    const rawAddr =
+      rawBody.address !== undefined
+        ? rawBody.address
+        : rawBody.ownerAddress !== undefined
+        ? rawBody.ownerAddress
+        : rawBody.solanaAddress;
+    const address = typeof rawAddr === 'string' ? rawAddr.trim() : '';
+    if (!address) {
+      reply(400, { error: 'address must be a non-empty Solana base58 public key.' });
+      return true;
+    }
+
+    if (
+      rawBody.dustMaxUsd !== undefined &&
+      (typeof rawBody.dustMaxUsd !== 'number' || !Number.isFinite(rawBody.dustMaxUsd))
+    ) {
+      reply(400, { error: 'dustMaxUsd must be a finite number.' });
+      return true;
+    }
+
+    let dustOutputAsset: 'USDC' | 'SOL' = 'USDC';
+    if (rawBody.dustOutputAsset !== undefined) {
+      const norm =
+        typeof rawBody.dustOutputAsset === 'string'
+          ? rawBody.dustOutputAsset.trim().toUpperCase()
+          : '';
+      if (norm !== 'USDC' && norm !== 'SOL') {
+        reply(400, { error: "dustOutputAsset must be 'USDC' or 'SOL'." });
+        return true;
+      }
+      dustOutputAsset = norm;
+    }
+
+    const dustMaxUsd = rawBody.dustMaxUsd as number | undefined;
+    const refresh = rawBody.refresh === true;
+    const cacheKey = `${address}:${dustMaxUsd ?? 50}:${dustOutputAsset}`;
+
+    try {
+      const overview = overviewCoalescer
+        ? (
+            await overviewCoalescer.run(
+              cacheKey,
+              () =>
+                fetchSolanaOverview({
+                  address,
+                  dustMaxUsd,
+                  dustOutputAsset,
+                  refresh,
+                }),
+              {
+                refresh,
+                cachePredicate: (res) => !res.rpcUnavailable,
+              }
+            )
+          ).value
+        : await fetchSolanaOverview({
+            address,
+            dustMaxUsd,
+            dustOutputAsset,
+            refresh,
+          });
+      reply(200, overview);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to fetch Solana overview.';
+      reply(400, { error: msg });
+    }
     return true;
   }
 

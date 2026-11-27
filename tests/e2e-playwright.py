@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Deterministic end-to-end headless Chromium regression & safety backtest suite for Turgalium.
-Verifies Desktop (1440x900), Tablet (900x800), and Mobile (390x844) across all 5 views:
+Verifies Desktop (1440x900), Tablet (900x800), and Mobile (390x844) across all 5 views
+(Sweep, Activity, AI, Agents, Contracts):
   1. Zero-default Solana destination guard & disconnect clearing (C-2)
   2. Stored DOM XSS & injection immunity on leg.assetCount, symbols, protocols (C-1)
   3. Execution safety: atomicRequired:true for fee batches, sequential receipt failure abort,
@@ -9,6 +10,9 @@ Verifies Desktop (1440x900), Tablet (900x800), and Mobile (390x844) across all 5
   4. DeFi quick-unwind panel, guided 2-stage auto-bridge, Dust Converter CTA sync,
      mobile 390px visible Honeypot/ROI safety badges, connected 390px/900px 0px overflow,
      constrained mobile toast rect, non-EVM modal footer copy, and turgalium-3d.js rAF pause when hidden.
+  5. Condensed backend batch endpoints (POST /api/workspace/hydrate, POST /api/tx/prepare-batch,
+     POST /api/solana/overview), 1-Click Sweep UX flow, 100% principal-safe Earn on Solana,
+     and strict regression checks that zero gambling / prediction-market UI or endpoints exist.
 """
 import json
 import os
@@ -16,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from playwright.sync_api import sync_playwright
 
@@ -63,6 +68,235 @@ def maybe_shot(page, filename, full_page=True):
         page.screenshot(path=os.path.join(SHOT_DIR, filename), full_page=full_page)
 
 
+def build_plan_for_scan(scan, body=None):
+    body = body or {}
+    default_ids = [a["id"] for a in scan.get("assets", []) if a.get("selectedByDefault")]
+    payload = {
+        "scan": scan,
+        "selectedAssetIds": default_ids,
+        "solanaDestination": body.get("solanaDestination") or "",
+        "outputAsset": body.get("outputAsset") or "USDC",
+        "bridgePreference": body.get("bridgePreference") or "auto",
+        "usePermit2Batch": body.get("usePermit2Batch", True),
+        "includeBurns": bool(body.get("includeBurns", False)),
+    }
+    req = urllib.request.Request(
+        f"{BASE}/api/plan",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+def make_solana_overview_payload(address=SOL_PUBKEY, dust_output_asset="USDC"):
+    return {
+        "address": address,
+        "durationMs": 22,
+        "dustOutputAsset": dust_output_asset,
+        "balances": {"usdcBalance": 12.5, "solBalance": 0.42, "hasUsdcAta": True},
+        "dust": {
+            "ownerAddress": address,
+            "dustCount": 1,
+            "totalDustUsd": 1.45,
+            "reclaimableRentSol": 0.00203928,
+            "dustAccounts": [
+                {
+                    "tokenAccount": "7dustAcct11111111111111111111111111111111111",
+                    "mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+                    "symbol": "BONK",
+                    "uiAmount": 42000,
+                    "estimatedUsd": 1.45,
+                    "rentSol": 0.00203928,
+                    "closeable": True,
+                }
+            ],
+        },
+        "yieldStrategies": [
+            {
+                "id": "jupsol",
+                "name": "Jupiter Staked SOL (JupSOL)",
+                "protocol": "Jupiter / Sanctum LST",
+                "symbol": "JupSOL",
+                "baselineApyPct": 7.1,
+                "executionMode": "jupiter_swap_v0",
+                "preservesUsdPeg": False,
+            },
+            {
+                "id": "jupiter_lend_usdc",
+                "name": "Jupiter Lend USDC (jlUSDC)",
+                "protocol": "Jupiter Lend",
+                "symbol": "jlUSDC",
+                "baselineApyPct": 8.4,
+                "executionMode": "vault_deposit",
+                "preservesUsdPeg": True,
+            },
+            {
+                "id": "kamino_usdc",
+                "name": "Kamino USDC Lending Vault",
+                "protocol": "Kamino Finance",
+                "symbol": "kUSDC",
+                "baselineApyPct": 6.8,
+                "executionMode": "vault_deposit",
+                "preservesUsdPeg": True,
+            },
+        ],
+        "rpcUnavailable": False,
+    }
+
+
+def make_sol_overview_route(hits=None):
+    def _route(route):
+        body = route.request.post_data_json or {}
+        if hits is not None:
+            hits.append(body)
+        addr = body.get("address") or SOL_PUBKEY
+        dust_out = body.get("dustOutputAsset") or "USDC"
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(make_solana_overview_payload(addr, dust_out)),
+        )
+
+    return _route
+
+
+def make_hydrate_route(scan_builder, hits=None):
+    def _route(route):
+        body = route.request.post_data_json or {}
+        if hits is not None:
+            hits.append(body)
+        if body.get("family") and body.get("family") != "evm":
+            route.continue_()
+            return
+        scan_copy = scan_builder(body)
+        plan = build_plan_for_scan(scan_copy, body)
+        sol_dest = (body.get("solanaDestination") or "").strip()
+        sol_bal = {"usdcBalance": 12.5, "solBalance": 0.42, "hasUsdcAta": True} if sol_dest else None
+        sol_ov = (
+            make_solana_overview_payload(sol_dest, body.get("outputAsset") or "USDC")
+            if sol_dest and body.get("includeSolanaOverview")
+            else None
+        )
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({
+                "cached": False,
+                "timingMs": {"total": 18, "scan": 10, "plan": 4, "solana": 4 if sol_dest else 0},
+                "scan": scan_copy,
+                "plan": plan,
+                "preservation": None,
+                "solanaBalances": sol_bal,
+                "solanaOverview": sol_ov,
+            }),
+        )
+
+    return _route
+
+
+def assert_zero_gambling_in_dom(page, context_label):
+    """Negative regression assertion: zero gambling/degen/prediction-market elements or copy in DOM."""
+    audit = page.evaluate("""() => {
+      const bannedSelectors = [
+        '#view-degen',
+        "[data-view='degen']",
+        '#degenRoot',
+        '[data-yield-split]',
+        "script[src*='degen.js']",
+        "link[href*='degen.css']",
+      ];
+      const matchedSelectors = bannedSelectors.filter((sel) => document.querySelectorAll(sel).length > 0);
+      const bodyText = document.body?.innerText || '';
+      const fullHtml = document.documentElement?.innerHTML || '';
+      const bannedTextPatterns = [
+        { name: 'degen', re: /\\bdegen\\b/i },
+        { name: 'side-pocket', re: /side[-_ ]pocket/i },
+        { name: '10% degen', re: /10%\\s*degen/i },
+        { name: '90% yield', re: /90%\\s*yield/i },
+        { name: 'prediction market', re: /prediction\\s*market/i },
+        { name: 'jup.ag/prediction', re: /jup\\.ag\\/prediction/i },
+        { name: 'gambling', re: /gambl/i },
+      ];
+      const matchedText = bannedTextPatterns.filter((p) => p.re.test(bodyText)).map((p) => p.name);
+      const hasDegenAssetRef = /degen\\.js|degen\\.css|view-degen/i.test(fullHtml);
+      return { matchedSelectors, matchedText, hasDegenAssetRef };
+    }""")
+    assert not audit["matchedSelectors"], f"[{context_label}] Banned gambling selectors present: {audit}"
+    assert not audit["matchedText"], f"[{context_label}] Banned gambling copy present in DOM: {audit}"
+    assert not audit["hasDegenAssetRef"], f"[{context_label}] Banned degen asset reference in HTML: {audit}"
+
+
+def verify_condensed_backend_endpoints(veteran_fixture):
+    """Verify real local server contracts for condensed batch APIs & 404 removal of degen endpoints."""
+    # 1. POST /api/workspace/hydrate
+    req_h = urllib.request.Request(
+        f"{BASE}/api/workspace/hydrate",
+        data=json.dumps({"presetId": "veteran_defi"}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req_h, timeout=15) as r:
+        assert r.status == 200
+        hydrate_data = json.loads(r.read().decode())
+    assert "scan" in hydrate_data and "plan" in hydrate_data, hydrate_data.keys()
+    assert isinstance(hydrate_data.get("timingMs"), dict) and "total" in hydrate_data["timingMs"], hydrate_data.get("timingMs")
+    scan_symbols = [str(a.get("symbol", "")).upper() for a in hydrate_data["scan"].get("assets", [])]
+    assert "DEGEN" not in scan_symbols, f"Banned DEGEN token found in preset hydrate scan: {scan_symbols}"
+
+    # 2. POST /api/solana/overview
+    req_s = urllib.request.Request(
+        f"{BASE}/api/solana/overview",
+        data=json.dumps({"address": SOL_PUBKEY, "dustMaxUsd": 50, "dustOutputAsset": "USDC"}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req_s, timeout=15) as r:
+        assert r.status == 200
+        overview_data = json.loads(r.read().decode())
+    assert overview_data.get("address") == SOL_PUBKEY, overview_data
+    assert isinstance(overview_data.get("durationMs"), (int, float)), overview_data
+    assert "balances" in overview_data and isinstance(overview_data.get("yieldStrategies"), list), overview_data
+    assert len(overview_data["yieldStrategies"]) >= 3, overview_data["yieldStrategies"]
+
+    # 3. POST /api/tx/prepare-batch
+    sample_assets = [a for a in veteran_fixture.get("assets", []) if a.get("selectedByDefault")][:2]
+    req_b = urllib.request.Request(
+        f"{BASE}/api/tx/prepare-batch",
+        data=json.dumps({
+            "assets": sample_assets,
+            "userAddress": VITALIK,
+            "solanaDestination": SOL_PUBKEY,
+            "outputAsset": "USDC",
+            "bridgePreference": "auto",
+            "includePreflight": False,
+        }).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req_b, timeout=20) as r:
+        assert r.status == 200
+        batch_data = json.loads(r.read().decode())
+    assert batch_data.get("count") == len(sample_assets), batch_data
+    assert batch_data.get("totalProtocolFeeUsd") == 0, batch_data
+    assert isinstance(batch_data.get("items"), list) and len(batch_data["items"]) == len(sample_assets), batch_data
+    assert batch_data.get("readyCount", 0) + batch_data.get("failedCount", 0) == batch_data["count"], batch_data
+
+    # 4. Removed gambling/degen endpoints and static assets must return 404
+    for removed_path in ["/api/degen/markets", f"/api/degen/positions?owner={SOL_PUBKEY}", "/degen.js", "/degen.css"]:
+        try:
+            with urllib.request.urlopen(f"{BASE}{removed_path}", timeout=5) as r:
+                raise AssertionError(f"Expected 404 for removed path {removed_path}, got HTTP {r.status}")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404, f"Expected 404 for {removed_path}, got HTTP {exc.code}"
+
+    return {
+        "ok": True,
+        "workspaceHydrateTimingMs": hydrate_data["timingMs"],
+        "solanaOverviewStrategies": len(overview_data["yieldStrategies"]),
+        "prepareBatchCount": batch_data["count"],
+        "prepareBatchFeeZero": batch_data["totalProtocolFeeUsd"] == 0,
+        "removedDegenEndpointsReturn404": True,
+    }
+
+
 def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     srv_log = tempfile.TemporaryFile()
@@ -82,7 +316,9 @@ def main():
     try:
         wait_ready(srv, srv_log)
         veteran_fixture = fetch_veteran_scan()
-        results = {}
+        results = {
+            "condensed_backend_apis": verify_condensed_backend_endpoints(veteran_fixture),
+        }
 
         with sync_playwright() as p:
             launch_args = []
@@ -210,19 +446,26 @@ def main():
               }});
             """)
 
-            # Deterministic scan + proof routes so Desktop E2E never flakes on public RPC latency
-            def route_scan_deterministic(route):
-                body = route.request.post_data_json or {}
-                if body.get("family") and body.get("family") != "evm":
-                    route.continue_()
-                    return
+            # Deterministic scan + hydrate + proof routes so Desktop E2E never flakes on public RPC latency
+            def build_deterministic_scan(body):
                 scan_copy = json.loads(json.dumps(veteran_fixture))
                 if body.get("address"):
                     scan_copy["walletAddress"] = body["address"]
                 else:
                     scan_copy["walletAddress"] = VITALIK
                     scan_copy["walletLabel"] = "vitalik.eth"
+                return scan_copy
+
+            def route_scan_deterministic(route):
+                body = route.request.post_data_json or {}
+                if body.get("family") and body.get("family") != "evm":
+                    route.continue_()
+                    return
+                scan_copy = build_deterministic_scan(body)
                 route.fulfill(status=200, content_type="application/json", body=json.dumps(scan_copy))
+
+            route_hydrate_deterministic = make_hydrate_route(build_deterministic_scan)
+            route_sol_overview = make_sol_overview_route()
 
             def route_proof_deterministic(route):
                 body = route.request.post_data_json or {}
@@ -314,13 +557,16 @@ def main():
                     return
                 route.continue_()
 
+            pgD.route("**/api/workspace/hydrate", route_hydrate_deterministic)
             pgD.route("**/api/scan", route_scan_deterministic)
             pgD.route("**/api/tx/simulate-proof", route_proof_deterministic)
+            pgD.route("**/api/solana/overview", route_sol_overview)
             pgD.route("**/api/solana/balance*", route_sol_balance)
             pgD.route("**/api/tx/prepare-chain-batch", route_prepare_base_eip5792)
 
             pgD.goto(BASE, wait_until="networkidle")
             pgD.wait_for_timeout(450)
+            assert_zero_gambling_in_dom(pgD, "desktop_website_1440")
 
             # 1A. Verify default Solana destination is EMPTY (C-2)
             boot_dest = pgD.evaluate("""() => ({
@@ -626,12 +872,15 @@ def main():
             assert sendCallsD[0]["params"][0]["chainId"] == "0x2105"
             assert sendCallsD[0]["params"][0]["atomicRequired"] is True, f"Expected atomicRequired=True for fee-bundled batch: {sendCallsD[0]}"
 
-            # 1H. Check all 5 views + Agents Mandate CRUD + HTTP 500 revoke handling (0 uncaught pageerror!)
-            for view in ["scanner", "activity", "agents", "contract"]:
+            # 1H. Check all 5 views (Sweep, Activity, AI, Agents, Contracts) + Agents Mandate CRUD + HTTP 500 revoke handling (0 uncaught pageerror!)
+            for view in ["scanner", "activity", "ai", "agents", "contract"]:
                 pgD.click(f".app-tab[data-view='{view}']")
                 pgD.wait_for_timeout(200)
                 overflowD[view] = pgD.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
-                if view == "agents":
+                assert_zero_gambling_in_dom(pgD, f"desktop_1440_{view}")
+                if view == "ai":
+                    pgD.wait_for_selector("#view-ai.active", timeout=5000)
+                elif view == "agents":
                     pgD.wait_for_function("() => (document.querySelector('#claudeMcpConfigHost')?.innerText || '').includes('turgalium')", timeout=5000)
                     # Queue a real permission request via POST /api/agents/approvals (replaces removed demo button)
                     queued_ok = pgD.evaluate("""async () => {
@@ -688,6 +937,8 @@ def main():
                 "rafPausedWhenHidden": True,
                 "atomicRequiredForFeeBatch": True,
                 "cosmosModalFooterFixed": True,
+                "zeroGamblingUiVerified": True,
+                "aiTabVerified": True,
                 "overflowPx": overflowD,
             }
             ctxD.close()
@@ -742,7 +993,7 @@ def main():
             # Hold /api/scan briefly to test #selectProfitableBtn null guard before scan resolves!
             scan_gate = {"release": False}
 
-            def route_safety_scan(route):
+            def build_safety_scan(body=None):
                 # Build deterministic dust-rescuable scan + XSS payloads in symbol/name/protocol
                 dust_scan = json.loads(json.dumps(veteran_fixture))
                 dust_scan["walletAddress"] = VET_ADDR
@@ -794,7 +1045,12 @@ def main():
                         "netRoiUsd": -0.18,
                     },
                 ]
-                route.fulfill(status=200, content_type="application/json", body=json.dumps(dust_scan))
+                return dust_scan
+
+            def route_safety_scan(route):
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(build_safety_scan()))
+
+            route_safety_hydrate = make_hydrate_route(build_safety_scan)
 
             def route_xss_jobs(route):
                 if route.request.method == "GET":
@@ -871,6 +1127,7 @@ def main():
             pgS_null = ctxS.new_page()
             errsS_null = []
             pgS_null.on("pageerror", lambda e: errsS_null.append(f"pageerror: {e}"))
+            pgS_null.route("**/api/workspace/hydrate", lambda r: r.abort())  # keep currentScan null
             pgS_null.route("**/api/scan", lambda r: r.abort())  # keep currentScan null
             pgS_null.goto(BASE, wait_until="domcontentloaded")
             pgS_null.wait_for_selector("#navLaunchBtn", timeout=5000)
@@ -880,11 +1137,13 @@ def main():
             assert not errsS_null, f"#selectProfitableBtn before scan threw: {errsS_null}"
             pgS_null.close()
 
+            pgS.route("**/api/workspace/hydrate", route_safety_hydrate)
             pgS.route("**/api/scan", route_safety_scan)
             pgS.route("**/api/jobs", route_xss_jobs)
             pgS.route("**/api/dust/plan", route_dust_plan_mock)
             pgS.route("**/api/tx/prepare-chain-batch", route_prepare_3step_seq)
             pgS.route("**/api/tx/status", route_status_reverted)
+            pgS.route("**/api/solana/overview", route_sol_overview)
             pgS.route("**/api/solana/balance*", route_sol_balance)
 
             pgS.goto(BASE, wait_until="networkidle")
@@ -1074,10 +1333,15 @@ def main():
               }};
             """)
 
-            def route_vet(route):
+            def build_vet_scan(body=None):
                 scan_copy = json.loads(json.dumps(veteran_fixture))
                 scan_copy["walletAddress"] = VET_ADDR
-                route.fulfill(status=200, content_type="application/json", body=json.dumps(scan_copy))
+                return scan_copy
+
+            def route_vet(route):
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(build_vet_scan()))
+
+            route_vet_hydrate = make_hydrate_route(build_vet_scan)
 
             def route_tx_status_ok(route):
                 route.fulfill(
@@ -1086,8 +1350,10 @@ def main():
                     body=json.dumps({"evmConfirmed": True, "evmFailed": False, "bridgeStatus": "confirmed"}),
                 )
 
+            pgL.route("**/api/workspace/hydrate", route_vet_hydrate)
             pgL.route("**/api/scan", route_vet)
             pgL.route("**/api/tx/status", route_tx_status_ok)
+            pgL.route("**/api/solana/overview", route_sol_overview)
             pgL.route("**/api/solana/balance*", route_sol_balance)
             pgL.goto(BASE, wait_until="networkidle")
             pgL.click("#siteConnectBtn")
@@ -1187,7 +1453,7 @@ def main():
               }};
             """)
 
-            def route_defi_plan_scan(route):
+            def build_defi_plan_scan(body=None):
                 payload = json.loads(json.dumps(veteran_fixture))
                 payload["walletAddress"] = VET_ADDR
                 for a in payload["assets"]:
@@ -1220,7 +1486,12 @@ def main():
                             "cooldownLabel": "7-day unbonding queue",
                             "underlyingSymbol": "USDC",
                         }
-                route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+                return payload
+
+            def route_defi_plan_scan(route):
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(build_defi_plan_scan()))
+
+            route_defi_plan_hydrate = make_hydrate_route(build_defi_plan_scan)
 
             prepare_call_count = {"n": 0}
 
@@ -1283,9 +1554,11 @@ def main():
                         }),
                     )
 
+            pgX.route("**/api/workspace/hydrate", route_defi_plan_hydrate)
             pgX.route("**/api/scan", route_defi_plan_scan)
             pgX.route("**/api/tx/prepare-chain-batch", route_prepare_two_stage)
             pgX.route("**/api/tx/status", route_tx_status_ok)
+            pgX.route("**/api/solana/overview", route_sol_overview)
             pgX.route("**/api/solana/balance*", route_sol_balance)
             pgX.goto(BASE, wait_until="networkidle")
             pgX.click("#siteConnectBtn")
@@ -1349,7 +1622,9 @@ def main():
                 }}
               }};
             """)
+            pgT.route("**/api/workspace/hydrate", route_hydrate_deterministic)
             pgT.route("**/api/scan", route_scan_deterministic)
+            pgT.route("**/api/solana/overview", route_sol_overview)
             pgT.route("**/api/solana/balance*", route_sol_balance)
             pgT.goto(BASE, wait_until="networkidle")
             pgT.wait_for_timeout(300)
@@ -1368,12 +1643,14 @@ def main():
             overflowT = {
                 "scanner_lite": pgT.evaluate("() => document.documentElement.scrollWidth - window.innerWidth"),
             }
+            assert_zero_gambling_in_dom(pgT, "tablet_900_lite")
             pgT.click(".ui-mode-btn[data-ui-mode='pro']")
             pgT.wait_for_timeout(120)
-            for view in ["scanner", "activity", "agents", "contract"]:
+            for view in ["scanner", "activity", "ai", "agents", "contract"]:
                 pgT.click(f".app-tab[data-view='{view}']")
                 pgT.wait_for_timeout(150)
                 overflowT[view] = pgT.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
+                assert_zero_gambling_in_dom(pgT, f"tablet_900_{view}")
             pgT.click("#backToSiteBtn")
             pgT.wait_for_selector("#siteShell:not(.hidden)")
             pgT.wait_for_timeout(150)
@@ -1405,10 +1682,13 @@ def main():
                 }}
               }};
             """)
+            pgM.route("**/api/workspace/hydrate", route_hydrate_deterministic)
             pgM.route("**/api/scan", route_scan_deterministic)
+            pgM.route("**/api/solana/overview", route_sol_overview)
             pgM.route("**/api/solana/balance*", route_sol_balance)
             pgM.goto(BASE, wait_until="networkidle")
             pgM.wait_for_timeout(350)
+            assert_zero_gambling_in_dom(pgM, "mobile_390_website")
 
             overflowM = {"website": pgM.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")}
             maybe_shot(pgM, "goal_mobile_website_390.png", full_page=True)
@@ -1477,13 +1757,16 @@ def main():
             pgM.wait_for_timeout(150)
             overflowM["scanner_defi"] = pgM.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
 
-            for view in ["scanner", "activity", "agents", "contract"]:
+            for view in ["scanner", "activity", "ai", "agents", "contract"]:
                 pgM.click(f".app-tab[data-view='{view}']")
                 pgM.wait_for_timeout(200)
                 overflowM[view] = pgM.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
+                assert_zero_gambling_in_dom(pgM, f"mobile_390_{view}")
                 if view == "activity":
                     svg_w = pgM.evaluate("() => document.getElementById('turgaliumFlowSvg')?.getBoundingClientRect()?.width || 0")
                     assert svg_w >= 700, f"Expected horizontally scrollable readable SVG (>=700px) on mobile, got {svg_w}px"
+                elif view == "ai":
+                    pgM.wait_for_selector("#view-ai.active", timeout=5000)
                 shot_name = "burns" if view == "activity" else view
                 maybe_shot(pgM, f"goal_mobile_{shot_name}_390.png", full_page=True)
 
@@ -1592,7 +1875,7 @@ def main():
               }};
             """)
 
-            def route_export_scan(route):
+            def build_export_scan(body=None):
                 scan_copy = json.loads(json.dumps(veteran_fixture))
                 scan_copy["walletAddress"] = VITALIK
                 scan_copy["assets"].extend([
@@ -1647,9 +1930,16 @@ def main():
                         "honeypotSafe": False,
                     },
                 ])
-                route.fulfill(status=200, content_type="application/json", body=json.dumps(scan_copy))
+                return scan_copy
 
+            def route_export_scan(route):
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(build_export_scan()))
+
+            route_export_hydrate = make_hydrate_route(build_export_scan)
+
+            pgE.route("**/api/workspace/hydrate", route_export_hydrate)
             pgE.route("**/api/scan", route_export_scan)
+            pgE.route("**/api/solana/overview", route_sol_overview)
             pgE.route("**/api/solana/balance*", route_sol_balance)
             pgE.route("**/api/tx/prepare-chain-batch", route_prepare_base_eip5792)
 
@@ -1800,14 +2090,17 @@ def main():
             ctxE.close()
 
             # ------------------------------------------------------------------
-            # 7. PRESERVATION TOOLS (RENT VACUUM, YIELD PARK, APPROVAL REVOKER),
-            #    TIERED FEE & ROUTE AUCTION CLARITY, GAS WATCHDOG, & DEGEN TAB
-            #    ACROSS DESKTOP (1440px), TABLET (900px), AND MOBILE (390px)
+            # 7. PRESERVATION TOOLS (RENT VACUUM, 100% PRINCIPAL-SAFE YIELD PARK,
+            #    APPROVAL REVOKER), CONDENSED BATCH APIs, 1-CLICK SWEEP UX,
+            #    GAS WATCHDOG & ANTI-GAMBLING REGRESSION ACROSS 1440/900/390px
             # ------------------------------------------------------------------
             ctxP = browser.new_context(viewport={"width": 1440, "height": 900})
             pgP = ctxP.new_page()
             errsP = []
             badHttpP = []
+            hydrate_hits_p = []
+            sol_overview_hits_p = []
+            prepare_batch_hits_p = []
             pgP.on("pageerror", lambda e: errsP.append(f"pageerror: {e}"))
             pgP.on("console", lambda m: errsP.append(f"console.{m.type}: {m.text}") if m.type == "error" else None)
             pgP.on(
@@ -1867,7 +2160,9 @@ def main():
               }};
             """)
 
+            pgP.route("**/api/workspace/hydrate", make_hydrate_route(build_deterministic_scan, hits=hydrate_hits_p))
             pgP.route("**/api/scan", route_scan_deterministic)
+            pgP.route("**/api/solana/overview", make_sol_overview_route(hits=sol_overview_hits_p))
             pgP.route("**/api/solana/balance*", route_sol_balance)
 
             # Real valid serialized Solana v0 VersionedTransactions for SOL_PUBKEY (verified client-side pre-sign!)
@@ -1979,9 +2274,9 @@ def main():
             def route_yield_park_mock(route):
                 body = route.request.post_data_json or {}
                 total = float(body.get("totalUsdcAmount", 100))
-                pct = float(body.get("preservePct", 90))
+                pct = float(body.get("preservePct", 100))
                 yield_usdc = round(total * pct / 100.0, 2)
-                degen_usdc = round(total - yield_usdc, 2)
+                liquid_reserve_usdc = round(total - yield_usdc, 2)
                 build_tx = bool(body.get("buildTransaction", False))
                 route.fulfill(
                     status=200,
@@ -2001,10 +2296,13 @@ def main():
                         },
                         "split": {
                             "totalUsdcAmount": total,
+                            "totalUsdcRaw": str(int(round(total * 1_000_000))),
                             "preservePct": pct,
-                            "degenPct": round(100.0 - pct, 2),
+                            "liquidReservePct": round(100.0 - pct, 2),
                             "yieldUsdc": yield_usdc,
-                            "degenSidePocketUsdc": degen_usdc,
+                            "yieldUsdcRaw": str(int(round(yield_usdc * 1_000_000))),
+                            "liquidReserveUsdc": liquid_reserve_usdc,
+                            "liquidReserveRaw": str(int(round(liquid_reserve_usdc * 1_000_000))),
                         },
                         "apy": {
                             "estimatedApyPct": 7.45,
@@ -2015,7 +2313,6 @@ def main():
                             "projectedAnnualYieldUsd": round(yield_usdc * 0.0745, 2),
                             "projectedMonthlyYieldUsd": round(yield_usdc * 0.0745 / 12.0, 2),
                             "projectedDailyYieldUsd": round(yield_usdc * 0.0745 / 365.0, 4),
-                            "yieldFundedDegenMonthlyBudgetUsd": round(yield_usdc * 0.0745 / 12.0, 2),
                         },
                         "jupiterQuote": {
                             "estimatedOutputUi": round(yield_usdc / 150.0, 6),
@@ -2118,74 +2415,101 @@ def main():
                     }),
                 )
 
-            def route_degen_markets_mock(route):
+            def route_prepare_batch_p(route):
+                body = route.request.post_data_json or {}
+                prepare_batch_hits_p.append(body)
+                assets = body.get("assets") or []
+                chains_seen = list(dict.fromkeys([a.get("chain") for a in assets if a.get("chain")]))
                 route.fulfill(
                     status=200,
                     content_type="application/json",
                     body=json.dumps({
-                        "ok": True,
-                        "live": True,
-                        "cached": False,
-                        "fetchedAt": "2026-11-25T20:00:00.000Z",
-                        "apiKeyConfigured": True,
-                        "geoBlocked": False,
-                        "events": [
+                        "preparedAt": "2026-11-27T12:00:00.000Z",
+                        "durationMs": 36,
+                        "count": len(assets),
+                        "readyCount": len(assets),
+                        "failedCount": 0,
+                        "totalNetUsd": 1412.25,
+                        "totalGasUsd": 0.48,
+                        "totalProtocolFeeUsd": 0,
+                        "totalSignatures": max(1, len(chains_seen)),
+                        "items": [
                             {
-                                "eventId": "evt-sol-e2e-1",
-                                "title": "Will SOL close above $250 this month?",
-                                "slug": "sol-above-250",
-                                "category": "crypto",
-                                "isLive": True,
-                                "volumeUsd": 1425000,
-                                "volume24hrUsd": 325000,
-                                "closeTime": "2026-12-31T00:00:00.000Z",
-                                "jupiterUrl": "https://jup.ag/prediction/sol-above-250",
-                                "markets": [
-                                    {
-                                        "marketId": "mkt-sol-250-yes",
-                                        "title": "SOL > $250",
-                                        "yes": {
-                                            "priceUsd": 0.42,
-                                            "cents": 42.0,
-                                            "impliedProbPct": 42.0,
-                                            "payoutMultiplier": 2.38,
-                                        },
-                                        "no": {
-                                            "priceUsd": 0.58,
-                                            "cents": 58.0,
-                                            "impliedProbPct": 58.0,
-                                            "payoutMultiplier": 1.72,
-                                        },
-                                    }
-                                ],
+                                "assetId": a.get("id", f"asset-{idx}"),
+                                "chain": a.get("chain", "base"),
+                                "symbol": a.get("symbol", "USDC"),
+                                "ok": True,
                             }
+                            for idx, a in enumerate(assets)
                         ],
-                        "gameModes": [],
                     }),
                 )
 
-            def route_degen_positions_mock(route):
+            def route_prepare_chain_batch_p(route):
+                body = route.request.post_data_json or {}
+                chain = body.get("chain", "base")
+                chain_id_map = {
+                    "ethereum": 1,
+                    "base": 8453,
+                    "arbitrum": 42161,
+                    "optimism": 10,
+                    "polygon": 137,
+                    "avalanche": 43114,
+                }
+                cid = chain_id_map.get(chain, 8453)
                 route.fulfill(
                     status=200,
                     content_type="application/json",
                     body=json.dumps({
-                        "ok": True,
-                        "owner": SOL_PUBKEY,
-                        "positions": [],
-                        "summary": {
-                            "openCount": 0,
-                            "claimableCount": 0,
-                            "totalClaimablePayoutUsd": 0,
-                            "totalUnrealizedPnlUsd": 0,
-                        },
+                        "chain": chain,
+                        "chainId": cid,
+                        "chainName": chain.title(),
+                        "calls": [{
+                            "stepId": "bridge",
+                            "assetId": f"{chain}-usdc",
+                            "assetSymbol": "USDC",
+                            "action": "BRIDGE_DIRECT_USDC",
+                            "provider": "relay",
+                            "label": f"Bridge {chain} USDC -> Solana",
+                            "to": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                            "data": "0x12345678",
+                            "value": "0x0",
+                        }],
+                        "bridgeTrackers": [{
+                            "assetId": f"{chain}-usdc",
+                            "assetSymbol": "USDC",
+                            "provider": "relay",
+                            "requestId": f"req_{chain}_p",
+                            "estimatedOutput": "250.00 USDC",
+                            "estimatedSeconds": 4,
+                            "requiresSolanaClaim": False,
+                        }],
+                        "skippedAssets": [],
+                        "savings": {"popupsSaved": 1},
+                    }),
+                )
+
+            def route_bridge_status_batch_p(route):
+                body = route.request.post_data_json or {}
+                bridges = body.get("bridges") or []
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({
+                        "results": [
+                            {"id": b.get("id"), "status": "landed", "bridgeStatus": "confirmed"}
+                            for b in bridges
+                        ]
                     }),
                 )
 
             pgP.route("**/api/solana/rent-scan", route_rent_scan_mock)
             pgP.route("**/api/solana/yield-park", route_yield_park_mock)
             pgP.route("**/api/approvals/scan", route_approvals_scan_mock)
-            pgP.route("**/api/degen/markets*", route_degen_markets_mock)
-            pgP.route("**/api/degen/positions*", route_degen_positions_mock)
+            pgP.route("**/api/tx/prepare-batch", route_prepare_batch_p)
+            pgP.route("**/api/tx/prepare-chain-batch", route_prepare_chain_batch_p)
+            pgP.route("**/api/bridge/status-batch", route_bridge_status_batch_p)
+            pgP.route("**/api/tx/status", route_tx_status_ok)
 
             pgP.goto(BASE, wait_until="networkidle")
             pgP.wait_for_timeout(300)
@@ -2225,13 +2549,22 @@ def main():
                 timeout=8000,
             )
 
-            # 7C. 1-Click Post-Arrival Solana Yield Park: strategies loaded, split toggle, preview + 1-Click Park
+            # 7C. 1-Click Post-Arrival Solana Yield Park: 100% principal-safe, zero gambling toggles, preview + 1-Click Park
+            assert len(hydrate_hits_p) >= 1, "Expected POST /api/workspace/hydrate to hydrate wallet on connect!"
+            assert len(sol_overview_hits_p) >= 1, "Expected POST /api/solana/overview to hydrate Solana balance/dust/yield on connect!"
             pgP.wait_for_function(
                 "() => (document.querySelectorAll('#yieldStrategySelect option').length) >= 3",
                 timeout=8000,
             )
-            pgP.click("[data-yield-split='100']")
-            pgP.click("[data-yield-split='90']")
+            yield_safety_check = pgP.evaluate("""() => ({
+              splitButtonsCount: document.querySelectorAll('#yieldParkCard [data-yield-split]').length,
+              principalPill: document.querySelector('#yieldParkCard .ptool-principal-pill')?.textContent?.trim() || '',
+              cardText: document.getElementById('yieldParkCard')?.innerText || '',
+            })""")
+            assert yield_safety_check["splitButtonsCount"] == 0, f"Removed yield split buttons still present: {yield_safety_check}"
+            assert "100% Principal-Safe" in yield_safety_check["principalPill"], yield_safety_check
+            assert_zero_gambling_in_dom(pgP, "preservation_yield_park_card")
+
             pgP.fill("#yieldAmountInput", "500")
             pgP.locator("#yieldAmountInput").dispatch_event("input")
             pgP.click("#previewYieldBtn")
@@ -2240,7 +2573,7 @@ def main():
                 timeout=8000,
             )
             yield_preview_text = pgP.locator("#yieldParkCard").inner_text()
-            assert "7.45%" in yield_preview_text and "$450.00" in yield_preview_text, yield_preview_text
+            assert "7.45%" in yield_preview_text and "$500.00" in yield_preview_text and "Deposited (100%)" in yield_preview_text, yield_preview_text
             pgP.click("#parkYieldBtn")
             pgP.wait_for_function("() => (window.__solSignCallsP || []).length === 2", timeout=8000)
             pgP.wait_for_function(
@@ -2277,36 +2610,50 @@ def main():
             pgP.click("[data-cancel-gas-watch]")
             pgP.wait_for_timeout(200)
 
-            # Return to Sweep for multi-viewport overflow check
+            # Return to Sweep for 1-Click Sweep Batch UX + multi-viewport overflow check
             pgP.click(".app-tab[data-view='scanner']")
             pgP.wait_for_timeout(150)
 
-            # 7F. Degen Tab: mocked live markets + side-pocket cap (default 10%, clamped max 50%)
-            pgP.click(".app-tab[data-view='degen']")
-            pgP.wait_for_selector("#degenCustomPctInput", timeout=10000)
-            pgP.wait_for_function(
-                "() => (document.getElementById('degenRoot')?.innerText || '').includes('SOL close above $250')",
-                timeout=10000,
-            )
-            degen_default_pct = pgP.evaluate("() => Number(document.getElementById('degenCustomPctInput')?.value)")
-            assert degen_default_pct == 10, f"Expected default Degen side-pocket cap 10%, got {degen_default_pct}"
-            pgP.fill("#degenCustomPctInput", "85")
-            pgP.locator("#degenCustomPctInput").dispatch_event("change")
-            pgP.wait_for_timeout(150)
-            degen_clamped_pct = pgP.evaluate("() => Number(document.getElementById('degenCustomPctInput')?.value)")
-            assert degen_clamped_pct == 50, f"Expected Degen side-pocket cap clamped to 50%, got {degen_clamped_pct}"
+            # 7F. 1-Click Sweep Batch UX: POST /api/tx/prepare-batch -> #oneClickSweepSummaryCard -> Cancel -> Confirm & Sign
+            pgP.click("#runLiveQueueBtn")
+            pgP.wait_for_selector("#oneClickSweepSummaryCard:not(.hidden)", timeout=10000)
+            assert len(prepare_batch_hits_p) == 1, f"Expected 1 POST /api/tx/prepare-batch call, got {len(prepare_batch_hits_p)}"
+            summary_text = pgP.locator("#oneClickSweepSummaryCard").inner_text()
+            assert (
+                "Pre-Sign Sweep Summary" in summary_text
+                and "0% ($0.00)" in summary_text
+                and ("$1.41k" in summary_text or "$1,412.25" in summary_text)
+            ), summary_text
+            assert pgP.locator("#confirmOneClickSweepBtn").count() == 1, summary_text
 
-            # 7G. Verify 0px horizontal overflow across Desktop (1440px), Tablet (900px), Mobile (390px)
-            # on BOTH Sweep (with Preservation Tools populated) and Degen views
+            # Cancel hides summary cleanly
+            pgP.click("#cancelOneClickSweepBtn")
+            pgP.wait_for_selector("#oneClickSweepSummaryCard", state="hidden", timeout=5000)
+
+            # Re-open 1-Click Sweep summary and confirm execution, waiting for queue completion
+            rpc_before_sweep = pgP.evaluate("() => (window.__evmRpcP || []).length")
+            pgP.click("#runLiveQueueBtn")
+            pgP.wait_for_selector("#confirmOneClickSweepBtn", timeout=10000)
+            pgP.click("#confirmOneClickSweepBtn")
+            pgP.wait_for_selector("#agentStatusCard:not(.hidden)", timeout=15000)
+            pgP.wait_for_function(
+                f"() => (window.__evmRpcP || []).length > {rpc_before_sweep} && !document.getElementById('runLiveQueueBtn')?.disabled",
+                timeout=20000,
+            )
+
+            # 7G. Verify 0px horizontal overflow & zero gambling DOM across Desktop (1440px), Tablet (900px), Mobile (390px)
+            # on BOTH Sweep (with Preservation Tools populated) and AI views
             overflowP = {}
             for label, vp in [("1440", {"width": 1440, "height": 900}), ("900", {"width": 900, "height": 800}), ("390", {"width": 390, "height": 844})]:
                 pgP.set_viewport_size(vp)
                 pgP.click(".app-tab[data-view='scanner']")
                 pgP.wait_for_timeout(180)
                 overflowP[f"scanner_{label}"] = pgP.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
-                pgP.click(".app-tab[data-view='degen']")
+                assert_zero_gambling_in_dom(pgP, f"preservation_scanner_{label}")
+                pgP.click(".app-tab[data-view='ai']")
                 pgP.wait_for_timeout(180)
-                overflowP[f"degen_{label}"] = pgP.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
+                overflowP[f"ai_{label}"] = pgP.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
+                assert_zero_gambling_in_dom(pgP, f"preservation_ai_{label}")
 
             # 7H. Wave 8C Hardening: verify Lite mode resets burnToggle/executionMode and wallet disconnect isolates state
             pgP.set_viewport_size({"width": 1440, "height": 900})
@@ -2337,17 +2684,21 @@ def main():
 
             xss_p = pgP.evaluate("() => Boolean(window.__xssP)")
             assert not xss_p, "XSS payload executed in Preservation Tools!"
-            assert all(v <= 0 for v in overflowP.values()), f"Preservation/Degen overflow: {overflowP}"
-            assert not errsP, f"Preservation/Degen errors: {errsP}"
-            assert not badHttpP, f"Preservation/Degen bad HTTP: {badHttpP}"
-            results["preservation_tools_and_degen_ux"] = {
+            assert all(v <= 0 for v in overflowP.values()), f"Preservation/AI overflow: {overflowP}"
+            assert not errsP, f"Preservation/One-Click Sweep errors: {errsP}"
+            assert not badHttpP, f"Preservation/One-Click Sweep bad HTTP: {badHttpP}"
+            results["preservation_tools_and_one_click_sweep"] = {
                 "ok": True,
                 "tieredFeeAndRouteWinnerVerified": True,
+                "workspaceHydrateUsed": len(hydrate_hits_p) >= 1,
+                "solanaOverviewUsed": len(sol_overview_hits_p) >= 1,
+                "prepareBatchUsed": len(prepare_batch_hits_p) >= 2,
                 "rentReclaimSigned": True,
-                "yieldParkQuotedAndSigned": True,
+                "yieldParkPrincipalSafe100Pct": True,
                 "approvalsSingleAndBatchRevoked": True,
                 "gasWatchdogCreatedAndCancelled": True,
-                "degenCapDefault10Clamped50": True,
+                "oneClickSweepSummaryAndConfirmVerified": True,
+                "zeroGamblingElementsVerified": True,
                 "liteResetAndDisconnectIsolationVerified": True,
                 "xssBlocked": True,
                 "overflowPx": overflowP,
@@ -2421,8 +2772,8 @@ def main():
                     body=json.dumps({"error": "Missing or invalid X-Turgalium-Admin-Session header."}),
                 )
 
-            def route_w9_scan(route):
-                body = route.request.post_data_json or {}
+            def build_w9_scan(body=None):
+                body = body or {}
                 scan_copy = json.loads(json.dumps(veteran_fixture))
                 scan_copy["walletAddress"] = body.get("address", VITALIK)
                 scan_copy["family"] = "evm"
@@ -2547,7 +2898,13 @@ def main():
                     scan_copy["chains"].append({"chain": "unichain", "chainName": "Unichain", "assetCount": 1, "totalUsd": 250})
                 if not any(c.get("chain") == "zksync" for c in scan_copy["chains"]):
                     scan_copy["chains"].append({"chain": "zksync", "chainName": "zkSync Era", "assetCount": 1, "totalUsd": 0})
-                route.fulfill(status=200, content_type="application/json", body=json.dumps(scan_copy))
+                return scan_copy
+
+            def route_w9_scan(route):
+                body = route.request.post_data_json or {}
+                route.fulfill(status=200, content_type="application/json", body=json.dumps(build_w9_scan(body)))
+
+            route_w9_hydrate = make_hydrate_route(build_w9_scan)
 
             def route_w9_rent_scan(route):
                 body = route.request.post_data_json or {}
@@ -2573,7 +2930,9 @@ def main():
             pgW9.route("**/api/agents/gas-watch*", route_w9_admin_401)
             pgW9.route("**/api/plugin/setup*", route_w9_admin_401)
             pgW9.route("**/api/plugin/tokens*", route_w9_admin_401)
+            pgW9.route("**/api/workspace/hydrate", route_w9_hydrate)
             pgW9.route("**/api/scan", route_w9_scan)
+            pgW9.route("**/api/solana/overview", route_sol_overview)
             pgW9.route("**/api/solana/balance*", route_sol_balance)
             pgW9.route("**/api/solana/rent-scan", route_w9_rent_scan)
 

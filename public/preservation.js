@@ -741,6 +741,35 @@ function installScanObserver() {
       if (
         response.ok &&
         method === 'POST' &&
+        (url.endsWith('/api/workspace/hydrate') || url.includes('/api/workspace/hydrate?'))
+      ) {
+        response
+          .clone()
+          .json()
+          .then((hydrated) => {
+            if (hydrated?.scan && Array.isArray(hydrated.scan.assets)) {
+              latestScanReport = hydrated.scan;
+              latestRouteAuction = null;
+              window.dispatchEvent(
+                new CustomEvent('turgalium:scan-updated', { detail: { scanReport: hydrated.scan } })
+              );
+              if (hydrated.preservation && hydrated.preservation.totals) {
+                optimizeSeq += 1;
+                latestPreservation = hydrated.preservation;
+                if (typeof hydrated.preservation.gasTiming?.primary?.currentGwei === 'number') {
+                  latestEthGwei = hydrated.preservation.gasTiming.primary.currentGwei;
+                }
+                renderPreservationStrip();
+                renderGasWatchAgentsPanel();
+              } else {
+                runPreservationOptimization(hydrated.scan);
+              }
+            }
+          })
+          .catch(() => {});
+      } else if (
+        response.ok &&
+        method === 'POST' &&
         (url.endsWith('/api/scan') ||
           url.includes('/api/scan?') ||
           url.endsWith('/api/scan/unified'))
@@ -758,7 +787,10 @@ function installScanObserver() {
       } else if (
         response.ok &&
         method === 'POST' &&
-        (url.endsWith('/api/tx/prepare-chain-batch') || url.includes('/api/tx/prepare-chain-batch?'))
+        (url.endsWith('/api/tx/prepare-chain-batch') ||
+          url.includes('/api/tx/prepare-chain-batch?') ||
+          url.endsWith('/api/tx/prepare-batch') ||
+          url.includes('/api/tx/prepare-batch?'))
       ) {
         response
           .clone()
@@ -768,6 +800,9 @@ function installScanObserver() {
               batchData?.routeAuction ||
               (Array.isArray(batchData?.bridgeTrackers)
                 ? batchData.bridgeTrackers.find((b) => b?.routeAuction)?.routeAuction
+                : null) ||
+              (Array.isArray(batchData?.items)
+                ? batchData.items.find((it) => it?.prepared?.routeAuction)?.prepared?.routeAuction
                 : null);
             if (auction && auction.winnerProvider) {
               latestRouteAuction = auction;

@@ -2305,9 +2305,12 @@ export interface SolanaWalletBalance {
   checkedAt: string;
 }
 
+const inFlightSolanaBalances = new Map<string, Promise<SolanaWalletBalance>>();
+
 /**
  * Fetches live Solana Mainnet SOL + native USDC balances for a Solana public key.
- * Validates the base58 Ed25519 key first, then queries PublicNode -> Solana Mainnet RPC with failover.
+ * Validates the base58 Ed25519 key first, coalesces concurrent in-flight requests for the
+ * same pubkey, and queries PublicNode -> Solana Mainnet RPC with failover.
  */
 export async function fetchSolanaWalletBalances(
   solanaAddress: string
@@ -2319,77 +2322,87 @@ export async function fetchSolanaWalletBalances(
     throw new Error('Invalid Solana address');
   }
 
-  let lastErr: unknown;
-  for (const rpcUrl of SOLANA_RPC_URLS) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4500);
-    try {
-      const res = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify([
-          { jsonrpc: '2.0', id: 1, method: 'getBalance', params: [pubkey, { commitment: 'confirmed' }] },
-          {
-            jsonrpc: '2.0',
-            id: 2,
-            method: 'getTokenAccountsByOwner',
-            params: [pubkey, { mint: SOLANA_USDC_MINT }, { encoding: 'jsonParsed', commitment: 'confirmed' }],
-          },
-        ]),
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) {
-        lastErr = new Error(`Solana RPC HTTP ${res.status}`);
-        continue;
-      }
+  const existing = inFlightSolanaBalances.get(pubkey);
+  if (existing) return existing;
 
-      const parsed = (await res.json()) as Array<{
-        id: number;
-        result?: {
-          context?: { slot?: number };
-          value?:
-            | number
-            | Array<{
-                account?: {
-                  data?: {
-                    parsed?: { info?: { tokenAmount?: { uiAmount?: number } } };
+  const task = (async (): Promise<SolanaWalletBalance> => {
+    let lastErr: unknown;
+    for (const rpcUrl of SOLANA_RPC_URLS) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      try {
+        const res = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify([
+            { jsonrpc: '2.0', id: 1, method: 'getBalance', params: [pubkey, { commitment: 'confirmed' }] },
+            {
+              jsonrpc: '2.0',
+              id: 2,
+              method: 'getTokenAccountsByOwner',
+              params: [pubkey, { mint: SOLANA_USDC_MINT }, { encoding: 'jsonParsed', commitment: 'confirmed' }],
+            },
+          ]),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (!res.ok) {
+          lastErr = new Error(`Solana RPC HTTP ${res.status}`);
+          continue;
+        }
+
+        const parsed = (await res.json()) as Array<{
+          id: number;
+          result?: {
+            context?: { slot?: number };
+            value?:
+              | number
+              | Array<{
+                  account?: {
+                    data?: {
+                      parsed?: { info?: { tokenAmount?: { uiAmount?: number } } };
+                    };
                   };
-                };
-              }>;
+                }>;
+          };
+        }>;
+
+        const byId = new Map((Array.isArray(parsed) ? parsed : [parsed]).map((r) => [r.id, r]));
+        const balRes = byId.get(1)?.result;
+        const tokRes = byId.get(2)?.result;
+        if (!balRes) {
+          lastErr = new Error('Solana RPC returned empty balance response');
+          continue;
+        }
+
+        const lamports = typeof balRes.value === 'number' ? balRes.value : 0;
+        const accounts = Array.isArray(tokRes?.value) ? tokRes.value : [];
+        const usdcBalance = accounts.reduce(
+          (sum, acc) => sum + Number(acc.account?.data?.parsed?.info?.tokenAmount?.uiAmount ?? 0),
+          0
+        );
+
+        return {
+          address: pubkey,
+          solBalance: Number((lamports / 1e9).toFixed(6)),
+          usdcBalance: Number(usdcBalance.toFixed(6)),
+          hasUsdcAta: accounts.length > 0,
+          slot: balRes.context?.slot ?? 0,
+          checkedAt: new Date().toISOString(),
         };
-      }>;
-
-      const byId = new Map((Array.isArray(parsed) ? parsed : [parsed]).map((r) => [r.id, r]));
-      const balRes = byId.get(1)?.result;
-      const tokRes = byId.get(2)?.result;
-      if (!balRes) {
-        lastErr = new Error('Solana RPC returned empty balance response');
-        continue;
+      } catch (err) {
+        clearTimeout(timer);
+        lastErr = err;
       }
-
-      const lamports = typeof balRes.value === 'number' ? balRes.value : 0;
-      const accounts = Array.isArray(tokRes?.value) ? tokRes.value : [];
-      const usdcBalance = accounts.reduce(
-        (sum, acc) => sum + Number(acc.account?.data?.parsed?.info?.tokenAmount?.uiAmount ?? 0),
-        0
-      );
-
-      return {
-        address: pubkey,
-        solBalance: Number((lamports / 1e9).toFixed(6)),
-        usdcBalance: Number(usdcBalance.toFixed(6)),
-        hasUsdcAta: accounts.length > 0,
-        slot: balRes.context?.slot ?? 0,
-        checkedAt: new Date().toISOString(),
-      };
-    } catch (err) {
-      clearTimeout(timer);
-      lastErr = err;
     }
-  }
 
-  throw new Error(
-    `Solana RPC unavailable (${lastErr instanceof Error ? lastErr.message : 'timeout'})`
-  );
+    throw new Error(
+      `Solana RPC unavailable (${lastErr instanceof Error ? lastErr.message : 'timeout'})`
+    );
+  })().finally(() => {
+    inFlightSolanaBalances.delete(pubkey);
+  });
+
+  inFlightSolanaBalances.set(pubkey, task);
+  return task;
 }

@@ -1169,37 +1169,75 @@ export async function scanLiveWallet(
     }
   }
 
-  // Probe ERC-4626 vaults (curated + discovered) in Multicall3 for convertToAssets / previewRedeem / maxRedeem / cooldownDuration
+  // Run ERC-4626 vault probes, Aave debt safety checks, and Permit2 Multicall3 allowance checks
+  // in a SINGLE parallel fan-out (eliminating a serial RPC round-trip waterfall on every EVM scan).
   const erc4626ByChain = new Map<EvmChainId, RawAssetSeed[]>();
+  const aavePoolKeys = new Map<string, { chain: EvmChainId; poolAddress?: string }>();
+  const erc20ByChain = new Map<EvmChainId, string[]>();
   for (const a of rawAssets) {
     if (a.kind === 'defi_position' && identifyProtocolExtractorId(a) === 'erc4626') {
       const list = erc4626ByChain.get(a.chain) ?? [];
       list.push(a);
       erc4626ByChain.set(a.chain, list);
     }
+    if (a.kind === 'defi_position' && (a.protocol ?? '').toLowerCase().includes('aave')) {
+      const isV2 = (a.protocol ?? '').toLowerCase().includes('aave v2');
+      const poolAddress =
+        a.protocolAddress || (isV2 ? AAVE_V2_LENDING_POOLS[a.chain] : EVM_CHAINS[a.chain].aaveV3Pool);
+      const key = `${a.chain}:${(poolAddress ?? '').toLowerCase()}`;
+      aavePoolKeys.set(key, { chain: a.chain, poolAddress });
+    }
+    if (a.address !== 'native' && a.kind !== 'dead_token' && !a.honeypot) {
+      const list = erc20ByChain.get(a.chain) ?? [];
+      list.push(a.address);
+      erc20ByChain.set(a.chain, list);
+    }
   }
-  if (erc4626ByChain.size > 0) {
-    const vaultResults = await Promise.all(
-      Array.from(erc4626ByChain.entries()).map(async ([chain, seeds]) => {
-        const cfg = EVM_CHAINS[chain];
-        const map = await probeErc4626VaultStates({
+
+  const [vaultResults, aaveChecks, permit2Checks] = await Promise.all([
+    erc4626ByChain.size > 0
+      ? Promise.all(
+          Array.from(erc4626ByChain.entries()).map(async ([chain, seeds]) => {
+            const map = await probeErc4626VaultStates({
+              chain,
+              owner: cleanAddr,
+              vaults: seeds.map((s) => ({
+                address: s.protocolAddress || s.address,
+                rawBalance: s.rawBalance,
+                decimals: s.decimals,
+                underlyingDecimals: resolveUnderlyingDecimals({
+                  chain,
+                  underlyingAddress: s.underlyingAddress,
+                  explicitDecimals: s.underlyingDecimals,
+                  fallbackDecimals: s.decimals,
+                }),
+              })),
+            });
+            return [chain, map] as const;
+          })
+        )
+      : Promise.resolve([]),
+    aavePoolKeys.size > 0
+      ? Promise.all(
+          Array.from(aavePoolKeys.entries()).map(async ([key, { chain, poolAddress }]) => [
+            key,
+            await checkAaveV3AccountSafety(chain, cleanAddr, poolAddress),
+          ] as const)
+        )
+      : Promise.resolve([]),
+    Promise.all(
+      Array.from(erc20ByChain.entries()).map(async ([chain, tokenAddresses]) => {
+        const approved = await detectPermit2Allowances({
           chain,
           owner: cleanAddr,
-          vaults: seeds.map((s) => ({
-            address: s.protocolAddress || s.address,
-            rawBalance: s.rawBalance,
-            decimals: s.decimals,
-            underlyingDecimals: resolveUnderlyingDecimals({
-              chain,
-              underlyingAddress: s.underlyingAddress,
-              explicitDecimals: s.underlyingDecimals,
-              fallbackDecimals: s.decimals,
-            }),
-          })),
+          tokenAddresses,
         });
-        return [chain, map] as const;
+        return [chain, approved] as const;
       })
-    );
+    ),
+  ]);
+
+  if (vaultResults.length > 0) {
     const vaultMapByChain = new Map(vaultResults);
     for (const a of rawAssets) {
       if (a.kind !== 'defi_position' || identifyProtocolExtractorId(a) !== 'erc4626') continue;
@@ -1208,7 +1246,6 @@ export async function scanLiveWallet(
       a.vaultState = vState;
       a.expectedUnderlyingRaw = vState.expectedUnderlyingRaw;
       // Re-price share value accurately using convertToAssets/previewRedeem when priced from underlying token
-      const cfg = EVM_CHAINS[a.chain];
       const uDec = resolveUnderlyingDecimals({
         chain: a.chain,
         underlyingAddress: a.underlyingAddress,
@@ -1232,44 +1269,6 @@ export async function scanLiveWallet(
       }
     }
   }
-
-  // Run Aave debt safety checks and Permit2 Multicall3 allowance checks in parallel
-  const aavePoolKeys = new Map<string, { chain: EvmChainId; poolAddress?: string }>();
-  const erc20ByChain = new Map<EvmChainId, string[]>();
-  for (const a of rawAssets) {
-    if (a.kind === 'defi_position' && (a.protocol ?? '').toLowerCase().includes('aave')) {
-      const isV2 = (a.protocol ?? '').toLowerCase().includes('aave v2');
-      const poolAddress =
-        a.protocolAddress || (isV2 ? AAVE_V2_LENDING_POOLS[a.chain] : EVM_CHAINS[a.chain].aaveV3Pool);
-      const key = `${a.chain}:${(poolAddress ?? '').toLowerCase()}`;
-      aavePoolKeys.set(key, { chain: a.chain, poolAddress });
-    }
-    if (a.address !== 'native' && a.kind !== 'dead_token' && !a.honeypot) {
-      const list = erc20ByChain.get(a.chain) ?? [];
-      list.push(a.address);
-      erc20ByChain.set(a.chain, list);
-    }
-  }
-  const [aaveChecks, permit2Checks] = await Promise.all([
-    aavePoolKeys.size > 0
-      ? Promise.all(
-          Array.from(aavePoolKeys.entries()).map(async ([key, { chain, poolAddress }]) => [
-            key,
-            await checkAaveV3AccountSafety(chain, cleanAddr, poolAddress),
-          ] as const)
-        )
-      : Promise.resolve([]),
-    Promise.all(
-      Array.from(erc20ByChain.entries()).map(async ([chain, tokenAddresses]) => {
-        const approved = await detectPermit2Allowances({
-          chain,
-          owner: cleanAddr,
-          tokenAddresses,
-        });
-        return [chain, approved] as const;
-      })
-    ),
-  ]);
   if (aaveChecks.length > 0) {
     const aaveMap = new Map(aaveChecks);
     for (const a of rawAssets) {
@@ -1330,7 +1329,7 @@ export async function scanPresetWallet(presetId: string): Promise<ScanReport> {
     'ethereum:0x514910771AF9Ca656af840dff83E8264EcF986CA',
     'ethereum:0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984',
     'base:0x940181a94A35A4569E4529A3CDfB74e38FD98631',
-    'base:0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed',
+    'base:0x532f27101965dd16442E59d40670FaF5eBB142E4',
     'arbitrum:0x912CE59144191C1204E64559FE8253a0e49E6548',
     'arbitrum:0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8',
     'optimism:0x4200000000000000000000000000000000000042',
@@ -1391,14 +1390,14 @@ export async function scanPresetWallet(presetId: string): Promise<ScanReport> {
         },
         {
           chain: 'base',
-          address: '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed',
-          symbol: 'DEGEN',
-          name: 'Degen (Base)',
+          address: '0x532f27101965dd16442E59d40670FaF5eBB142E4',
+          symbol: 'BRETT',
+          name: 'Brett (Base)',
           decimals: 18,
           kind: 'erc20',
-          rawBalance: 24_500n * 10n ** 18n,
-          priceUsd: prices.get('base:0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed') ?? 0.0042,
-          liquidityUsd: 4_500_000,
+          rawBalance: 2_750n * 10n ** 18n,
+          priceUsd: prices.get('base:0x532f27101965dd16442E59d40670FaF5eBB142E4') ?? 0.038,
+          liquidityUsd: 8_500_000,
         },
         {
           chain: 'optimism',
@@ -1510,7 +1509,7 @@ export async function scanPresetWallet(presetId: string): Promise<ScanReport> {
           liquidityUsd: 0,
         },
 
-        // BASE — Compound v3 + AERO + DEGEN + dead token
+        // BASE — Compound v3 + AERO + BRETT + dead token
         {
           chain: 'base',
           address: '0xb125E6687d4313864e53df431d5425969c15Eb2F',
@@ -1538,14 +1537,14 @@ export async function scanPresetWallet(presetId: string): Promise<ScanReport> {
         },
         {
           chain: 'base',
-          address: '0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed',
-          symbol: 'DEGEN',
-          name: 'Degen (Base)',
+          address: '0x532f27101965dd16442E59d40670FaF5eBB142E4',
+          symbol: 'BRETT',
+          name: 'Brett (Base)',
           decimals: 18,
           kind: 'erc20',
-          rawBalance: 16_800n * 10n ** 18n,
-          priceUsd: prices.get('base:0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed') ?? 0.0042,
-          liquidityUsd: 4_500_000,
+          rawBalance: 1_850n * 10n ** 18n,
+          priceUsd: prices.get('base:0x532f27101965dd16442E59d40670FaF5eBB142E4') ?? 0.038,
+          liquidityUsd: 8_500_000,
         },
         {
           chain: 'base',

@@ -2856,7 +2856,7 @@ export async function claimCctpOnSolana(claimPlan, options = {}) {
 
 /**
  * Signs and submits a server-built Solana VersionedTransaction (base64),
- * such as Empty-ATA Rent Reclaim, Jupiter Swap Yield Park, or Jupiter Prediction Order.
+ * such as Empty-ATA Rent Reclaim, SPL Dust Sweep, or Jupiter Swap Yield Park.
  * ALWAYS deserializes and verifies fee payer, Wallet Standard account match, and
  * flow-specific program/instruction constraints before touching the wallet.
  */

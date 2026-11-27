@@ -9,7 +9,7 @@
 **Bring every chain home to Solana — 0% protocol fees, 100% open source (MIT).**
 *Named after Turgalium — the ancient homeland of Maximus Decimus Meridius.*
 
-Turgalium is a free, MIT-licensed, non-custodial multi-chain portfolio migration engine that scans wallets across **30 live chains / 7 ecosystems** (**19 EVMs**, **6 Cosmos/IBC chains**, **Sui**, **Aptos**, **TON**, **Tron**, and **Bitcoin**), unwinds DeFi positions in 1 click, races cross-chain bridge routes in parallel for maximum net arrival, rescues batchable dust under a signed Two-Level Negative-ROI Guard, settles directly to your **Solana (USDC / SOL)** wallet with **0% protocol fees**, and includes Solana Rent Reclaim, Solana SPL Dust Consolidation, Post-Arrival Yield Park, Safe Multisig Batch Export, Migration Tax Export, Stale ERC-20 Approval Revoker, Jupiter Prediction Markets, and Claude MCP / ChatGPT Actions.
+Turgalium is a free, MIT-licensed, non-custodial multi-chain portfolio migration engine that scans wallets across **30 live chains / 7 ecosystems** (**19 EVMs**, **6 Cosmos/IBC chains**, **Sui**, **Aptos**, **TON**, **Tron**, and **Bitcoin**), unwinds DeFi positions in 1 click, races cross-chain bridge routes in parallel for maximum net arrival, rescues batchable dust under a signed Two-Level Negative-ROI Guard, settles directly to your **Solana (USDC / SOL)** wallet with **0% protocol fees**, and includes 1-Click Multi-Chain Sweep, Solana Rent Reclaim, Solana SPL Dust Consolidation, 100% Principal-Safe Post-Arrival Yield Park, Safe Multisig Batch Export, Migration Tax Export, Stale ERC-20 Approval Revoker, and Claude MCP / ChatGPT Actions.
 
 - **Live App:** [https://turgalium.vercel.app](https://turgalium.vercel.app)
 - **Repository:** [https://github.com/TrustlessMike/turgalium](https://github.com/TrustlessMike/turgalium)
@@ -25,7 +25,8 @@ Turgalium is a free, MIT-licensed, non-custodial multi-chain portfolio migration
 - **Live Parallel Route Auction (`src/execution/route-auction.ts`)**: Races **Circle CCTP V2 Fast Transfer (`minFinalityThreshold=1000`)**, **Mayan Swift**, **deBridge DLN**, **Relay**, and **LI.FI** in parallel, selecting strictly by highest net USD.
 - **1-Click Empty-ATA SOL Rent Reclaim (`src/bridge/solana-rent.ts`)**: Reclaims `0.00203928 SOL` per empty SPL / Token-2022 account via compiled `VersionedTransaction` (`MessageV0`) with strict client-side `CloseAccount` & fee-payer verification.
 - **Solana SPL Dust Consolidation**: Batch-sweeps scattered low-value SPL & Token-2022 balances directly into SOL or USDC with ROI guardrails and optional empty-account rent recovery.
-- **1-Click Earn on Solana (`src/solana/yield-park.ts`)**: Parks 90% (or 100%) into **JupSOL**, **Jupiter Lend (`jlUSDC`)**, or **Kamino USDC**, paired with an optional capped **Jupiter Prediction Markets Degen Tab** (`src/degen/jupiter-markets.ts`).
+- **1-Click Multi-Chain Sweep UX**: Connecting an EVM wallet or selecting an address automatically hydrates your scan and optimal route plan in one round-trip. A single primary **1-Click Sweep** action prepares all selected profitable assets in parallel, displays a concise single-card pre-sign summary (total net USD arriving on Solana, `0%` Turgalium fee, exact signature count, chains covered), and runs through wallet signing, automatic chain switching, and live batch finality tracking.
+- **1-Click Earn on Solana (`src/solana/yield-park.ts`)**: Parks **100% principal-safe** arrived USDC directly into **JupSOL**, **Jupiter Lend (`jlUSDC`)**, or **Kamino USDC** with live APY quotes and 1-click VersionedTransaction signing.
 - **Safe Multisig Batching & Tax / Accounting Export**: Export multi-step EVM migration plans as **Safe Transaction Builder** JSON batches for multisig treasuries, and download timestamped migration receipts (source chains, gross/net USD, gas & bridge fees, tx hashes, and Solana settlement details) as CSV/JSON for tax & accounting reconciliation.
 - **1-Click Stale ERC-20 Approval Revoker (`src/scanner/approvals.ts`)**: Multicall3 allowance scan across all 19 EVM chains + EIP-5792 batch `approve(spender, 0)` revocation.
 
@@ -50,9 +51,20 @@ Turgalium is a free, MIT-licensed, non-custodial multi-chain portfolio migration
 - Verified with **37 Foundry unit/fuzz/exploit-proof tests** + **3 live Ethereum Mainnet-fork tests**.
 
 ### 5. Permissioned AI Agents, Public SDK & Production Hardening (`src/agent/`, `src/mcp/`, `src/sdk/`)
-- **Claude MCP (`POST /mcp` & `npx turgalium-mcp`)**: Exposes 10 scoped tools (`scan:read`, `dust:plan`, `agent:propose`) including `turgalium_preservation_audit`, `turgalium_list_unlock_schedule`, `turgalium_solana_rent_scan`, `turgalium_solana_yield_preview`, and read-only `turgalium_degen_markets`.
-- **Public TypeScript SDK (`src/sdk/index.ts`)**: Import the scanner, chain registry, parallel route auction, CCTP V2 builder, Solana rent/yield tools, and server/MCP factories directly from `turgalium-migrator`.
+- **Claude MCP (`POST /mcp` & `npx turgalium-mcp`)**: Exposes scoped read/propose tools (`scan:read`, `dust:plan`, `agent:propose`) including `turgalium_preservation_audit`, `turgalium_list_unlock_schedule`, `turgalium_solana_rent_scan`, and `turgalium_solana_yield_preview`.
+- **Public TypeScript SDK (`src/sdk/index.ts`)**: Import the scanner, chain registry, parallel route auction, batch transaction preparer, CCTP V2 builder, Solana rent/yield tools, and server/MCP factories directly from `turgalium-migrator`.
 - **Production Hardening**: Atomic file-backed persistence (`TURGALIUM_DATA_DIR`) with corrupt-file quarantine, sliding-window rate limiter, RPC circuit breaker with URL redaction, fail-closed non-loopback admin auth, strict HTML/API CSP & CORP headers, Vercel adapter (`api/index.mjs`), multi-stage Node 22 `Dockerfile`, `docker-compose.yml`, and `fly.toml`.
+
+### 6. Condensed Batch Backend APIs (`src/server/app.ts`)
+Turgalium batches multi-step wallet hydration, transaction preparation, Solana overview, bridge finality polling, and AI handoff into condensed server-side endpoints with in-flight request deduplication and short TTL caching (`refresh: true` bypasses caches):
+
+| Endpoint | Purpose | Key Request / Response Fields |
+| :--- | :--- | :--- |
+| `POST /api/workspace/hydrate` | Single round-trip wallet load (scan + route plan + preservation + optional Solana overview) | Req: `{ address?, presetId?, family?, chains?, refresh?, solanaDestination?, outputAsset?, bridgePreference?, includeSolanaOverview? }` → Res: `{ cached, timingMs: { total, scan, plan, solana }, scan, plan, preservation, solanaBalances, solanaOverview }` |
+| `POST /api/tx/prepare-batch` | Parallel transaction preparation + optional DeFi preflight across up to 12 selected assets | Req: `{ assets, userAddress, solanaDestination, outputAsset?, bridgePreference?, hasSolanaUsdcAta?, includePreflight? }` → Res: `{ preparedAt, durationMs, count, readyCount, failedCount, totalNetUsd, totalGasUsd, totalProtocolFeeUsd: 0, totalSignatures, items }` |
+| `POST /api/solana/overview` | Single-call Solana wallet hydration (SOL/USDC balances + SPL dust scan + live yield APYs) | Req: `{ address, dustMaxUsd?, dustOutputAsset? }` → Res: `{ address, durationMs, balances, dust, yieldStrategies, rpcUnavailable }` |
+| `POST /api/bridge/status-batch` | Parallel cross-chain finality & bridge fill polling for all in-flight legs in 1 request | Req: `{ bridges: [{ id?, chain, txHash, provider?, requestId?, solanaDestination? }] }` → Res: batched per-leg settlement statuses |
+| `POST /api/agent/handoff` | Non-custodial read-only AI review & handoff kit for Claude / ChatGPT assistants | Req: `{ wallet?, family?, solanaDestination?, outputAsset?, agentName?, note? }` → Res: scoped workspace hydration URL, MCP/OpenAPI prompts & read-only instructions |
 
 ---
 
