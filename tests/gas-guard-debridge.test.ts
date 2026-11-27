@@ -284,6 +284,38 @@ test('Wave 24: evaluateChainNativeGasStatus and buildGasRefuelQuote + HTTP /api/
   assert.equal(quote.toChain, 'polygon');
   assert.equal(quote.transaction.to, RELAY_ROUTER);
   assert.equal(quote.transaction.chainId, 8453);
+  assert.ok(quote.amountInUi < 0.01, `Expected ~$1 in ETH (<0.01 ETH), got ${quote.amountInUi}`);
+
+  // Regression guard: using default FALLBACK_PRICES via nativeLlamaId must NOT fall back to $1/ETH (1.0 ETH!)
+  const quoteDefaultPrices = await buildGasRefuelQuote({
+    fromChain: 'base',
+    toChain: 'polygon',
+    userAddress: USER_ADDR,
+    amountUsd: 1.0,
+    nativePrices: {},
+    fetcher: (async () =>
+      new Response(
+        JSON.stringify({
+          requestId: 'req_refuel_default',
+          details: {
+            timeEstimate: 4,
+            currencyOut: { amountFormatted: '4.10', amountUsd: '0.98', currency: { symbol: 'POL' } },
+          },
+          steps: [
+            {
+              id: 'deposit',
+              kind: 'transaction',
+              items: [{ data: { from: USER_ADDR, to: RELAY_ROUTER, data: '0x', value: '595000000000000', chainId: 8453 } }],
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )) as unknown as typeof fetch,
+  });
+  assert.ok(
+    quoteDefaultPrices.amountInUi > 0 && quoteDefaultPrices.amountInUi < 0.005,
+    `Expected fallback ETH price via coingecko:ethereum (~0.0006 ETH), got ${quoteDefaultPrices.amountInUi}`
+  );
 
   // HTTP validation check on POST /api/gas/refuel-quote (same chain rejected 400)
   const app = createTurgaliumServer({ enableBackgroundPollers: false });
