@@ -1705,7 +1705,12 @@ function getPlainDisplayToken(asset, plan) {
 
 function normalizeDefiPosition(asset, targetOut = outputAsset) {
   const plan = asset?.defiExitPlan && typeof asset.defiExitPlan === 'object' ? asset.defiExitPlan : null;
-  const protocolGroup = getProtocolGroupName(asset);
+  const backendDisplay =
+    asset?.defiDisplay && typeof asset.defiDisplay === 'object' ? asset.defiDisplay : null;
+  const protocolGroup =
+    plan?.protocolName || plan?.protocol
+      ? getProtocolGroupName(asset)
+      : backendDisplay?.protocolGroup || getProtocolGroupName(asset);
   const localLogo = getProtocolLogoPath(protocolGroup) || getProtocolLogoPath(asset?.protocol) || '/logos/vault.svg';
   const remoteLogo = safeHttpUrl(asset?.protocolLogoUrl || plan?.protocolLogoUrl);
   const protocolLogo = localLogo === '/logos/vault.svg' && remoteLogo ? remoteLogo : localLogo;
@@ -6559,93 +6564,51 @@ async function pollInflightBridgesFinality({ manual = false } = {}) {
   let anyLanded = false;
 
   try {
-    for (const entry of pending.slice(0, 6)) {
-      const isEvmHash = /^0x[0-9a-fA-F]{64}$/.test(entry.txHash);
-      if (isCctpBridgeEntry(entry) && isEvmHash) {
-        try {
-          const att = await api('/api/cctp/attestation', {
-            method: 'POST',
-            body: JSON.stringify({
-              chain: entry.chain,
-              txHash: entry.txHash,
-              solanaDestination: entry.solanaDestination || undefined,
-            }),
-          });
-          if (att && typeof att === 'object') {
-            const nextAtt = String(att.attestationStatus || '').toLowerCase();
-            if (nextAtt === 'complete') {
-              entry.status = 'attested';
-              entry.attestationStatus = 'complete';
-              entry.requiresSolanaClaim = true;
-              entry.statusText = att.nextStep || 'CCTP V2 attested — ready to claim on Solana';
-              entry.updatedAt = Date.now();
-              anyChanged = true;
-            } else if (att.nextStep) {
-              entry.attestationStatus = nextAtt || entry.attestationStatus;
-              entry.statusText = String(att.nextStep).slice(0, 180);
-              entry.updatedAt = Date.now();
-              anyChanged = true;
-            }
-          }
-        } catch {
-          // non-fatal CCTP poll failure
-        }
-      }
+    const batchTargets = pending.slice(0, 12);
+    const resp = await api('/api/bridge/status-batch', {
+      method: 'POST',
+      body: JSON.stringify({
+        bridges: batchTargets.map((entry) => ({
+          id: entry.id,
+          chain: entry.chain,
+          chainName: entry.chainName,
+          txHash: entry.txHash,
+          provider: entry.provider || undefined,
+          requestId: entry.requestId || undefined,
+          solanaDestination: entry.solanaDestination || undefined,
+          status: entry.status,
+        })),
+      }),
+    });
+    const results = Array.isArray(resp?.results) ? resp.results : [];
+    const byId = new Map(results.map((r) => [r.id, r]));
 
-      if (entry.status !== 'attested' && entry.status !== 'landed') {
-        try {
-          const st = await api('/api/tx/status', {
-            method: 'POST',
-            body: JSON.stringify({
-              chain: entry.chain,
-              txHash: entry.txHash,
-              requestId: entry.requestId || undefined,
-              provider: entry.provider || undefined,
-            }),
-          });
-          if (st && typeof st === 'object') {
-            const bridgeSt = String(st.bridgeStatus || st.status || '').toLowerCase();
-            const solHash =
-              typeof st.solanaTxHash === 'string' && isTrackableBridgeTxHash(st.solanaTxHash)
-                ? st.solanaTxHash.trim()
-                : '';
-            if (
-              solHash ||
-              bridgeSt === 'completed' ||
-              bridgeSt === 'success' ||
-              bridgeSt === 'landed' ||
-              bridgeSt === 'settled'
-            ) {
-              entry.status = 'landed';
-              if (solHash) entry.solanaTxHash = solHash;
-              entry.statusText = st.summary || 'Settled on Solana';
-              entry.updatedAt = Date.now();
-              anyChanged = true;
-              anyLanded = true;
-            } else if (
-              st.evmFailed ||
-              bridgeSt === 'failed' ||
-              bridgeSt === 'refunded' ||
-              bridgeSt === 'reverted'
-            ) {
-              entry.status = 'failed';
-              entry.statusText = st.summary || 'Transfer failed or refunded';
-              entry.updatedAt = Date.now();
-              anyChanged = true;
-            } else if (st.evmConfirmed && entry.status === 'confirming') {
-              entry.status = 'relaying';
-              entry.statusText = st.summary || `Confirmed on ${entry.chainName} · relaying to Solana…`;
-              entry.updatedAt = Date.now();
-              anyChanged = true;
-            } else if (st.summary && !entry.statusText) {
-              entry.statusText = String(st.summary).slice(0, 180);
-              entry.updatedAt = Date.now();
-              anyChanged = true;
-            }
-          }
-        } catch {
-          // non-fatal status poll failure
-        }
+    for (const entry of batchTargets) {
+      const next = byId.get(entry.id);
+      if (!next) continue;
+      if (next.status && next.status !== entry.status) {
+        entry.status = next.status;
+        anyChanged = true;
+        if (next.status === 'landed') anyLanded = true;
+      }
+      if (next.attestationStatus && next.attestationStatus !== entry.attestationStatus) {
+        entry.attestationStatus = next.attestationStatus;
+        anyChanged = true;
+      }
+      if (next.requiresSolanaClaim && !entry.requiresSolanaClaim) {
+        entry.requiresSolanaClaim = true;
+        anyChanged = true;
+      }
+      if (next.solanaTxHash && isTrackableBridgeTxHash(next.solanaTxHash) && next.solanaTxHash !== entry.solanaTxHash) {
+        entry.solanaTxHash = next.solanaTxHash;
+        anyChanged = true;
+      }
+      if (next.statusText && next.statusText !== entry.statusText) {
+        entry.statusText = String(next.statusText).slice(0, 180);
+        anyChanged = true;
+      }
+      if (anyChanged) {
+        entry.updatedAt = Date.now();
       }
     }
 
@@ -6659,6 +6622,8 @@ async function pollInflightBridgesFinality({ manual = false } = {}) {
     if (manual) {
       showToast('Checked live bridge finality status.');
     }
+  } catch {
+    // non-fatal batch poll error
   } finally {
     inFlightPollInProgress = false;
     ensureInflightPolling();

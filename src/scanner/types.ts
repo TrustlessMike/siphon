@@ -278,6 +278,17 @@ export interface ScannedAsset {
   defiUnlockAt?: number;
   defiNetUsd?: number;
   defiDebtSummary?: string;
+  /** Canonical backend-computed plain-English DeFi display metadata shared across UI, MCP, and SDK */
+  defiDisplay?: {
+    protocolGroup: string;
+    category: 'one_click' | 'instant_swap' | 'debt_guard' | 'cooldown' | 'external_app';
+    badgeIcon: string;
+    badgeText: string;
+    requiresTwoStep: boolean;
+    signaturesRequired: number;
+    sigLabel: string;
+    plainRouteSummary: string;
+  };
 }
 
 export interface ChainScanSummary {
