@@ -392,3 +392,178 @@ test('HTTP POST /api/defi/aave-flash-unwind-plan rejects spoofed pools fail-clos
     await new Promise<void>((r) => srv.close(() => r()));
   }
 });
+
+test('Unified gas: buildAaveFlashUnwindPlan reports 0-gas nativeGasStatus & valid EIP-712 sponsoredUnwind; submitSponsoredFlashUnwind verifies signature and fails closed', async () => {
+  const { secp256k1 } = await import('@noble/curves/secp256k1');
+  const { deriveEvmAddressFromPrivateKey } = await import('../src/relayer/broadcaster.js');
+  const {
+    computeSponsoredFlashUnwindDigest,
+    FLASH_UNWIND_SELECTORS,
+    hashUniversalUnwindParams,
+    submitSponsoredFlashUnwind,
+  } = await import('../src/defi/flash-unwind.js');
+
+  const userPrivHex = '1111111111111111111111111111111111111111111111111111111111111111';
+  const relayerPrivHex = '2222222222222222222222222222222222222222222222222222222222222222';
+  const signerUser = deriveEvmAddressFromPrivateKey(userPrivHex);
+  const relayerAddr = deriveEvmAddressFromPrivateKey(relayerPrivHex);
+
+  const plan = await buildAaveFlashUnwindPlan({
+    chain: 'monad',
+    poolAddress: NEVERLAND_POOL,
+    userAddress: signerUser,
+    flashUnwindContractOverride: DEPLOYED_FLASH_CONTRACT,
+    nowUnixSec: 1_800_000_000,
+    positionInspectorFn: async () => ({
+      ...MOCK_NEVERLAND_POSITION,
+      userAddress: signerUser,
+      collaterals: MOCK_NEVERLAND_POSITION.collaterals.map((c) => ({
+        ...c,
+        aTokenAllowanceRaw: (1n << 256n) - 1n, // already approved
+      })),
+    }),
+    swapQuoterFn: async () => ({
+      provider: 'kyberswap',
+      router: CANONICAL_FLASH_SWAP_ROUTERS.kyberswapV2,
+      tokenIn: MONAD_SMON,
+      tokenInSymbol: 'sMON',
+      tokenOut: MONAD_WMON,
+      tokenOutSymbol: 'WMON',
+      amountInRaw: 75_000n * 10n ** 18n,
+      amountInUi: 75_000,
+      expectedOutRaw: 84_542n * 10n ** 18n,
+      expectedOutUi: 84_542,
+      minAmountOutRaw: 83_696n * 10n ** 18n,
+      minAmountOutUi: 83_696,
+      callData: '0xe21fd0e900000001',
+    }),
+    rpcCallFn: async (_urls, method) => {
+      if (method === 'eth_getBalance') {
+        return { result: '0x0', rpcUrl: 'mock' } as any;
+      }
+      return { result: '0x', rpcUrl: 'mock' } as any;
+    },
+  });
+
+  assert.equal(plan.supported, true);
+  assert.ok(plan.nativeGasStatus, 'nativeGasStatus must be populated');
+  assert.equal(plan.nativeGasStatus.hasEnoughGas, false, '0 MON must report hasEnoughGas=false');
+  assert.equal(plan.nativeGasStatus.nativeBalanceWei, '0');
+  assert.ok(plan.sponsoredUnwind, 'sponsoredUnwind payload must be generated');
+  assert.ok(BigInt(plan.sponsoredUnwind.maxGasReimbursementRaw) > 0n);
+
+  const sp = plan.sponsoredUnwind;
+  // Sign EIP-712 digest with userPrivHex (low-s canonical)
+  const digestBytes = Buffer.from(sp.eip712Digest.slice(2), 'hex');
+  const sigObj = secp256k1.sign(digestBytes, Buffer.from(userPrivHex, 'hex'), { lowS: true });
+  const sigHex =
+    '0x' +
+    sigObj.r.toString(16).padStart(64, '0') +
+    sigObj.s.toString(16).padStart(64, '0') +
+    (sigObj.recovery + 27).toString(16).padStart(2, '0');
+
+  // Recompute paramsHash matches plan
+  const recomputedHash = hashUniversalUnwindParams({
+    ...sp.universalParams,
+    debtAmount: BigInt(sp.universalParams.debtAmount),
+    interestRateMode: BigInt(sp.universalParams.interestRateMode),
+    collaterals: sp.universalParams.collaterals.map((c) => ({
+      asset: c.asset,
+      aTokenAmount: BigInt(c.aTokenAmount),
+      minRemainingOut: BigInt(c.minRemainingOut),
+    })),
+    swaps: sp.universalParams.swaps.map((s) => ({
+      router: s.router,
+      tokenIn: s.tokenIn,
+      tokenOut: s.tokenOut,
+      amountIn: BigInt(s.amountIn),
+      minAmountOut: BigInt(s.minAmountOut),
+      callData: s.callData,
+    })),
+    minDebtSurplus: BigInt(sp.universalParams.minDebtSurplus),
+    deadline: BigInt(sp.universalParams.deadline),
+  });
+  assert.equal(recomputedHash, sp.paramsHash);
+  const recomputedDigest = computeSponsoredFlashUnwindDigest({
+    chainId: 143,
+    verifyingContract: DEPLOYED_FLASH_CONTRACT,
+    user: signerUser,
+    recipient: signerUser,
+    paramsHash: sp.paramsHash,
+    maxGasReimbursement: BigInt(sp.maxGasReimbursementRaw),
+    nonce: BigInt(sp.nonce),
+    deadline: BigInt(sp.deadline),
+  });
+  assert.equal(recomputedDigest.digest, sp.eip712Digest);
+
+  let capturedCalldata = '';
+  const submitRes = await submitSponsoredFlashUnwind({
+    chain: 'monad',
+    userAddress: signerUser,
+    lendingFamily: 'aave_v3',
+    universalParams: sp.universalParams,
+    maxGasReimbursementRaw: sp.maxGasReimbursementRaw,
+    gasReimbursementRaw: '1000000000000000000',
+    nonce: sp.nonce,
+    signature: sigHex,
+    flashUnwindContractOverride: DEPLOYED_FLASH_CONTRACT,
+    relayerPrivateKeyOverride: relayerPrivHex,
+    nowUnixSec: 1_800_000_050,
+    broadcasterFn: async (b) => {
+      capturedCalldata = b.data ?? '';
+      return {
+        broadcasted: true,
+        reasonCode: 'broadcasted',
+        diagnostic: 'Mock broadcast succeeded',
+        txHash: '0x' + 'ab'.repeat(32),
+        relayerAddress: relayerAddr,
+        nonce: 0,
+        gasLimit: '800000',
+        maxFeePerGasWei: '200000000000',
+        maxPriorityFeePerGasWei: '2000000000',
+      };
+    },
+  });
+
+  assert.equal(submitRes.ok, true);
+  assert.equal(submitRes.relayerAddress, relayerAddr);
+  assert.ok(
+    capturedCalldata.startsWith(FLASH_UNWIND_SELECTORS.unwindUniversalSponsored),
+    `Calldata must start with unwindUniversalSponsored selector ${FLASH_UNWIND_SELECTORS.unwindUniversalSponsored}`
+  );
+
+  // Fail-closed: over-cap reimbursement rejected
+  await assert.rejects(
+    submitSponsoredFlashUnwind({
+      chain: 'monad',
+      userAddress: signerUser,
+      lendingFamily: 'aave_v3',
+      universalParams: sp.universalParams,
+      maxGasReimbursementRaw: sp.maxGasReimbursementRaw,
+      gasReimbursementRaw: (BigInt(sp.maxGasReimbursementRaw) + 1n).toString(),
+      nonce: sp.nonce,
+      signature: sigHex,
+      flashUnwindContractOverride: DEPLOYED_FLASH_CONTRACT,
+      relayerPrivateKeyOverride: relayerPrivHex,
+      nowUnixSec: 1_800_000_050,
+    }),
+    /exceeds user-signed maxGasReimbursement/i
+  );
+
+  // Fail-closed: tampered recipient breaks signature verification
+  await assert.rejects(
+    submitSponsoredFlashUnwind({
+      chain: 'monad',
+      userAddress: signerUser,
+      lendingFamily: 'aave_v3',
+      universalParams: { ...sp.universalParams, recipient: '0x1111111111111111111111111111111111111111' },
+      maxGasReimbursementRaw: sp.maxGasReimbursementRaw,
+      nonce: sp.nonce,
+      signature: sigHex,
+      flashUnwindContractOverride: DEPLOYED_FLASH_CONTRACT,
+      relayerPrivateKeyOverride: relayerPrivHex,
+      nowUnixSec: 1_800_000_050,
+    }),
+    /Invalid EIP-712 SponsoredUnwindIntent signature/i
+  );
+});

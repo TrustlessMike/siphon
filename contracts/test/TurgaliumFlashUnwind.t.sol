@@ -913,6 +913,154 @@ contract TurgaliumFlashUnwindTest is TestBase {
         assertEq(flashUnwind.owner(), RECIPIENT);
     }
 
+    function testSponsoredZeroGasUnwindWithPermitAndSecurityGuards() public {
+        uint256 userPk = 0xA11CE;
+        address zeroGasUser = vm.addr(userPk);
+        address relayer = address(0xBEEF01);
+
+        // Give zeroGasUser a looped Neverland position with 0 pre-approvals and 0 native gas
+        smon.mint(address(neverlandPool), 72_950e18);
+        gmon.mint(address(neverlandPool), 14_646e18);
+        wmon.mint(address(dexRouter), 200_000e18);
+        wmon.mint(address(morphoBlue), 200_000e18);
+        nSmon.mint(zeroGasUser, 72_950e18);
+        nGmon.mint(zeroGasUser, 14_646e18);
+        neverlandPool.mintDebt(zeroGasUser, address(wmon), 82_455e18);
+
+        // Owner allowlists relayer (and relayer cannot also be a swap router)
+        vm.prank(OWNER);
+        flashUnwind.setAllowedRelayer(relayer, true);
+        assertTrue(flashUnwind.allowedRelayers(relayer));
+
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumFlashUnwind.DisjointAllowlistViolation.selector, relayer));
+        flashUnwind.setAllowedSwapRouter(relayer, true);
+
+        TurgaliumFlashUnwind.CollateralPull[] memory cols = new TurgaliumFlashUnwind.CollateralPull[](2);
+        cols[0] = TurgaliumFlashUnwind.CollateralPull({ asset: address(smon), aTokenAmount: type(uint256).max, minRemainingOut: 0 });
+        cols[1] = TurgaliumFlashUnwind.CollateralPull({ asset: address(gmon), aTokenAmount: type(uint256).max, minRemainingOut: 0 });
+
+        TurgaliumFlashUnwind.SwapStep[] memory swaps = new TurgaliumFlashUnwind.SwapStep[](2);
+        swaps[0] = TurgaliumFlashUnwind.SwapStep({
+            router: address(dexRouter),
+            tokenIn: address(smon),
+            tokenOut: address(wmon),
+            amountIn: 72_950e18,
+            minAmountOut: 81_000e18,
+            callData: abi.encodeWithSelector(MockDexRouter.swap.selector, address(smon), address(wmon), 72_950e18, 82_238e18)
+        });
+        swaps[1] = TurgaliumFlashUnwind.SwapStep({
+            router: address(dexRouter),
+            tokenIn: address(gmon),
+            tokenOut: address(wmon),
+            amountIn: 14_646e18,
+            minAmountOut: 16_000e18,
+            callData: abi.encodeWithSelector(MockDexRouter.swap.selector, address(gmon), address(wmon), 14_646e18, 16_326e18)
+        });
+
+        // Gasless EIP-2612 permits for both aTokens (zero native gas needed by zeroGasUser)
+        TurgaliumFlashUnwind.PermitApproval[] memory permits = new TurgaliumFlashUnwind.PermitApproval[](2);
+        permits[0] = TurgaliumFlashUnwind.PermitApproval({
+            token: address(nSmon),
+            value: type(uint256).max,
+            deadline: block.timestamp + 600,
+            v: 27,
+            r: bytes32(uint256(1)),
+            s: bytes32(uint256(2))
+        });
+        permits[1] = TurgaliumFlashUnwind.PermitApproval({
+            token: address(nGmon),
+            value: type(uint256).max,
+            deadline: block.timestamp + 600,
+            v: 27,
+            r: bytes32(uint256(3)),
+            s: bytes32(uint256(4))
+        });
+
+        TurgaliumFlashUnwind.UniversalUnwindParams memory p = TurgaliumFlashUnwind.UniversalUnwindParams({
+            flashProviderKind: TurgaliumFlashUnwind.FlashProviderKind.MORPHO_BLUE,
+            flashProvider: address(morphoBlue),
+            lendingKind: TurgaliumFlashUnwind.LendingProtocolKind.AAVE_V3,
+            lendingMarket: address(neverlandPool),
+            debtAsset: address(wmon),
+            debtAmount: type(uint256).max,
+            interestRateMode: 2,
+            protocolData: "",
+            collaterals: cols,
+            swaps: swaps,
+            permits: permits,
+            recipient: zeroGasUser,
+            minDebtSurplus: 15_000e18,
+            deadline: block.timestamp + 600
+        });
+
+        uint256 maxGasReimb = 50e18;
+        uint256 actualGasReimb = 12e18;
+        uint256 nonce = flashUnwind.nonces(zeroGasUser);
+        bytes32 structHash = keccak256(
+            abi.encode(
+                flashUnwind.SPONSORED_UNWIND_TYPEHASH(),
+                zeroGasUser,
+                zeroGasUser,
+                flashUnwind.hashUniversalParams(p),
+                maxGasReimb,
+                nonce,
+                p.deadline
+            )
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", flashUnwind.domainSeparator(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(userPk, digest);
+
+        // Guard 1: Unauthorized relayer rejected
+        vm.prank(ATTACKER);
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumFlashUnwind.NotAllowed.selector, ATTACKER));
+        flashUnwind.unwindUniversalSponsored(zeroGasUser, p, maxGasReimb, actualGasReimb, nonce, v, r, s);
+
+        // Guard 2: Gas reimbursement above signed user cap rejected
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumFlashUnwind.InvalidInput.selector, uint8(9)));
+        flashUnwind.unwindUniversalSponsored(zeroGasUser, p, maxGasReimb, maxGasReimb + 1, nonce, v, r, s);
+
+        // Guard 3: Tampering with recipient breaks EIP-712 signature
+        p.recipient = ATTACKER;
+        vm.prank(relayer);
+        vm.expectRevert(TurgaliumFlashUnwind.Unauthorized.selector);
+        flashUnwind.unwindUniversalSponsored(zeroGasUser, p, maxGasReimb, actualGasReimb, nonce, v, r, s);
+        p.recipient = zeroGasUser;
+
+        // Execute valid $0-gas sponsored unwind via allowlisted relayer
+        vm.prank(relayer);
+        (uint256 repaid, uint256 netSurplus) = flashUnwind.unwindUniversalSponsored(
+            zeroGasUser,
+            p,
+            maxGasReimb,
+            actualGasReimb,
+            nonce,
+            v,
+            r,
+            s
+        );
+
+        assertEq(repaid, 82_455e18, "Debt fully cleared");
+        assertEq(vDebtWmon.balanceOf(zeroGasUser), 0, "Zero remaining debt");
+        assertEq(wmon.balanceOf(relayer), actualGasReimb, "Relayer received exact gas reimbursement");
+        assertEq(netSurplus, (82_238e18 + 16_326e18) - 82_455e18 - actualGasReimb, "User got 100% surplus minus gas");
+        assertEq(wmon.balanceOf(zeroGasUser), netSurplus, "User received full net surplus");
+        assertEq(wmon.balanceOf(address(flashUnwind)), 0, "Zero residual dust");
+        assertEq(flashUnwind.nonces(zeroGasUser), 1, "Nonce incremented");
+
+        // Guard 4: Replay rejected
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(TurgaliumFlashUnwind.InvalidInput.selector, uint8(10)));
+        flashUnwind.unwindUniversalSponsored(zeroGasUser, p, maxGasReimb, actualGasReimb, nonce, v, r, s);
+
+        // Guard 5: User cancelNonce invalidates pending nonce
+        vm.prank(zeroGasUser);
+        uint256 nextNonce = flashUnwind.cancelNonce();
+        assertEq(nextNonce, 2);
+        assertEq(flashUnwind.nonces(zeroGasUser), 2);
+    }
+
     /// @notice Live Monad Mainnet fork verification: uses 0.00% FREE Morpho Blue flash loan
     ///         (0xD5D960E8C380B724a48AC59E2DfF1b2CB4a1eAee) to unwind Malik's REAL live Neverland
     ///         position (0xb7b570Dc117b4946925bc39166418516FB011CbB) with 0% Turgalium fee AND 0% flash fee!

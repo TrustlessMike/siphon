@@ -27,7 +27,9 @@ import {
   buildAaveFlashUnwindPlan,
   getDefaultLendingMarket,
   isAllowedLendingMarket,
+  submitSponsoredFlashUnwind,
   type FlashUnwindProtocolFamily,
+  type SerializedUniversalUnwindParams,
 } from '../defi/flash-unwind.js';
 import { isAllowedAaveV3Pool } from '../defi/extractors.js';
 import { buildPreSignSimulationProof, verifyOnchainExecutionProof } from '../execution/proof.js';
@@ -1928,6 +1930,77 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         });
 
         return reply(200, plan);
+      }
+
+      if (method === 'POST' && pathname === '/api/defi/flash-unwind-sponsor-submit') {
+        const body = await readJsonBody<{
+          chain?: string;
+          userAddress?: string;
+          protocolFamily?: string;
+          universalParams?: SerializedUniversalUnwindParams;
+          permits?: Array<{
+            token: string;
+            value: string;
+            deadline: string | number;
+            signature?: string;
+            v?: number;
+            r?: string;
+            s?: string;
+          }>;
+          maxGasReimbursementRaw?: string;
+          gasReimbursementRaw?: string;
+          nonce?: string | number;
+          signature?: string;
+        }>(req);
+
+        const chainRaw = typeof body.chain === 'string' ? body.chain.trim().toLowerCase() : '';
+        if (!isEvmChain(chainRaw)) {
+          return reply(400, { error: 'Valid EVM chain is required.' });
+        }
+        const userAddress = typeof body.userAddress === 'string' ? body.userAddress.trim() : '';
+        if (!/^0x[0-9a-fA-F]{40}$/.test(userAddress)) {
+          return reply(400, { error: 'Valid 0x EVM userAddress is required.' });
+        }
+        if (!body.universalParams || typeof body.signature !== 'string' || !body.maxGasReimbursementRaw) {
+          return reply(400, {
+            error: 'universalParams, maxGasReimbursementRaw, and EIP-712 signature are required.',
+          });
+        }
+        const familyRaw =
+          typeof body.protocolFamily === 'string' ? body.protocolFamily.trim().toLowerCase() : 'aave_v3';
+        const validFamilies: FlashUnwindProtocolFamily[] = [
+          'aave_v3',
+          'aave_v2',
+          'compound_v3',
+          'compound_v2',
+          'morpho_blue',
+        ];
+        const lendingFamily: FlashUnwindProtocolFamily = validFamilies.includes(
+          familyRaw as FlashUnwindProtocolFamily
+        )
+          ? (familyRaw as FlashUnwindProtocolFamily)
+          : 'aave_v3';
+
+        try {
+          const res = await submitSponsoredFlashUnwind({
+            chain: chainRaw,
+            userAddress,
+            lendingFamily,
+            universalParams: body.universalParams,
+            permits: Array.isArray(body.permits) ? body.permits : [],
+            maxGasReimbursementRaw: String(body.maxGasReimbursementRaw),
+            ...(body.gasReimbursementRaw !== undefined
+              ? { gasReimbursementRaw: String(body.gasReimbursementRaw) }
+              : {}),
+            nonce: body.nonce ?? '0',
+            signature: body.signature,
+          });
+          return reply(200, res);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Sponsored flash unwind submission failed.',
+          });
+        }
       }
 
       if (method === 'POST' && pathname === '/api/tx/prepare') {

@@ -1,3 +1,5 @@
+import { keccak_256 } from '@noble/hashes/sha3';
+import { secp256k1 } from '@noble/curves/secp256k1';
 import { EVM_CHAINS } from '../scanner/chains.js';
 import {
   decodeMulticall3Aggregate3,
@@ -6,6 +8,16 @@ import {
   formatUnits,
 } from '../scanner/rpc.js';
 import type { EvmChainId } from '../scanner/types.js';
+import {
+  evaluateChainNativeGasStatus,
+  fetchChainNativeBalancesWei,
+  type ChainNativeGasStatus,
+} from '../execution/gas-refuel.js';
+import {
+  broadcastSignedRelayerTx,
+  deriveEvmAddressFromPrivateKey,
+  type RelayerBroadcastResult,
+} from '../relayer/broadcaster.js';
 import {
   AAVE_V3_UNWIND_SELECTORS,
   buildAaveRepayPreSteps,
@@ -32,9 +44,13 @@ const MAX_UINT256 = (1n << 256n) - 1n;
  */
 export const FLASH_UNWIND_SELECTORS = {
   unwindUniversal: '0x894e6c04',
+  unwindUniversalSponsored: '0xe8dd8219',
   unwindMulti: '0xfd11edd9',
   // Legacy alias kept for backwards compatibility with callers referencing unwindSimple
   unwindSimple: '0x894e6c04',
+  nonces: '0x7ecebe00', // nonces(address)
+  eip2612Name: '0x06fdde03', // name()
+  eip2612DomainSeparator: '0x3644e515', // DOMAIN_SEPARATOR()
   flashLoanPremiumTotal: '0x074b2e43', // Pool.FLASHLOAN_PREMIUM_TOTAL() -> uint128
   balanceOf: '0x70a08231',
   cometAllow: '0x05287496', // Comet.allow(address manager, bool isAllowed)
@@ -253,8 +269,64 @@ export interface AaveFlashUnwindPlan {
     symbol: string;
     amountUi: number;
   }>;
+  /** Live native gas check on target chain so UI can trigger 1-click unified gas refuel or $0-gas sponsorship */
+  nativeGasStatus?: ChainNativeGasStatus;
+  /** Optional $0-gas EIP-712 sponsored unwind payload (pay chain gas strictly from unwind surplus up to signed cap) */
+  sponsoredUnwind?: SponsoredFlashUnwindPlan;
   transactions: AaveRepayStepTx[];
   notes: string[];
+  reason?: string;
+}
+
+export interface SerializedUniversalUnwindParams {
+  flashProviderKind: FlashProviderKindValue;
+  flashProvider: string;
+  lendingKind: LendingProtocolKindValue;
+  lendingMarket: string;
+  debtAsset: string;
+  debtAmount: string;
+  interestRateMode: string;
+  protocolData: string;
+  collaterals: Array<{ asset: string; aTokenAmount: string; minRemainingOut: string }>;
+  swaps: Array<{
+    router: string;
+    tokenIn: string;
+    tokenOut: string;
+    amountIn: string;
+    minAmountOut: string;
+    callData: string;
+  }>;
+  recipient: string;
+  minDebtSurplus: string;
+  deadline: string;
+}
+
+export interface SponsoredPermitRequest {
+  token: string;
+  symbol: string;
+  tokenName: string;
+  version: string;
+  nonce: string;
+  value: string;
+  deadline: number;
+  typedData: Record<string, unknown>;
+}
+
+export interface SponsoredFlashUnwindPlan {
+  available: boolean;
+  relayerConfigured: boolean;
+  relayerAddress: string | null;
+  nonce: string;
+  deadline: number;
+  maxGasReimbursementRaw: string;
+  maxGasReimbursementUi: number;
+  gasReimbursementSymbol: string;
+  estimatedGasUsd: number;
+  paramsHash: string;
+  eip712Digest: string;
+  typedData: Record<string, unknown>;
+  permitRequests: SponsoredPermitRequest[];
+  universalParams: SerializedUniversalUnwindParams;
   reason?: string;
 }
 
@@ -411,12 +483,7 @@ function encodeUint256Array(vals: bigint[]): string {
   return `${padUint256(vals.length)}${vals.map(padUint256).join('')}`;
 }
 
-/**
- * Encodes `TurgaliumFlashUnwind.unwindUniversal(UniversalUnwindParams p)` (selector `0x894e6c04`).
- * Supports ALL 5 lending families (Aave V3, Aave V2, Compound V3, Compound V2, Morpho Blue)
- * funded by ANY of the 3 flash providers (Aave V3, 0% Morpho Blue, 0% Balancer V2).
- */
-export function encodeFlashUnwindUniversalCalldata(params: {
+function encodeUniversalUnwindTupleBody(params: {
   flashProviderKind: FlashProviderKindValue;
   flashProvider: string;
   lendingKind: LendingProtocolKindValue;
@@ -465,8 +532,189 @@ export function encodeFlashUnwindUniversalCalldata(params: {
     padUint256(params.deadline),
   ].join('');
 
+  return `${tupleHead}${protoDataEnc}${colEnc}${swapEnc}${permitEnc}`;
+}
+
+function keccakHex(hexNoPrefix: string): string {
+  const bytes = hexNoPrefix.length === 0 ? new Uint8Array(0) : Buffer.from(hexNoPrefix, 'hex');
+  return '0x' + Buffer.from(keccak_256(bytes)).toString('hex');
+}
+
+function keccakUtf8(text: string): string {
+  return '0x' + Buffer.from(keccak_256(Buffer.from(text, 'utf8'))).toString('hex');
+}
+
+const SECP256K1_HALF_N =
+  0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n;
+const EIP712_DOMAIN_TYPEHASH_HEX = keccakUtf8(
+  'EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)'
+);
+const FLASH_UNWIND_NAME_HASH_HEX = keccakUtf8('TurgaliumFlashUnwind');
+const FLASH_UNWIND_VERSION_HASH_HEX = keccakUtf8('2');
+export const SPONSORED_UNWIND_TYPEHASH_HEX = keccakUtf8(
+  'SponsoredUnwindIntent(address user,address recipient,bytes32 paramsHash,uint256 maxGasReimbursement,uint256 nonce,uint256 deadline)'
+);
+
+/**
+ * Computes exact byte-for-byte parity with Solidity `TurgaliumFlashUnwind.hashUniversalParams(p)`.
+ */
+export function hashUniversalUnwindParams(params: {
+  flashProviderKind: FlashProviderKindValue;
+  flashProvider: string;
+  lendingKind: LendingProtocolKindValue;
+  lendingMarket: string;
+  debtAsset: string;
+  debtAmount: bigint;
+  interestRateMode?: bigint;
+  protocolData?: string;
+  collaterals: FlashCollateralPullParam[];
+  swaps: FlashSwapStepParam[];
+  recipient: string;
+  minDebtSurplus: bigint;
+  deadline: bigint;
+}): string {
+  const protoHex = (params.protocolData ?? '0x').replace(/^0x/i, '');
+  const protoDataHash = keccakHex(protoHex);
+  // Solidity abi.encode(dynamicArray) prepends 0x20 offset word before array length+elements
+  const collateralsHash = keccakHex(`${padUint256(32)}${encodeCollateralPullArray(params.collaterals)}`);
+  const swapsHash = keccakHex(`${padUint256(32)}${encodeSwapStepArray(params.swaps)}`);
+
+  const encoded = [
+    padUint256(params.flashProviderKind),
+    padAddress(params.flashProvider),
+    padUint256(params.lendingKind),
+    padAddress(params.lendingMarket),
+    padAddress(params.debtAsset),
+    padUint256(params.debtAmount),
+    padUint256(params.interestRateMode ?? 2n),
+    padBytes32(protoDataHash),
+    padBytes32(collateralsHash),
+    padBytes32(swapsHash),
+    padAddress(params.recipient),
+    padUint256(params.minDebtSurplus),
+    padUint256(params.deadline),
+  ].join('');
+  return keccakHex(encoded);
+}
+
+export function computeEip712DomainSeparator(params: {
+  name: string;
+  version: string;
+  chainId: number;
+  verifyingContract: string;
+}): string {
+  return keccakHex(
+    [
+      padBytes32(EIP712_DOMAIN_TYPEHASH_HEX),
+      padBytes32(keccakUtf8(params.name)),
+      padBytes32(keccakUtf8(params.version)),
+      padUint256(params.chainId),
+      padAddress(params.verifyingContract),
+    ].join('')
+  );
+}
+
+export function computeSponsoredFlashUnwindDigest(params: {
+  chainId: number;
+  verifyingContract: string;
+  user: string;
+  recipient: string;
+  paramsHash: string;
+  maxGasReimbursement: bigint;
+  nonce: bigint;
+  deadline: bigint;
+}): { domainSeparator: string; structHash: string; digest: string } {
+  const domainSeparator = keccakHex(
+    [
+      padBytes32(EIP712_DOMAIN_TYPEHASH_HEX),
+      padBytes32(FLASH_UNWIND_NAME_HASH_HEX),
+      padBytes32(FLASH_UNWIND_VERSION_HASH_HEX),
+      padUint256(params.chainId),
+      padAddress(params.verifyingContract),
+    ].join('')
+  );
+  const structHash = keccakHex(
+    [
+      padBytes32(SPONSORED_UNWIND_TYPEHASH_HEX),
+      padAddress(params.user),
+      padAddress(params.recipient),
+      padBytes32(params.paramsHash),
+      padUint256(params.maxGasReimbursement),
+      padUint256(params.nonce),
+      padUint256(params.deadline),
+    ].join('')
+  );
+  const digest = keccakHex(`1901${padBytes32(domainSeparator)}${padBytes32(structHash)}`);
+  return { domainSeparator, structHash, digest };
+}
+
+/**
+ * Encodes `TurgaliumFlashUnwind.unwindUniversal(UniversalUnwindParams p)` (selector `0x894e6c04`).
+ * Supports ALL 5 lending families (Aave V3, Aave V2, Compound V3, Compound V2, Morpho Blue)
+ * funded by ANY of the 3 flash providers (Aave V3, 0% Morpho Blue, 0% Balancer V2).
+ */
+export function encodeFlashUnwindUniversalCalldata(params: {
+  flashProviderKind: FlashProviderKindValue;
+  flashProvider: string;
+  lendingKind: LendingProtocolKindValue;
+  lendingMarket: string;
+  debtAsset: string;
+  debtAmount: bigint;
+  interestRateMode?: bigint;
+  protocolData?: string;
+  collaterals: FlashCollateralPullParam[];
+  swaps: FlashSwapStepParam[];
+  permits?: FlashPermitApprovalParam[];
+  recipient: string;
+  minDebtSurplus: bigint;
+  deadline: bigint;
+}): string {
+  const tupleBody = encodeUniversalUnwindTupleBody(params);
   // Top-level has 1 dynamic tuple argument -> offset = 0x20 (32 bytes)
-  return `${FLASH_UNWIND_SELECTORS.unwindUniversal}${padUint256(32)}${tupleHead}${protoDataEnc}${colEnc}${swapEnc}${permitEnc}`;
+  return `${FLASH_UNWIND_SELECTORS.unwindUniversal}${padUint256(32)}${tupleBody}`;
+}
+
+/**
+ * Encodes `TurgaliumFlashUnwind.unwindUniversalSponsored(...)` (selector `0xe8dd8219`).
+ */
+export function encodeFlashUnwindSponsoredCalldata(params: {
+  user: string;
+  universalParams: {
+    flashProviderKind: FlashProviderKindValue;
+    flashProvider: string;
+    lendingKind: LendingProtocolKindValue;
+    lendingMarket: string;
+    debtAsset: string;
+    debtAmount: bigint;
+    interestRateMode?: bigint;
+    protocolData?: string;
+    collaterals: FlashCollateralPullParam[];
+    swaps: FlashSwapStepParam[];
+    permits?: FlashPermitApprovalParam[];
+    recipient: string;
+    minDebtSurplus: bigint;
+    deadline: bigint;
+  };
+  maxGasReimbursement: bigint;
+  gasReimbursement: bigint;
+  nonce: bigint;
+  v: number;
+  r: string;
+  s: string;
+}): string {
+  const tupleBody = encodeUniversalUnwindTupleBody(params.universalParams);
+  // 8 top-level args -> 8 head words = 256 bytes (0x100) before dynamic tuple `p`
+  const head = [
+    padAddress(params.user),
+    padUint256(8 * 32),
+    padUint256(params.maxGasReimbursement),
+    padUint256(params.gasReimbursement),
+    padUint256(params.nonce),
+    padUint256(params.v),
+    padBytes32(params.r),
+    padBytes32(params.s),
+  ].join('');
+  return `${FLASH_UNWIND_SELECTORS.unwindUniversalSponsored}${head}${tupleBody}`;
 }
 
 /**
@@ -1538,6 +1786,7 @@ export async function buildAaveFlashUnwindPlan(params: {
   flashUnwindContractOverride?: string | null;
   positionInspectorFn?: typeof inspectAavePoolFullPosition;
   swapQuoterFn?: typeof quoteFlashUnwindSwap;
+  rpcCallFn?: typeof evmJsonRpcCall;
   nowUnixSec?: number;
 }): Promise<AaveFlashUnwindPlan> {
   const cfg = EVM_CHAINS[params.chain];
@@ -1987,6 +2236,59 @@ export async function buildAaveFlashUnwindPlan(params: {
     });
   }
 
+  // Unified Gas Check: inspect user's live native balance on target chain so UI can trigger
+  // either 1-click Relay Cross-Chain Gas Refuel OR $0-gas Sponsored Flash Unwind.
+  const estimatedGasUsd = params.chain === 'ethereum' ? 4.5 : 0.35;
+  let nativeGasStatus: ChainNativeGasStatus | undefined;
+  try {
+    const balances = await fetchChainNativeBalancesWei({
+      chains: [params.chain],
+      userAddress: params.userAddress,
+      rpcCallFn: params.rpcCallFn,
+    });
+    nativeGasStatus = evaluateChainNativeGasStatus({
+      chain: params.chain,
+      nativeBalanceWei: balances[params.chain],
+      requiredMsgValueWei: 0n,
+      estimatedGasUsd,
+    });
+  } catch {
+    // Non-blocking: UI falls back gracefully when RPC gas probe fails
+  }
+
+  // $0-Gas Sponsored Flash Unwind payload (single-debt universal path when contract is deployed)
+  let sponsoredUnwind: SponsoredFlashUnwindPlan | undefined;
+  if (isSingleDebt && contractDeployed && flashUnwindContract) {
+    sponsoredUnwind = await buildSponsoredFlashUnwindMeta({
+      chain: params.chain,
+      chainId: cfg.chainId,
+      flashUnwindContract,
+      userAddress: params.userAddress,
+      recipient,
+      lendingFamily,
+      flashProviderKind,
+      flashProviderAddress,
+      lendingKind: lendingKindVal,
+      lendingMarket: params.poolAddress,
+      debtAsset: primaryDebt.asset,
+      debtSymbol: primaryDebt.symbol,
+      debtDecimals: primaryDebt.decimals,
+      expectedDebtSurplusRaw: (() => {
+        const expTotal = expectedDebtTotals.get(primaryDebt.asset.toLowerCase()) ?? 0n;
+        return expTotal > primaryDebt.totalFlashRepayRaw
+          ? expTotal - primaryDebt.totalFlashRepayRaw
+          : 0n;
+      })(),
+      protocolDataHex,
+      collaterals: orderedCollaterals,
+      collateralParams,
+      swapParams,
+      deadlineSec,
+      estimatedGasUsd,
+      rpcCallFn: params.rpcCallFn,
+    });
+  }
+
   const notes: string[] = [
     `0% Turgalium protocol fee · Flash lender: ${flashProviderName} (${(effectivePremiumBps / 100).toFixed(2)}% / ${effectivePremiumBps} bps).`,
   ];
@@ -1998,6 +2300,13 @@ export async function buildAaveFlashUnwindPlan(params: {
             `${q.amountInUi} ${q.tokenInSymbol} -> ${q.expectedOutUi} ${q.tokenOutSymbol} via ${q.provider}`
         )
         .join('; ')}.`
+    );
+  }
+  if (nativeGasStatus && !nativeGasStatus.hasEnoughGas) {
+    notes.push(
+      sponsoredUnwind?.available
+        ? `${cfg.name} has low native gas (${nativeGasStatus.nativeBalanceUi} ${nativeGasStatus.nativeSymbol}) — $0-gas Sponsored Flash Unwind or 1-click Relay Gas Refuel ready.`
+        : `${cfg.name} has low native gas (${nativeGasStatus.nativeBalanceUi} ${nativeGasStatus.nativeSymbol}) — 1-click Relay Cross-Chain Gas Refuel ready before signing.`
     );
   }
   if (!contractDeployed) {
@@ -2039,7 +2348,552 @@ export async function buildAaveFlashUnwindPlan(params: {
       minAmountOutUi: s.minAmountOutUi,
     })),
     estimatedNetSurplus,
+    ...(nativeGasStatus ? { nativeGasStatus } : {}),
+    ...(sponsoredUnwind ? { sponsoredUnwind } : {}),
     transactions,
     notes,
   });
+}
+
+// ---------------------------------------------------------------------------
+// $0-Gas Sponsored Flash Unwind Helpers & Relayer Submission
+// ---------------------------------------------------------------------------
+
+const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+
+export function getFlashUnwindRelayerConfig(): {
+  configured: boolean;
+  privateKey: string | null;
+  relayerAddress: string | null;
+} {
+  const raw =
+    process.env.TURGALIUM_RELAYER_PRIVATE_KEY?.trim() ||
+    process.env.TURGALIUM_SPONSOR_PRIVATE_KEY?.trim() ||
+    '';
+  if (!raw) {
+    return { configured: false, privateKey: null, relayerAddress: null };
+  }
+  try {
+    const relayerAddress = deriveEvmAddressFromPrivateKey(raw);
+    return { configured: true, privateKey: raw, relayerAddress };
+  } catch {
+    return { configured: false, privateKey: null, relayerAddress: null };
+  }
+}
+
+export function splitEcdsaSignature(sigHex: string): { v: number; r: string; s: string } {
+  const clean = sigHex.trim().replace(/^0x/i, '');
+  if (!/^[0-9a-fA-F]{130}$/.test(clean)) {
+    throw new Error('Signature must be a 65-byte hex string (0x + 130 hex chars).');
+  }
+  const r = '0x' + clean.slice(0, 64).toLowerCase();
+  const s = '0x' + clean.slice(64, 128).toLowerCase();
+  let v = parseInt(clean.slice(128, 130), 16);
+  if (v === 0 || v === 1) v += 27;
+  const rBi = BigInt(r);
+  const sBi = BigInt(s);
+  if (rBi === 0n || rBi >= SECP256K1_N || sBi === 0n || sBi > SECP256K1_HALF_N) {
+    throw new Error('Invalid ECDSA signature scalar (out of range or high-s malleability).');
+  }
+  if (v !== 27 && v !== 28) {
+    throw new Error(`Invalid ECDSA recovery id v=${v} (expected 27 or 28).`);
+  }
+  return { v, r, s };
+}
+
+export function recoverSignerFromDigest(
+  digestHex: string,
+  sig: { v: number; r: string; s: string }
+): string {
+  const cleanDigest = digestHex.trim().replace(/^0x/i, '');
+  if (!/^[0-9a-fA-F]{64}$/.test(cleanDigest)) {
+    throw new Error('Digest must be a 32-byte hex string.');
+  }
+  const rBi = BigInt(sig.r);
+  const sBi = BigInt(sig.s);
+  if (rBi === 0n || rBi >= SECP256K1_N || sBi === 0n || sBi > SECP256K1_HALF_N) {
+    throw new Error('Invalid ECDSA signature scalar.');
+  }
+  if (sig.v !== 27 && sig.v !== 28) {
+    throw new Error('Invalid ECDSA v.');
+  }
+  const sigObj = new secp256k1.Signature(rBi, sBi, sig.v - 27);
+  const pubPoint = sigObj.recoverPublicKey(Buffer.from(cleanDigest, 'hex'));
+  const uncompressed = pubPoint.toRawBytes(false);
+  const addrBytes = keccak_256(uncompressed.slice(1)).slice(-20);
+  return '0x' + Buffer.from(addrBytes).toString('hex');
+}
+
+async function buildSponsoredFlashUnwindMeta(params: {
+  chain: EvmChainId;
+  chainId: number;
+  flashUnwindContract: string;
+  userAddress: string;
+  recipient: string;
+  lendingFamily: FlashUnwindProtocolFamily;
+  flashProviderKind: FlashProviderKindValue;
+  flashProviderAddress: string;
+  lendingKind: LendingProtocolKindValue;
+  lendingMarket: string;
+  debtAsset: string;
+  debtSymbol: string;
+  debtDecimals: number;
+  expectedDebtSurplusRaw: bigint;
+  protocolDataHex: string;
+  collaterals: FlashUnwindCollateralItem[];
+  collateralParams: FlashCollateralPullParam[];
+  swapParams: FlashSwapStepParam[];
+  deadlineSec: bigint;
+  estimatedGasUsd: number;
+  rpcCallFn?: typeof evmJsonRpcCall;
+}): Promise<SponsoredFlashUnwindPlan> {
+  const cfg = EVM_CHAINS[params.chain];
+  const rpcFn = params.rpcCallFn ?? evmJsonRpcCall;
+  const relayerCfg = getFlashUnwindRelayerConfig();
+
+  const unapprovedCollaterals = params.collaterals.filter(
+    (c) => c.aTokenAllowanceRaw < c.aTokenBalanceRaw
+  );
+
+  // Batch contract nonces(user) + unapproved aToken EIP-2612 metadata (name, nonces, DOMAIN_SEPARATOR)
+  let contractNonce = 0n;
+  const permitRequests: SponsoredPermitRequest[] = [];
+  let missingPermitSupport = false;
+
+  try {
+    const mcCalls: Array<{ target: string; allowFailure: boolean; callData: string }> = [
+      {
+        target: params.flashUnwindContract,
+        allowFailure: true,
+        callData: `${FLASH_UNWIND_SELECTORS.nonces}${padAddress(params.userAddress)}`,
+      },
+    ];
+    for (const col of unapprovedCollaterals) {
+      mcCalls.push(
+        { target: col.aTokenAddress, allowFailure: true, callData: FLASH_UNWIND_SELECTORS.eip2612Name },
+        {
+          target: col.aTokenAddress,
+          allowFailure: true,
+          callData: `${FLASH_UNWIND_SELECTORS.nonces}${padAddress(params.userAddress)}`,
+        },
+        {
+          target: col.aTokenAddress,
+          allowFailure: true,
+          callData: FLASH_UNWIND_SELECTORS.eip2612DomainSeparator,
+        }
+      );
+    }
+
+    const mcRes = await rpcFn<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [{ to: cfg.multicall3, data: encodeMulticall3Aggregate3(mcCalls) }, 'latest'],
+      4_500
+    );
+    const decoded = decodeMulticall3Aggregate3(mcRes.result ?? '0x');
+    if (decoded[0]?.success && decoded[0].returnData.length >= 66) {
+      contractNonce = BigInt(decoded[0].returnData.slice(0, 66));
+    }
+
+    for (let i = 0; i < unapprovedCollaterals.length; i++) {
+      const col = unapprovedCollaterals[i];
+      const base = 1 + i * 3;
+      const nameItem = decoded[base];
+      const nonceItem = decoded[base + 1];
+      const domItem = decoded[base + 2];
+      const onchainDomain =
+        domItem?.success && domItem.returnData.length >= 66
+          ? domItem.returnData.slice(0, 66).toLowerCase()
+          : '';
+      if (!nameItem?.success || !nonceItem?.success || !onchainDomain || /^0x0+$/.test(onchainDomain)) {
+        missingPermitSupport = true;
+        continue;
+      }
+      const tokenName = decodeAbiString(nameItem.returnData, col.symbol);
+      const tokenNonce = BigInt(nonceItem.returnData.slice(0, 66));
+
+      // Verify EIP-2612 version ('1' or '2') matches live on-chain DOMAIN_SEPARATOR
+      let matchedVersion: string | null = null;
+      for (const candidateVer of ['1', '2']) {
+        const computed = computeEip712DomainSeparator({
+          name: tokenName,
+          version: candidateVer,
+          chainId: params.chainId,
+          verifyingContract: col.aTokenAddress,
+        });
+        if (computed.toLowerCase() === onchainDomain) {
+          matchedVersion = candidateVer;
+          break;
+        }
+      }
+      if (!matchedVersion) {
+        missingPermitSupport = true;
+        continue;
+      }
+
+      permitRequests.push({
+        token: col.aTokenAddress,
+        symbol: col.symbol,
+        tokenName,
+        version: matchedVersion,
+        nonce: tokenNonce.toString(),
+        value: MAX_UINT256.toString(),
+        deadline: Number(params.deadlineSec),
+        typedData: {
+          types: {
+            EIP712Domain: [
+              { name: 'name', type: 'string' },
+              { name: 'version', type: 'string' },
+              { name: 'chainId', type: 'uint256' },
+              { name: 'verifyingContract', type: 'address' },
+            ],
+            Permit: [
+              { name: 'owner', type: 'address' },
+              { name: 'spender', type: 'address' },
+              { name: 'value', type: 'uint256' },
+              { name: 'nonce', type: 'uint256' },
+              { name: 'deadline', type: 'uint256' },
+            ],
+          },
+          primaryType: 'Permit',
+          domain: {
+            name: tokenName,
+            version: matchedVersion,
+            chainId: params.chainId,
+            verifyingContract: col.aTokenAddress,
+          },
+          message: {
+            owner: params.userAddress,
+            spender: params.flashUnwindContract,
+            value: MAX_UINT256.toString(),
+            nonce: tokenNonce.toString(),
+            deadline: params.deadlineSec.toString(),
+          },
+        },
+      });
+    }
+  } catch {
+    if (unapprovedCollaterals.length > 0) {
+      missingPermitSupport = true;
+    }
+  }
+
+  // Cap gas reimbursement conservatively at <= 2% of expected debt surplus (and >= 1 wei when surplus > 0)
+  // so user can never be overcharged while covering actual chain gas.
+  const twoPctSurplus = params.expectedDebtSurplusRaw / 50n;
+  const maxGasReimbursementRaw = twoPctSurplus > 0n ? twoPctSurplus : 0n;
+  const maxGasReimbursementUi = Number(
+    formatUnits(maxGasReimbursementRaw, params.debtDecimals).toFixed(6)
+  );
+
+  const universalParamsObj = {
+    flashProviderKind: params.flashProviderKind,
+    flashProvider: params.flashProviderAddress,
+    lendingKind: params.lendingKind,
+    lendingMarket: params.lendingMarket,
+    debtAsset: params.debtAsset,
+    debtAmount: MAX_UINT256,
+    interestRateMode: 2n,
+    protocolData: params.protocolDataHex,
+    collaterals: params.collateralParams,
+    swaps: params.swapParams,
+    recipient: params.recipient,
+    minDebtSurplus: 0n,
+    deadline: params.deadlineSec,
+  };
+
+  const paramsHash = hashUniversalUnwindParams(universalParamsObj);
+  const { digest } = computeSponsoredFlashUnwindDigest({
+    chainId: params.chainId,
+    verifyingContract: params.flashUnwindContract,
+    user: params.userAddress,
+    recipient: params.recipient,
+    paramsHash,
+    maxGasReimbursement: maxGasReimbursementRaw,
+    nonce: contractNonce,
+    deadline: params.deadlineSec,
+  });
+
+  const typedData = {
+    types: {
+      EIP712Domain: [
+        { name: 'name', type: 'string' },
+        { name: 'version', type: 'string' },
+        { name: 'chainId', type: 'uint256' },
+        { name: 'verifyingContract', type: 'address' },
+      ],
+      SponsoredUnwindIntent: [
+        { name: 'user', type: 'address' },
+        { name: 'recipient', type: 'address' },
+        { name: 'paramsHash', type: 'bytes32' },
+        { name: 'maxGasReimbursement', type: 'uint256' },
+        { name: 'nonce', type: 'uint256' },
+        { name: 'deadline', type: 'uint256' },
+      ],
+    },
+    primaryType: 'SponsoredUnwindIntent',
+    domain: {
+      name: 'TurgaliumFlashUnwind',
+      version: '2',
+      chainId: params.chainId,
+      verifyingContract: params.flashUnwindContract,
+    },
+    message: {
+      user: params.userAddress,
+      recipient: params.recipient,
+      paramsHash,
+      maxGasReimbursement: maxGasReimbursementRaw.toString(),
+      nonce: contractNonce.toString(),
+      deadline: params.deadlineSec.toString(),
+    },
+  };
+
+  const serializedUniversalParams: SerializedUniversalUnwindParams = {
+    flashProviderKind: params.flashProviderKind,
+    flashProvider: params.flashProviderAddress,
+    lendingKind: params.lendingKind,
+    lendingMarket: params.lendingMarket,
+    debtAsset: params.debtAsset,
+    debtAmount: MAX_UINT256.toString(),
+    interestRateMode: '2',
+    protocolData: params.protocolDataHex,
+    collaterals: params.collateralParams.map((c) => ({
+      asset: c.asset,
+      aTokenAmount: c.aTokenAmount.toString(),
+      minRemainingOut: c.minRemainingOut.toString(),
+    })),
+    swaps: params.swapParams.map((s) => ({
+      router: s.router,
+      tokenIn: s.tokenIn,
+      tokenOut: s.tokenOut,
+      amountIn: s.amountIn.toString(),
+      minAmountOut: s.minAmountOut.toString(),
+      callData: s.callData,
+    })),
+    recipient: params.recipient,
+    minDebtSurplus: '0',
+    deadline: params.deadlineSec.toString(),
+  };
+
+  const canSponsor =
+    relayerCfg.configured &&
+    !missingPermitSupport &&
+    maxGasReimbursementRaw > 0n &&
+    (params.lendingFamily === 'aave_v3' ||
+      params.lendingFamily === 'aave_v2' ||
+      unapprovedCollaterals.length === 0);
+
+  const reason = !relayerCfg.configured
+    ? 'Relayer key not configured on server (use 1-click Relay Cross-Chain Gas Refuel or Direct mode).'
+    : missingPermitSupport
+    ? 'One or more collateral receipt tokens do not support EIP-2612 gasless permit (use 1-click Relay Gas Refuel).'
+    : maxGasReimbursementRaw === 0n
+    ? 'Debt-token surplus is 0; gas reimbursement requires positive debt-token surplus (use 1-click Relay Gas Refuel).'
+    : undefined;
+
+  return {
+    available: canSponsor,
+    relayerConfigured: relayerCfg.configured,
+    relayerAddress: relayerCfg.relayerAddress,
+    nonce: contractNonce.toString(),
+    deadline: Number(params.deadlineSec),
+    maxGasReimbursementRaw: maxGasReimbursementRaw.toString(),
+    maxGasReimbursementUi,
+    gasReimbursementSymbol: params.debtSymbol,
+    estimatedGasUsd: params.estimatedGasUsd,
+    paramsHash,
+    eip712Digest: digest,
+    typedData,
+    permitRequests,
+    universalParams: serializedUniversalParams,
+    ...(reason ? { reason } : {}),
+  };
+}
+
+export interface SubmitSponsoredFlashUnwindRequest {
+  chain: EvmChainId;
+  userAddress: string;
+  lendingFamily: FlashUnwindProtocolFamily;
+  universalParams: SerializedUniversalUnwindParams;
+  permits?: Array<{
+    token: string;
+    value: string;
+    deadline: string | number;
+    signature?: string;
+    v?: number;
+    r?: string;
+    s?: string;
+  }>;
+  maxGasReimbursementRaw: string;
+  gasReimbursementRaw?: string;
+  nonce: string | number;
+  signature: string;
+  flashUnwindContractOverride?: string | null;
+  relayerPrivateKeyOverride?: string | null;
+  nowUnixSec?: number;
+  broadcasterFn?: typeof broadcastSignedRelayerTx;
+}
+
+export async function submitSponsoredFlashUnwind(
+  req: SubmitSponsoredFlashUnwindRequest
+): Promise<{
+  ok: true;
+  chain: EvmChainId;
+  chainId: number;
+  txHash: string;
+  explorerTxUrl: string;
+  relayerAddress: string;
+  gasReimbursementRaw: string;
+}> {
+  const cfg = EVM_CHAINS[req.chain];
+  if (!cfg) throw new Error(`Unsupported EVM chain: ${req.chain}`);
+  if (!EVM_ADDR_RE.test(req.userAddress)) {
+    throw new Error('Valid 0x EVM userAddress is required.');
+  }
+
+  const contractAddr =
+    req.flashUnwindContractOverride !== undefined
+      ? req.flashUnwindContractOverride
+      : getFlashUnwindContractAddress(req.chain);
+  if (!contractAddr || !EVM_ADDR_RE.test(contractAddr)) {
+    throw new Error(`TurgaliumFlashUnwind is not deployed/configured on ${cfg.name}.`);
+  }
+
+  const relayerPriv =
+    req.relayerPrivateKeyOverride !== undefined
+      ? req.relayerPrivateKeyOverride
+      : getFlashUnwindRelayerConfig().privateKey;
+  if (!relayerPriv) {
+    throw new Error('Sponsored flash-unwind relayer is not configured on this server.');
+  }
+  const relayerAddress = deriveEvmAddressFromPrivateKey(relayerPriv);
+
+  const up = req.universalParams;
+  if (!isAllowedLendingMarket(req.chain, req.lendingFamily, up.lendingMarket)) {
+    throw new Error(`Untrusted lending market ${up.lendingMarket} on ${cfg.name}.`);
+  }
+  for (const s of up.swaps ?? []) {
+    if (!isTrustedFlashSwapRouter(req.chain, s.router)) {
+      throw new Error(`Untrusted swap router ${s.router} on ${cfg.name}.`);
+    }
+  }
+
+  const nowSec = BigInt(req.nowUnixSec ?? Math.floor(Date.now() / 1000));
+  const deadline = BigInt(up.deadline);
+  if (deadline <= nowSec) {
+    throw new Error('Sponsored unwind intent has expired. Please re-quote.');
+  }
+
+  const maxGasReimbursement = BigInt(req.maxGasReimbursementRaw);
+  const gasReimbursement =
+    req.gasReimbursementRaw !== undefined
+      ? BigInt(req.gasReimbursementRaw)
+      : maxGasReimbursement / 2n;
+  if (gasReimbursement < 0n || gasReimbursement > maxGasReimbursement) {
+    throw new Error('Requested gas reimbursement exceeds user-signed maxGasReimbursement.');
+  }
+  const nonce = BigInt(req.nonce);
+  const recipient =
+    up.recipient && EVM_ADDR_RE.test(up.recipient) && up.recipient.toLowerCase() !== ZERO_ADDRESS
+      ? up.recipient
+      : req.userAddress;
+
+  const parsedCollaterals: FlashCollateralPullParam[] = (up.collaterals ?? []).map((c) => ({
+    asset: c.asset,
+    aTokenAmount: BigInt(c.aTokenAmount),
+    minRemainingOut: BigInt(c.minRemainingOut),
+  }));
+  const parsedSwaps: FlashSwapStepParam[] = (up.swaps ?? []).map((s) => ({
+    router: s.router,
+    tokenIn: s.tokenIn,
+    tokenOut: s.tokenOut,
+    amountIn: BigInt(s.amountIn),
+    minAmountOut: BigInt(s.minAmountOut),
+    callData: s.callData,
+  }));
+  const parsedPermits: FlashPermitApprovalParam[] = (req.permits ?? []).map((pm) => {
+    const split = pm.signature
+      ? splitEcdsaSignature(pm.signature)
+      : { v: Number(pm.v), r: String(pm.r), s: String(pm.s) };
+    return {
+      token: pm.token,
+      value: BigInt(pm.value),
+      deadline: BigInt(pm.deadline),
+      v: split.v,
+      r: split.r,
+      s: split.s,
+    };
+  });
+
+  const universalParamsObj = {
+    flashProviderKind: up.flashProviderKind,
+    flashProvider: up.flashProvider,
+    lendingKind: up.lendingKind,
+    lendingMarket: up.lendingMarket,
+    debtAsset: up.debtAsset,
+    debtAmount: BigInt(up.debtAmount),
+    interestRateMode: BigInt(up.interestRateMode || '2'),
+    protocolData: up.protocolData || '0x',
+    collaterals: parsedCollaterals,
+    swaps: parsedSwaps,
+    permits: parsedPermits,
+    recipient,
+    minDebtSurplus: BigInt(up.minDebtSurplus || '0'),
+    deadline,
+  };
+
+  // Fail-closed cryptographic verification BEFORE spending any relayer gas
+  const paramsHash = hashUniversalUnwindParams(universalParamsObj);
+  const { digest } = computeSponsoredFlashUnwindDigest({
+    chainId: cfg.chainId,
+    verifyingContract: contractAddr,
+    user: req.userAddress,
+    recipient,
+    paramsHash,
+    maxGasReimbursement,
+    nonce,
+    deadline,
+  });
+  const sig = splitEcdsaSignature(req.signature);
+  const recovered = recoverSignerFromDigest(digest, sig);
+  if (recovered.toLowerCase() !== req.userAddress.toLowerCase()) {
+    throw new Error(
+      `Invalid EIP-712 SponsoredUnwindIntent signature (recovered ${recovered}, expected ${req.userAddress}).`
+    );
+  }
+
+  const callData = encodeFlashUnwindSponsoredCalldata({
+    user: req.userAddress,
+    universalParams: universalParamsObj,
+    maxGasReimbursement,
+    gasReimbursement,
+    nonce,
+    v: sig.v,
+    r: sig.r,
+    s: sig.s,
+  });
+
+  const broadcaster = req.broadcasterFn ?? broadcastSignedRelayerTx;
+  const broadcastRes: RelayerBroadcastResult = await broadcaster({
+    chain: req.chain,
+    to: contractAddr,
+    data: callData,
+    privateKeyHex: relayerPriv,
+  });
+
+  if (!broadcastRes.broadcasted || !broadcastRes.txHash) {
+    throw new Error(
+      `Sponsored flash-unwind broadcast failed (${broadcastRes.reasonCode}): ${broadcastRes.diagnostic}`
+    );
+  }
+
+  return {
+    ok: true,
+    chain: req.chain,
+    chainId: cfg.chainId,
+    txHash: broadcastRes.txHash,
+    explorerTxUrl: `${cfg.explorerUrl}/tx/${broadcastRes.txHash}`,
+    relayerAddress,
+    gasReimbursementRaw: gasReimbursement.toString(),
+  };
 }

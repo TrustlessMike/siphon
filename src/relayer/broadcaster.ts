@@ -99,7 +99,7 @@ export interface Eip1559TransactionParams {
 }
 
 const DEFAULT_CHAIN_MAX_GAS_LIMIT = 15_000_000n;
-const HIGH_GAS_PRICE_CHAINS = new Set<EvmChainId>(['ethereum', 'polygon', 'avalanche', 'sonic']);
+const HIGH_GAS_PRICE_CHAINS = new Set<EvmChainId>(['ethereum', 'polygon', 'avalanche', 'sonic', 'monad']);
 const DEFAULT_HIGH_CHAIN_MAX_FEE_CAP_WEI = 500_000_000_000n; // 500 gwei
 const DEFAULT_L2_CHAIN_MAX_FEE_CAP_WEI = 50_000_000_000n; // 50 gwei
 

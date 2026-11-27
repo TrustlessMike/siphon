@@ -189,6 +189,18 @@ contract TurgaliumFlashUnwind {
     uint8 public constant FLAG_COMPOUND_V2 = 1 << 3;
     uint8 public constant FLAG_MORPHO_BLUE = 1 << 4;
     uint8 public constant FLAG_BALANCER_V2 = 1 << 5;
+    uint8 public constant FLAG_RELAYER = 1 << 6;
+
+    uint256 private constant _SECP256K1N_HALF =
+        0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
+    bytes32 private constant _EIP712_DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 private constant _NAME_HASH = keccak256("TurgaliumFlashUnwind");
+    bytes32 private constant _VERSION_HASH = keccak256("2");
+    bytes32 public constant SPONSORED_UNWIND_TYPEHASH =
+        keccak256(
+            "SponsoredUnwindIntent(address user,address recipient,bytes32 paramsHash,uint256 maxGasReimbursement,uint256 nonce,uint256 deadline)"
+        );
 
     // -------------------------------------------------------------------------
     // Enums & Structs
@@ -302,6 +314,7 @@ contract TurgaliumFlashUnwind {
 
     mapping(address => uint8) public protocolFlags;
     mapping(address => bool) public allowedSwapRouters;
+    mapping(address => uint256) public nonces;
 
     // -------------------------------------------------------------------------
     // Events
@@ -312,6 +325,17 @@ contract TurgaliumFlashUnwind {
     event PausedSet(bool paused);
     event ProtocolFlagSet(address indexed target, uint8 flag, bool allowed);
     event AllowedSwapRouterSet(address indexed router, bool allowed);
+    event NonceCancelled(address indexed user, uint256 newNonce);
+    event FlashUnwoundSponsored(
+        address indexed user,
+        address indexed relayer,
+        address indexed lendingMarket,
+        address debtAsset,
+        uint256 debtRepaid,
+        uint256 netDebtSurplus,
+        uint256 gasReimbursement,
+        address recipient
+    );
     event FlashUnwoundSimple(
         address indexed user,
         address indexed pool,
@@ -408,6 +432,48 @@ contract TurgaliumFlashUnwind {
         return (protocolFlags[a] & FLAG_AAVE_V3) != 0;
     }
 
+    function allowedRelayers(address a) external view returns (bool) {
+        return (protocolFlags[a] & FLAG_RELAYER) != 0;
+    }
+
+    function setAllowedRelayer(address relayer, bool allowed) external onlyOwner {
+        _setFlag(relayer, FLAG_RELAYER, allowed);
+    }
+
+    function domainSeparator() public view returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(_EIP712_DOMAIN_TYPEHASH, _NAME_HASH, _VERSION_HASH, block.chainid, address(this))
+            );
+    }
+
+    function cancelNonce() external returns (uint256 newNonce) {
+        newNonce = nonces[msg.sender] + 1;
+        nonces[msg.sender] = newNonce;
+        emit NonceCancelled(msg.sender, newNonce);
+    }
+
+    function hashUniversalParams(UniversalUnwindParams calldata p) public pure returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    p.flashProviderKind,
+                    p.flashProvider,
+                    p.lendingKind,
+                    p.lendingMarket,
+                    p.debtAsset,
+                    p.debtAmount,
+                    p.interestRateMode,
+                    keccak256(p.protocolData),
+                    keccak256(abi.encode(p.collaterals)),
+                    keccak256(abi.encode(p.swaps)),
+                    p.recipient,
+                    p.minDebtSurplus,
+                    p.deadline
+                )
+            );
+    }
+
     function configureExtendedMarkets(
         address[] calldata aaveV2Pools,
         address[] calldata compoundV3Comets,
@@ -476,22 +542,10 @@ contract TurgaliumFlashUnwind {
     function unwindUniversal(
         UniversalUnwindParams calldata p
     ) external nonReentrant whenNotPaused returns (uint256 debtRepaid, uint256 debtSurplus) {
-        (debtRepaid, debtSurplus) = _runSingleFlashUnwind(
-            p.flashProviderKind,
-            p.flashProvider,
-            p.lendingKind,
-            p.lendingMarket,
-            p.debtAsset,
-            p.debtAmount,
-            p.interestRateMode,
-            p.protocolData,
-            p.collaterals,
-            p.swaps,
-            p.permits,
-            p.recipient,
-            p.minDebtSurplus,
-            p.deadline
-        );
+        address recipient = p.recipient == address(0) ? msg.sender : p.recipient;
+        uint256 totalSurplus;
+        (debtRepaid, totalSurplus) = _runSingleFlashUnwind(msg.sender, p);
+        debtSurplus = _settleSurplus(p.debtAsset, recipient, address(0), 0, p.minDebtSurplus, totalSurplus);
         emit FlashUnwoundUniversal(
             msg.sender,
             uint8(p.flashProviderKind),
@@ -501,7 +555,72 @@ contract TurgaliumFlashUnwind {
             p.debtAsset,
             debtRepaid,
             debtSurplus,
-            p.recipient == address(0) ? msg.sender : p.recipient
+            recipient
+        );
+    }
+
+    /**
+     * @notice $0-gas sponsored unwind executed by an owner-allowlisted relayer on behalf of `user`.
+     *         Verifies an EIP-712 `SponsoredUnwindIntent` binding every routing/slippage parameter,
+     *         applies optional EIP-2612 aToken permits from `p.permits`, and reimburses the relayer
+     *         strictly `gasReimbursement <= maxGasReimbursement` out of the unwind debt-token surplus
+     *         while guaranteeing `netDebtSurplus >= p.minDebtSurplus` to `recipient`.
+     *         Turgalium protocol fee remains 0%.
+     */
+    function unwindUniversalSponsored(
+        address user,
+        UniversalUnwindParams calldata p,
+        uint256 maxGasReimbursement,
+        uint256 gasReimbursement,
+        uint256 nonce,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external nonReentrant whenNotPaused returns (uint256 debtRepaid, uint256 netDebtSurplus) {
+        if ((protocolFlags[msg.sender] & FLAG_RELAYER) == 0) revert NotAllowed(msg.sender);
+        if (user == address(0)) revert InvalidAddress();
+        if (gasReimbursement > maxGasReimbursement) revert InvalidInput(9);
+        if (nonce != nonces[user]) revert InvalidInput(10);
+        if (block.timestamp > p.deadline) revert InvalidInput(1);
+        if ((v != 27 && v != 28) || uint256(s) > _SECP256K1N_HALF) revert Unauthorized();
+
+        address recipient = p.recipient == address(0) ? user : p.recipient;
+        bytes32 structHash = keccak256(
+            abi.encode(
+                SPONSORED_UNWIND_TYPEHASH,
+                user,
+                recipient,
+                hashUniversalParams(p),
+                maxGasReimbursement,
+                nonce,
+                p.deadline
+            )
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator(), structHash));
+        address recovered = ecrecover(digest, v, r, s);
+        if (recovered == address(0) || recovered != user) revert Unauthorized();
+
+        nonces[user] = nonce + 1;
+
+        uint256 totalSurplus;
+        (debtRepaid, totalSurplus) = _runSingleFlashUnwind(user, p);
+        netDebtSurplus = _settleSurplus(
+            p.debtAsset,
+            recipient,
+            msg.sender,
+            gasReimbursement,
+            p.minDebtSurplus,
+            totalSurplus
+        );
+        emit FlashUnwoundSponsored(
+            user,
+            msg.sender,
+            p.lendingMarket,
+            p.debtAsset,
+            debtRepaid,
+            netDebtSurplus,
+            gasReimbursement,
+            recipient
         );
     }
 
@@ -693,96 +812,109 @@ contract TurgaliumFlashUnwind {
     // Internal Shared Core (Single Memory Signature = Zero Duplicate Decoders)
     // -------------------------------------------------------------------------
 
-    function _runSingleFlashUnwind(
-        FlashProviderKind flashProviderKind,
-        address flashProvider,
-        LendingProtocolKind lendingKind,
-        address lendingMarket,
+    function _settleSurplus(
         address debtAsset,
-        uint256 debtAmount,
-        uint256 interestRateMode,
-        bytes memory protocolData,
-        CollateralPull[] calldata collaterals,
-        SwapStep[] calldata swaps,
-        PermitApproval[] calldata permits,
-        address recipientRaw,
+        address recipient,
+        address relayer,
+        uint256 gasReimbursement,
         uint256 minDebtSurplus,
-        uint256 deadline
-    ) private returns (uint256 debtRepaid, uint256 debtSurplus) {
-        if (block.timestamp > deadline) revert InvalidInput(1);
-        if (debtAsset == address(0)) revert InvalidAddress();
-        if (collaterals.length == 0) revert InvalidInput(2);
+        uint256 totalSurplus
+    ) private returns (uint256 netDebtSurplus) {
+        if (gasReimbursement > 0) {
+            if (totalSurplus < gasReimbursement) {
+                revert SlippageOrRepayShortfall(debtAsset, totalSurplus, gasReimbursement);
+            }
+            _safeTransfer(debtAsset, relayer, gasReimbursement);
+            netDebtSurplus = totalSurplus - gasReimbursement;
+        } else {
+            netDebtSurplus = totalSurplus;
+        }
+        if (netDebtSurplus < minDebtSurplus) {
+            revert SlippageOrRepayShortfall(debtAsset, netDebtSurplus, minDebtSurplus);
+        }
+        if (netDebtSurplus > 0) _safeTransfer(debtAsset, recipient, netDebtSurplus);
+    }
 
-        _validateFlashProvider(flashProviderKind, flashProvider);
-        _validateLendingMarket(lendingKind, lendingMarket);
+    function _runSingleFlashUnwind(
+        address user,
+        UniversalUnwindParams calldata p
+    ) private returns (uint256 debtRepaid, uint256 totalSurplus) {
+        if (block.timestamp > p.deadline) revert InvalidInput(1);
+        if (p.debtAsset == address(0)) revert InvalidAddress();
+        if (p.collaterals.length == 0) revert InvalidInput(2);
+
+        _validateFlashProvider(p.flashProviderKind, p.flashProvider);
+        _validateLendingMarket(p.lendingKind, p.lendingMarket);
 
         if (
-            (lendingKind == LendingProtocolKind.AAVE_V3 ||
-                lendingKind == LendingProtocolKind.AAVE_V2) &&
-            interestRateMode != 1 &&
-            interestRateMode != 2
+            (p.lendingKind == LendingProtocolKind.AAVE_V3 ||
+                p.lendingKind == LendingProtocolKind.AAVE_V2) &&
+            p.interestRateMode != 1 &&
+            p.interestRateMode != 2
         ) {
             revert InvalidInput(3);
         }
 
-        address recipient = recipientRaw == address(0) ? msg.sender : recipientRaw;
-        _applyPermits(msg.sender, permits);
+        address recipient = p.recipient == address(0) ? user : p.recipient;
+        _applyPermits(user, p.permits);
 
-        bool repayFull = debtAmount == type(uint256).max;
+        bool repayFull = p.debtAmount == type(uint256).max;
         uint256 flashAmount = _resolveUniversalFlashAmount(
-            lendingKind,
-            lendingMarket,
-            debtAsset,
-            debtAmount,
-            interestRateMode,
-            protocolData,
-            msg.sender
+            p.lendingKind,
+            p.lendingMarket,
+            p.debtAsset,
+            p.debtAmount,
+            p.interestRateMode,
+            p.protocolData,
+            user
         );
 
         bytes memory callbackParams = abi.encode(
             UniversalCallbackContext({
-                user: msg.sender,
-                debtAsset: debtAsset,
-                lendingKind: lendingKind,
-                lendingMarket: lendingMarket,
+                user: user,
+                debtAsset: p.debtAsset,
+                lendingKind: p.lendingKind,
+                lendingMarket: p.lendingMarket,
                 repayFull: repayFull,
-                interestRateMode: interestRateMode,
-                protocolData: protocolData,
-                collaterals: collaterals,
-                swaps: swaps
+                interestRateMode: p.interestRateMode,
+                protocolData: p.protocolData,
+                collaterals: p.collaterals,
+                swaps: p.swaps
             })
         );
 
-        _activeFlashLender = flashProvider;
-        _activeDebtAsset = debtAsset;
+        _activeFlashLender = p.flashProvider;
+        _activeDebtAsset = p.debtAsset;
         _lastRepaidSingle = 0;
 
-        uint8 kindTag = flashProviderKind == FlashProviderKind.AAVE_V3
+        uint8 kindTag = p.flashProviderKind == FlashProviderKind.AAVE_V3
             ? 1
-            : flashProviderKind == FlashProviderKind.MORPHO_BLUE
+            : p.flashProviderKind == FlashProviderKind.MORPHO_BLUE
             ? 3
             : 4;
         _activeFlashKind = kindTag;
-        _activeCallbackHash = keccak256(abi.encode(kindTag, flashProvider, debtAsset, flashAmount, callbackParams));
+        _activeCallbackHash = keccak256(
+            abi.encode(kindTag, p.flashProvider, p.debtAsset, flashAmount, callbackParams)
+        );
 
         if (kindTag == 1) {
-            IAaveV3FlashPool(flashProvider).flashLoanSimple(
+            IAaveV3FlashPool(p.flashProvider).flashLoanSimple(
                 address(this),
-                debtAsset,
+                p.debtAsset,
                 flashAmount,
                 callbackParams,
                 0
             );
-            _forceApprove(debtAsset, flashProvider, 0);
+            _forceApprove(p.debtAsset, p.flashProvider, 0);
         } else if (kindTag == 3) {
-            IMorphoBlue(flashProvider).flashLoan(debtAsset, flashAmount, callbackParams);
-            _forceApprove(debtAsset, flashProvider, 0);
+            IMorphoBlue(p.flashProvider).flashLoan(p.debtAsset, flashAmount, callbackParams);
+            _forceApprove(p.debtAsset, p.flashProvider, 0);
         } else {
             address[] memory tokens = new address[](1);
-            tokens[0] = debtAsset;
+            tokens[0] = p.debtAsset;
             uint256[] memory amounts = new uint256[](1);
             amounts[0] = flashAmount;
-            IBalancerV2Vault(flashProvider).flashLoan(address(this), tokens, amounts, callbackParams);
+            IBalancerV2Vault(p.flashProvider).flashLoan(address(this), tokens, amounts, callbackParams);
         }
 
         _activeFlashLender = address(0);
@@ -792,13 +924,10 @@ contract TurgaliumFlashUnwind {
         debtRepaid = _lastRepaidSingle;
         _lastRepaidSingle = 0;
 
-        debtSurplus = IERC20(debtAsset).balanceOf(address(this));
-        if (debtSurplus < minDebtSurplus) {
-            revert SlippageOrRepayShortfall(debtAsset, debtSurplus, minDebtSurplus);
-        }
-        if (debtSurplus > 0) _safeTransfer(debtAsset, recipient, debtSurplus);
-
-        _sweepRemainingTokens(recipient, lendingKind, collaterals, swaps);
+        totalSurplus = IERC20(p.debtAsset).balanceOf(address(this));
+        // NOTE: non-debt collateral leftovers swept to recipient; debtAsset surplus is settled by caller
+        // so sponsored relayer reimbursement cannot touch collateral or bypass minDebtSurplus.
+        _sweepNonDebtTokens(recipient, p.debtAsset, p.lendingKind, p.collaterals, p.swaps);
     }
 
     function _executeSingleBody(
@@ -1223,8 +1352,9 @@ contract TurgaliumFlashUnwind {
         }
     }
 
-    function _sweepRemainingTokens(
+    function _sweepNonDebtTokens(
         address recipient,
+        address skipToken,
         LendingProtocolKind lendingKind,
         CollateralPull[] calldata collaterals,
         SwapStep[] calldata swaps
@@ -1233,6 +1363,7 @@ contract TurgaliumFlashUnwind {
             address cAsset = lendingKind == LendingProtocolKind.COMPOUND_V2
                 ? ICompoundV2Token(collaterals[i].asset).underlying()
                 : collaterals[i].asset;
+            if (cAsset == skipToken) continue;
             uint256 bal = IERC20(cAsset).balanceOf(address(this));
             if (bal < collaterals[i].minRemainingOut) {
                 revert SlippageOrRepayShortfall(cAsset, bal, collaterals[i].minRemainingOut);
@@ -1242,8 +1373,18 @@ contract TurgaliumFlashUnwind {
 
         for (uint256 i = 0; i < swaps.length; i++) {
             address outToken = swaps[i].tokenOut;
+            if (outToken == skipToken) continue;
             uint256 bal = IERC20(outToken).balanceOf(address(this));
             if (bal > 0) _safeTransfer(outToken, recipient, bal);
         }
+    }
+
+    function _sweepRemainingTokens(
+        address recipient,
+        LendingProtocolKind lendingKind,
+        CollateralPull[] calldata collaterals,
+        SwapStep[] calldata swaps
+    ) private {
+        _sweepNonDebtTokens(recipient, address(0), lendingKind, collaterals, swaps);
     }
 }
