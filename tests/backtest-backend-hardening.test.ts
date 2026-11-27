@@ -25,10 +25,6 @@ import {
   decodeLidoWithdrawalRequestIds,
   decodeLidoWithdrawalStatuses,
 } from '../src/defi/unlock-readers.js';
-import {
-  JupiterMarketsClient,
-  verifyJupiterTransactionBase64,
-} from '../src/degen/jupiter-markets.js';
 import { buildUnlockSchedule } from '../src/execution/preservation-optimizer.js';
 import {
   fetchMayanSwiftQuote,
@@ -985,7 +981,7 @@ test('yield-park rejects prototype keys, mismatched Jupiter mints/inAmount, inva
         JSON.stringify({
           inputMint: SOLANA_USDC_MINT,
           outputMint: 'So11111111111111111111111111111111111111112',
-          inAmount: '90000000',
+          inAmount: '100000000',
           outAmount: '500000000',
           otherAmountThreshold: '490000000',
           priceImpactPct: '0.001',
@@ -1029,7 +1025,7 @@ test('yield-park rejects prototype keys, mismatched Jupiter mints/inAmount, inva
         JSON.stringify({
           inputMint: SOLANA_USDC_MINT,
           outputMint: SOLANA_JUPSOL_MINT,
-          inAmount: '90000000',
+          inAmount: '100000000',
           outAmount: '500000000',
           otherAmountThreshold: 'not-digits',
           priceImpactPct: '0.001',
@@ -1051,7 +1047,7 @@ test('yield-park rejects prototype keys, mismatched Jupiter mints/inAmount, inva
         JSON.stringify({
           inputMint: SOLANA_USDC_MINT,
           outputMint: SOLANA_JUPSOL_MINT,
-          inAmount: '90000000',
+          inAmount: '100000000',
           outAmount: '500000000',
           otherAmountThreshold: '490000000',
           priceImpactPct: '0.08', // 8% > 5% cap
@@ -1067,82 +1063,21 @@ test('yield-park rejects prototype keys, mismatched Jupiter mints/inAmount, inva
   );
 });
 
-test('degen-routes propagates 400/413/415 on claim/close and jupiter-markets verifies feePayer on /orders, /claim, /close', async () => {
-  const validTx = buildMockSolanaV0TxBase64(SOL_USER_A);
-  const attackerTx = buildMockSolanaV0TxBase64(SOL_USER_B);
-
-  assert.equal(verifyJupiterTransactionBase64(validTx, SOL_USER_A).ok, true);
-  assert.equal(verifyJupiterTransactionBase64(attackerTx, SOL_USER_A).ok, false);
-  assert.equal(verifyJupiterTransactionBase64('not-valid-tx-bytes', SOL_USER_A).ok, false);
-
-  const mockClient = new JupiterMarketsClient({
-    apiKey: 'jup-test-key',
-    fetchImpl: async () =>
-      new Response(JSON.stringify({ transaction: attackerTx, orderId: 'ord_spoof' }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-  });
-
-  // Spoofed feePayer fails closed on /orders, /claim, /close
-  const orderRes = await mockClient.buildOrderPreview({
-    marketId: 'POLY-1',
-    side: 'yes',
-    stakeUsd: 10,
-    availableUsdc: 500,
-    riskPct: 10,
-    priceUsd: 0.5,
-    walletAddress: SOL_USER_A,
-    requestLiveTx: true,
-  });
-  assert.equal(orderRes.liveOrder.available, false);
-  assert.equal(orderRes.liveOrder.transactionBase64, null);
-  assert.match(orderRes.liveOrder.reason ?? '', /feePayer mismatch/i);
-
-  const claimRes = await mockClient.claimPosition('pos_1', SOL_USER_A);
-  assert.equal(claimRes.available, false);
-  assert.equal(claimRes.transactionBase64, null);
-  assert.match(claimRes.reason ?? '', /feePayer mismatch/i);
-
-  const closeRes = await mockClient.closePosition('pos_1', SOL_USER_A);
-  assert.equal(closeRes.available, false);
-  assert.equal(closeRes.transactionBase64, null);
-  assert.match(closeRes.reason ?? '', /feePayer mismatch/i);
-
-  // HTTP degen-routes: malformed JSON -> 400, oversized >32 KiB -> 413, wrong Content-Type -> 415
-  const { server } = createTurgaliumServer({ degenClient: mockClient, rateLimit: { enabled: false } });
+test('removed gambling /api/degen/* routes return 404 fail-closed', async () => {
+  const { server } = createTurgaliumServer({ rateLimit: { enabled: false } });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
   try {
-    const badJson = await fetch(`${base}/api/degen/positions/pos_1/claim`, {
+    const marketsRes = await fetch(`${base}/api/degen/markets`);
+    assert.equal(marketsRes.status, 404);
+
+    const claimRes = await fetch(`${base}/api/degen/positions/pos_1/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{malformed json',
+      body: '{}',
     });
-    assert.equal(badJson.status, 400);
-
-    const oversized = await fetch(`${base}/api/degen/positions/pos_1/close`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pad: 'a'.repeat(40_000) }),
-    });
-    assert.equal(oversized.status, 413);
-
-    const wrongCt = await fetch(`${base}/api/degen/positions/pos_1/claim`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body: 'hello',
-    });
-    assert.equal(wrongCt.status, 415);
-
-    // Genuinely empty POST still works cleanly
-    const emptyOk = await fetch(`${base}/api/degen/positions/pos_1/claim`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '',
-    });
-    assert.equal(emptyOk.status, 200);
+    assert.equal(claimRes.status, 404);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }

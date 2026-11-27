@@ -99,3 +99,73 @@ export class BoundedTtlCache<K, V> {
     return removed;
   }
 }
+
+/**
+ * In-flight promise coalescer with optional BoundedTtlCache backing.
+ * Concurrent identical callers share a single upstream request; completed values
+ * are optionally cached for the cache's TTL while `refresh: true` bypasses both
+ * cache reads and existing in-flight promises.
+ */
+export class InFlightCoalescer<K, V> {
+  private readonly inFlight = new Map<K, Promise<V>>();
+  private readonly cache?: BoundedTtlCache<K, V>;
+
+  constructor(cache?: BoundedTtlCache<K, V>) {
+    this.cache = cache;
+  }
+
+  get inFlightSize(): number {
+    return this.inFlight.size;
+  }
+
+  getCached(key: K): V | undefined {
+    return this.cache?.get(key);
+  }
+
+  clear(): void {
+    this.inFlight.clear();
+    this.cache?.clear();
+  }
+
+  async run(
+    key: K,
+    factory: () => Promise<V>,
+    opts?: { refresh?: boolean; cachePredicate?: (value: V) => boolean }
+  ): Promise<{ value: V; cached: boolean; coalesced: boolean }> {
+    const refresh = Boolean(opts?.refresh);
+
+    if (!refresh && this.cache) {
+      const hit = this.cache.get(key);
+      if (hit !== undefined) {
+        return { value: hit, cached: true, coalesced: false };
+      }
+    }
+
+    if (!refresh) {
+      const existing = this.inFlight.get(key);
+      if (existing) {
+        const value = await existing;
+        return { value, cached: false, coalesced: true };
+      }
+    }
+
+    let promise!: Promise<V>;
+    promise = (async () => {
+      try {
+        const value = await factory();
+        if (this.cache && (!opts?.cachePredicate || opts.cachePredicate(value))) {
+          this.cache.set(key, value);
+        }
+        return value;
+      } finally {
+        if (this.inFlight.get(key) === promise) {
+          this.inFlight.delete(key);
+        }
+      }
+    })();
+
+    this.inFlight.set(key, promise);
+    const value = await promise;
+    return { value, cached: false, coalesced: false };
+  }
+}

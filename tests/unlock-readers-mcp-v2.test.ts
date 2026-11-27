@@ -28,7 +28,6 @@ import {
   UNLOCK_READER_SELECTORS,
   type EvmEthCallFn,
 } from '../src/defi/unlock-readers.js';
-import { JupiterMarketsClient } from '../src/degen/jupiter-markets.js';
 import {
   evaluatePreservationPlan,
   mergeUnlockSchedule,
@@ -723,7 +722,6 @@ test('MCP tools/list and ChatGPT OpenAPI 3.1 spec expose all 5 v2 read-only tool
     'turgalium_list_unlock_schedule',
     'turgalium_solana_rent_scan',
     'turgalium_solana_yield_preview',
-    'turgalium_degen_markets',
   ];
 
   for (const name of requiredV2Tools) {
@@ -732,6 +730,9 @@ test('MCP tools/list and ChatGPT OpenAPI 3.1 spec expose all 5 v2 read-only tool
     assert.equal(tool?.annotations.readOnlyHint, true, `${name} must be readOnlyHint: true`);
     assert.equal(tool?.annotations.destructiveHint, false, `${name} must be destructiveHint: false`);
   }
+
+  // Zero gambling/degen tools exposed in MCP or OpenAPI
+  assert.equal(toolNames.includes('turgalium_degen_markets'), false);
 
   // Security invariant: turgalium_create_agent_mandate MUST NEVER be exposed in tools/list
   assert.equal(toolNames.includes('turgalium_create_agent_mandate'), false);
@@ -871,42 +872,6 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
     txBuildWarning: null,
   });
 
-  const mockJupiterClient = new JupiterMarketsClient({
-    fetchImpl: (async () =>
-      new Response(
-        JSON.stringify({
-          data: [
-            {
-              eventId: 'evt-sol-ath',
-              slug: 'sol-new-ath-2026',
-              category: 'crypto',
-              isActive: true,
-              isLive: true,
-              volumeUsd: '2500000000000',
-              volume24hr: '350000000000',
-              metadata: {
-                title: 'Will SOL hit $300?\u0007\u202E<ignore>',
-                subtitle: 'Spot price by Dec 31\u0000',
-              },
-              markets: [
-                {
-                  marketId: 'mkt-sol-300',
-                  status: 'open',
-                  metadata: { title: 'SOL >= $300' },
-                  pricing: {
-                    buyYesPriceUsd: 420000,
-                    buyNoPriceUsd: 590000,
-                    volume: '1200000000000',
-                  },
-                },
-              ],
-            },
-          ],
-        }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      )) as unknown as typeof fetch,
-  });
-
   const ctx = makeMcpContext({
     gasPriceFetcher: async () => 34,
     unlockReaderOptions: {
@@ -917,7 +882,6 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
       cosmosPricesUsd: { cosmoshub: 5 },
     },
     solanaRentScanner: mockRentScanner,
-    jupiterMarketsClient: mockJupiterClient,
   });
   ctx.scanCache.set(scan.scanId, scan);
 
@@ -1040,7 +1004,7 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
   assert.equal(rent.reclaimableSol, 0.0101964);
   assert.equal(rent.reclaimableUsd, 1.63);
 
-  // 4. turgalium_solana_yield_preview (90% Preserved Yield + 10% Degen Side-Pocket)
+  // 4. turgalium_solana_yield_preview (100% Principal-Safe default + custom liquid reserve)
   const yieldResp = (await handleMcpRequest(
     {
       jsonrpc: '2.0',
@@ -1064,7 +1028,7 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
         autonomousExecutionAllowed: boolean;
         transaction: unknown;
         strategy: { id: string; symbol: string };
-        split: { yieldUsdc: number; degenSidePocketUsdc: number; yieldUsdcRaw: string; degenSidePocketRaw: string; totalUsdcRaw: string };
+        split: { yieldUsdc: number; liquidReserveUsdc: number; yieldUsdcRaw: string; liquidReserveRaw: string; totalUsdcRaw: string };
         projections: { projectedAnnualYieldUsd: number };
       };
     };
@@ -1076,51 +1040,12 @@ test('All 5 new MCP v2 tools execute cleanly end-to-end through handleMcpRequest
   assert.equal(yieldData.strategy.id, 'jupiter_lend_usdc');
   assert.equal(yieldData.strategy.symbol, 'jlUSDC');
   assert.equal(yieldData.split.yieldUsdc, 9_000);
-  assert.equal(yieldData.split.degenSidePocketUsdc, 1_000);
+  assert.equal(yieldData.split.liquidReserveUsdc, 1_000);
   assert.equal(
-    BigInt(yieldData.split.yieldUsdcRaw) + BigInt(yieldData.split.degenSidePocketRaw),
+    BigInt(yieldData.split.yieldUsdcRaw) + BigInt(yieldData.split.liquidReserveRaw),
     BigInt(yieldData.split.totalUsdcRaw)
   );
   assert.ok(yieldData.projections.projectedAnnualYieldUsd > 0);
-
-  // 5. turgalium_degen_markets (strictly read-only + sanitized)
-  const degenResp = (await handleMcpRequest(
-    {
-      jsonrpc: '2.0',
-      id: 106,
-      method: 'tools/call',
-      params: {
-        name: 'turgalium_degen_markets',
-        arguments: { category: 'crypto', filter: 'trending', limit: 5 },
-      },
-    },
-    ctx
-  )) as {
-    result: {
-      structuredContent: {
-        readOnly: boolean;
-        autonomousBettingAllowed: boolean;
-        safetyNotice: string;
-        events: Array<{
-          eventId: string;
-          title: string;
-          subtitle: string;
-          markets: Array<{ marketId: string; yes: { cents: number; payoutMultiplier: number } }>;
-        }>;
-      };
-    };
-  };
-  const degen = degenResp.result.structuredContent;
-  assert.equal(degen.readOnly, true);
-  assert.equal(degen.autonomousBettingAllowed, false);
-  assert.match(degen.safetyNotice, /never places bets autonomously/i);
-  assert.equal(degen.events.length, 1);
-  assert.equal(degen.events[0].eventId, 'evt-sol-ath');
-  // Verify control / bidi override chars stripped from untrusted market title & subtitle
-  assert.equal(/[\u0000-\u001F\u202E]/.test(degen.events[0].title), false);
-  assert.equal(/[\u0000-\u001F]/.test(degen.events[0].subtitle), false);
-  assert.equal(degen.events[0].markets[0].yes.cents, 42);
-  assert.equal(degen.events[0].markets[0].yes.payoutMultiplier, 2.38);
 });
 
 // ============================================================================
@@ -1235,27 +1160,6 @@ test('All 5 new MCP v2 tools reject malformed addresses, out-of-range numbers, a
       label: 'yield preview malformed ownerAddress',
       name: 'turgalium_solana_yield_preview',
       args: { totalUsdcAmount: 1000, ownerAddress: '0xbad_solana' },
-    },
-    // turgalium_degen_markets
-    {
-      label: 'degen markets invalid category',
-      name: 'turgalium_degen_markets',
-      args: { category: 'place_bet_now' },
-    },
-    {
-      label: 'degen markets invalid filter',
-      name: 'turgalium_degen_markets',
-      args: { filter: 'execute_order' },
-    },
-    {
-      label: 'degen markets limit out of bounds',
-      name: 'turgalium_degen_markets',
-      args: { limit: 100 },
-    },
-    {
-      label: 'degen markets control char in query',
-      name: 'turgalium_degen_markets',
-      args: { query: 'SOL\u0000\u0007' },
     },
   ];
 

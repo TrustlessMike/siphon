@@ -117,10 +117,12 @@ interface CacheEntry {
 }
 
 const priceCache = new Map<string, CacheEntry>();
+const inFlightKeyPrices = new Map<string, Promise<{ price: number | null; failed: boolean }>>();
 const CACHE_TTL_MS = 60_000;
 
 export function clearPriceCache(): void {
   priceCache.clear();
+  inFlightKeyPrices.clear();
 }
 
 export interface LiveUsdPricesResult {
@@ -130,23 +132,41 @@ export interface LiveUsdPricesResult {
   usedFallbackKeys: Set<string>;
 }
 
-export async function fetchLiveUsdPricesWithStatus(keys: string[]): Promise<LiveUsdPricesResult> {
+export interface FetchLiveUsdPricesOptions {
+  refresh?: boolean;
+}
+
+export async function fetchLiveUsdPricesWithStatus(
+  keys: string[],
+  opts?: FetchLiveUsdPricesOptions
+): Promise<LiveUsdPricesResult> {
   const unique = Array.from(new Set(keys.filter(Boolean)));
   const now = Date.now();
+  const refresh = Boolean(opts?.refresh);
   const prices = new Map<string, number>();
   const toFetch: string[] = [];
+  const waitingKeys: Array<{ key: string; promise: Promise<{ price: number | null; failed: boolean }> }> = [];
   const failedKeys = new Set<string>();
   const usedFallbackKeys = new Set<string>();
   let hadError = false;
 
   for (const k of unique) {
-    const cached = priceCache.get(k);
-    if (cached && now - cached.ts < CACHE_TTL_MS) {
-      prices.set(k, cached.price);
-    } else {
-      toFetch.push(k);
+    if (!refresh) {
+      const cached = priceCache.get(k);
+      if (cached && now - cached.ts < CACHE_TTL_MS) {
+        prices.set(k, cached.price);
+        continue;
+      }
+      const existing = inFlightKeyPrices.get(k);
+      if (existing) {
+        waitingKeys.push({ key: k, promise: existing });
+        continue;
+      }
     }
+    toFetch.push(k);
   }
+
+  const fetchPromises: Array<Promise<void>> = [];
 
   if (toFetch.length > 0) {
     const chunks: string[][] = [];
@@ -154,40 +174,86 @@ export async function fetchLiveUsdPricesWithStatus(keys: string[]): Promise<Live
       chunks.push(toFetch.slice(i, i + LLAMA_PRICE_BATCH_SIZE));
     }
 
-    await Promise.all(
-      chunks.map(async (chunk) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 4500);
-        try {
-          const url = `https://coins.llama.fi/prices/current/${encodeURIComponent(chunk.join(','))}`;
-          const res = await fetch(url, { signal: controller.signal });
-          clearTimeout(timer);
-          if (!res.ok) {
+    for (const chunk of chunks) {
+      const resolvers = new Map<string, (val: { price: number | null; failed: boolean }) => void>();
+      for (const k of chunk) {
+        let resolveFn!: (val: { price: number | null; failed: boolean }) => void;
+        const p = new Promise<{ price: number | null; failed: boolean }>((resolve) => {
+          resolveFn = resolve;
+        });
+        resolvers.set(k, resolveFn);
+        inFlightKeyPrices.set(k, p);
+      }
+
+      fetchPromises.push(
+        (async () => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 4500);
+          try {
+            const url = `https://coins.llama.fi/prices/current/${encodeURIComponent(chunk.join(','))}`;
+            const res = await fetch(url, { signal: controller.signal });
+            clearTimeout(timer);
+            if (!res.ok) {
+              hadError = true;
+              for (const k of chunk) {
+                failedKeys.add(k);
+                resolvers.get(k)?.({ price: null, failed: true });
+              }
+              return;
+            }
+            const json = (await res.json()) as {
+              coins?: Record<string, { price?: number; confidence?: number }>;
+            };
+            const coins = json.coins ?? {};
+            const coinsLower = new Map<string, { price?: number; confidence?: number }>(
+              Object.entries(coins).map(([ck, cv]) => [ck.toLowerCase(), cv])
+            );
+            const fetchedTs = Date.now();
+            for (const k of chunk) {
+              const entry = coins[k] ?? coinsLower.get(k.toLowerCase());
+              if (entry && typeof entry.price === 'number' && Number.isFinite(entry.price) && entry.price > 0) {
+                prices.set(k, entry.price);
+                priceCache.set(k, { price: entry.price, ts: fetchedTs });
+                resolvers.get(k)?.({ price: entry.price, failed: false });
+              } else {
+                resolvers.get(k)?.({ price: null, failed: false });
+              }
+            }
+          } catch {
+            clearTimeout(timer);
             hadError = true;
-            for (const k of chunk) failedKeys.add(k);
-            return;
-          }
-          const json = (await res.json()) as {
-            coins?: Record<string, { price?: number; confidence?: number }>;
-          };
-          const coins = json.coins ?? {};
-          const coinsLower = new Map<string, { price?: number; confidence?: number }>(
-            Object.entries(coins).map(([ck, cv]) => [ck.toLowerCase(), cv])
-          );
-          for (const k of chunk) {
-            const entry = coins[k] ?? coinsLower.get(k.toLowerCase());
-            if (entry && typeof entry.price === 'number' && Number.isFinite(entry.price) && entry.price > 0) {
-              prices.set(k, entry.price);
-              priceCache.set(k, { price: entry.price, ts: now });
+            for (const k of chunk) {
+              failedKeys.add(k);
+              resolvers.get(k)?.({ price: null, failed: true });
+            }
+          } finally {
+            for (const k of chunk) {
+              inFlightKeyPrices.delete(k);
             }
           }
-        } catch {
-          clearTimeout(timer);
-          hadError = true;
-          for (const k of chunk) failedKeys.add(k);
-        }
-      })
+        })()
+      );
+    }
+  }
+
+  if (waitingKeys.length > 0) {
+    fetchPromises.push(
+      Promise.all(
+        waitingKeys.map(async ({ key, promise }) => {
+          const res = await promise;
+          if (res.price !== null && res.price > 0) {
+            prices.set(key, res.price);
+          } else if (res.failed) {
+            hadError = true;
+            failedKeys.add(key);
+          }
+        })
+      ).then(() => undefined)
     );
+  }
+
+  if (fetchPromises.length > 0) {
+    await Promise.all(fetchPromises);
   }
 
   for (const k of unique) {
@@ -203,7 +269,10 @@ export async function fetchLiveUsdPricesWithStatus(keys: string[]): Promise<Live
   return { prices, hadError, failedKeys, usedFallbackKeys };
 }
 
-export async function fetchLiveUsdPrices(keys: string[]): Promise<Map<string, number>> {
-  const res = await fetchLiveUsdPricesWithStatus(keys);
+export async function fetchLiveUsdPrices(
+  keys: string[],
+  opts?: FetchLiveUsdPricesOptions
+): Promise<Map<string, number>> {
+  const res = await fetchLiveUsdPricesWithStatus(keys, opts);
   return res.prices;
 }
