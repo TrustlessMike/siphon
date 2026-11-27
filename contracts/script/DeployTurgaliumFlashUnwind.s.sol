@@ -234,6 +234,7 @@ contract DeployTurgaliumFlashUnwind {
         uint256 pk = vm.envOr("TURGALIUM_DEPLOYER_PRIVATE_KEY", uint256(0));
         address deployerAddr = pk != 0 ? vm.addr(pk) : msg.sender;
         address ownerAddr = vm.envOr("TURGALIUM_OWNER", deployerAddr);
+        address relayerAddr = vm.envOr("TURGALIUM_RELAYER", address(0));
         bytes32 salt = vm.envOr("TURGALIUM_FLASH_UNWIND_SALT", DEFAULT_SALT);
 
         address[] memory pools = getChainPools(block.chainid);
@@ -264,6 +265,10 @@ contract DeployTurgaliumFlashUnwind {
             balancer.length > 0
         ) {
             deployed.configureExtendedMarkets(aaveV2, compV3, compV2, morpho, balancer);
+        }
+
+        if (relayerAddr != address(0)) {
+            deployed.setAllowedRelayer(relayerAddr, true);
         }
 
         if (ownerAddr != deployerAddr) {

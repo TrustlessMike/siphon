@@ -2614,6 +2614,124 @@ async function executeAaveFlashUnwind({ chain, poolAddress, protocolFamily = 'aa
       openWalletModal('evm');
       return;
     }
+
+    // Unified Gas Handling: if target chain has $0 / insufficient native gas (or user chose Gasless 1-Sig),
+    // automatically use (A) $0-Gas Sponsored Flash Unwind (relayer pays gas, reimbursed <= signed cap from surplus)
+    // OR (B) 1-Click Relay Cross-Chain Gas Refuel from any funded chain in the user's wallet (1–4s).
+    const needsNativeGas =
+      plan.nativeGasStatus &&
+      !plan.nativeGasStatus.hasEnoughGas &&
+      !plan.nativeGasStatus.gasUnknown;
+    const preferSponsored =
+      Boolean(plan.sponsoredUnwind?.available) &&
+      (needsNativeGas || executionMode === 'gasless');
+
+    if (preferSponsored && plan.sponsoredUnwind) {
+      const sp = plan.sponsoredUnwind;
+      const signedPermits = [];
+      for (const permReq of sp.permitRequests || []) {
+        if (triggerBtn) {
+          triggerBtn.textContent = `Sign $0-Gas Permit (${permReq.symbol})…`;
+        }
+        const permSig = await signGaslessTypedData(permReq.typedData, plan.chainId, {
+          expectedFrom: connectedEvm,
+        });
+        signedPermits.push({
+          token: permReq.token,
+          value: permReq.value,
+          deadline: permReq.deadline,
+          signature: permSig,
+        });
+      }
+
+      if (triggerBtn) {
+        triggerBtn.textContent = `Sign $0-Gas Unwind (${plan.chainName})…`;
+      }
+      const intentSig = await signGaslessTypedData(sp.typedData, plan.chainId, {
+        expectedFrom: connectedEvm,
+      });
+
+      if (triggerBtn) {
+        triggerBtn.textContent = `Relaying $0-Gas Unwind (${plan.chainName})…`;
+      }
+      const relayRes = await api('/api/defi/flash-unwind-sponsor-submit', {
+        method: 'POST',
+        body: JSON.stringify({
+          chain: plan.chain,
+          userAddress: connectedEvm,
+          protocolFamily: plan.lendingFamily || protocolFamily,
+          universalParams: sp.universalParams,
+          permits: signedPermits,
+          maxGasReimbursementRaw: sp.maxGasReimbursementRaw,
+          nonce: sp.nonce,
+          signature: intentSig,
+        }),
+      });
+      if (!relayRes?.ok) {
+        throw new Error(relayRes?.error || 'Sponsored Flash Unwind relay failed.');
+      }
+      showToast(
+        `$0-Gas Sponsored Flash Unwind sent on ${plan.chainName}! Cleared ${debtSummary} → returning ${netSummary || 'net equity'} (gas paid from surplus, 0% Turgalium fee). Refreshing scan…`,
+        8000
+      );
+      setTimeout(() => {
+        runScan({ address: connectedEvm, refresh: true, autoOpen: true }).catch(() => {});
+      }, 5000);
+      return;
+    }
+
+    if (needsNativeGas) {
+      const refuelSource = findBestGasRefuelSourceChain(plan.chain);
+      if (!refuelSource) {
+        showToast(
+          plan.nativeGasStatus.reason ||
+            `${plan.chainName} needs native gas (${plan.nativeGasStatus.nativeSymbol}) to submit Flash Unwind.`,
+          8000
+        );
+        return;
+      }
+      if (triggerBtn) {
+        triggerBtn.textContent = `Refueling ${plan.chainName} gas from ${refuelSource.chainName || refuelSource.chain}…`;
+      }
+      const refuelQuote = await api('/api/gas/refuel-quote', {
+        method: 'POST',
+        body: JSON.stringify({
+          fromChain: refuelSource.chain,
+          toChain: plan.chain,
+          userAddress: connectedEvm,
+          amountUsd: Math.max(0.5, Number(plan.nativeGasStatus.shortfallUsd || 0.5) + 0.5),
+        }),
+      });
+      if (!refuelQuote?.transaction?.to) {
+        throw new Error('Could not quote unified cross-chain gas refuel.');
+      }
+      const refuelSend = await sendCallsWithFallback({
+        chainId: refuelQuote.fromChainId,
+        chain: refuelQuote.fromChain,
+        chainName: refuelQuote.fromChainName,
+        calls: [
+          {
+            to: refuelQuote.transaction.to,
+            data: refuelQuote.transaction.data || '0x',
+            value: refuelQuote.transaction.value || '0x0',
+            stepId: 'flash_unwind_gas_refuel',
+            label: refuelQuote.transaction.label,
+          },
+        ],
+        primaryProvider: 'relay',
+        expectedFrom: connectedEvm,
+      });
+      if (refuelSend?.failed) {
+        throw new Error(refuelSend.failedReason || 'Unified gas refuel transaction failed.');
+      }
+      const waitMs = Math.min(8000, Math.max(2500, Number(refuelQuote.estimatedSeconds || 3) * 1000));
+      showToast(
+        `Unified gas sent (${refuelQuote.estimatedOutFormatted} arriving on ${plan.chainName} in ~${refuelQuote.estimatedSeconds}s) — continuing into Flash Unwind…`,
+        5000
+      );
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+
     if (triggerBtn) triggerBtn.textContent = `Confirm in Wallet (${plan.chainName})…`;
     const sendRes = await sendCallsWithFallback({
       chainId: plan.chainId,
