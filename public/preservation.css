@@ -647,39 +647,26 @@ html[data-ui-mode="lite"] .preservation-strip {
   color: var(--ink-2, #52525b);
 }
 
-.ptool-split-row {
+.ptool-yield-meta-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
   align-items: center;
+  justify-content: space-between;
   min-width: 0;
 }
 
-.ptool-split-btn {
-  flex: 1 1 auto;
-  min-width: 0;
-  padding: 6px 9px;
-  border-radius: 9px;
-  border: 1px solid var(--border, #e4e6eb);
-  background: var(--bg-surface, #ffffff);
-  color: var(--ink-1, #27272a);
-  font-size: 11.5px;
-  font-weight: 500;
-  cursor: pointer;
-  text-align: center;
-  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
-}
-
-.ptool-split-btn:hover {
-  border-color: var(--border-strong, #d1d5db);
-  color: var(--ink-0, #0a0a0a);
-}
-
-.ptool-split-btn.active {
-  background: var(--ice-soft, #e8faff);
-  border-color: var(--ice-border, #7dd3fc);
-  color: var(--ink-0, #0a0a0a);
+.ptool-principal-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: var(--allow-bg, #ecfdf5);
+  border: 1px solid var(--allow-border, #a7f3d0);
+  color: var(--allow, #059669);
+  font-size: 11px;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .ptool-card-body {

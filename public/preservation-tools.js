@@ -2,7 +2,7 @@
  * Turgalium Capital-Preservation & Post-Arrival Solana Tools Module:
  *  1. 1-Click Reclaim Free SOL (Empty-ATA Rent Vacuum) -> POST /api/solana/rent-scan
  *  2. 1-Click Sweep Solana SPL Dust (Swap to USDC/SOL + Atomic CloseAccount Rent Reclaim) -> POST /api/solana/dust-scan + /api/solana/dust-sweep
- *  3. 1-Click Post-Arrival Solana Yield Park (90% Safe Compound) -> GET /api/solana/yield-strategies + POST /api/solana/yield-park
+ *  3. 1-Click Post-Arrival Solana Yield Park (100% Principal-Safe) -> GET /api/solana/yield-strategies + POST /api/solana/yield-park
  *  4. 1-Click Stale ERC-20 Approval Revoker -> POST /api/approvals/scan + EIP-5792 / sequential revoke
  *
  * Security: Zero `innerHTML` with untrusted API strings — all dynamic values rendered strictly via `textContent`.
@@ -40,7 +40,13 @@ const SUPPORTED_APPROVAL_CHAINS = [
 ];
 
 const SOLSCAN_ALLOWED_HOSTS = ['solscan.io'];
-const YIELD_VAULT_ALLOWED_HOSTS = ['jup.ag', 'app.kamino.finance', 'kamino.finance'];
+const YIELD_VAULT_ALLOWED_HOSTS = [
+  'jup.ag',
+  'app.kamino.finance',
+  'kamino.finance',
+  'marinade.finance',
+  'app.marinade.finance',
+];
 const EVM_EXPLORER_ALLOWED_HOSTS = [
   'etherscan.io',
   'basescan.org',
@@ -73,11 +79,10 @@ const state = {
   rentSeq: 0,
   userEditedRentOwner: false,
 
-  // Yield Park
+  // Yield Park (100% principal-safe)
   strategies: [],
   strategiesLoaded: false,
   selectedStrategyId: 'jupsol',
-  preservePct: 90,
   yieldAmountUsdc: 100,
   userEditedYieldAmount: false,
   yieldPlan: null,
@@ -257,10 +262,10 @@ function updateSectionSummaryBadges() {
       state.strategies.find((s) => s.id === state.selectedStrategyId) || state.strategies[0];
     const apy = state.yieldPlan?.apy?.estimatedApyPct ?? activeStrat?.baselineApyPct;
     if (Number.isFinite(Number(apy))) {
-      yieldBadge.textContent = `${state.preservePct}% Yield · ~${Number(apy).toFixed(1)}% APY`;
+      yieldBadge.textContent = `100% Safe Yield · ~${Number(apy).toFixed(1)}% APY`;
       yieldBadge.classList.add('is-active');
     } else {
-      yieldBadge.textContent = '90% Safe Compound';
+      yieldBadge.textContent = 'Earn on Solana';
       yieldBadge.classList.remove('is-active');
     }
   }
@@ -598,7 +603,7 @@ function renderRentVacuumCard() {
 }
 
 // =========================================================================
-// 2. POST-ARRIVAL SOLANA YIELD PARK (90% SAFE COMPOUND)
+// 2. POST-ARRIVAL SOLANA YIELD PARK (100% PRINCIPAL-SAFE)
 // =========================================================================
 
 async function loadSolanaYieldStrategies() {
@@ -666,7 +671,7 @@ async function runYieldParkRequest({ buildTransaction = false } = {}) {
       body: JSON.stringify({
         ownerAddress: buildTransaction ? connectedSol : ownerAddress,
         totalUsdcAmount: parsedAmount,
-        preservePct: state.preservePct,
+        preservePct: 100,
         strategy: state.selectedStrategyId,
         buildTransaction,
       }),
@@ -748,6 +753,7 @@ function resolveLogo(preferred, fallback) {
 function getYieldStrategyLogo(strategyId) {
   const id = String(strategyId || '').toLowerCase();
   if (id.includes('kamino')) return resolveLogo('/logos/kamino.svg', '/logos/vault.svg');
+  if (id.includes('marinade') || id.includes('msol')) return '/logos/solana.svg';
   if (id.includes('sanctum')) return resolveLogo('/logos/sanctum.svg', '/logos/solana.svg');
   if (id.includes('jupsol')) return resolveLogo('/logos/jupsol.svg', '/logos/solana.svg');
   if (id.includes('jupiter')) return resolveLogo('/logos/jupiter.svg', '/logos/usdc.svg');
@@ -789,11 +795,6 @@ function renderYieldParkCard() {
     }
   }
 
-  document.querySelectorAll('[data-yield-split]').forEach((btn) => {
-    const pct = Number(btn.getAttribute('data-yield-split'));
-    btn.classList.toggle('active', pct === state.preservePct);
-  });
-
   if (previewBtn) {
     previewBtn.disabled = state.yieldLoading || state.yieldSigning;
     previewBtn.textContent = state.yieldLoading ? 'Quoting…' : 'Preview Quote';
@@ -826,7 +827,7 @@ function renderYieldParkCard() {
         el(
           'span',
           '',
-          `Split ready (${fmtUsd(state.yieldLastTx.yieldUsdc)} → ${state.yieldLastTx.strategyName}) · `
+          `Vault ready (${fmtUsd(state.yieldLastTx.yieldUsdc)} → ${state.yieldLastTx.strategyName}) · `
         )
       );
       const vaultHref = safeHttpsUrl(state.yieldLastTx.explorerUrl, YIELD_VAULT_ALLOWED_HOSTS);
@@ -857,11 +858,9 @@ function renderYieldParkCard() {
     frag.appendChild(okBox);
   }
 
-  // Compute live split preview even before server round-trip
+  // 100% principal-safe projection preview
   const totalUsdc = Math.max(0, Number(state.yieldAmountUsdc) || 0);
-  const yieldUsdc = plan?.split?.yieldUsdc ?? Number(((totalUsdc * state.preservePct) / 100).toFixed(2));
-  const degenUsdc =
-    plan?.split?.degenSidePocketUsdc ?? Number(Math.max(0, totalUsdc - yieldUsdc).toFixed(2));
+  const yieldUsdc = plan?.split?.yieldUsdc ?? Number(totalUsdc.toFixed(2));
   const annualUsd =
     plan?.projections?.projectedAnnualYieldUsd ??
     Number(((yieldUsdc * Number(apyPct)) / 100).toFixed(2));
@@ -870,18 +869,18 @@ function renderYieldParkCard() {
 
   const kpis = el('div', 'ptool-kpi-grid');
   const k1 = el('div', 'ptool-kpi');
-  k1.appendChild(el('span', 'ptool-kpi-label', `Yield (${state.preservePct}%)`));
+  k1.appendChild(el('span', 'ptool-kpi-label', 'Deposited (100%)'));
   k1.appendChild(el('strong', 'ptool-kpi-val mono is-emerald', fmtUsd(yieldUsdc)));
   kpis.appendChild(k1);
 
   const k2 = el('div', 'ptool-kpi');
-  k2.appendChild(el('span', 'ptool-kpi-label', 'Est. Annual'));
-  k2.appendChild(el('strong', 'ptool-kpi-val mono', `+${fmtUsd(annualUsd)}/yr`));
+  k2.appendChild(el('span', 'ptool-kpi-label', 'Projected APY'));
+  k2.appendChild(el('strong', 'ptool-kpi-val mono', `${Number(apyPct).toFixed(2)}%`));
   kpis.appendChild(k2);
 
   const k3 = el('div', 'ptool-kpi');
-  k3.appendChild(el('span', 'ptool-kpi-label', `Side-Pocket (${100 - state.preservePct}%)`));
-  k3.appendChild(el('strong', 'ptool-kpi-val mono', fmtUsd(degenUsdc)));
+  k3.appendChild(el('span', 'ptool-kpi-label', 'Est. Yield'));
+  k3.appendChild(el('strong', 'ptool-kpi-val mono', `+${fmtUsd(annualUsd)}/yr`));
   kpis.appendChild(k3);
   frag.appendChild(kpis);
 
@@ -1844,18 +1843,6 @@ function bindEvents() {
     updateSectionSummaryBadges();
   });
 
-  document.querySelectorAll('[data-yield-split]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const pct = Number(btn.getAttribute('data-yield-split'));
-      if (pct === 90 || pct === 100) {
-        state.preservePct = pct;
-        state.yieldPlan = null;
-        renderYieldParkCard();
-        updateSectionSummaryBadges();
-      }
-    });
-  });
-
   document.getElementById('yieldAmountInput')?.addEventListener('input', (ev) => {
     const val = Number(ev.target.value);
     state.userEditedYieldAmount = true;
@@ -1962,7 +1949,7 @@ function bindEvents() {
   });
 
   window.addEventListener('turgalium:scan-updated', (ev) => {
-    const scanReport = ev?.detail?.scanReport;
+    const scanReport = ev?.detail?.scanReport || ev?.detail?.scan;
     if (!scanReport) return;
     state.latestScanReport = scanReport;
     const bestChain = pickBestApprovalChainFromScan(scanReport);
@@ -1973,13 +1960,44 @@ function bindEvents() {
     updateSectionSummaryBadges();
   });
 
+  // Hydrate SPL dust + live yield strategies in 1 request from POST /api/solana/overview or /api/workspace/hydrate
+  window.addEventListener('turgalium:solana-overview', (ev) => {
+    const overview = ev?.detail;
+    if (!overview || typeof overview !== 'object') return;
+    if (Array.isArray(overview.yieldStrategies) && overview.yieldStrategies.length > 0) {
+      state.strategies = overview.yieldStrategies;
+      state.strategiesLoaded = true;
+      populateYieldStrategySelect();
+    }
+    if (overview.dust && typeof overview.dust === 'object') {
+      state.dustSeq += 1;
+      state.dustScan = overview.dust;
+      state.dustError = null;
+      state.dustLoading = false;
+      state.sweptDustAccounts.clear();
+    }
+    if (
+      overview.balances &&
+      !state.userEditedYieldAmount &&
+      Number(overview.balances.usdcBalance) > 0
+    ) {
+      state.yieldAmountUsdc = Number(Number(overview.balances.usdcBalance).toFixed(2));
+    }
+    renderRentVacuumCard();
+    renderSplDustCard();
+    renderYieldParkCard();
+    updateSectionSummaryBadges();
+  });
+
   ensureSplDustCard();
   renderRentVacuumCard();
   renderSplDustCard();
   renderYieldParkCard();
   renderApprovalRevokerCard();
   updateSectionSummaryBadges();
-  loadSolanaYieldStrategies();
+  if (!state.strategiesLoaded) {
+    loadSolanaYieldStrategies();
+  }
 }
 
 if (document.readyState === 'loading') {

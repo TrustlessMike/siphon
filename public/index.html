@@ -18,13 +18,12 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=14" />
-    <link rel="stylesheet" href="/degen.css?v=3" />
-    <link rel="stylesheet" href="/preservation.css?v=6" />
+    <link rel="stylesheet" href="/styles.css?v=15" />
+    <link rel="stylesheet" href="/preservation.css?v=7" />
   </head>
   <body>
     <!-- =============================================================== -->
-    <!-- MODE 1: SINGLE-SCREEN JUPITER ENTRY                             -->
+    <!-- MODE 1: SINGLE-SCREEN TURGALIUM ENTRY                           -->
     <!-- =============================================================== -->
     <div class="site-shell" id="siteShell">
       <header class="site-nav">
@@ -150,7 +149,7 @@
     </div>
 
     <!-- =============================================================== -->
-    <!-- MODE 2: JUPITER SWEEP CONSOLE                                   -->
+    <!-- MODE 2: TURGALIUM SWEEP CONSOLE                                 -->
     <!-- =============================================================== -->
     <div class="app-shell hidden" id="appShell">
       <header class="app-topbar">
@@ -175,10 +174,6 @@
             <button type="button" class="app-tab" data-view="activity" role="tab">
               Activity
               <span class="tab-count muted" id="tabBurnCount">0</span>
-            </button>
-            <button type="button" class="app-tab" data-view="degen" role="tab">
-              Degen
-              <span class="tab-count muted" id="tabDegenCount">JUP</span>
             </button>
             <button type="button" class="app-tab" data-view="ai" role="tab">
               AI
@@ -496,10 +491,13 @@
                 <!-- Real-Time Pre-Sign Proof Panel (Pro Mode Only) -->
                 <div class="proof-card hidden pro-only" id="preSignProofCard"></div>
 
+                <!-- 1-Click Batch Pre-Sign Summary Card (Lite + Pro) -->
+                <div class="one-click-summary-card hidden" id="oneClickSweepSummaryCard" role="region" aria-label="Pre-sign sweep summary" aria-live="polite"></div>
+
                 <!-- Primary Action + Pre-Sign Simulation -->
                 <div class="cta-action-stack">
                   <button type="button" class="sweep-cta-btn" id="runLiveQueueBtn">
-                    Sweep to Solana
+                    1-Click Sweep to Solana
                   </button>
                   <button type="button" class="proof-trigger-btn pro-only" id="verifyProofBtn">
                     Simulate before signing
@@ -579,7 +577,7 @@
                 <div class="ptool-card-body" id="rentVacuumBody" aria-live="polite"></div>
               </article>
 
-              <!-- Card 2: Earn on Solana -->
+              <!-- Card 2: Earn on Solana (100% Principal-Safe) -->
               <article class="ptool-card" id="yieldParkCard">
                 <div class="ptool-card-head">
                   <div>
@@ -587,7 +585,7 @@
                       <img src="/logos/usdc.svg" width="16" height="16" alt="" class="chain-logo-sm" id="yieldStrategyLogoImg" />
                       <h3>Earn on Solana</h3>
                     </div>
-                    <p class="ptool-card-sub">Put arrived USDC to work</p>
+                    <p class="ptool-card-sub">100% principal-safe Solana yield</p>
                   </div>
                   <span class="ptool-badge is-emerald" id="yieldApyBadge">~7.1% Est. APY</span>
                 </div>
@@ -602,7 +600,7 @@
                       </select>
                     </label>
                     <label class="ptool-field ptool-field-amount">
-                      <span class="ptool-label">Amount (USDC)</span>
+                      <span class="ptool-label">Deposit (USDC)</span>
                       <input
                         type="number"
                         id="yieldAmountInput"
@@ -611,13 +609,12 @@
                         min="1"
                         max="10000000"
                         step="1"
-                        aria-label="Total USDC amount for yield split"
+                        aria-label="USDC deposit amount for Solana yield"
                       />
                     </label>
                   </div>
-                  <div class="ptool-split-row" role="group" aria-label="Preservation yield split">
-                    <button type="button" class="ptool-split-btn active" data-yield-split="90">90% Yield / 10% Degen</button>
-                    <button type="button" class="ptool-split-btn" data-yield-split="100">100% Principal Safe</button>
+                  <div class="ptool-yield-meta-row">
+                    <span class="ptool-principal-pill">100% Principal-Safe · 0% Fee</span>
                     <button type="button" class="btn-outline-sm ptool-inline-btn" id="previewYieldBtn">Preview Quote</button>
                   </div>
                 </div>
@@ -1022,14 +1019,7 @@
         </section>
 
         <!-- ======================================================= -->
-        <!-- VIEW 5: DEGEN — JUPITER PREDICTION MARKETS & GAMES      -->
-        <!-- ======================================================= -->
-        <section class="view-pane" id="view-degen" aria-label="Degen Jupiter Prediction Markets">
-          <div id="degenRoot" class="degen-root"></div>
-        </section>
-
-        <!-- ======================================================= -->
-        <!-- VIEW 6: ZERO-KEY AI AGENT LAUNCHPAD (CHATGPT / CLAUDE)  -->
+        <!-- VIEW 5: ZERO-KEY AI AGENT LAUNCHPAD (CHATGPT / CLAUDE)  -->
         <!-- ======================================================= -->
         <section class="view-pane" id="view-ai" aria-label="Launch with AI Agent">
           <div class="ai-launchpad-shell">
@@ -1266,13 +1256,13 @@
         <span class="mobile-sticky-sweep-sub" id="mobileStickySweepSub">0 assets · 0% fee</span>
       </div>
       <button type="button" class="btn-pill-dark mobile-sticky-sweep-btn" id="mobileStickySweepBtn">
-        Sweep to Solana
+        1-Click Sweep
       </button>
     </div>
 
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>
 
-    <script type="module" src="/app.js?v=16"></script>
-    <script type="module" src="/preservation.js?v=5"></script>
+    <script type="module" src="/app.js?v=17"></script>
+    <script type="module" src="/preservation.js?v=6"></script>
   </body>
 </html>
