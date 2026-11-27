@@ -14,7 +14,14 @@ import {
   type AaveActiveDebtItem,
   type AaveRepayStepTx,
 } from './aave-unwind.js';
-import { isAllowedAaveV3Pool } from './extractors.js';
+import {
+  AAVE_V2_LENDING_POOLS,
+  BALANCER_V2_FLASH_VAULTS,
+  COMPOUND_V2_COMPTROLLERS,
+  COMPOUND_V3_COMETS,
+  isAllowedAaveV3Pool,
+  MORPHO_BLUE_SINGLETONS,
+} from './extractors.js';
 
 const EVM_ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -24,11 +31,51 @@ const MAX_UINT256 = (1n << 256n) - 1n;
  * Cryptographically verified 4-byte selectors from `forge inspect TurgaliumFlashUnwind methodIdentifiers`.
  */
 export const FLASH_UNWIND_SELECTORS = {
-  unwindSimple: '0x0ed15974',
+  unwindUniversal: '0x894e6c04',
   unwindMulti: '0xfd11edd9',
-  flashLoanPremiumTotal: '0x074b2e43', // Pool.FLASHLOAN_PREMIUM_TOTAL() -> uint128 (bps, 10000 = 100%)
+  // Legacy alias kept for backwards compatibility with callers referencing unwindSimple
+  unwindSimple: '0x894e6c04',
+  flashLoanPremiumTotal: '0x074b2e43', // Pool.FLASHLOAN_PREMIUM_TOTAL() -> uint128
   balanceOf: '0x70a08231',
+  cometAllow: '0x05287496', // Comet.allow(address manager, bool isAllowed)
+  cometIsAllowed: '0x32934603', // Comet.isAllowed(address owner, address manager)
+  cometBaseToken: '0xc55dae63', // Comet.baseToken()
+  cometBorrowBalanceOf: '0x374c49b4', // Comet.borrowBalanceOf(address)
+  cometCollateralBalanceOf: '0x2b92a07d', // Comet.collateralBalanceOf(address account, address asset)
+  comptrollerGetAssetsIn: '0xabfceffc', // Comptroller.getAssetsIn(address account)
+  cTokenUnderlying: '0x6f307dc3', // cToken.underlying()
+  cTokenBorrowBalanceStored: '0x95dd9193', // cToken.borrowBalanceStored(address)
+  cTokenExchangeRateStored: '0x182df0f5', // cToken.exchangeRateStored()
+  morphoSetAuthorization: '0xeecea000', // Morpho.setAuthorization(address authorized, bool newIsAuthorized)
+  morphoIsAuthorized: '0x65e4ad9e', // Morpho.isAuthorized(address authorizer, address authorized)
 } as const;
+
+export const FLASH_PROVIDER_KIND = {
+  AAVE_V3: 0,
+  MORPHO_BLUE: 1,
+  BALANCER_V2: 2,
+} as const;
+
+export type FlashProviderKindValue =
+  (typeof FLASH_PROVIDER_KIND)[keyof typeof FLASH_PROVIDER_KIND];
+
+export const LENDING_PROTOCOL_KIND = {
+  AAVE_V3: 0,
+  AAVE_V2: 1,
+  COMPOUND_V3: 2,
+  COMPOUND_V2: 3,
+  MORPHO_BLUE: 4,
+} as const;
+
+export type LendingProtocolKindValue =
+  (typeof LENDING_PROTOCOL_KIND)[keyof typeof LENDING_PROTOCOL_KIND];
+
+export type FlashUnwindProtocolFamily =
+  | 'aave_v3'
+  | 'aave_v2'
+  | 'compound_v3'
+  | 'compound_v2'
+  | 'morpho_blue';
 
 export const CANONICAL_FLASH_SWAP_ROUTERS = {
   kyberswapV2: '0x6131B5fae19EA4f9D964eAc0408E4408b66337b5',
@@ -37,9 +84,6 @@ export const CANONICAL_FLASH_SWAP_ROUTERS = {
   openOceanExchange: '0x6352a56caadC4F1E25CD6c75970Fa768A3304e64',
 } as const;
 
-/**
- * KyberSwap aggregator chain slug mapping across all Aave V3 / fork EVM chains.
- */
 const KYBERSWAP_CHAIN_SLUGS: Partial<Record<EvmChainId, string>> = {
   ethereum: 'ethereum',
   base: 'base',
@@ -77,6 +121,12 @@ export interface FlashUnwindDebtItem extends AaveActiveDebtItem {
   totalFlashRepayRaw: bigint;
   totalFlashRepayUi: number;
   hasSufficientFlashLiquidity: boolean;
+  /** Optional 0%-fee flash provider (Morpho Blue / Balancer V2) verified live on-chain */
+  zeroFeeFlashProvider?: {
+    kind: 'morpho_blue' | 'balancer_v2';
+    address: string;
+    liquidityRaw: bigint;
+  };
 }
 
 export interface AavePoolFullPosition {
@@ -86,6 +136,7 @@ export interface AavePoolFullPosition {
   userAddress: string;
   reservesCount: number;
   flashLoanPremiumBps: number;
+  lendingFamily?: FlashUnwindProtocolFamily;
   collaterals: FlashUnwindCollateralItem[];
   activeDebts: FlashUnwindDebtItem[];
   canRepayAllFromWallet: boolean;
@@ -137,6 +188,7 @@ export interface AaveFlashUnwindPlan {
   supported: boolean;
   mode:
     | 'flash_simple'
+    | 'flash_universal'
     | 'flash_multi'
     | 'wallet_repay'
     | 'no_debt'
@@ -144,6 +196,9 @@ export interface AaveFlashUnwindPlan {
     | 'swap_quote_unavailable'
     | 'unprofitable'
     | 'error';
+  lendingFamily: FlashUnwindProtocolFamily;
+  flashProviderName: string;
+  flashProviderAddress: string | null;
   chain: EvmChainId;
   chainId: number;
   chainName: string;
@@ -223,10 +278,46 @@ export function isTrustedFlashSwapRouter(chain: EvmChainId, router: string): boo
   return getTrustedFlashSwapRouters(chain).includes(router.toLowerCase());
 }
 
-/**
- * Resolves the deployed `TurgaliumFlashUnwind` contract address for a given EVM chain from
- * `TURGALIUM_FLASH_UNWIND_<CHAIN>` (or `TURGALIUM_FLASH_UNWIND_DEFAULT` for identical CREATE2 deploys).
- */
+export function isAllowedLendingMarket(
+  chain: EvmChainId,
+  family: FlashUnwindProtocolFamily,
+  marketAddress?: string | null
+): boolean {
+  if (!marketAddress || !EVM_ADDR_RE.test(marketAddress)) return false;
+  const low = marketAddress.toLowerCase();
+  if (family === 'aave_v3') return isAllowedAaveV3Pool(chain, marketAddress);
+  if (family === 'aave_v2') return AAVE_V2_LENDING_POOLS[chain]?.toLowerCase() === low;
+  if (family === 'compound_v3') {
+    const allowed = new Set(
+      [...(COMPOUND_V3_COMETS[chain] ?? []), EVM_CHAINS[chain]?.compoundV3Comet]
+        .filter((x): x is string => Boolean(x))
+        .map((x) => x.toLowerCase())
+    );
+    return allowed.has(low);
+  }
+  if (family === 'compound_v2') {
+    return (COMPOUND_V2_COMPTROLLERS[chain] ?? []).some((c) => c.toLowerCase() === low);
+  }
+  if (family === 'morpho_blue') {
+    return MORPHO_BLUE_SINGLETONS[chain]?.toLowerCase() === low;
+  }
+  return false;
+}
+
+export function getDefaultLendingMarket(
+  chain: EvmChainId,
+  family: FlashUnwindProtocolFamily
+): string | null {
+  if (family === 'aave_v3') return EVM_CHAINS[chain]?.aaveV3Pool ?? null;
+  if (family === 'aave_v2') return AAVE_V2_LENDING_POOLS[chain] ?? null;
+  if (family === 'compound_v3') {
+    return COMPOUND_V3_COMETS[chain]?.[0] ?? EVM_CHAINS[chain]?.compoundV3Comet ?? null;
+  }
+  if (family === 'compound_v2') return COMPOUND_V2_COMPTROLLERS[chain]?.[0] ?? null;
+  if (family === 'morpho_blue') return MORPHO_BLUE_SINGLETONS[chain] ?? null;
+  return null;
+}
+
 export function getFlashUnwindContractAddress(chain: EvmChainId): string | null {
   const specific = process.env[`TURGALIUM_FLASH_UNWIND_${chain.toUpperCase()}`]?.trim();
   if (specific && EVM_ADDR_RE.test(specific) && specific.toLowerCase() !== ZERO_ADDRESS) {
@@ -240,7 +331,7 @@ export function getFlashUnwindContractAddress(chain: EvmChainId): string | null 
 }
 
 // ---------------------------------------------------------------------------
-// Low-level pure-TS ABI helpers (zero external deps, verified against Forge)
+// Pure-TS ABI Encoders (verified byte-for-byte against Foundry `cast`)
 // ---------------------------------------------------------------------------
 
 function padAddress(addr: string): string {
@@ -275,9 +366,6 @@ function encodeCollateralPullArray(collaterals: FlashCollateralPullParam[]): str
 function encodeSwapStepArray(swaps: FlashSwapStepParam[]): string {
   if (swaps.length === 0) return padUint256(0);
 
-  // Each SwapStep is dynamic (contains `bytes callData`), so array body has:
-  //   length | offset[0] | ... | offset[n-1] | elem[0] | ... | elem[n-1]
-  // where offsets are relative to the start of the offset table (right after `length`).
   const encodedElems = swaps.map((s) => {
     const head = [
       padAddress(s.router),
@@ -285,7 +373,7 @@ function encodeSwapStepArray(swaps: FlashSwapStepParam[]): string {
       padAddress(s.tokenOut),
       padUint256(s.amountIn),
       padUint256(s.minAmountOut),
-      padUint256(6 * 32), // callData starts right after the 6 head words (192 bytes)
+      padUint256(6 * 32),
     ].join('');
     return `${head}${encodeDynamicBytes(s.callData)}`;
   });
@@ -324,7 +412,65 @@ function encodeUint256Array(vals: bigint[]): string {
 }
 
 /**
- * Encodes `TurgaliumFlashUnwind.unwindSimple(address pool, SimpleUnwindParams p)`.
+ * Encodes `TurgaliumFlashUnwind.unwindUniversal(UniversalUnwindParams p)` (selector `0x894e6c04`).
+ * Supports ALL 5 lending families (Aave V3, Aave V2, Compound V3, Compound V2, Morpho Blue)
+ * funded by ANY of the 3 flash providers (Aave V3, 0% Morpho Blue, 0% Balancer V2).
+ */
+export function encodeFlashUnwindUniversalCalldata(params: {
+  flashProviderKind: FlashProviderKindValue;
+  flashProvider: string;
+  lendingKind: LendingProtocolKindValue;
+  lendingMarket: string;
+  debtAsset: string;
+  debtAmount: bigint;
+  interestRateMode?: bigint;
+  protocolData?: string;
+  collaterals: FlashCollateralPullParam[];
+  swaps: FlashSwapStepParam[];
+  permits?: FlashPermitApprovalParam[];
+  recipient: string;
+  minDebtSurplus: bigint;
+  deadline: bigint;
+}): string {
+  const rateMode = params.interestRateMode ?? 2n;
+  const protoDataEnc = encodeDynamicBytes(params.protocolData ?? '0x');
+  const colEnc = encodeCollateralPullArray(params.collaterals);
+  const swapEnc = encodeSwapStepArray(params.swaps);
+  const permitEnc = encodePermitArray(params.permits ?? []);
+
+  // UniversalUnwindParams has 14 fields -> 14 head words = 448 bytes
+  let cursor = 14 * 32;
+  const offProtoData = cursor;
+  cursor += protoDataEnc.length / 2;
+  const offCols = cursor;
+  cursor += colEnc.length / 2;
+  const offSwaps = cursor;
+  cursor += swapEnc.length / 2;
+  const offPermits = cursor;
+
+  const tupleHead = [
+    padUint256(params.flashProviderKind),
+    padAddress(params.flashProvider),
+    padUint256(params.lendingKind),
+    padAddress(params.lendingMarket),
+    padAddress(params.debtAsset),
+    padUint256(params.debtAmount),
+    padUint256(rateMode),
+    padUint256(offProtoData),
+    padUint256(offCols),
+    padUint256(offSwaps),
+    padUint256(offPermits),
+    padAddress(params.recipient),
+    padUint256(params.minDebtSurplus),
+    padUint256(params.deadline),
+  ].join('');
+
+  // Top-level has 1 dynamic tuple argument -> offset = 0x20 (32 bytes)
+  return `${FLASH_UNWIND_SELECTORS.unwindUniversal}${padUint256(32)}${tupleHead}${protoDataEnc}${colEnc}${swapEnc}${permitEnc}`;
+}
+
+/**
+ * Convenience wrapper targeting Aave V3 self-flash via `unwindUniversal`.
  */
 export function encodeFlashUnwindSimpleCalldata(params: {
   pool: string;
@@ -338,35 +484,26 @@ export function encodeFlashUnwindSimpleCalldata(params: {
   minDebtSurplus: bigint;
   deadline: bigint;
 }): string {
-  const rateMode = params.interestRateMode ?? 2n;
-  const colEnc = encodeCollateralPullArray(params.collaterals);
-  const swapEnc = encodeSwapStepArray(params.swaps);
-  const permitEnc = encodePermitArray(params.permits ?? []);
-
-  // SimpleUnwindParams has 9 head words = 288 bytes
-  const headBytes = 9 * 32;
-  const colOffset = headBytes;
-  const swapOffset = colOffset + colEnc.length / 2;
-  const permitOffset = swapOffset + swapEnc.length / 2;
-
-  const tupleHead = [
-    padAddress(params.debtAsset),
-    padUint256(params.debtAmount),
-    padUint256(rateMode),
-    padUint256(colOffset),
-    padUint256(swapOffset),
-    padUint256(permitOffset),
-    padAddress(params.recipient),
-    padUint256(params.minDebtSurplus),
-    padUint256(params.deadline),
-  ].join('');
-
-  const topHead = `${padAddress(params.pool)}${padUint256(2 * 32)}`;
-  return `${FLASH_UNWIND_SELECTORS.unwindSimple}${topHead}${tupleHead}${colEnc}${swapEnc}${permitEnc}`;
+  return encodeFlashUnwindUniversalCalldata({
+    flashProviderKind: FLASH_PROVIDER_KIND.AAVE_V3,
+    flashProvider: params.pool,
+    lendingKind: LENDING_PROTOCOL_KIND.AAVE_V3,
+    lendingMarket: params.pool,
+    debtAsset: params.debtAsset,
+    debtAmount: params.debtAmount,
+    interestRateMode: params.interestRateMode ?? 2n,
+    protocolData: '0x',
+    collaterals: params.collaterals,
+    swaps: params.swaps,
+    permits: params.permits,
+    recipient: params.recipient,
+    minDebtSurplus: params.minDebtSurplus,
+    deadline: params.deadline,
+  });
 }
 
 /**
- * Encodes `TurgaliumFlashUnwind.unwindMulti(address pool, MultiUnwindParams p)`.
+ * Encodes `TurgaliumFlashUnwind.unwindMulti(address pool, MultiUnwindParams p)` (selector `0xfd11edd9`).
  */
 export function encodeFlashUnwindMultiCalldata(params: {
   pool: string;
@@ -388,7 +525,6 @@ export function encodeFlashUnwindMultiCalldata(params: {
   const permitEnc = encodePermitArray(params.permits ?? []);
   const minSurplusEnc = encodeUint256Array(params.minDebtSurpluses);
 
-  // MultiUnwindParams has 9 head words = 288 bytes
   let cursor = 9 * 32;
   const offDebtAssets = cursor;
   cursor += debtAssetsEnc.length / 2;
@@ -418,6 +554,14 @@ export function encodeFlashUnwindMultiCalldata(params: {
 
   const topHead = `${padAddress(params.pool)}${padUint256(2 * 32)}`;
   return `${FLASH_UNWIND_SELECTORS.unwindMulti}${topHead}${tupleHead}${debtAssetsEnc}${debtAmountsEnc}${modesEnc}${colEnc}${swapEnc}${permitEnc}${minSurplusEnc}`;
+}
+
+export function encodeCometAllowCalldata(manager: string, isAllowed: boolean): string {
+  return `${FLASH_UNWIND_SELECTORS.cometAllow}${padAddress(manager)}${padUint256(isAllowed ? 1n : 0n)}`;
+}
+
+export function encodeMorphoSetAuthorizationCalldata(authorized: string, isAllowed: boolean): string {
+  return `${FLASH_UNWIND_SELECTORS.morphoSetAuthorization}${padAddress(authorized)}${padUint256(isAllowed ? 1n : 0n)}`;
 }
 
 function decodeWordAddress(hex: string, wordIndex: number): string | null {
@@ -479,24 +623,24 @@ function decodeAbiString(hex: string, fallback: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Full Position Inspector (Collaterals + Active Debts + Live Flash Loan Fee)
+// Full Position Inspectors: Aave V3/V2 + Compound V2 + Zero-Fee Flash Probing
 // ---------------------------------------------------------------------------
 
 /**
- * Inspects ANY Aave V3 or Aave V3 fork Pool in 2 batched Multicall3 RPCs to discover:
- *   - Live `FLASHLOAN_PREMIUM_TOTAL()` bps (e.g. 50 bps on Neverland, 5 bps on Aave v3)
- *   - Every supplied collateral (`aToken.balanceOf(user) > 0`) + allowance to `flashUnwindContract`
- *   - Every active variable debt (`variableDebtToken.balanceOf(user) > 0`) + pool flash liquidity
+ * Inspects ANY Aave V3 or Aave V2 / fork Pool in 2 batched Multicall3 RPCs, AND simultaneously
+ * checks 0.00%-fee flash-loan liquidity on Morpho Blue & Balancer V2 Vault on that chain!
  */
 export async function inspectAavePoolFullPosition(params: {
   chain: EvmChainId;
   poolAddress: string;
   userAddress: string;
+  lendingFamily?: 'aave_v3' | 'aave_v2';
   flashUnwindContract?: string | null;
   timeoutMs?: number;
   rpcCallFn?: typeof evmJsonRpcCall;
 }): Promise<AavePoolFullPosition> {
   const { chain, poolAddress, userAddress } = params;
+  const family = params.lendingFamily ?? 'aave_v3';
   const cfg = EVM_CHAINS[chain];
   if (!cfg || !EVM_ADDR_RE.test(poolAddress) || !EVM_ADDR_RE.test(userAddress)) {
     return {
@@ -506,6 +650,7 @@ export async function inspectAavePoolFullPosition(params: {
       userAddress,
       reservesCount: 0,
       flashLoanPremiumBps: 5,
+      lendingFamily: family,
       collaterals: [],
       activeDebts: [],
       canRepayAllFromWallet: false,
@@ -519,9 +664,10 @@ export async function inspectAavePoolFullPosition(params: {
     params.flashUnwindContract && EVM_ADDR_RE.test(params.flashUnwindContract)
       ? params.flashUnwindContract
       : poolAddress;
+  const morphoAddr = MORPHO_BLUE_SINGLETONS[chain] ?? null;
+  const balancerAddr = BALANCER_V2_FLASH_VAULTS[chain] ?? null;
 
   try {
-    // 1. Fetch reserves list + live FLASHLOAN_PREMIUM_TOTAL() in ONE Multicall3 call
     const mc0 = await rpcFn<string>(
       cfg.rpcUrls,
       'eth_call',
@@ -554,6 +700,7 @@ export async function inspectAavePoolFullPosition(params: {
         userAddress,
         reservesCount: 0,
         flashLoanPremiumBps: 5,
+        lendingFamily: family,
         collaterals: [],
         activeDebts: [],
         canRepayAllFromWallet: false,
@@ -567,8 +714,10 @@ export async function inspectAavePoolFullPosition(params: {
       : [];
     const rawPremium = mc0Decoded[1]?.success
       ? Number(decodeWordUint(mc0Decoded[1].returnData, 0))
+      : family === 'aave_v2'
+      ? 9
       : 5;
-    const flashLoanPremiumBps =
+    const poolPremiumBps =
       Number.isFinite(rawPremium) && rawPremium >= 0 && rawPremium <= 500 ? rawPremium : 5;
 
     if (!reserves.length) {
@@ -578,14 +727,20 @@ export async function inspectAavePoolFullPosition(params: {
         poolAddress,
         userAddress,
         reservesCount: 0,
-        flashLoanPremiumBps,
+        flashLoanPremiumBps: poolPremiumBps,
+        lendingFamily: family,
         collaterals: [],
         activeDebts: [],
         canRepayAllFromWallet: true,
       };
     }
 
-    // 2. Multicall3 #1: Pool.getReserveData(reserve) for every reserve
+    // Multicall3 #1: Pool.getReserveData(reserve)
+    //   Aave V3: word 8 = aToken, word 10 = variableDebtToken
+    //   Aave V2: word 7 = aToken, word 9 = variableDebtToken
+    const aTokenWord = family === 'aave_v2' ? 7 : 8;
+    const vDebtWord = family === 'aave_v2' ? 9 : 10;
+
     const mc1 = await rpcFn<string>(
       cfg.rpcUrls,
       'eth_call',
@@ -612,7 +767,8 @@ export async function inspectAavePoolFullPosition(params: {
         poolAddress,
         userAddress,
         reservesCount: reserves.length,
-        flashLoanPremiumBps,
+        flashLoanPremiumBps: poolPremiumBps,
+        lendingFamily: family,
         collaterals: [],
         activeDebts: [],
         canRepayAllFromWallet: false,
@@ -630,8 +786,8 @@ export async function inspectAavePoolFullPosition(params: {
     for (let i = 0; i < reserves.length; i += 1) {
       const entry = mc1Decoded[i];
       if (!entry?.success) continue;
-      const aToken = decodeWordAddress(entry.returnData, 8);
-      const vDebt = decodeWordAddress(entry.returnData, 10);
+      const aToken = decodeWordAddress(entry.returnData, aTokenWord);
+      const vDebt = decodeWordAddress(entry.returnData, vDebtWord);
       if (aToken && vDebt) {
         parsedReserves.push({
           asset: reserves[i],
@@ -641,18 +797,15 @@ export async function inspectAavePoolFullPosition(params: {
       }
     }
 
-    // 3. Multicall3 #2: 8 reads per reserve in ONE single RPC call:
-    //    [0] aToken.balanceOf(user)
-    //    [1] aToken.allowance(user, flashUnwindContract)
-    //    [2] variableDebt.balanceOf(user)
-    //    [3] underlying.balanceOf(user)
-    //    [4] underlying.allowance(user, pool)
-    //    [5] underlying.balanceOf(aToken)  <- available flash-loan liquidity!
-    //    [6] underlying.symbol()
-    //    [7] underlying.decimals()
+    // Multicall3 #2: 10 reads per reserve (includes live 0%-fee Morpho Blue + Balancer V2 balances!)
     const userBalCall = `${FLASH_UNWIND_SELECTORS.balanceOf}${padAddress(userAddress)}`;
     const aTokenAllowCall = encodeErc20AllowanceCalldata(userAddress, spenderForAToken);
     const underlyingAllowCall = encodeErc20AllowanceCalldata(userAddress, poolAddress);
+    const morphoBalCall = morphoAddr ? `${FLASH_UNWIND_SELECTORS.balanceOf}${padAddress(morphoAddr)}` : null;
+    const balancerBalCall = balancerAddr
+      ? `${FLASH_UNWIND_SELECTORS.balanceOf}${padAddress(balancerAddr)}`
+      : null;
+
     const mc2Calls = parsedReserves.flatMap((r) => [
       { target: r.aTokenAddress, allowFailure: true, callData: userBalCall },
       { target: r.aTokenAddress, allowFailure: true, callData: aTokenAllowCall },
@@ -666,6 +819,16 @@ export async function inspectAavePoolFullPosition(params: {
       },
       { target: r.asset, allowFailure: true, callData: AAVE_V3_UNWIND_SELECTORS.symbol },
       { target: r.asset, allowFailure: true, callData: AAVE_V3_UNWIND_SELECTORS.decimals },
+      {
+        target: r.asset,
+        allowFailure: true,
+        callData: morphoBalCall ?? userBalCall,
+      },
+      {
+        target: r.asset,
+        allowFailure: true,
+        callData: balancerBalCall ?? userBalCall,
+      },
     ]);
 
     const mc2 = await rpcFn<string>(
@@ -682,7 +845,8 @@ export async function inspectAavePoolFullPosition(params: {
         poolAddress,
         userAddress,
         reservesCount: reserves.length,
-        flashLoanPremiumBps,
+        flashLoanPremiumBps: poolPremiumBps,
+        lendingFamily: family,
         collaterals: [],
         activeDebts: [],
         canRepayAllFromWallet: false,
@@ -695,7 +859,7 @@ export async function inspectAavePoolFullPosition(params: {
     const activeDebts: FlashUnwindDebtItem[] = [];
 
     for (let i = 0; i < parsedReserves.length; i += 1) {
-      const base = i * 8;
+      const base = i * 10;
       const r = parsedReserves[i];
       const aTokenBalRaw = mc2Decoded[base]?.success
         ? decodeWordUint(mc2Decoded[base].returnData, 0)
@@ -715,7 +879,7 @@ export async function inspectAavePoolFullPosition(params: {
       const underlyingAllowRaw = mc2Decoded[base + 4]?.success
         ? decodeWordUint(mc2Decoded[base + 4].returnData, 0)
         : 0n;
-      const flashLiquidityRaw = mc2Decoded[base + 5]?.success
+      const poolFlashLiqRaw = mc2Decoded[base + 5]?.success
         ? decodeWordUint(mc2Decoded[base + 5].returnData, 0)
         : 0n;
       const symbol = mc2Decoded[base + 6]?.success
@@ -725,6 +889,14 @@ export async function inspectAavePoolFullPosition(params: {
         ? Number(decodeWordUint(mc2Decoded[base + 7].returnData, 0))
         : 18;
       const decimals = Number.isFinite(rawDec) && rawDec >= 0 && rawDec <= 36 ? rawDec : 18;
+      const morphoLiqRaw =
+        morphoAddr && mc2Decoded[base + 8]?.success
+          ? decodeWordUint(mc2Decoded[base + 8].returnData, 0)
+          : 0n;
+      const balancerLiqRaw =
+        balancerAddr && mc2Decoded[base + 9]?.success
+          ? decodeWordUint(mc2Decoded[base + 9].returnData, 0)
+          : 0n;
 
       if (aTokenBalRaw > 0n) {
         collaterals.push({
@@ -743,7 +915,33 @@ export async function inspectAavePoolFullPosition(params: {
         const canRepayFull = walletBalRaw >= bufferedDebtRaw;
         const shortfallRaw = canRepayFull ? 0n : bufferedDebtRaw - walletBalRaw;
         const flashBufferRaw = debtRaw + debtRaw / 1_000_000n + 2n;
-        const flashPremiumRaw = (flashBufferRaw * BigInt(flashLoanPremiumBps)) / 10_000n + 1n;
+
+        // Auto-select 0.00% FREE flash loan source (Morpho Blue or Balancer V2) whenever liquid!
+        let zeroFeeFlashProvider: FlashUnwindDebtItem['zeroFeeFlashProvider'];
+        if (morphoAddr && morphoLiqRaw >= flashBufferRaw) {
+          zeroFeeFlashProvider = {
+            kind: 'morpho_blue',
+            address: morphoAddr,
+            liquidityRaw: morphoLiqRaw,
+          };
+        } else if (balancerAddr && balancerLiqRaw >= flashBufferRaw) {
+          zeroFeeFlashProvider = {
+            kind: 'balancer_v2',
+            address: balancerAddr,
+            liquidityRaw: balancerLiqRaw,
+          };
+        }
+
+        const effectivePremiumBps = zeroFeeFlashProvider ? 0 : poolPremiumBps;
+        const effectiveLiquidityRaw = zeroFeeFlashProvider
+          ? zeroFeeFlashProvider.liquidityRaw
+          : family === 'aave_v3'
+          ? poolFlashLiqRaw
+          : 0n;
+        const flashPremiumRaw =
+          effectivePremiumBps === 0
+            ? 0n
+            : (flashBufferRaw * BigInt(effectivePremiumBps)) / 10_000n + 1n;
         const totalFlashRepayRaw = flashBufferRaw + flashPremiumRaw;
 
         activeDebts.push({
@@ -762,17 +960,21 @@ export async function inspectAavePoolFullPosition(params: {
           shortfallUi: Number(formatUnits(shortfallRaw, decimals).toFixed(6)),
           repayCallAmountRaw: canRepayFull ? MAX_UINT256 : walletBalRaw,
           repayApproveAmountRaw: canRepayFull ? bufferedDebtRaw : walletBalRaw,
-          flashLiquidityRaw,
-          flashLiquidityUi: Number(formatUnits(flashLiquidityRaw, decimals).toFixed(6)),
-          flashPremiumBps: flashLoanPremiumBps,
+          flashLiquidityRaw: effectiveLiquidityRaw,
+          flashLiquidityUi: Number(formatUnits(effectiveLiquidityRaw, decimals).toFixed(6)),
+          flashPremiumBps: effectivePremiumBps,
           flashPremiumRaw,
           flashPremiumUi: Number(formatUnits(flashPremiumRaw, decimals).toFixed(6)),
           totalFlashRepayRaw,
           totalFlashRepayUi: Number(formatUnits(totalFlashRepayRaw, decimals).toFixed(6)),
-          hasSufficientFlashLiquidity: flashLiquidityRaw >= flashBufferRaw,
+          hasSufficientFlashLiquidity: effectiveLiquidityRaw >= flashBufferRaw,
+          zeroFeeFlashProvider,
         });
       }
     }
+
+    const effectivePoolPremium =
+      activeDebts.length === 1 && activeDebts[0].zeroFeeFlashProvider ? 0 : poolPremiumBps;
 
     return {
       checked: true,
@@ -780,7 +982,8 @@ export async function inspectAavePoolFullPosition(params: {
       poolAddress,
       userAddress,
       reservesCount: reserves.length,
-      flashLoanPremiumBps,
+      flashLoanPremiumBps: effectivePoolPremium,
+      lendingFamily: family,
       collaterals,
       activeDebts,
       canRepayAllFromWallet: activeDebts.every((d) => d.canRepayFull),
@@ -793,10 +996,325 @@ export async function inspectAavePoolFullPosition(params: {
       userAddress,
       reservesCount: 0,
       flashLoanPremiumBps: 5,
+      lendingFamily: family,
       collaterals: [],
       activeDebts: [],
       canRepayAllFromWallet: false,
-      reason: err instanceof Error ? err.message : 'Unexpected RPC error inspecting Aave pool.',
+      reason: err instanceof Error ? err.message : 'Unexpected RPC error inspecting lending pool.',
+    };
+  }
+}
+
+/**
+ * Inspects ANY Compound V2 fork Comptroller (Compound V2, Venus, Benqi, Moonwell, Mendi)
+ * to discover supplied collateral cTokens + active borrow cTokens and live 0%-fee flash liquidity.
+ */
+export async function inspectCompoundV2FullPosition(params: {
+  chain: EvmChainId;
+  comptrollerAddress: string;
+  userAddress: string;
+  flashUnwindContract?: string | null;
+  timeoutMs?: number;
+  rpcCallFn?: typeof evmJsonRpcCall;
+}): Promise<AavePoolFullPosition> {
+  const { chain, comptrollerAddress, userAddress } = params;
+  const cfg = EVM_CHAINS[chain];
+  if (!cfg || !EVM_ADDR_RE.test(comptrollerAddress) || !EVM_ADDR_RE.test(userAddress)) {
+    return {
+      checked: false,
+      chain,
+      poolAddress: comptrollerAddress,
+      userAddress,
+      reservesCount: 0,
+      flashLoanPremiumBps: 0,
+      lendingFamily: 'compound_v2',
+      collaterals: [],
+      activeDebts: [],
+      canRepayAllFromWallet: false,
+      reason: 'Invalid chain, comptrollerAddress, or userAddress.',
+    };
+  }
+
+  const rpcFn = params.rpcCallFn ?? evmJsonRpcCall;
+  const timeoutMs = params.timeoutMs ?? 4_500;
+  const spender =
+    params.flashUnwindContract && EVM_ADDR_RE.test(params.flashUnwindContract)
+      ? params.flashUnwindContract
+      : comptrollerAddress;
+
+  try {
+    // 1. Read user's entered cToken markets from Comptroller.getAssetsIn(user)
+    const assetsRes = await rpcFn<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [
+        {
+          to: comptrollerAddress,
+          data: `${FLASH_UNWIND_SELECTORS.comptrollerGetAssetsIn}${padAddress(userAddress)}`,
+        },
+        'latest',
+      ],
+      timeoutMs
+    );
+    if (!assetsRes.result || assetsRes.error) {
+      return {
+        checked: false,
+        chain,
+        poolAddress: comptrollerAddress,
+        userAddress,
+        reservesCount: 0,
+        flashLoanPremiumBps: 0,
+        lendingFamily: 'compound_v2',
+        collaterals: [],
+        activeDebts: [],
+        canRepayAllFromWallet: false,
+        reason: assetsRes.error?.message || 'Comptroller.getAssetsIn() failed.',
+      };
+    }
+
+    const cTokens = decodeDynamicAddressArray(assetsRes.result);
+    if (!cTokens.length) {
+      return {
+        checked: true,
+        chain,
+        poolAddress: comptrollerAddress,
+        userAddress,
+        reservesCount: 0,
+        flashLoanPremiumBps: 0,
+        lendingFamily: 'compound_v2',
+        collaterals: [],
+        activeDebts: [],
+        canRepayAllFromWallet: true,
+      };
+    }
+
+    // 2. Multicall3 #1: for each cToken read underlying(), balanceOf(user), allowance(user, spender),
+    //    borrowBalanceStored(user), exchangeRateStored()
+    const userBalCall = `${FLASH_UNWIND_SELECTORS.balanceOf}${padAddress(userAddress)}`;
+    const allowCall = encodeErc20AllowanceCalldata(userAddress, spender);
+    const borrowCall = `${FLASH_UNWIND_SELECTORS.cTokenBorrowBalanceStored}${padAddress(userAddress)}`;
+    const mc1 = await rpcFn<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [
+        {
+          to: cfg.multicall3,
+          data: encodeMulticall3Aggregate3(
+            cTokens.flatMap((ct) => [
+              { target: ct, allowFailure: true, callData: FLASH_UNWIND_SELECTORS.cTokenUnderlying },
+              { target: ct, allowFailure: true, callData: userBalCall },
+              { target: ct, allowFailure: true, callData: allowCall },
+              { target: ct, allowFailure: true, callData: borrowCall },
+              {
+                target: ct,
+                allowFailure: true,
+                callData: FLASH_UNWIND_SELECTORS.cTokenExchangeRateStored,
+              },
+            ])
+          ),
+        },
+        'latest',
+      ],
+      timeoutMs
+    );
+    if (!mc1.result || mc1.error) {
+      return {
+        checked: false,
+        chain,
+        poolAddress: comptrollerAddress,
+        userAddress,
+        reservesCount: cTokens.length,
+        flashLoanPremiumBps: 0,
+        lendingFamily: 'compound_v2',
+        collaterals: [],
+        activeDebts: [],
+        canRepayAllFromWallet: false,
+        reason: mc1.error?.message || 'Compound v2 cToken multicall failed.',
+      };
+    }
+
+    const mc1Dec = decodeMulticall3Aggregate3(mc1.result);
+    const entries: Array<{
+      cToken: string;
+      underlying: string;
+      cBal: bigint;
+      cAllow: bigint;
+      debt: bigint;
+      exchangeRate: bigint;
+    }> = [];
+    for (let i = 0; i < cTokens.length; i += 1) {
+      const b = i * 5;
+      const underlying = mc1Dec[b]?.success ? decodeWordAddress(mc1Dec[b].returnData, 0) : null;
+      if (!underlying) continue; // skip native cETH in v1 ERC-20 flash flow
+      const cBal = mc1Dec[b + 1]?.success ? decodeWordUint(mc1Dec[b + 1].returnData, 0) : 0n;
+      const cAllow = mc1Dec[b + 2]?.success ? decodeWordUint(mc1Dec[b + 2].returnData, 0) : 0n;
+      const debt = mc1Dec[b + 3]?.success ? decodeWordUint(mc1Dec[b + 3].returnData, 0) : 0n;
+      const exchangeRate = mc1Dec[b + 4]?.success ? decodeWordUint(mc1Dec[b + 4].returnData, 0) : 0n;
+      if (cBal > 0n || debt > 0n) {
+        entries.push({ cToken: cTokens[i], underlying, cBal, cAllow, debt, exchangeRate });
+      }
+    }
+
+    if (!entries.length) {
+      return {
+        checked: true,
+        chain,
+        poolAddress: comptrollerAddress,
+        userAddress,
+        reservesCount: cTokens.length,
+        flashLoanPremiumBps: 0,
+        lendingFamily: 'compound_v2',
+        collaterals: [],
+        activeDebts: [],
+        canRepayAllFromWallet: true,
+      };
+    }
+
+    // 3. Multicall3 #2: underlying symbol, decimals, walletBalance, Morpho/Balancer/Aave flash liquidity
+    const morphoAddr = MORPHO_BLUE_SINGLETONS[chain] ?? null;
+    const balancerAddr = BALANCER_V2_FLASH_VAULTS[chain] ?? null;
+    const mc2 = await rpcFn<string>(
+      cfg.rpcUrls,
+      'eth_call',
+      [
+        {
+          to: cfg.multicall3,
+          data: encodeMulticall3Aggregate3(
+            entries.flatMap((e) => [
+              { target: e.underlying, allowFailure: true, callData: AAVE_V3_UNWIND_SELECTORS.symbol },
+              { target: e.underlying, allowFailure: true, callData: AAVE_V3_UNWIND_SELECTORS.decimals },
+              { target: e.underlying, allowFailure: true, callData: userBalCall },
+              {
+                target: e.underlying,
+                allowFailure: true,
+                callData: morphoAddr
+                  ? `${FLASH_UNWIND_SELECTORS.balanceOf}${padAddress(morphoAddr)}`
+                  : userBalCall,
+              },
+              {
+                target: e.underlying,
+                allowFailure: true,
+                callData: balancerAddr
+                  ? `${FLASH_UNWIND_SELECTORS.balanceOf}${padAddress(balancerAddr)}`
+                  : userBalCall,
+              },
+            ])
+          ),
+        },
+        'latest',
+      ],
+      timeoutMs
+    );
+    if (!mc2.result || mc2.error) {
+      return {
+        checked: false,
+        chain,
+        poolAddress: comptrollerAddress,
+        userAddress,
+        reservesCount: cTokens.length,
+        flashLoanPremiumBps: 0,
+        lendingFamily: 'compound_v2',
+        collaterals: [],
+        activeDebts: [],
+        canRepayAllFromWallet: false,
+        reason: mc2.error?.message || 'Compound v2 underlying metadata multicall failed.',
+      };
+    }
+
+    const mc2Dec = decodeMulticall3Aggregate3(mc2.result);
+    const collaterals: FlashUnwindCollateralItem[] = [];
+    const activeDebts: FlashUnwindDebtItem[] = [];
+
+    for (let i = 0; i < entries.length; i += 1) {
+      const b = i * 5;
+      const e = entries[i];
+      const symbol = mc2Dec[b]?.success ? decodeAbiString(mc2Dec[b].returnData, 'TOKEN') : 'TOKEN';
+      const rawDec = mc2Dec[b + 1]?.success ? Number(decodeWordUint(mc2Dec[b + 1].returnData, 0)) : 18;
+      const decimals = Number.isFinite(rawDec) && rawDec >= 0 && rawDec <= 36 ? rawDec : 18;
+      const walletBal = mc2Dec[b + 2]?.success ? decodeWordUint(mc2Dec[b + 2].returnData, 0) : 0n;
+      const morphoLiq =
+        morphoAddr && mc2Dec[b + 3]?.success ? decodeWordUint(mc2Dec[b + 3].returnData, 0) : 0n;
+      const balancerLiq =
+        balancerAddr && mc2Dec[b + 4]?.success ? decodeWordUint(mc2Dec[b + 4].returnData, 0) : 0n;
+
+      if (e.cBal > 0n && e.exchangeRate > 0n) {
+        const underlyingAmountRaw = (e.cBal * e.exchangeRate) / 10n ** 18n;
+        if (underlyingAmountRaw > 0n) {
+          collaterals.push({
+            asset: e.underlying,
+            symbol,
+            decimals,
+            aTokenAddress: e.cToken, // stores cToken address for Compound V2 approve & CollateralPull.asset!
+            aTokenBalanceRaw: underlyingAmountRaw,
+            aTokenBalanceUi: Number(formatUnits(underlyingAmountRaw, decimals).toFixed(6)),
+            aTokenAllowanceRaw: e.cAllow,
+          });
+        }
+      }
+
+      if (e.debt > 0n) {
+        const flashBufferRaw = e.debt + e.debt / 1_000_000n + 2n;
+        let zeroFeeFlashProvider: FlashUnwindDebtItem['zeroFeeFlashProvider'];
+        if (morphoAddr && morphoLiq >= flashBufferRaw) {
+          zeroFeeFlashProvider = { kind: 'morpho_blue', address: morphoAddr, liquidityRaw: morphoLiq };
+        } else if (balancerAddr && balancerLiq >= flashBufferRaw) {
+          zeroFeeFlashProvider = { kind: 'balancer_v2', address: balancerAddr, liquidityRaw: balancerLiq };
+        }
+        const flashLiq = zeroFeeFlashProvider?.liquidityRaw ?? 0n;
+        activeDebts.push({
+          asset: e.underlying,
+          symbol,
+          decimals,
+          aTokenAddress: e.cToken,
+          variableDebtToken: e.cToken, // stores debtCToken for protocolData!
+          debtRaw: e.debt,
+          debtUi: Number(formatUnits(e.debt, decimals).toFixed(6)),
+          walletBalanceRaw: walletBal,
+          walletBalanceUi: Number(formatUnits(walletBal, decimals).toFixed(6)),
+          allowanceRaw: 0n,
+          canRepayFull: false,
+          shortfallRaw: e.debt,
+          shortfallUi: Number(formatUnits(e.debt, decimals).toFixed(6)),
+          repayCallAmountRaw: 0n,
+          repayApproveAmountRaw: 0n,
+          flashLiquidityRaw: flashLiq,
+          flashLiquidityUi: Number(formatUnits(flashLiq, decimals).toFixed(6)),
+          flashPremiumBps: 0,
+          flashPremiumRaw: 0n,
+          flashPremiumUi: 0,
+          totalFlashRepayRaw: flashBufferRaw,
+          totalFlashRepayUi: Number(formatUnits(flashBufferRaw, decimals).toFixed(6)),
+          hasSufficientFlashLiquidity: Boolean(zeroFeeFlashProvider),
+          zeroFeeFlashProvider,
+        });
+      }
+    }
+
+    return {
+      checked: true,
+      chain,
+      poolAddress: comptrollerAddress,
+      userAddress,
+      reservesCount: cTokens.length,
+      flashLoanPremiumBps: 0,
+      lendingFamily: 'compound_v2',
+      collaterals,
+      activeDebts,
+      canRepayAllFromWallet: false,
+    };
+  } catch (err) {
+    return {
+      checked: false,
+      chain,
+      poolAddress: comptrollerAddress,
+      userAddress,
+      reservesCount: 0,
+      flashLoanPremiumBps: 0,
+      lendingFamily: 'compound_v2',
+      collaterals: [],
+      activeDebts: [],
+      canRepayAllFromWallet: false,
+      reason: err instanceof Error ? err.message : 'Unexpected RPC error inspecting Compound V2.',
     };
   }
 }
@@ -823,7 +1341,7 @@ export async function quoteFlashUnwindSwap(params: {
   if (!cfg || params.amountInRaw <= 0n) return null;
 
   const fetcher = params.fetchFn ?? fetch;
-  const slippageBps = Math.max(20, Math.min(500, params.slippageBps ?? 100)); // default 1.00%
+  const slippageBps = Math.max(20, Math.min(500, params.slippageBps ?? 100));
   const timeoutMs = params.timeoutMs ?? 4_500;
   const amountInStr = params.amountInRaw.toString();
   const amountInUi = Number(formatUnits(params.amountInRaw, params.tokenInDecimals).toFixed(6));
@@ -838,7 +1356,6 @@ export async function quoteFlashUnwindSwap(params: {
     }
   };
 
-  // 1. KyberSwap (supports Monad + 15 Aave V3 chains; 2-step routes -> build for exact calldata)
   const quoteKyber = async (): Promise<FlashSwapQuote | null> => {
     const slug = KYBERSWAP_CHAIN_SLUGS[params.chain];
     if (!slug) return null;
@@ -900,7 +1417,6 @@ export async function quoteFlashUnwindSwap(params: {
     }
   };
 
-  // 2. LI.FI same-chain swap quote
   const quoteLifi = async (): Promise<FlashSwapQuote | null> => {
     try {
       const slippageFrac = (slippageBps / 10_000).toFixed(4);
@@ -945,7 +1461,6 @@ export async function quoteFlashUnwindSwap(params: {
     }
   };
 
-  // 3. OpenOcean v4 same-chain swap quote
   const quoteOpenOcean = async (): Promise<FlashSwapQuote | null> => {
     try {
       const slipPct = (slippageBps / 100).toFixed(2);
@@ -995,31 +1510,28 @@ export async function quoteFlashUnwindSwap(params: {
     (q): q is FlashSwapQuote => q !== null && q.expectedOutRaw > 0n
   );
   if (!candidates.length) return null;
-  candidates.sort((a, b) => (b.expectedOutRaw > a.expectedOutRaw ? 1 : b.expectedOutRaw < a.expectedOutRaw ? -1 : 0));
+  candidates.sort((a, b) =>
+    b.expectedOutRaw > a.expectedOutRaw ? 1 : b.expectedOutRaw < a.expectedOutRaw ? -1 : 0
+  );
   return candidates[0];
 }
 
 // ---------------------------------------------------------------------------
-// High-Level Cross-Chain Flash-Loan Self-Unwind Planner
+// Universal Multi-Protocol Flash-Loan Self-Unwind Planner
 // ---------------------------------------------------------------------------
 
 /**
- * Builds a complete 1-click atomic Flash-Loan Self-Unwind plan for ANY Aave V3 / fork Pool
- * across all 20 EVM chains (Monad Neverland, Ethereum/Base/Arbitrum/Optimism/Polygon/Avalanche/
- * BNB/Gnosis/Scroll/Linea/Sonic/zkSync/Ink Aave V3, SparkLend, Seamless, Lendle, HyperLend).
- *
- * Automatically:
- *   1. Reads all collaterals, active variable debts, and live `FLASHLOAN_PREMIUM_TOTAL()` on-chain.
- *   2. If the user already holds the debt token in wallet, returns the cheaper 0-premium wallet repay path.
- *   3. Otherwise quotes live DEX swaps (KyberSwap / LI.FI / OpenOcean) for ONLY the collateral legs
- *      needed to cover `debt + flashLoanPremium` (or all collaterals if `swapAllCollaterals: true`).
- *   4. Emits ready-to-sign `[aToken.approve..., TurgaliumFlashUnwind.unwindSimple/Multi]` txs when
- *      `TURGALIUM_FLASH_UNWIND_<CHAIN>` is configured, or an accurate live-quoted preview otherwise.
+ * Builds a complete 1-click atomic Flash-Loan Self-Unwind plan across ALL lending protocol forks:
+ *   - Aave V3 & ALL Aave V3 forks (Neverland, HyperLend, HypurrFi, SparkLend, Seamless, Lendle, ZeroLend, Kinza, Radiant Base, Tydro)
+ *   - Aave V2 & forks (Aave V2 Eth/Polygon/Avalanche)
+ *   - Compound V2 & ALL Compound V2 forks (Compound V2, Venus, Benqi, Moonwell, Mendi)
+ *   - Automatically prefers 0.00% FREE flash loans (Morpho Blue / Balancer V2) whenever liquid on-chain!
  */
 export async function buildAaveFlashUnwindPlan(params: {
   chain: EvmChainId;
   poolAddress: string;
   userAddress: string;
+  lendingFamily?: FlashUnwindProtocolFamily;
   recipient?: string;
   slippageBps?: number;
   swapAllCollaterals?: boolean;
@@ -1029,8 +1541,20 @@ export async function buildAaveFlashUnwindPlan(params: {
   nowUnixSec?: number;
 }): Promise<AaveFlashUnwindPlan> {
   const cfg = EVM_CHAINS[params.chain];
+  const lendingFamily: FlashUnwindProtocolFamily = params.lendingFamily ?? 'aave_v3';
   const protocolName =
-    params.chain === 'monad' ? 'Neverland' : `Aave v3 (${cfg?.name ?? params.chain})`;
+    lendingFamily === 'compound_v2'
+      ? `Compound v2 Fork (${cfg?.name ?? params.chain})`
+      : lendingFamily === 'compound_v3'
+      ? `Compound v3 (${cfg?.name ?? params.chain})`
+      : lendingFamily === 'aave_v2'
+      ? `Aave v2 (${cfg?.name ?? params.chain})`
+      : lendingFamily === 'morpho_blue'
+      ? `Morpho Blue (${cfg?.name ?? params.chain})`
+      : params.chain === 'monad'
+      ? 'Neverland'
+      : `Aave v3 (${cfg?.name ?? params.chain})`;
+
   const recipient =
     params.recipient && EVM_ADDR_RE.test(params.recipient) ? params.recipient : params.userAddress;
   const slippageBps = Math.max(25, Math.min(500, params.slippageBps ?? 100));
@@ -1039,15 +1563,18 @@ export async function buildAaveFlashUnwindPlan(params: {
       ? params.flashUnwindContractOverride
       : getFlashUnwindContractAddress(params.chain);
   const contractDeployed = Boolean(
-    flashUnwindContract && EVM_ADDR_RE.test(flashUnwindContract) && flashUnwindContract.toLowerCase() !== ZERO_ADDRESS
+    flashUnwindContract &&
+      EVM_ADDR_RE.test(flashUnwindContract) &&
+      flashUnwindContract.toLowerCase() !== ZERO_ADDRESS
   );
 
-  const baseResult = (
-    overrides: Partial<AaveFlashUnwindPlan>
-  ): AaveFlashUnwindPlan => ({
+  const baseResult = (overrides: Partial<AaveFlashUnwindPlan>): AaveFlashUnwindPlan => ({
     checked: false,
     supported: false,
     mode: 'error',
+    lendingFamily,
+    flashProviderName: protocolName,
+    flashProviderAddress: params.poolAddress,
     chain: params.chain,
     chainId: cfg?.chainId ?? 0,
     chainName: cfg?.name ?? params.chain,
@@ -1069,23 +1596,46 @@ export async function buildAaveFlashUnwindPlan(params: {
     ...overrides,
   });
 
-  if (!cfg || !isAllowedAaveV3Pool(params.chain, params.poolAddress)) {
+  if (!cfg || !isAllowedLendingMarket(params.chain, lendingFamily, params.poolAddress)) {
     return baseResult({
-      reason: `Pool ${params.poolAddress} is not an audited Aave V3 / fork Pool on ${params.chain}.`,
+      reason: `Market ${params.poolAddress} is not an audited ${lendingFamily} protocol on ${params.chain}.`,
     });
   }
 
-  const inspector = params.positionInspectorFn ?? inspectAavePoolFullPosition;
-  const pos = await inspector({
-    chain: params.chain,
-    poolAddress: params.poolAddress,
-    userAddress: params.userAddress,
-    flashUnwindContract,
-  });
+  let pos: AavePoolFullPosition;
+  if (params.positionInspectorFn) {
+    pos = await params.positionInspectorFn({
+      chain: params.chain,
+      poolAddress: params.poolAddress,
+      userAddress: params.userAddress,
+      flashUnwindContract,
+    });
+  } else if (lendingFamily === 'compound_v2') {
+    pos = await inspectCompoundV2FullPosition({
+      chain: params.chain,
+      comptrollerAddress: params.poolAddress,
+      userAddress: params.userAddress,
+      flashUnwindContract,
+    });
+  } else if (lendingFamily === 'aave_v3' || lendingFamily === 'aave_v2') {
+    pos = await inspectAavePoolFullPosition({
+      chain: params.chain,
+      poolAddress: params.poolAddress,
+      userAddress: params.userAddress,
+      lendingFamily,
+      flashUnwindContract,
+    });
+  } else {
+    return baseResult({
+      checked: true,
+      supported: false,
+      reason: `Automated RPC position inspector for ${lendingFamily} requires explicit market parameters; contract-level unwindUniversal supports ${lendingFamily} directly via SDK.`,
+    });
+  }
 
   if (!pos.checked) {
     return baseResult({
-      reason: pos.reason || 'Could not inspect on-chain Aave V3 position.',
+      reason: pos.reason || 'Could not inspect on-chain lending position.',
     });
   }
 
@@ -1120,12 +1670,11 @@ export async function buildAaveFlashUnwindPlan(params: {
         estimatedRemainingUi: c.aTokenBalanceUi,
       })),
       activeDebts: [],
-      notes: ['No active debt on this pool — standard 1-click Pool.withdraw is already unlocked.'],
+      notes: ['No active debt on this market — standard 1-click withdrawal is already unlocked.'],
     });
   }
 
-  // If wallet already holds 100% of all debts, wallet-repay avoids flash-loan premium & swap slippage!
-  if (pos.canRepayAllFromWallet) {
+  if (lendingFamily === 'aave_v3' && pos.canRepayAllFromWallet) {
     const repayTxs = buildAaveRepayPreSteps({
       chain: params.chain,
       poolAddress: params.poolAddress,
@@ -1138,7 +1687,7 @@ export async function buildAaveFlashUnwindPlan(params: {
       supported: true,
       mode: 'wallet_repay',
       previewOnly: false,
-      flashLoanPremiumBps: pos.flashLoanPremiumBps,
+      flashLoanPremiumBps: 0,
       collaterals: pos.collaterals.map((c) => ({
         asset: c.asset,
         symbol: c.symbol,
@@ -1157,7 +1706,6 @@ export async function buildAaveFlashUnwindPlan(params: {
     });
   }
 
-  // Check flash-loan liquidity across all debt reserves
   const illiquidDebt = pos.activeDebts.find((d) => !d.hasSufficientFlashLiquidity);
   if (illiquidDebt) {
     return baseResult({
@@ -1166,17 +1714,37 @@ export async function buildAaveFlashUnwindPlan(params: {
       mode: 'insufficient_liquidity',
       flashLoanPremiumBps: pos.flashLoanPremiumBps,
       activeDebts: formattedDebts,
-      reason: `${protocolName} currently has ${illiquidDebt.flashLiquidityUi} ${illiquidDebt.symbol} available for flash loans, below the ${illiquidDebt.debtUi} ${illiquidDebt.symbol} needed.`,
+      reason: `No flash-loan source on ${cfg.name} currently holds ${illiquidDebt.debtUi} ${illiquidDebt.symbol} liquid.`,
     });
   }
 
-  // Only single-debt flashLoanSimple is auto-quoted in v1 when swaps are needed; multi-debt supported too!
   const quoter = params.swapQuoterFn ?? quoteFlashUnwindSwap;
-  const quoteExecutor = contractDeployed && flashUnwindContract ? flashUnwindContract : params.userAddress;
+  const quoteExecutor =
+    contractDeployed && flashUnwindContract ? flashUnwindContract : params.userAddress;
   const isSingleDebt = pos.activeDebts.length === 1;
   const primaryDebt = pos.activeDebts[0];
 
-  // Sort collaterals so same-asset collateral comes first, then largest token balance first
+  // Choose flash provider: prefer 0.00% FREE Morpho Blue / Balancer V2 whenever liquid!
+  const useZeroFeeProvider = isSingleDebt && Boolean(primaryDebt.zeroFeeFlashProvider);
+  const flashProviderKind: FlashProviderKindValue =
+    useZeroFeeProvider && primaryDebt.zeroFeeFlashProvider?.kind === 'morpho_blue'
+      ? FLASH_PROVIDER_KIND.MORPHO_BLUE
+      : useZeroFeeProvider && primaryDebt.zeroFeeFlashProvider?.kind === 'balancer_v2'
+      ? FLASH_PROVIDER_KIND.BALANCER_V2
+      : FLASH_PROVIDER_KIND.AAVE_V3;
+  const flashProviderAddress =
+    useZeroFeeProvider && primaryDebt.zeroFeeFlashProvider
+      ? primaryDebt.zeroFeeFlashProvider.address
+      : params.poolAddress;
+  const flashProviderName =
+    flashProviderKind === FLASH_PROVIDER_KIND.MORPHO_BLUE
+      ? 'Morpho Blue (0.00% free flash loan)'
+      : flashProviderKind === FLASH_PROVIDER_KIND.BALANCER_V2
+      ? 'Balancer V2 Vault (0.00% free flash loan)'
+      : `${protocolName} (flashLoanSimple)`;
+  const effectivePremiumBps =
+    flashProviderKind === FLASH_PROVIDER_KIND.AAVE_V3 ? pos.flashLoanPremiumBps : 0;
+
   const orderedCollaterals = [...pos.collaterals].sort((a, b) => {
     const aMatchesDebt = a.asset.toLowerCase() === primaryDebt.asset.toLowerCase() ? 1 : 0;
     const bMatchesDebt = b.asset.toLowerCase() === primaryDebt.asset.toLowerCase() ? 1 : 0;
@@ -1184,12 +1752,10 @@ export async function buildAaveFlashUnwindPlan(params: {
     return b.aTokenBalanceUi - a.aTokenBalanceUi;
   });
 
-  // Track how much debt token we'll have inside TurgaliumFlashUnwind to cover totalFlashRepayRaw
   const swapQuotes: FlashSwapQuote[] = [];
   const swappedAssetSet = new Set<string>();
   const debtCoverageByAsset = new Map<string, bigint>();
 
-  // First credit any same-asset collateral directly (zero DEX swap needed!)
   for (const col of orderedCollaterals) {
     const key = col.asset.toLowerCase();
     const matchingDebt = pos.activeDebts.find((d) => d.asset.toLowerCase() === key);
@@ -1198,8 +1764,6 @@ export async function buildAaveFlashUnwindPlan(params: {
     }
   }
 
-  // Quote swaps for non-debt collaterals until every debt leg's totalFlashRepayRaw is covered
-  // (or all collaterals if swapAllCollaterals === true)
   const nonDebtCollaterals = orderedCollaterals.filter(
     (c) => !pos.activeDebts.some((d) => d.asset.toLowerCase() === c.asset.toLowerCase())
   );
@@ -1231,24 +1795,27 @@ export async function buildAaveFlashUnwindPlan(params: {
 
       swapQuotes.push(q);
       swappedAssetSet.add(colKey);
-      // Credit conservative minAmountOutRaw when testing debt coverage so flash repay never reverts on slippage!
       debtCoverageByAsset.set(debtKey, currentCovered + q.minAmountOutRaw);
     }
   }
 
-  // Verify every debt leg is safely covered by withdrawn collateral + quoted swaps
   const uncoveredDebt = pos.activeDebts.find(
     (d) => (debtCoverageByAsset.get(d.asset.toLowerCase()) ?? 0n) < d.totalFlashRepayRaw
   );
   if (uncoveredDebt) {
     const coveredRaw = debtCoverageByAsset.get(uncoveredDebt.asset.toLowerCase()) ?? 0n;
     const coveredUi = Number(formatUnits(coveredRaw, uncoveredDebt.decimals).toFixed(4));
-    const mode = swapQuotes.length === 0 && nonDebtCollaterals.length > 0 ? 'swap_quote_unavailable' : 'unprofitable';
+    const mode =
+      swapQuotes.length === 0 && nonDebtCollaterals.length > 0
+        ? 'swap_quote_unavailable'
+        : 'unprofitable';
     return baseResult({
       checked: true,
       supported: false,
       mode,
-      flashLoanPremiumBps: pos.flashLoanPremiumBps,
+      flashProviderName,
+      flashProviderAddress,
+      flashLoanPremiumBps: effectivePremiumBps,
       collaterals: orderedCollaterals.map((c) => ({
         asset: c.asset,
         symbol: c.symbol,
@@ -1277,11 +1844,10 @@ export async function buildAaveFlashUnwindPlan(params: {
       reason:
         mode === 'swap_quote_unavailable'
           ? `Could not fetch a live DEX quote to swap collateral into ${uncoveredDebt.symbol} on ${cfg.name}.`
-          : `Quoted collateral output after ${pos.flashLoanPremiumBps / 100}% flash loan fee & ${slippageBps / 100}% slippage (${coveredUi} ${uncoveredDebt.symbol}) is below the ${uncoveredDebt.totalFlashRepayUi} ${uncoveredDebt.symbol} required to repay debt.`,
+          : `Quoted collateral output after ${effectivePremiumBps / 100}% flash fee & ${slippageBps / 100}% slippage (${coveredUi} ${uncoveredDebt.symbol}) is below the ${uncoveredDebt.totalFlashRepayUi} ${uncoveredDebt.symbol} required to repay debt.`,
     });
   }
 
-  // Compute expected net equity returned to user (surplus debt tokens + unswapped collaterals)
   const expectedDebtTotals = new Map<string, bigint>();
   for (const col of orderedCollaterals) {
     const key = col.asset.toLowerCase();
@@ -1307,7 +1873,9 @@ export async function buildAaveFlashUnwindPlan(params: {
     }
   }
   for (const col of orderedCollaterals) {
-    const isDebtAsset = pos.activeDebts.some((d) => d.asset.toLowerCase() === col.asset.toLowerCase());
+    const isDebtAsset = pos.activeDebts.some(
+      (d) => d.asset.toLowerCase() === col.asset.toLowerCase()
+    );
     if (!isDebtAsset && !swappedAssetSet.has(col.asset.toLowerCase())) {
       estimatedNetSurplus.push({
         asset: col.asset,
@@ -1317,15 +1885,15 @@ export async function buildAaveFlashUnwindPlan(params: {
     }
   }
 
-  // Build transactions (aToken.approve -> TurgaliumFlashUnwind.unwindSimple/Multi)
   const transactions: AaveRepayStepTx[] = [];
-  const deadlineSec = BigInt((params.nowUnixSec ?? Math.floor(Date.now() / 1000)) + 900); // 15 min
+  const deadlineSec = BigInt((params.nowUnixSec ?? Math.floor(Date.now() / 1000)) + 900);
 
   const collateralParams: FlashCollateralPullParam[] = orderedCollaterals.map((c) => {
     const isSwapped = swappedAssetSet.has(c.asset.toLowerCase());
     const isDebtAsset = pos.activeDebts.some((d) => d.asset.toLowerCase() === c.asset.toLowerCase());
     return {
-      asset: c.asset,
+      // Compound V2 pulls the cToken address; Aave/Comet/Morpho pull by underlying asset address
+      asset: lendingFamily === 'compound_v2' ? c.aTokenAddress : c.asset,
       aTokenAmount: MAX_UINT256,
       minRemainingOut: isSwapped || isDebtAsset ? 0n : (c.aTokenBalanceRaw * 9950n) / 10000n,
     };
@@ -1340,12 +1908,26 @@ export async function buildAaveFlashUnwindPlan(params: {
     callData: s.callData,
   }));
 
+  const lendingKindVal: LendingProtocolKindValue =
+    lendingFamily === 'aave_v2'
+      ? LENDING_PROTOCOL_KIND.AAVE_V2
+      : lendingFamily === 'compound_v3'
+      ? LENDING_PROTOCOL_KIND.COMPOUND_V3
+      : lendingFamily === 'compound_v2'
+      ? LENDING_PROTOCOL_KIND.COMPOUND_V2
+      : lendingFamily === 'morpho_blue'
+      ? LENDING_PROTOCOL_KIND.MORPHO_BLUE
+      : LENDING_PROTOCOL_KIND.AAVE_V3;
+
+  const protocolDataHex =
+    lendingFamily === 'compound_v2' ? `0x${padAddress(primaryDebt.variableDebtToken)}` : '0x';
+
   if (contractDeployed && flashUnwindContract) {
     for (const col of orderedCollaterals) {
       if (col.aTokenAllowanceRaw < col.aTokenBalanceRaw) {
         transactions.push({
           stepId: `approve_atoken_${col.symbol.toLowerCase()}`,
-          label: `Approve ${col.symbol} aToken for Flash Unwind`,
+          label: `Approve ${col.symbol} receipt token for Flash Unwind`,
           description: `Allows TurgaliumFlashUnwind (${flashUnwindContract.slice(0, 10)}...) to withdraw your ${col.aTokenBalanceUi} ${col.symbol} collateral atomically right after clearing debt.`,
           chain: params.chain,
           chainId: cfg.chainId,
@@ -1360,11 +1942,15 @@ export async function buildAaveFlashUnwindPlan(params: {
     }
 
     const callData = isSingleDebt
-      ? encodeFlashUnwindSimpleCalldata({
-          pool: params.poolAddress,
+      ? encodeFlashUnwindUniversalCalldata({
+          flashProviderKind,
+          flashProvider: flashProviderAddress,
+          lendingKind: lendingKindVal,
+          lendingMarket: params.poolAddress,
           debtAsset: primaryDebt.asset,
           debtAmount: MAX_UINT256,
           interestRateMode: 2n,
+          protocolData: protocolDataHex,
           collaterals: collateralParams,
           swaps: swapParams,
           recipient,
@@ -1387,9 +1973,9 @@ export async function buildAaveFlashUnwindPlan(params: {
     const netDesc = estimatedNetSurplus.map((s) => `${s.amountUi} ${s.symbol}`).join(' + ');
 
     transactions.push({
-      stepId: isSingleDebt ? 'aave_flash_unwind_simple' : 'aave_flash_unwind_multi',
+      stepId: isSingleDebt ? 'aave_flash_unwind_universal' : 'aave_flash_unwind_multi',
       label: `Flash-Unwind ${protocolName} (${debtDesc} debt -> ${netDesc || 'net equity'})`,
-      description: `Atomic 1-tx flash loan unwind on ${cfg.name} (0% Turgalium fee, ${(pos.flashLoanPremiumBps / 100).toFixed(2)}% pool flash fee): clears 100% debt with $0 upfront capital and returns ${netDesc || 'net equity'} to ${recipient.slice(0, 10)}...`,
+      description: `Atomic 1-tx flash unwind via ${flashProviderName} on ${cfg.name} (0% Turgalium fee, ${(effectivePremiumBps / 100).toFixed(2)}% flash fee): clears 100% debt with $0 upfront capital and returns ${netDesc || 'net equity'} to ${recipient.slice(0, 10)}...`,
       chain: params.chain,
       chainId: cfg.chainId,
       chainName: cfg.name,
@@ -1402,12 +1988,15 @@ export async function buildAaveFlashUnwindPlan(params: {
   }
 
   const notes: string[] = [
-    `0% Turgalium protocol fee · Pool flash-loan fee: ${(pos.flashLoanPremiumBps / 100).toFixed(2)}% (${pos.flashLoanPremiumBps} bps).`,
+    `0% Turgalium protocol fee · Flash lender: ${flashProviderName} (${(effectivePremiumBps / 100).toFixed(2)}% / ${effectivePremiumBps} bps).`,
   ];
   if (swapQuotes.length > 0) {
     notes.push(
       `DEX route: ${swapQuotes
-        .map((q) => `${q.amountInUi} ${q.tokenInSymbol} -> ${q.expectedOutUi} ${q.tokenOutSymbol} via ${q.provider}`)
+        .map(
+          (q) =>
+            `${q.amountInUi} ${q.tokenInSymbol} -> ${q.expectedOutUi} ${q.tokenOutSymbol} via ${q.provider}`
+        )
         .join('; ')}.`
     );
   }
@@ -1420,8 +2009,10 @@ export async function buildAaveFlashUnwindPlan(params: {
   return baseResult({
     checked: true,
     supported: true,
-    mode: isSingleDebt ? 'flash_simple' : 'flash_multi',
-    flashLoanPremiumBps: pos.flashLoanPremiumBps,
+    mode: isSingleDebt ? 'flash_universal' : 'flash_multi',
+    flashProviderName,
+    flashProviderAddress,
+    flashLoanPremiumBps: effectivePremiumBps,
     collaterals: orderedCollaterals.map((c) => ({
       asset: c.asset,
       symbol: c.symbol,

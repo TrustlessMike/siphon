@@ -2429,8 +2429,18 @@ function renderDefiUnwindPanel() {
       (p) =>
         p.category === 'debt_guard' &&
         !p.isReady &&
-        /aave|neverland|hyperlend|spark|seamless|lendle/i.test(String(p.asset?.protocol || grp.name || ''))
+        /aave|neverland|hyperlend|hypurrfi|spark|seamless|lendle|zerolend|kinza|radiant|tydro|compound|venus|benqi|moonwell|mendi|morpho/i.test(
+          String(p.asset?.protocol || grp.name || '')
+        )
     );
+    const inferFlashFamily = (protoStr) => {
+      const s = String(protoStr || '').toLowerCase();
+      if (s.includes('aave v2')) return 'aave_v2';
+      if (s.includes('compound v2') || s.includes('venus') || s.includes('benqi') || s.includes('moonwell') || s.includes('mendi')) return 'compound_v2';
+      if (s.includes('compound')) return 'compound_v3';
+      if (s.includes('morpho')) return 'morpho_blue';
+      return 'aave_v3';
+    };
 
     const headerActionHtml =
       grp.readyCount > 0
@@ -2446,6 +2456,7 @@ function renderDefiUnwindPanel() {
               class="btn-outline-sm defi-proto-extract-btn"
               data-flash-unwind-chain="${escHtml(flashUnwindCandidate.asset.chain)}"
               data-flash-unwind-pool="${escHtml(flashUnwindCandidate.asset.protocolAddress || '')}"
+              data-flash-unwind-family="${escHtml(inferFlashFamily(flashUnwindCandidate.asset.protocol || grp.name))}"
               data-flash-unwind-proto="${escHtml(grp.name)}"
             >Flash Unwind ($0 Upfront)</button>
             ${
@@ -2533,12 +2544,13 @@ function renderDefiUnwindPanel() {
     });
   });
 
-  // Wire Flash-Loan Self-Unwind ($0 Upfront) buttons for Aave V3 / Neverland / HyperLend Debt Guard groups
+  // Wire Flash-Loan Self-Unwind ($0 Upfront) buttons for ALL 5 lending families & forks
   groupsHost.querySelectorAll('[data-flash-unwind-chain]').forEach((btn) => {
     btn.addEventListener('click', () => {
       executeAaveFlashUnwind({
         chain: btn.dataset.flashUnwindChain,
         poolAddress: btn.dataset.flashUnwindPool || undefined,
+        protocolFamily: btn.dataset.flashUnwindFamily || 'aave_v3',
         protocolName: btn.dataset.flashUnwindProto || 'Aave v3',
         triggerBtn: btn,
       });
@@ -2546,7 +2558,7 @@ function renderDefiUnwindPanel() {
   });
 }
 
-async function executeAaveFlashUnwind({ chain, poolAddress, protocolName, triggerBtn }) {
+async function executeAaveFlashUnwind({ chain, poolAddress, protocolFamily = 'aave_v3', protocolName, triggerBtn }) {
   const userAddress =
     getConnectedEvmAddress() ||
     (currentScan?.address && /^0x[0-9a-fA-F]{40}$/.test(currentScan.address)
@@ -2562,11 +2574,12 @@ async function executeAaveFlashUnwind({ chain, poolAddress, protocolName, trigge
     triggerBtn.textContent = 'Quoting Flash Unwind…';
   }
   try {
-    const plan = await api('/api/defi/aave-flash-unwind-plan', {
+    const plan = await api('/api/defi/flash-unwind-plan', {
       method: 'POST',
       body: JSON.stringify({
         chain,
         poolAddress,
+        protocolFamily,
         userAddress,
       }),
     });

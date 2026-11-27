@@ -170,7 +170,7 @@ test('Flash-Unwind planner swaps ONLY sMON to clear 82,453 WMON debt & preserves
 
   assert.equal(plan.checked, true);
   assert.equal(plan.supported, true);
-  assert.equal(plan.mode, 'flash_simple');
+  assert.equal(plan.mode, 'flash_universal');
   assert.equal(plan.previewOnly, false);
   assert.equal(plan.flashLoanPremiumBps, 50);
   // Only sMON is swapped; gMON stays 100% untouched!
@@ -184,13 +184,13 @@ test('Flash-Unwind planner swaps ONLY sMON to clear 82,453 WMON debt & preserves
   const gmonSurplus = plan.estimatedNetSurplus.find((s) => s.symbol === 'gMON');
   assert.ok(wmonSurplus && wmonSurplus.amountUi > 1_600);
   assert.equal(gmonSurplus?.amountUi, 15_000);
-  // Emits 2 aToken approves + 1 atomic unwindSimple tx
+  // Emits 2 aToken approves + 1 atomic unwindUniversal tx
   assert.equal(plan.transactions.length, 3);
   assert.equal(plan.transactions[0].stepId, 'approve_atoken_smon');
   assert.equal(plan.transactions[1].stepId, 'approve_atoken_gmon');
-  assert.equal(plan.transactions[2].stepId, 'aave_flash_unwind_simple');
+  assert.equal(plan.transactions[2].stepId, 'aave_flash_unwind_universal');
   assert.equal(plan.transactions[2].to, DEPLOYED_FLASH_CONTRACT);
-  assert.ok(plan.transactions[2].data.startsWith(FLASH_UNWIND_SELECTORS.unwindSimple));
+  assert.ok(plan.transactions[2].data.startsWith(FLASH_UNWIND_SELECTORS.unwindUniversal));
 });
 
 test('Flash-Unwind same-asset collateral + debt requires 0 DEX swaps and works across chains', async () => {
@@ -251,11 +251,11 @@ test('Flash-Unwind same-asset collateral + debt requires 0 DEX swaps and works a
   });
 
   assert.equal(plan.supported, true);
-  assert.equal(plan.mode, 'flash_simple');
+  assert.equal(plan.mode, 'flash_universal');
   assert.equal(plan.swaps.length, 0);
   // Already approved -> literally 1 single tx!
   assert.equal(plan.transactions.length, 1);
-  assert.equal(plan.transactions[0].stepId, 'aave_flash_unwind_simple');
+  assert.equal(plan.transactions[0].stepId, 'aave_flash_unwind_universal');
   assert.ok(plan.estimatedNetSurplus[0].amountUi > 199);
 });
 
@@ -339,8 +339,35 @@ test('prepareRealExecution seamlessly promotes blocked Aave V3 debt position to 
 
   assert.equal(prepared.provider, 'aave_flash_unwind');
   assert.equal(prepared.transactions.length, 3);
-  assert.equal(prepared.transactions[2].stepId, 'aave_flash_unwind_simple');
+  assert.equal(prepared.transactions[2].stepId, 'aave_flash_unwind_universal');
   assert.match(prepared.notes[0] ?? '', /Atomic Flash-Loan Self-Unwind/i);
+});
+
+test('All-forks registry validates Aave V3 forks, Aave V2, Compound V3, Compound V2 forks, and Morpho Blue', async () => {
+  const { isAllowedLendingMarket } = await import('../src/defi/flash-unwind.js');
+  // Aave V3 forks
+  assert.equal(isAllowedLendingMarket('monad', 'aave_v3', NEVERLAND_POOL), true);
+  assert.equal(isAllowedLendingMarket('hyperevm', 'aave_v3', '0xceCcE0EB9DD2Ef7996e01e25DD70e461F918A14b'), true); // HypurrFi
+  assert.equal(isAllowedLendingMarket('bnb', 'aave_v3', '0xcB0620b181140e57D1C0D8b724cde623cA963c8C'), true); // Kinza
+  assert.equal(isAllowedLendingMarket('linea', 'aave_v3', '0x2f9bB73a8e98793e26Cb2F6C4ad037BDf1C6B269'), true); // ZeroLend Linea
+  assert.equal(isAllowedLendingMarket('zksync', 'aave_v3', '0x4d9429246EA989C9CeE203B43F6d1C7D83e3B8F8'), true); // ZeroLend zkSync
+  // Aave V2
+  assert.equal(isAllowedLendingMarket('ethereum', 'aave_v2', '0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9'), true);
+  assert.equal(isAllowedLendingMarket('polygon', 'aave_v2', '0x8dFf5E27EA6b7AC08EbFdf9eB090F32ee9a30fcf'), true);
+  // Compound V3
+  assert.equal(isAllowedLendingMarket('base', 'compound_v3', '0xb125E6687d4313864e53df431d5425969c15Eb2F'), true);
+  // Compound V2 forks (Moonwell, Venus, Benqi, Mendi)
+  assert.equal(isAllowedLendingMarket('base', 'compound_v2', '0xfBb21d0380beE3312B33c4353c8936a0F13EF26C'), true); // Moonwell Base
+  assert.equal(isAllowedLendingMarket('optimism', 'compound_v2', '0xCa889f40aae37FFf165BccF69aeF1E82b5C511B9'), true); // Moonwell OP
+  assert.equal(isAllowedLendingMarket('bnb', 'compound_v2', '0xfD36E2c2a6789Db23113685031d7F16329158384'), true); // Venus BNB
+  assert.equal(isAllowedLendingMarket('avalanche', 'compound_v2', '0x486Af39519B4Dc9a7fCcd318217352830E8AD9b4'), true); // Benqi
+  assert.equal(isAllowedLendingMarket('linea', 'compound_v2', '0x1b4d3b0421dDc1eB216D230Bc01527422Fb93103'), true); // Mendi
+  // Morpho Blue (0% flash loans + Morpho market unwinding)
+  assert.equal(isAllowedLendingMarket('monad', 'morpho_blue', '0xD5D960E8C380B724a48AC59E2DfF1b2CB4a1eAee'), true);
+  assert.equal(isAllowedLendingMarket('ethereum', 'morpho_blue', '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb'), true);
+  // Spoofed rejected across all families
+  assert.equal(isAllowedLendingMarket('monad', 'aave_v3', '0x1111111111111111111111111111111111111111'), false);
+  assert.equal(isAllowedLendingMarket('base', 'compound_v2', '0x1111111111111111111111111111111111111111'), false);
 });
 
 test('HTTP POST /api/defi/aave-flash-unwind-plan rejects spoofed pools fail-closed (400)', async () => {
@@ -360,7 +387,7 @@ test('HTTP POST /api/defi/aave-flash-unwind-plan rejects spoofed pools fail-clos
     });
     assert.equal(res.status, 400);
     const body = (await res.json()) as { error: string };
-    assert.match(body.error, /No audited Aave v3/i);
+    assert.match(body.error, /No audited/i);
   } finally {
     await new Promise<void>((r) => srv.close(() => r()));
   }
