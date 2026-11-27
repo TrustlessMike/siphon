@@ -85,8 +85,8 @@ function makeAsset(chain: EvmChainId, overrides: Partial<ScannedAsset> = {}): Sc
   };
 }
 
-test('Wave 7B: All 19 EVM chains have unique EIP-155 chainIds, valid addresses, RPC failover arrays, and explorer URLs', () => {
-  assert.equal(CHAIN_LIST.length, 19, `Expected 19 EVM chains, got ${CHAIN_LIST.length}`);
+test('Wave 7B: All 20 EVM chains have unique EIP-155 chainIds, valid addresses, RPC failover arrays, and explorer URLs', () => {
+  assert.equal(CHAIN_LIST.length, 20, `Expected 20 EVM chains, got ${CHAIN_LIST.length}`);
 
   const seenIds = new Set<string>();
   const seenChainIds = new Set<number>();

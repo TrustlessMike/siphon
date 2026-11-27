@@ -2972,8 +2972,8 @@ def main():
             lite_fee_num = float(w9_lite["liteCost"].replace("~", "").replace("$", "").replace(",", ""))
             assert 0.0 <= lite_fee_num <= 25.0, f"Lite Est. network gas should reflect 0% protocol fee, got {w9_lite}"
             assert not w9_lite["applyBtnVisible"] and not w9_lite["clarityRowVisible"], f"Pro-only controls leaked in Lite Preservation Strip: {w9_lite}"
-            assert w9_lite["evmBadgeCount"] == "19", f"Expected dynamic 19 EVM badge, got {w9_lite}"
-            assert w9_lite["approvalOptCount"] == 19 and w9_lite["gasWatchOptCount"] == 19, w9_lite
+            assert w9_lite["evmBadgeCount"] == "20", f"Expected dynamic 20 EVM badge, got {w9_lite}"
+            assert w9_lite["approvalOptCount"] == 20 and w9_lite["gasWatchOptCount"] == 20, w9_lite
             assert w9_lite["hasHyperEvm"] and w9_lite["hasGnosis"], w9_lite
 
             # 8B. Verify blocked $0.00 Uniswap V3 LP NFT has single coherent blocked badge & compact liquidity

@@ -631,6 +631,7 @@ const FALLBACK_GAS_PRICE_WEI: Record<EvmChainId, bigint> = {
   zksync: 25_000_000n, // 0.025 gwei
   ink: 50_000_000n, // 0.05 gwei
   gnosis: 2_000_000_000n, // 2 gwei
+  monad: 50_000_000_000n, // 50 gwei
 };
 
 /** Per-tx L1 blob data posting floor (in native wei) for L2 chains under EIP-4844 */

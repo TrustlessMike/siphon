@@ -365,6 +365,17 @@ export {
   type GasRefuelQuoteResult,
   type GasRefuelTransaction,
 } from '../execution/gas-refuel.js';
+
+export {
+  inspectAavePoolActiveDebts,
+  buildAaveRepayPreSteps,
+  encodeAaveV3RepayCalldata,
+  encodeAaveV3WithdrawCalldata,
+  AAVE_V3_UNWIND_SELECTORS,
+  type AaveActiveDebtItem,
+  type AavePoolDebtInspection,
+  type AaveRepayStepTx,
+} from '../defi/aave-unwind.js';
 export {
   BoundedTtlCache,
   InFlightCoalescer,

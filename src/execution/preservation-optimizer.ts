@@ -192,6 +192,7 @@ const DEFAULT_NATIVE_PRICE_USD: Partial<Record<EvmChainId, number>> = {
   zksync: 2500,
   ink: 2500,
   gnosis: 1,
+  monad: 0.5,
 };
 
 function r2(n: number): number {

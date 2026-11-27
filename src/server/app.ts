@@ -19,6 +19,11 @@ import {
   fetchLatestSolanaBlockhash,
 } from '../bridge/solana-claim.js';
 import { runDefiPreflightBatch } from '../defi/preflight.js';
+import {
+  buildAaveRepayPreSteps,
+  inspectAavePoolActiveDebts,
+} from '../defi/aave-unwind.js';
+import { isAllowedAaveV3Pool } from '../defi/extractors.js';
 import { buildPreSignSimulationProof, verifyOnchainExecutionProof } from '../execution/proof.js';
 import {
   buildSafeTransactionBatch,
@@ -1782,6 +1787,75 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           skipRpc: Boolean(body.skipRpc),
         });
         return reply(200, preflight);
+      }
+
+      if (method === 'POST' && pathname === '/api/defi/aave-unwind-plan') {
+        const body = await readJsonBody<{
+          chain?: string;
+          poolAddress?: string;
+          userAddress?: string;
+        }>(req);
+
+        const chainRaw = typeof body.chain === 'string' ? body.chain.trim().toLowerCase() : '';
+        if (!isEvmChain(chainRaw)) {
+          return reply(400, { error: 'Valid EVM chain is required.' });
+        }
+        const userAddress = typeof body.userAddress === 'string' ? body.userAddress.trim() : '';
+        if (!/^0x[0-9a-fA-F]{40}$/.test(userAddress)) {
+          return reply(400, { error: 'Valid 0x EVM userAddress is required.' });
+        }
+        const chainCfg = CHAIN_LIST.find((c) => c.id === chainRaw);
+        const poolAddress =
+          (typeof body.poolAddress === 'string' && body.poolAddress.trim()) ||
+          chainCfg?.aaveV3Pool ||
+          '';
+        if (!poolAddress || !isAllowedAaveV3Pool(chainRaw, poolAddress)) {
+          return reply(400, {
+            error: `No audited Aave v3 / fork Pool configured for ${chainRaw}${poolAddress ? ` (${poolAddress})` : ''}.`,
+          });
+        }
+
+        const inspection = await inspectAavePoolActiveDebts({
+          chain: chainRaw,
+          poolAddress,
+          userAddress,
+        });
+        const protocolName = chainRaw === 'monad' ? 'Neverland' : `Aave v3 (${chainCfg?.name ?? chainRaw})`;
+        const repayTransactions = inspection.canRepayAllFromWallet
+          ? buildAaveRepayPreSteps({
+              chain: chainRaw,
+              poolAddress,
+              protocolName,
+              userAddress,
+              activeDebts: inspection.activeDebts,
+            })
+          : [];
+
+        return reply(200, {
+          checked: inspection.checked,
+          chain: chainRaw,
+          chainName: chainCfg?.name ?? chainRaw,
+          poolAddress,
+          protocolName,
+          reservesCount: inspection.reservesCount,
+          canRepayAllFromWallet: inspection.canRepayAllFromWallet,
+          activeDebts: inspection.activeDebts.map((d) => ({
+            asset: d.asset,
+            symbol: d.symbol,
+            decimals: d.decimals,
+            aTokenAddress: d.aTokenAddress,
+            variableDebtToken: d.variableDebtToken,
+            debtRaw: d.debtRaw.toString(),
+            debtUi: d.debtUi,
+            walletBalanceRaw: d.walletBalanceRaw.toString(),
+            walletBalanceUi: d.walletBalanceUi,
+            canRepayFull: d.canRepayFull,
+            shortfallRaw: d.shortfallRaw.toString(),
+            shortfallUi: d.shortfallUi,
+          })),
+          repayTransactions,
+          ...(inspection.reason ? { reason: inspection.reason } : {}),
+        });
       }
 
       if (method === 'POST' && pathname === '/api/tx/prepare') {

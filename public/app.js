@@ -552,6 +552,7 @@ function getChainLogoPath(chain) {
       'zksync',
       'ink',
       'gnosis',
+      'monad',
       'osmosis',
       'sui',
       'aptos',
@@ -618,6 +619,7 @@ function getTokenLogoPath(symbol, chain) {
   if (sym === 'AAVE') return '/logos/aave.svg';
   if (sym === 'UNI') return '/logos/uniswap.svg';
   if (sym === 'GNO') return '/logos/gnosis.svg';
+  if (sym === 'MON' || sym === 'WMON' || sym === 'SMON' || sym === 'SHMON' || sym === 'GMON' || sym === 'HMON') return '/logos/monad.svg';
   if (sym === 'ZK') return '/logos/zksync.svg';
   if (sym === 'BNB' || sym === 'WBNB') return '/logos/bnb.svg';
   if (sym === 'AVAX' || sym === 'WAVAX') return '/logos/avalanche.svg';

@@ -88,7 +88,7 @@ test('Solana base58 pubkey converts to 32-byte Circle CCTP mintRecipient and val
 
 test('Preset multi-chain scan reconciles DeFi withdrawals, liquid dust, zero-liq burns, and honeypot skips', async () => {
   const report = await scanPresetWallet('veteran_defi');
-  assert.equal(report.chainsScanned, 19);
+  assert.equal(report.chainsScanned, 20);
   assert.ok(report.totals.defiPositionCount >= 5);
   assert.ok(report.totals.liquidDustCount >= 7);
   assert.ok(report.totals.burnCandidateCount >= 4);
@@ -583,8 +583,8 @@ test('Protocol fee defaults to 0% (open source), clamps explicit overrides (0-10
   }
 });
 
-test('Multi-chain expansion: 19 EVMs + 7 families registry + auto address detection', () => {
-  assert.equal(CHAIN_LIST.length, 19);
+test('Multi-chain expansion: 20 EVMs + 7 families registry + auto address detection', () => {
+  assert.equal(CHAIN_LIST.length, 20);
   for (const id of [
     'bnb',
     'sonic',
@@ -599,6 +599,7 @@ test('Multi-chain expansion: 19 EVMs + 7 families registry + auto address detect
     'zksync',
     'ink',
     'gnosis',
+    'monad',
   ] as const) {
     assert.ok(EVM_CHAINS[id], `Missing extended EVM chain ${id}`);
     assert.ok(EVM_CHAINS[id].rpcUrls.length >= 2);
@@ -614,12 +615,13 @@ test('Multi-chain expansion: 19 EVMs + 7 families registry + auto address detect
   assert.equal(EVM_CHAINS.berachain.cctpDomain, null);
   assert.equal(EVM_CHAINS.zksync.cctpDomain, null);
   assert.equal(EVM_CHAINS.gnosis.cctpDomain, null);
+  assert.equal(EVM_CHAINS.monad.cctpDomain, null);
 
   const metas = listAllFamilyMetas();
   assert.equal(metas.length, 7);
   assert.equal(
     metas.reduce((s, m) => s + m.chains.length, 0),
-    30 // 19 EVMs + 6 Cosmos + Sui + Aptos + TON + Tron + Bitcoin
+    31 // 20 EVMs + 6 Cosmos + Sui + Aptos + TON + Tron + Bitcoin
   );
 
   // Address auto-detection across all 7 families
@@ -816,7 +818,7 @@ test('Wave 1-3 adapters build 1-sig gasless intents, pre-sign proofs, and Bitcoi
   try {
     const fams = await fetch(`${base}/api/families`).then((r) => r.json());
     assert.equal(fams.totalFamilies, 7);
-    assert.equal(fams.totalChains, 30);
+    assert.equal(fams.totalChains, 31);
 
     const httpBtcProof = await fetch(`${base}/api/tx/simulate-proof`, {
       method: 'POST',

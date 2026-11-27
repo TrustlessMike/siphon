@@ -345,7 +345,8 @@ export function estimateBridgeFixedFeeUsd(chain: AnyChainId): number {
     chain === 'sonic' ||
     chain === 'hyperevm' ||
     chain === 'berachain' ||
-    chain === 'gnosis'
+    chain === 'gnosis' ||
+    chain === 'monad'
   ) {
     return 0.2;
   }
