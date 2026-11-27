@@ -1,11 +1,16 @@
 import { EVM_CHAINS } from '../scanner/chains.js';
 import type { EvmChainId } from '../scanner/types.js';
 import { evmJsonRpcCall, formatUnits } from '../scanner/rpc.js';
-import { FALLBACK_PRICES } from '../scanner/prices.js';
+import { FALLBACK_PRICES, fetchLiveUsdPrices } from '../scanner/prices.js';
 import { validateRouterCallTarget, type RouteAuctionFetcher } from './route-auction.js';
 
-function getFallbackNativePriceUsd(symbol: string): number {
-  return FALLBACK_PRICES[symbol] ?? FALLBACK_PRICES[symbol.toUpperCase()] ?? 1;
+function getFallbackNativePriceUsd(llamaId: string, symbol: string): number {
+  const byLlama = FALLBACK_PRICES[llamaId];
+  if (typeof byLlama === 'number' && Number.isFinite(byLlama) && byLlama > 0) return byLlama;
+  const bySym = FALLBACK_PRICES[symbol] ?? FALLBACK_PRICES[symbol.toUpperCase()];
+  if (typeof bySym === 'number' && Number.isFinite(bySym) && bySym > 0) return bySym;
+  if (symbol.toUpperCase() === 'ETH') return FALLBACK_PRICES['coingecko:ethereum'] ?? 2000;
+  return 1;
 }
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -163,7 +168,7 @@ export function evaluateChainNativeGasStatus(params: {
   const nativePriceUsd =
     typeof params.nativePriceUsd === 'number' && params.nativePriceUsd > 0
       ? params.nativePriceUsd
-      : getFallbackNativePriceUsd(cfg.nativeSymbol);
+      : getFallbackNativePriceUsd(cfg.nativeLlamaId, cfg.nativeSymbol);
 
   const requiredMsgValueUi = round6(formatUnits(params.requiredMsgValueWei, 18));
   const requiredMsgValueUsd = requiredMsgValueUi * nativePriceUsd;
@@ -250,10 +255,18 @@ export async function buildGasRefuelQuote(
       : 1.0;
   const amountUsd = Math.min(25, Math.max(0.25, round2(requestedUsd)));
 
-  const livePrices = params.nativePrices ?? FALLBACK_PRICES;
+  const livePriceMap = params.nativePrices
+    ? null
+    : await fetchLiveUsdPrices([fromCfg.nativeLlamaId, toCfg.nativeLlamaId]).catch(() => null);
   const fromPriceUsd =
-    livePrices[fromCfg.nativeSymbol] || getFallbackNativePriceUsd(fromCfg.nativeSymbol);
-  const amountInUi = round6(amountUsd / Math.max(0.01, fromPriceUsd));
+    params.nativePrices?.[fromCfg.nativeLlamaId] ||
+    params.nativePrices?.[fromCfg.nativeSymbol] ||
+    livePriceMap?.get(fromCfg.nativeLlamaId) ||
+    getFallbackNativePriceUsd(fromCfg.nativeLlamaId, fromCfg.nativeSymbol);
+  if (!Number.isFinite(fromPriceUsd) || fromPriceUsd <= 0) {
+    throw new Error(`Unable to price ${fromCfg.nativeSymbol} safely for gas refuel.`);
+  }
+  const amountInUi = round6(amountUsd / fromPriceUsd);
   const amountInWei = BigInt(Math.max(1, Math.floor(amountInUi * 1e18)));
 
   const fetcher = params.fetcher ?? globalThis.fetch.bind(globalThis);
@@ -355,6 +368,11 @@ export async function buildGasRefuelQuote(
       ? `${Number(json.details.currencyOut.amountFormatted).toFixed(4)} ${json.details.currencyOut.currency.symbol}`
       : `~$${amountUsd.toFixed(2)} ${toCfg.nativeSymbol}`;
   const outUsd = Number(json.details?.currencyOut?.amountUsd ?? amountUsd);
+  if (Number.isFinite(outUsd) && outUsd > Math.max(amountUsd * 3, amountUsd + 5)) {
+    throw new Error(
+      `Gas refuel safety cap tripped: quoted $${outUsd.toFixed(2)} exceeds requested $${amountUsd.toFixed(2)}.`
+    );
+  }
 
   return {
     provider: 'relay',
