@@ -1,7 +1,7 @@
 # Turgalium — Product, Cost-Efficiency & Gap Research Report (2026)
 
 > **Scope:** Deep codebase audit of `main` (`af526a0`) + unmerged `feat/cost-preservation-autopilot-agents` (`5a841a2`) benchmarked against live 2026 cross-chain, EVM account abstraction, and Jupiter/Solana infrastructure.
-> **North Star:** Preserve maximum user capital (99%+ on principal tiers, positive-ROI-only on dust) while compressing multi-chain migration to **1 click** (or minimal clicks), and turning the optional **Jupiter Degen Tab** into a best-in-class Solana experience while keeping **90%+ principal safely preserved and compounding**.
+> **North Star:** Preserve maximum user capital (0% protocol fees, 99%+ net preservation on principal tiers, positive-ROI-only on dust) while compressing multi-chain migration to **1 click** and keeping **100% of migrated principal safely preserved and compounding** on Solana.
 
 ---
 
@@ -13,7 +13,7 @@ Ranked by **Dollars Saved / UX Clicks Cut / Engineering Effort**:
 | :---: | :--- | :--- | :--- | :---: | :--- |
 | **1** | **Progressive Tiered Protocol Fee + Hard Cap** (replace flat `500–1000 bps` floor across TS + Solidity) | **+650 to +695 bps** (**+$675** on $10k; **+$6,950** on $100k) — turns Turgalium from unusable >$1k into a 99.5%+ preservation migrator | 0 (removes #1 conversion blocker) | **S (1–2d)** | `src/scanner/chains.ts:7-9`, `contracts/TurgaliumRouter.sol:196-197`, `contracts/TurgaliumSweepDelegate.sol:112-113` |
 | **2** | **Upgrade Major Chains to Circle CCTP V2 (`TokenMessengerV2`) + Fast Transfer + Forwarding Service + Live Parallel Route Auction** (Mayan Swift / deBridge DLN / Relay / CCTP V2) | **+10 to +25 bps** (**+$10–$25** on $10k; **+$100–$250** on $100k) vs current `Relay → LI.FI` waterfall; cuts ETH finality from **13m → ~15s** | **Cuts 1–2 clicks** (eliminates manual Solana `receiveMessage` claim + zero-SOL arrival trap) | **M (3–4d)** | `src/scanner/chains.ts:90-235`, `src/bridge/cctp.ts:156-172`, `src/execution/tx-builder.ts:1069-1186`, `public/wallets.js:238` (live V2 selector bug!) |
-| **3** | **True 1-Click Solana Arrival (`VersionedTransaction` + ALTs + Jupiter Swap v2 / Lend Yield Parking) + Inline Degen Order Signing & Claim** | **+6% to +9% APY** on 90% preserved principal (**+$1,500–$2,250/yr** on $25k) + **$4–$20** free SOL from empty-ATA rent recovery | **Cuts 3–5 clicks** (claim + yield deposit + Degen trade/claim in 1-click Phantom/Solflare signing) | **M (3–5d)** | `src/bridge/solana-claim.ts:593-605`, `src/degen/jupiter-markets.ts:977-1015`, `public/degen.js:428-434,980-996` |
+| **3** | **True 1-Click Solana Arrival (`VersionedTransaction` + ALTs + 100% Principal-Safe Yield Parking + SPL Dust & Rent Reclaim)** | **+6% to +9% APY** on 100% preserved principal (**+$1,500–$2,250/yr** on $25k) + **$4–$20** free SOL from empty-ATA rent recovery | **Cuts 3–5 clicks** (claim + yield deposit + dust/rent reclaim in 1-click Phantom/Solflare signing) | **M (3–5d)** | `src/bridge/solana-claim.ts:593-605`, `src/solana/yield-park.ts`, `src/bridge/solana-rent.ts` |
 | **4** | **Fix On-Chain Security & Persistence Blockers Before Mainnet** (Foundry/Anvil forked-mainnet suite, wire `TurgaliumAgentVault` into Router/Delegate, Postgres/Redis state, rate limiting, fail-closed public deploy) | Prevents **catastrophic contract/quota exploits** (crash-reset of 24h mandate caps, unverified V2 CCTP selector, unbroadcast relayer stub) | Prevents dropped jobs & lost 17m ETH attestations | **L (5–7d)** | `contracts/*.sol`, `src/relayer/sponsor.ts:822-839`, `src/server/jobs.ts`, `src/agent/mandate-engine.ts`, `src/server/app.ts` |
 | **5** | **True 1-Click Multi-Wallet & Mobile UX + Real EIP-5792 Paymaster + Dynamic Gas-Reserve Sweeping** | **+$8–$18** recovered stranded native gas dust per multi-chain wallet + **$1.50–$6/token** saved L1 approval gas via Permit2/EIP-2612 | **Cuts 2–6 clicks** (unified Phantom/Coinbase dual-VM connect, WalletConnect default ID, Phantom mobile deep-links, Paymaster URL) | **M (3–4d)** | `public/wallets.js:238,669-712,891-931,1108-1119`, `src/scanner/chains.ts:99-267`, `src/execution/tx-builder.ts:920-1067` |
 
@@ -36,7 +36,7 @@ Ranked by **Dollars Saved / UX Clicks Cut / Engineering Effort**:
 - **Recommended Progressive Preservation Fee Schedule:**
   - **Micro-Dust / Gasless Sponsored Tier (`< $100`):** `500–700 bps` (5–7%) to sustain 1.5× relayer solvency.
   - **Mid Tier (`$100 – $10,000` self-funded):** `25 bps` (0.25%), capped at `$15`.
-  - **Principal / Whale Tier (`> $10,000` self-funded):** `5–10 bps` capped at **$25–$50 max** (or `0 bps` protocol fee on principal, monetizing via Jupiter Ultra/Swap v2 partner fee bps + Jupiter Lend/Predict referrals + micro-dust rescue).
+  - **Principal / Whale Tier (`> $10,000` self-funded):** `5–10 bps` capped at **$25–$50 max** (or `0 bps` protocol fee on principal, zero protocol fee / open-source MIT model).
   - **Solidity Change:** Lower `MIN_FEE_BPS` to `0` in `TurgaliumRouter.sol` and `TurgaliumSweepDelegate.sol` (keeping `MAX_FEE_BPS = 1000` as an immutable user-protection ceiling), and add an optional `maxFeeUsdcCap` in `SweepParams`/`SweepIntent`.
 
 ### 2.2 Circle CCTP V1 Pinning & Missing CCTP V2 Fast Transfer + Forwarding Service
@@ -150,7 +150,7 @@ Tracing `public/index.html` + `public/app.js` + `public/wallets.js` from landing
    - Only supports 4 action bits (`dust_convert`, `defi_withdraw`, `bridge_solana`, `burn_zero_liq`) — lacks bits for `yield_park_solana`, `revoke_approval`, and `gas_window_sweep`.
 4. **Claude MCP & ChatGPT Action Surface (`src/mcp/server.ts`, `src/agent/plugin-spec.ts`):**
    - Currently limited to 5 tools (`turgalium_scan_wallets`, `turgalium_plan_dust_conversion`, `turgalium_list_agent_mandates`, `turgalium_request_sweep_permission`, `turgalium_list_pending_approvals`).
-   - Missing high-utility tools: `turgalium_preservation_audit` (live route auction + exact $ saved), `turgalium_watch_gas_window`, `turgalium_list_unlock_schedule`, `turgalium_scan_stale_approvals`, `turgalium_solana_yield_quotes`, and `turgalium_degen_positions` (read-only P&L & claimable winnings).
+   - Missing high-utility tools: `turgalium_preservation_audit` (live route auction + exact $ saved), `turgalium_watch_gas_window`, `turgalium_list_unlock_schedule`, `turgalium_scan_stale_approvals`, and `turgalium_solana_yield_quotes`.
 
 ### 4.2 Five Concrete Autonomous Agent Jobs That Genuinely Save Money or Time
 
@@ -158,36 +158,28 @@ Tracing `public/index.html` + `public/app.js` + `public/wallets.js` from landing
 | :--- | :--- | :--- | :--- |
 | **1. L1 Gas-Window Sniper** | **$15–$40 saved per Ethereum migration** (executes at 6–10 gwei overnight UTC vs 30–50 gwei peak) | Builds on `feat/cost-preservation-autopilot-agents` (`PreservationAgentStore`). Polls `eth_feeHistory`/baseFee every 60s; when `baseFee <= maxBaseFeeGwei`, either pushes a 1-click sign alert (Telegram/webhook/browser push) or auto-executes a pre-signed EIP-712 `SweepIntent` via the sponsored relayer within `TurgaliumAgentVault` bounds. | Merge `5a841a2`, add persistent cron worker + real relayer broadcaster + signed-intent queue |
 | **2. DeFi Unlock & Unbonding Auto-Harvester** | **Prevents 5–15% APY dead-capital drag** on forgotten 7d–21d unlocks | Tracks pending withdrawal queues & unbonding timers: **Ethena sUSDe (7d)**, **Lido stETH withdrawal NFTs (1–5d)**, **Cosmos/Osmosis/Celestia unbonding (14–21d)**, **Aerodrome/Velodrome ve-locks**, and **Pendle/Wayfinder maturities**. Fires the exact hour funds unlock to claim + bridge to Solana via CCTP V2. | Extend `unlockSchedule` (`preservation-optimizer.ts`) with live on-chain queue readers (`Lido WithdrawalQueueERC721`, Cosmos `/cosmos/staking/v1beta1/delegators/{addr}/unbonding_delegations`, Ethena `cooldowns(user)`). |
-| **3. Post-Bridge 90% Principal Yield-Parking Agent** | **+$1,500–$2,250/yr** on $25k migrated USDC (6–9% APY vs 0% idle) | Watches Solana destination ATA for incoming migration settlements; auto-proposes (or executes via 1-click Solana session / `VersionedTransaction`) parking 90%+ principal into **Jupiter Lend (`jlUSDC`)**, **Kamino USDC Earn**, or **JupSOL**. | Solana arrival watcher + `@jup-ag/lend/earn` (`getDepositIxs`) + Kamino SDK adapter + `TurgaliumAgentVault` yield preference metadata |
+| **3. Post-Bridge 100% Principal Yield-Parking Agent** | **+$1,500–$2,250/yr** on $25k migrated USDC (6–9% APY vs 0% idle) | Watches Solana destination ATA for incoming migration settlements; auto-proposes (or executes via 1-click Solana session / `VersionedTransaction`) parking 100% principal-safe into **Jupiter Lend (`jlUSDC`)**, **Kamino USDC Earn**, or **JupSOL**. | Solana arrival watcher + `@jup-ag/lend/earn` (`getDepositIxs`) + Kamino SDK adapter + `TurgaliumAgentVault` yield preference metadata |
 | **4. Stale Approval Revoker & Solana Empty-ATA Rent Vacuum** | **Eliminates infinite-approval exploit risk** + recovers **+$3–$20 free SOL** | `TurgaliumSweepDelegate.sol:503-507` **already supports `ApprovalRevoke[] revokes`**, yet nothing populates it! Add an approval indexer (RPC `Approval` logs / Moralis / Dune Sim) to auto-attach `approve(spender, 0)` for emptied tokens during sweep, plus a Solana scanner for `amount === 0` ATAs (`closeAccount`). | `src/scanner/approvals.ts`, populate `revokes[]` in `tx-builder.ts` / `sponsor.ts`, `src/bridge/solana-rent.ts` |
 | **5. Continuous Multi-Wallet Dust & Airdrop Vacuum** | **Rescues $50–$500+/yr** in forgotten airdrops, LP fees & staking rebates | Weekly background scan across all unified wallets under a tight `TurgaliumAgentVault` mandate (e.g., `maxPerTx: $100`, `minNetOutBps: 8500`). Stays completely silent until new sweepable value exceeds the profitable Level-2 batch threshold, then executes or sends a 1-click digest. | Persistent `watchlists` table + scheduled `scanUnifiedWallets` worker + threshold trigger |
 
 ---
 
-## 5. Pillar 4 — Degen Tab & Jupiter Ecosystem Expansion
+## 5. Pillar 4 — Condensed Batch APIs, 1-Click Sweep UX & Principal-Safe Solana Arrival
 
-### 5.1 Audit of Current Degen Tab (`src/degen/jupiter-markets.ts`, `src/server/degen-routes.ts`, `public/degen.js`)
-The foundation is clean, XSS-hardened, and already nails the **Preservation-First Side-Pocket** philosophy (default 10% cap, hard 50% ceiling, live `api.jup.ag/prediction/v1` events + search). However, **five concrete product/technical gaps** block it from feeling native and awesome:
+### 5.1 Condensed Backend Batch Endpoints (Single-Round-Trip Architecture)
+To eliminate sequential HTTP waterfalls across wallet hydration, transaction quoting, Solana balance/dust/APY loading, and finality tracking, Turgalium exposes five condensed batch endpoints backed by in-flight promise deduplication and short TTL caching (`refresh: true` bypass):
 
-1. **Inline Order Signing Is Incomplete (`public/degen.js:428-434,990-995`, `src/degen/jupiter-markets.ts:977-1015`):**
-   - `JupiterMarketsClient.buildOrderPreview` hits `POST /orders` and returns `liveOrder.transactionBase64`, **but `public/degen.js` never signs or submits it to Phantom/Solflare/Backpack!** It merely prints `"Inline Jupiter tx built"` and leaves the user to click an external `jup.ag` link.
-   - `src/degen/jupiter-markets.ts:980-986` omits `depositMint` (Jupiter Prediction v1 requires `depositMint` — USDC `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` or JupUSD `JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD`).
-   - Missing **$5.00 minimum order validation** (`5_000_000` micro-USD enforced by Jupiter Predict) and clean geo-restriction UX handling (Jupiter Predict restricts US/KR IPs).
-2. **Zero Position Tracking, Live P&L, Early Cashout, or 1-Click Payout Claims:**
-   - Jupiter Prediction API exposes `GET /positions?ownerPubkey=...`, `DELETE /positions/{positionPubkey}` (sell/close early), and `POST /positions/{positionPubkey}/claim` (claim $1.00/winning share with **0 claim fees**).
-   - Turgalium currently has **none** of these endpoints in `src/degen/jupiter-markets.ts` or `src/server/degen-routes.ts`. Adding a **"My Bets & Claimable Payouts"** drawer in `#view-degen` turns Turgalium into a sticky home for migrated capital!
-3. **"Preserve 90% Safe" Is Idle Cash Instead of Active Yield + "Yield-Funded Degen" Mode:**
-   - Right now the 90% green bar (`public/degen.js:540-543`) just sits in 0% USDC.
-   - **Killer Feature — 1-Click "90% Yield + 10% Degen" Split Presets:**
-     - **Preset A — Compound + Play (Default):** Park **90%** in **Jupiter Lend (`jlUSDC`)** or **Kamino USDC** (~6–9% APY) in 1 click; unlock **10%** in the Degen Side-Pocket.
-     - **Preset B — Zero-Principal-Loss "Yield-Funded Degen":** Park **100%** of migrated USDC in Jupiter Lend / JupSOL, and set the Degen side-pocket cap strictly equal to **accrued yield only**! Users literally cannot lose their migrated principal.
-     - **Preset C — SOL Believer Split:** Convert **80%** to **JupSOL** (native Solana staking yield via Jupiter Swap v2 / Ultra), keep **10% USDC**, play **10%** on Jupiter Predict/Arcade.
-4. **Expand Beyond External Links for Jupiter Games, Perps & Swap/Trigger/DCA (`public/degen.js:612-646`):**
-   - **Jupiter Swap v2 / Ultra API (`api.jup.ag/swap/v2` or `ultra/v1`):** Embed an inline **Quick Swap / DCA / Trigger (Limit Order)** mini-module inside Solana post-migration! Supports **gasless swaps** when user holds `< 0.01 SOL` (trade ≥ ~$10) and lets Turgalium earn sustainable **5–10 bps partner fees** transparently!
-   - **Live Arcade (1m) & Degen (5m/15m) Fast-Rounds Strip:** Replace static cards with live countdown timers and current pool multipliers for 1m/5m/15m BTC & SOL Up/Down rounds.
-   - **Jupiter Perps Safe-Collateral Preview:** Show live SOL/BTC/ETH mark price & funding rate and strictly cap max collateral to the user's side-pocket (with clear liquidation price preview before launching or signing).
-5. **Fragile DOM-Scraping Balance Sync (`public/degen.js:189-210`):**
-   - Replace regex scraping of `#solanaLiveBalanceBadge` and `#kpiNetUsdc` with a clean `CustomEvent('turgalium:balance-updated', { detail: { solanaUsdc, solBalance, projectedSweepUsdc, solanaWallet } })` dispatched by `public/app.js`.
+1. **`POST /api/workspace/hydrate`**: Hydrates wallet `scan`, optimal `plan`, `preservation` analysis, `solanaBalances`, optional `solanaOverview` (`includeSolanaOverview: true`), and `timingMs: { total, scan, plan, solana }` in a single server call.
+2. **`POST /api/tx/prepare-batch`**: Prepares up to 12 selected assets in parallel (bounded concurrency) with optional DeFi preflight (`includePreflight`), returning aggregated `totalNetUsd`, `totalGasUsd`, `totalProtocolFeeUsd: 0`, `totalSignatures`, and per-item `prepared` / `preflight` status.
+3. **`POST /api/solana/overview`**: Combines Solana balances, SPL dust scan (`dustMaxUsd`, `dustOutputAsset`), and live yield strategy APYs into one parallel request on Solana wallet connect.
+4. **`POST /api/bridge/status-batch`**: Polls settlement and bridge finality across all in-flight cross-chain legs in a single batch call.
+5. **`POST /api/agent/handoff`**: Produces a non-custodial read-only review & handoff kit for Claude MCP and ChatGPT assistants.
+
+### 5.2 True 1-Click Workflows & 100% Principal-Safe Post-Arrival Yield
+- **1-Click Auto-Scan & Plan on Connect**: Connecting an EVM wallet or selecting an address hydrates scan + optimal route plan automatically with zero extra clicks.
+- **1-Click Sweep All Ready**: Primary CTA (and sticky mobile sweep bar) prepares all selected profitable assets via `POST /api/tx/prepare-batch`, presents a concise single-card pre-sign summary (total net USD arriving on Solana, `0%` Turgalium fee, exact signature count, chains covered), and walks through signing, auto chain-switching, and live batch finality tracking.
+- **100% Principal-Safe Earn on Solana**: Parks 100% of arrived USDC into **JupSOL**, **Jupiter Lend (`jlUSDC`)**, or **Kamino USDC** via 1-click VersionedTransaction signing, paired with 1-click SPL dust consolidation and empty-ATA SOL rent reclaim.
+- **Clean Event-Driven Balance Sync**: `public/app.js` dispatches `CustomEvent('turgalium:balance-updated', { detail: { solanaUsdc, solBalance, projectedSweepUsdc, solanaWallet } })` so downstream tools stay synchronized without fragile DOM scraping.
 
 ---
 
@@ -215,7 +207,7 @@ The foundation is clean, XSS-hardened, and already nails the **Preservation-Firs
   - **Redis** (Upstash / Fly Redis) for shared scan/Jupiter caches, distributed rate-limit counters, and single-leader poller leases across replicas.
 
 ### 6.3 API Hardening, Rate Limiting, RPC Circuit Breakers & Deployment Hygiene
-1. **Zero HTTP Rate Limiting (`src/server/app.ts`):** Expensive endpoints (`/api/scan`, `/api/scan/unified`, `/api/tx/prepare-chain-batch`, `/api/tx/simulate-proof`, `/api/degen/*`, `/mcp`) have zero per-IP or per-token rate limits. A burst of 50 requests can exhaust upstream Alchemy, LI.FI, Relay, and Jupiter API quotas.
+1. **Zero HTTP Rate Limiting (`src/server/app.ts`):** Expensive endpoints (`/api/scan`, `/api/scan/unified`, `/api/workspace/hydrate`, `/api/tx/prepare-batch`, `/api/tx/prepare-chain-batch`, `/api/tx/simulate-proof`, `/api/solana/overview`, `/mcp`) need per-IP or per-token rate limits so bursts cannot exhaust upstream Alchemy, LI.FI, Relay, and Jupiter API quotas.
 2. **Public Deployment Fail-Closed Guard (`src/server/app.ts:563-564,666-671`):** When `TURGALIUM_ADMIN_SESSION_TOKEN` is unset, `hasValidAdminSession()` returns `true` unconditionally. On localhost (`127.0.0.1`) this is ergonomic; on a public host (`HOST=0.0.0.0`), it would expose `/api/agents/mandates`, `/api/plugin/tokens`, and `/api/jobs` to unauthenticated mutations! Add a startup assertion refusing non-loopback binding unless `TURGALIUM_ADMIN_SESSION_TOKEN` and `TURGALIUM_ALLOWED_HOSTS`/`TURGALIUM_ALLOWED_ORIGIN` are explicitly set.
 3. **RPC Provider Circuit-Breaker & Keyed Fallback Tiers (`src/scanner/rpc.ts`, `src/scanner/chains.ts`):**
    - `evmJsonRpcBatch` / `evmJsonRpcCall` iterate `rpcUrls` linearly from index `0` on *every* request with no cooldown memory for degraded/429 endpoints, adding 4–8s latency spikes when a public node degrades.
@@ -223,7 +215,7 @@ The foundation is clean, XSS-hardened, and already nails the **Preservation-Firs
 4. **Deployment Artifacts, Graceful Shutdown & Telemetry (`src/server/index.ts`, `.github/workflows/ci.yml`):**
    - Missing `Dockerfile` (multi-stage Node 22 Alpine), `fly.toml` (or Railway/Render/Cloudflare Container spec), and `.env.example`.
    - `src/server/index.ts` lacks `SIGTERM`/`SIGINT` graceful drain (`server.close()` + `jobStore.dispose()`).
-   - Missing structured JSON logging (`pino` or lightweight JSON logger), `/api/metrics` (quote latencies, route-auction bps saved, RPC failover rates, job settlement funnels), and CI checks for `node --check public/degen.js` + Playwright E2E + Foundry tests.
+   - Missing structured JSON logging (`pino` or lightweight JSON logger), `/api/metrics` (quote latencies, route-auction bps saved, RPC failover rates, job settlement funnels), and CI checks for `node --check public/app.js public/preservation.js public/sw.js` + Playwright E2E + Foundry tests.
 
 ---
 
@@ -246,10 +238,10 @@ Seven crisp, self-contained, non-overlapping engineering tickets designed so **M
 - **Owned Files:** `src/bridge/solana-claim.ts`, `src/bridge/solana-rent.ts` (new), `src/solana/yield-park.ts` (new), `src/server/app.ts` (new `/api/solana/rent-scan` & `/api/solana/yield-deposit-tx` routes), `tests/solana-v0-yield-rent.test.ts` (new).
 - **Acceptance Criteria:** Compiled `VersionedTransaction` with `ComputeBudget` + `createAtaIdempotent` + `receiveMessage` + optional `closeAccount` / Jupiter Lend deposit; verified unit tests for PDA/ALT serialization and rent math.
 
-### Ticket 4 — `feat/degen-inline-signing-positions-and-yield-split`
-- **Goal:** Complete the Jupiter Degen Tab: wire **1-click in-app Phantom/Solflare/Backpack signing** for `POST /api/degen/order-preview` (`transactionBase64`), add missing `depositMint` + `$5` min order + geo-block handling, add **Live Positions / P&L / Early Close / 1-Click Claim** (`GET /positions`, `DELETE /positions/{id}`, `POST /positions/{id}/claim`), add **"90% Yield + 10% Degen"** & **"Yield-Funded Degen"** presets, and replace DOM-scraping balance sync with a clean custom event.
-- **Owned Files:** `src/degen/jupiter-markets.ts`, `src/server/degen-routes.ts`, `public/degen.js`, `public/degen.css`, `tests/degen-jupiter.test.ts`.
-- **Acceptance Criteria:** Connected Solana wallet signs & submits Jupiter Predict order directly inside Turgalium; open/claimable positions render with live P&L and 1-click `$1.00` claim; clean `turgalium:balance-updated` event replaces DOM regex scraping; `node --check public/degen.js` passes.
+### Ticket 4 — `feat/condensed-batch-apis-and-one-click-sweep`
+- **Goal:** Condense multi-step backend waterfalls into high-speed parallel batch endpoints (`POST /api/workspace/hydrate` with `timingMs` & optional `solanaOverview`, `POST /api/tx/prepare-batch` with bounded parallel preparation & optional DeFi preflight, `POST /api/solana/overview`, `POST /api/bridge/status-batch`, and `POST /api/agent/handoff`), add in-flight promise deduplication and short TTL caching (`refresh: true` bypass), wire 1-click Sweep All Ready + 100% principal-safe Earn on Solana, and replace DOM-scraping balance sync with a clean `turgalium:balance-updated` event.
+- **Owned Files:** `src/execution/prepare-batch.ts`, `src/solana/*`, `src/server/app.ts`, `public/app.js`, `public/preservation.js`, `public/index.html`, `tests/*.test.ts`.
+- **Acceptance Criteria:** Single-round-trip wallet hydration, parallel batch tx prep across up to 12 assets with `0%` Turgalium fee, 1-click Sweep pre-sign summary, 100% principal-safe yield park, and `node --check public/app.js public/preservation.js public/sw.js` passes.
 
 ### Ticket 5 — `feat/one-click-wallet-ux-paymaster-and-mobile`
 - **Goal:** Cut onboarding & multi-chain clicks in half: (1) **1-Click Unified Dual-VM Connect** for Phantom/OKX/Coinbase/Backpack (connects EVM + Solana in one flow), (2) attach **ERC-7677 Paymaster `capabilities`** inside `sendEip5792Batch` when advertised by Coinbase/MetaMask, (3) **parallel chain pre-quoting** before multi-chain queue execution, (4) **mobile Phantom/Solflare universal deep-links** & server-configured WalletConnect default, and (5) **stale ERC-20 approval scanner** populating `ApprovalRevoke[]`.
@@ -259,7 +251,7 @@ Seven crisp, self-contained, non-overlapping engineering tickets designed so **M
 ### Ticket 6 — `feat/foundry-mainnet-fork-tests-and-contract-v2`
 - **Goal:** Establish real Solidity compilation, Slither static analysis, and **Foundry/Anvil forked-mainnet tests** for all 4 contracts + add missing concrete `TurgaliumDelegateRegistry.sol`, wire `TurgaliumAgentVault.authorizeAgentAction` into `TurgaliumRouter` & `TurgaliumSweepDelegate`, lower `MIN_FEE_BPS` to `0`, and add CCTP V2 Fast Transfer + Hook parameters on-chain.
 - **Owned Files:** `foundry.toml` (new), `contracts/TurgaliumRouter.sol`, `contracts/TurgaliumSweepDelegate.sol`, `contracts/TurgaliumAgentVault.sol`, `contracts/TurgaliumFeeVault.sol`, `contracts/TurgaliumDelegateRegistry.sol` (new), `contracts/test/*.t.sol` (new), `.github/workflows/ci.yml`.
-- **Acceptance Criteria:** `forge build && forge test` passes against forked Ethereum/Base mainnet (real Aave v3, Compound v3, ERC-4626, Permit2, CCTP V2); fuzz/invariant tests verify zero residual token stranding, exact fee bounds, and `TurgaliumAgentVault` cap enforcement; CI runs `forge test` + `node --check public/degen.js`.
+- **Acceptance Criteria:** `forge build && forge test` passes against forked Ethereum/Base mainnet (real Aave v3, Compound v3, ERC-4626, Permit2, CCTP V2); fuzz/invariant tests verify zero residual token stranding, exact fee bounds, and `TurgaliumAgentVault` cap enforcement; CI runs `forge test` + Playwright E2E.
 
 ### Ticket 7 — `feat/prod-persistence-relayer-ratelimit-and-deploy`
 - **Goal:** Make Turgalium production-deployable and resilient across restarts: (1) pluggable **Postgres + Redis persistence** for jobs, mandates (preserving 24h rolling spend across restarts!), approvals, plugin tokens, gas-watch triggers, and replay-protected intents, (2) **real EVM relayer broadcaster** (`src/relayer/broadcaster.ts`) replacing the stub in `sponsor.ts`, (3) **per-IP/token rate limiting**, RPC circuit-breaker cooldowns, and fail-closed non-loopback startup guard, (4) `Dockerfile`, `fly.toml`, `.env.example`, graceful `SIGTERM` shutdown, and structured JSON logging + `/api/metrics`.
@@ -267,6 +259,6 @@ Seven crisp, self-contained, non-overlapping engineering tickets designed so **M
 - **Acceptance Criteria:** Restarting the server preserves active jobs, mandates, 24h spend totals, and Bearer tokens; rate limiter returns `429` with `Retry-After`; non-loopback startup without `TURGALIUM_ADMIN_SESSION_TOKEN` exits fail-closed; RPC circuit breaker skips 429'd nodes for 60s.
 
 ### Ticket 8 — `feat/merge-preservation-autopilot-and-mcp-v2` *(Coordinate after Ticket 1 & 7)*
-- **Goal:** Merge `feat/cost-preservation-autopilot-agents` (`5a841a2`) cleanly into `main`, back `PreservationAgentStore` with Ticket 7's persistent store, wire live on-chain unlock-queue readers (Lido Withdrawal Queue, Ethena `cooldowns`, Cosmos `unbonding_delegations`), and expand Claude MCP (`src/mcp/server.ts`) & ChatGPT OpenAPI (`src/agent/plugin-spec.ts`) with `turgalium_preservation_audit`, `turgalium_watch_gas_window`, `turgalium_list_unlock_schedule`, `turgalium_scan_stale_approvals`, and `turgalium_degen_positions`.
+- **Goal:** Merge `feat/cost-preservation-autopilot-agents` (`5a841a2`) cleanly into `main`, back `PreservationAgentStore` with Ticket 7's persistent store, wire live on-chain unlock-queue readers (Lido Withdrawal Queue, Ethena `cooldowns`, Cosmos `unbonding_delegations`), and expand Claude MCP (`src/mcp/server.ts`) & ChatGPT OpenAPI (`src/agent/plugin-spec.ts`) with `turgalium_preservation_audit`, `turgalium_watch_gas_window`, `turgalium_list_unlock_schedule`, and `turgalium_scan_stale_approvals`.
 - **Owned Files:** `src/execution/preservation-optimizer.ts`, `src/agent/preservation-agents.ts`, `src/server/preservation-routes.ts`, `src/mcp/server.ts`, `src/agent/plugin-spec.ts`, `tests/preservation-optimizer.test.ts`.
 - **Acceptance Criteria:** Clean rebase/merge with zero conflicts; live MCP & ChatGPT tools pass schema + auth adversarial tests; unlock harvester detects real pending Lido/Ethena/Cosmos unbondings.
