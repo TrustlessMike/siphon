@@ -1,4 +1,4 @@
-import { renderConvergenceSvg } from './turgalium-svg.js?v=4';
+import { renderConvergenceSvg, mountTurgaliumHeroSvg } from './turgalium-svg.js?v=5';
 import {
   claimCctpOnSolana,
   connectCoinbaseSmartWallet,
@@ -775,23 +775,14 @@ let isPreparingOneClickBatch = false;
 function ensureHeroScene() {
   if (heroScene) return Promise.resolve(heroScene);
   if (heroScenePromise) return heroScenePromise;
-  const canvas = document.getElementById('turgaliumHeroCanvas');
-  if (!canvas) return Promise.resolve(null);
-  heroScenePromise = import('./turgalium-3d.js?v=3')
-    .then(({ mountTurgaliumFunnelScene }) => {
-      if (!heroScene) {
-        heroScene = mountTurgaliumFunnelScene(canvas);
-        window.__turgaliumHeroScene = heroScene;
-        if (document.getElementById('siteShell')?.classList.contains('hidden')) {
-          heroScene?.setPaused(true);
-        }
-      }
-      return heroScene;
-    })
-    .catch(() => {
-      heroScenePromise = null;
-      return null;
-    });
+  const stage = document.getElementById('turgaliumHeroCanvas');
+  if (!stage) return Promise.resolve(null);
+  heroScene = mountTurgaliumHeroSvg(stage);
+  window.__turgaliumHeroScene = heroScene;
+  if (document.getElementById('siteShell')?.classList.contains('hidden')) {
+    heroScene?.setPaused(true);
+  }
+  heroScenePromise = Promise.resolve(heroScene);
   return heroScenePromise;
 }
 
@@ -6627,30 +6618,24 @@ loadWalletConnectorConfig().then((cfg) => {
   }
 });
 const heroCanvasEl = document.getElementById('turgaliumHeroCanvas');
-if (heroCanvasEl && typeof window.IntersectionObserver === 'function') {
-  const heroIo = new window.IntersectionObserver(
-    (entries) => {
-      const entry = entries[0];
-      const siteVisible = !document.getElementById('siteShell')?.classList.contains('hidden');
-      if (entry && entry.isIntersecting && siteVisible) {
-        ensureHeroScene().then((scene) => scene?.setPaused(false));
-      } else {
-        heroScene?.setPaused(true);
-      }
-    },
-    { threshold: 0.35 }
-  );
-  heroIo.observe(heroCanvasEl);
-} else {
-  const scheduleHeroScene = () => {
-    if (!document.getElementById('siteShell')?.classList.contains('hidden')) {
-      ensureHeroScene();
-    }
-  };
-  if (typeof window.requestIdleCallback === 'function') {
-    window.requestIdleCallback(scheduleHeroScene, { timeout: 250 });
-  } else {
-    setTimeout(scheduleHeroScene, 60);
+if (heroCanvasEl) {
+  if (!document.getElementById('siteShell')?.classList.contains('hidden')) {
+    ensureHeroScene();
+  }
+  if (typeof window.IntersectionObserver === 'function') {
+    const heroIo = new window.IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        const siteVisible = !document.getElementById('siteShell')?.classList.contains('hidden');
+        if (entry && entry.isIntersecting && siteVisible) {
+          ensureHeroScene().then((scene) => scene?.setPaused(false));
+        } else {
+          heroScene?.setPaused(true);
+        }
+      },
+      { threshold: 0.25 }
+    );
+    heroIo.observe(heroCanvasEl);
   }
 }
 

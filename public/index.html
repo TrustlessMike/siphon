@@ -18,7 +18,7 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=16" />
+    <link rel="stylesheet" href="/styles.css?v=17" />
     <link rel="stylesheet" href="/preservation.css?v=7" />
   </head>
   <body>
@@ -108,20 +108,21 @@
           </div>
 
           <div class="hero-visual-col">
-            <canvas
+            <div
               id="turgaliumHeroCanvas"
-              class="hero-3d-canvas"
-              aria-label="3D porcelain, brushed titanium, and ice-cyan convergence sculpture"
-            ></canvas>
+              class="hero-svg-stage"
+              role="region"
+              aria-label="Multi-chain convergence diagram showing 20 EVM chains, Bitcoin, Cosmos, Sui, Aptos, TON, and Tron flowing home to Solana"
+            ></div>
             <div class="hero-stage-bar">
               <div class="hero-chain-strip" aria-label="Supported source ecosystems">
-                <span class="hero-chain-chip"><img src="/logos/ethereum.svg" width="15" height="15" alt="" class="chain-logo-xs" />19 EVMs</span>
-                <span class="hero-chain-chip"><img src="/logos/cosmos.svg" width="15" height="15" alt="" class="chain-logo-xs" />Cosmos</span>
-                <span class="hero-chain-chip"><img src="/logos/sui.svg" width="15" height="15" alt="" class="chain-logo-xs" />Sui</span>
-                <span class="hero-chain-chip"><img src="/logos/aptos.svg" width="15" height="15" alt="" class="chain-logo-xs" />Aptos</span>
-                <span class="hero-chain-chip"><img src="/logos/ton.svg" width="15" height="15" alt="" class="chain-logo-xs" />TON</span>
-                <span class="hero-chain-chip"><img src="/logos/tron.svg" width="15" height="15" alt="" class="chain-logo-xs" />Tron</span>
-                <span class="hero-chain-chip"><img src="/logos/btc.svg" width="15" height="15" alt="" class="chain-logo-xs" />Bitcoin</span>
+                <span class="hero-chain-chip" tabindex="0" role="button" data-hero-group="evm"><img src="/logos/ethereum.svg" width="15" height="15" alt="" class="chain-logo-xs" />20 EVMs</span>
+                <span class="hero-chain-chip" tabindex="0" role="button" data-hero-chain="cosmos"><img src="/logos/cosmos.svg" width="15" height="15" alt="" class="chain-logo-xs" />Cosmos</span>
+                <span class="hero-chain-chip" tabindex="0" role="button" data-hero-chain="sui"><img src="/logos/sui.svg" width="15" height="15" alt="" class="chain-logo-xs" />Sui</span>
+                <span class="hero-chain-chip" tabindex="0" role="button" data-hero-chain="aptos"><img src="/logos/aptos.svg" width="15" height="15" alt="" class="chain-logo-xs" />Aptos</span>
+                <span class="hero-chain-chip" tabindex="0" role="button" data-hero-chain="ton"><img src="/logos/ton.svg" width="15" height="15" alt="" class="chain-logo-xs" />TON</span>
+                <span class="hero-chain-chip" tabindex="0" role="button" data-hero-chain="tron"><img src="/logos/tron.svg" width="15" height="15" alt="" class="chain-logo-xs" />Tron</span>
+                <span class="hero-chain-chip" tabindex="0" role="button" data-hero-chain="btc"><img src="/logos/btc.svg" width="15" height="15" alt="" class="chain-logo-xs" />Bitcoin</span>
               </div>
               <span class="stage-domain"><img src="/logos/solana.svg" width="15" height="15" alt="" class="chain-logo-xs" />Solana</span>
             </div>
@@ -1264,7 +1265,7 @@
 
     <div class="toast-host" id="toastRegion" aria-live="polite"></div>
 
-    <script type="module" src="/app.js?v=20"></script>
+    <script type="module" src="/app.js?v=21"></script>
     <script type="module" src="/preservation.js?v=6"></script>
   </body>
 </html>

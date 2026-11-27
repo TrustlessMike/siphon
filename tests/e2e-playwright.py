@@ -577,26 +577,30 @@ def main():
             assert boot_dest["inputVal"] == "", f"Expected empty default #solanaDestInput, got {boot_dest}"
             assert "Connect Solana or enter destination" in boot_dest["summary"], boot_dest
 
-            # 1B. Verify Coinbase Smart Wallet SDK + WalletConnect SDK + HEAD / COOP + WebGL canvas
+            # 1B. Verify Coinbase Smart Wallet SDK + WalletConnect SDK + HEAD / COOP + Custom SVG Hero
             sdk_gfx = pgD.evaluate("""async () => {
               const headRes = await fetch('/', { method: 'HEAD' });
               const mod = await import('/vendor/wallet-sdks.js');
               const sdk = mod.createCoinbaseWalletSDK({ appName: 'Turgalium', appChainIds: [1, 8453] });
               const prov = sdk.getProvider();
-              const canvas = document.getElementById('turgaliumHeroCanvas');
+              const hero = document.getElementById('turgaliumHeroCanvas');
+              const svg = document.getElementById('turgaliumHeroSvg');
+              const rect = svg ? svg.getBoundingClientRect() : (hero ? hero.getBoundingClientRect() : { width: 0, height: 0 });
               return {
                 headStatus: headRes.status,
                 coop: headRes.headers.get('cross-origin-opener-policy'),
                 coinbaseReady: typeof prov?.request === 'function',
                 wcReady: typeof mod.EthereumProvider?.init === 'function',
-                canvasW: canvas?.width || 0,
-                canvasH: canvas?.height || 0,
+                canvasW: Math.round(rect.width || 0),
+                canvasH: Math.round(rect.height || 0),
+                heroChainNodes: svg ? svg.querySelectorAll('.tg-hero-node').length : 0,
               };
             }""")
             assert sdk_gfx["headStatus"] == 200, sdk_gfx
             assert sdk_gfx["coop"] == "same-origin-allow-popups", sdk_gfx
             assert sdk_gfx["coinbaseReady"] and sdk_gfx["wcReady"], sdk_gfx
             assert sdk_gfx["canvasW"] > 200 and sdk_gfx["canvasH"] > 200, sdk_gfx
+            assert sdk_gfx["heroChainNodes"] == 12, sdk_gfx
 
             overflowD = {"website": pgD.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")}
             maybe_shot(pgD, "goal_desktop_website_1440.png", full_page=True)

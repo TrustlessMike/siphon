@@ -554,19 +554,219 @@ select option {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 20px;
+  padding: 18px 18px 16px;
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: 20px;
-  min-height: 460px;
+  border-radius: 22px;
+  box-shadow:
+    0 1px 2px rgba(10, 10, 10, 0.03),
+    0 14px 36px -18px rgba(10, 10, 10, 0.08);
   min-width: 0;
 }
 
-.hero-3d-canvas {
+.hero-svg-stage {
+  position: relative;
   width: 100%;
-  height: 390px;
+  aspect-ratio: 680 / 468;
+  border-radius: 15px;
+  background: radial-gradient(circle at 50% 49%, #ffffff 0%, #fafcff 66%, #f4f7fb 100%);
+  border: 1px solid #edf0f5;
+  overflow: hidden;
+}
+
+.tg-hero-svg {
   display: block;
-  border-radius: 14px;
+  width: 100%;
+  height: auto;
+  user-select: none;
+}
+
+.tg-hero-node {
+  cursor: pointer;
+  outline: none;
+  transition: opacity 200ms ease;
+}
+
+.tg-hero-node-disc {
+  transition: stroke 200ms ease, stroke-width 200ms ease;
+}
+
+.tg-hero-node-ring {
+  opacity: 0;
+  transition: opacity 220ms ease;
+}
+
+.tg-hero-node-label {
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  fill: #3f3f46;
+  letter-spacing: -0.012em;
+  transition: fill 180ms ease;
+}
+
+.tg-hero-conduit-base {
+  fill: none;
+  stroke: #e4e7ee;
+  stroke-width: 1.35;
+  stroke-linecap: round;
+  transition: stroke 220ms ease, stroke-width 220ms ease, opacity 220ms ease;
+}
+
+.tg-hero-conduit-flow {
+  fill: none;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  opacity: 0.62;
+  transition: opacity 220ms ease, stroke-width 220ms ease;
+}
+
+.tg-hero-chevron {
+  fill: none;
+  stroke-width: 1.45;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.65;
+  transition: opacity 200ms ease, stroke-width 200ms ease;
+}
+
+.tg-hero-pulse {
+  transition: opacity 220ms ease;
+}
+
+.tg-hero-more-evms {
+  cursor: pointer;
+  outline: none;
+}
+
+.tg-hero-svg.has-focus .tg-hero-node:not(.is-active) {
+  opacity: 0.34;
+}
+
+.tg-hero-svg.has-focus .tg-hero-conduit-base:not(.is-active) {
+  opacity: 0.32;
+}
+
+.tg-hero-svg.has-focus .tg-hero-conduit-flow:not(.is-active) {
+  opacity: 0.12;
+}
+
+.tg-hero-svg.has-focus .tg-hero-chevron:not(.is-active) {
+  opacity: 0.14;
+}
+
+.tg-hero-svg.has-focus .tg-hero-pulse:not(.is-active) {
+  opacity: 0.15;
+}
+
+.tg-hero-node.is-active .tg-hero-node-disc {
+  stroke-width: 1.75;
+}
+
+.tg-hero-node.is-active .tg-hero-node-ring {
+  opacity: 1;
+}
+
+.tg-hero-node.is-active .tg-hero-node-label {
+  fill: #0a0a0a;
+}
+
+.tg-hero-conduit-flow.is-active {
+  opacity: 1;
+  stroke-width: 2.55;
+}
+
+.tg-hero-chevron.is-active {
+  opacity: 1;
+  stroke-width: 1.9;
+}
+
+@keyframes tg-hero-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes tg-hero-spin-rev {
+  from {
+    transform: rotate(360deg);
+  }
+  to {
+    transform: rotate(0deg);
+  }
+}
+
+@keyframes tg-hero-ripple {
+  0% {
+    r: 44;
+    opacity: 0.38;
+    stroke-width: 1.4;
+  }
+  100% {
+    r: 82;
+    opacity: 0;
+    stroke-width: 0.5;
+  }
+}
+
+@keyframes tg-hero-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.42;
+  }
+}
+
+.tg-hero-aperture-spin {
+  transform-origin: 340px 232px;
+  animation: tg-hero-spin 48s linear infinite;
+}
+
+.tg-hero-aperture-rev {
+  transform-origin: 340px 232px;
+  animation: tg-hero-spin-rev 68s linear infinite;
+}
+
+.tg-hero-ripple-1 {
+  animation: tg-hero-ripple 3.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.tg-hero-ripple-2 {
+  animation: tg-hero-ripple 3.8s cubic-bezier(0.16, 1, 0.3, 1) infinite 1.9s;
+}
+
+.tg-hero-live-dot {
+  animation: tg-hero-breathe 2.4s ease-in-out infinite;
+}
+
+.tg-hero-svg.is-boosted .tg-hero-sol-bloom {
+  opacity: 1;
+}
+
+.tg-hero-svg.is-paused .tg-hero-aperture-spin,
+.tg-hero-svg.is-paused .tg-hero-aperture-rev,
+.tg-hero-svg.is-paused .tg-hero-ripple-1,
+.tg-hero-svg.is-paused .tg-hero-ripple-2,
+.tg-hero-svg.is-paused .tg-hero-live-dot {
+  animation-play-state: paused;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tg-hero-aperture-spin,
+  .tg-hero-aperture-rev,
+  .tg-hero-ripple-1,
+  .tg-hero-ripple-2,
+  .tg-hero-live-dot {
+    animation: none !important;
+  }
+  .tg-hero-pulse {
+    display: none;
+  }
 }
 
 .hero-stage-bar {
@@ -574,9 +774,9 @@ select option {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   padding-top: 12px;
-  margin-top: 8px;
+  margin-top: 10px;
   border-top: 1px solid var(--border);
   font-size: 11.5px;
   color: var(--ink-2);
@@ -584,6 +784,10 @@ select option {
 
 .stage-domain {
   color: var(--accent-mint);
+  background: var(--allow-bg);
+  border: 1px solid var(--allow-border);
+  border-radius: 999px;
+  padding: 3px 9px;
   font-weight: 700;
   white-space: nowrap;
   flex-shrink: 0;
@@ -2199,7 +2403,7 @@ select option {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 5px 10px;
+  gap: 4px 8px;
   font-size: 11.5px;
   color: var(--ink-1);
 }
@@ -2209,6 +2413,21 @@ select option {
   align-items: center;
   gap: 4px;
   white-space: nowrap;
+  padding: 2px 6px;
+  margin: -2px -4px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+
+.hero-chain-chip:hover,
+.hero-chain-chip:focus-visible,
+.hero-chain-chip.is-active {
+  background: var(--bg-well);
+  border-color: var(--border);
+  color: var(--ink-0);
+  outline: none;
 }
 
 .calldata-title {
@@ -3698,11 +3917,13 @@ html[data-ui-mode="pro"] .lite-only {
     padding: 10px 14px;
   }
   .hero-visual-col {
-    min-height: 280px;
-    padding: 14px;
+    padding: 12px;
+    border-radius: 16px;
   }
-  .hero-3d-canvas {
-    height: 240px;
+  .hero-stage-bar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
   }
   .site-footer {
     flex-direction: column;
