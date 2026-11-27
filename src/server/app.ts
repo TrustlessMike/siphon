@@ -23,6 +23,7 @@ import {
   buildAaveRepayPreSteps,
   inspectAavePoolActiveDebts,
 } from '../defi/aave-unwind.js';
+import { buildAaveFlashUnwindPlan } from '../defi/flash-unwind.js';
 import { isAllowedAaveV3Pool } from '../defi/extractors.js';
 import { buildPreSignSimulationProof, verifyOnchainExecutionProof } from '../execution/proof.js';
 import {
@@ -1856,6 +1857,50 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
           repayTransactions,
           ...(inspection.reason ? { reason: inspection.reason } : {}),
         });
+      }
+
+      if (method === 'POST' && pathname === '/api/defi/aave-flash-unwind-plan') {
+        const body = await readJsonBody<{
+          chain?: string;
+          poolAddress?: string;
+          userAddress?: string;
+          recipient?: string;
+          slippageBps?: number;
+          swapAllCollaterals?: boolean;
+        }>(req);
+
+        const chainRaw = typeof body.chain === 'string' ? body.chain.trim().toLowerCase() : '';
+        if (!isEvmChain(chainRaw)) {
+          return reply(400, { error: 'Valid EVM chain is required.' });
+        }
+        const userAddress = typeof body.userAddress === 'string' ? body.userAddress.trim() : '';
+        if (!/^0x[0-9a-fA-F]{40}$/.test(userAddress)) {
+          return reply(400, { error: 'Valid 0x EVM userAddress is required.' });
+        }
+        const chainCfg = CHAIN_LIST.find((c) => c.id === chainRaw);
+        const poolAddress =
+          (typeof body.poolAddress === 'string' && body.poolAddress.trim()) ||
+          chainCfg?.aaveV3Pool ||
+          '';
+        if (!poolAddress || !isAllowedAaveV3Pool(chainRaw, poolAddress)) {
+          return reply(400, {
+            error: `No audited Aave v3 / fork Pool configured for ${chainRaw}${poolAddress ? ` (${poolAddress})` : ''}.`,
+          });
+        }
+
+        const plan = await buildAaveFlashUnwindPlan({
+          chain: chainRaw,
+          poolAddress,
+          userAddress,
+          recipient: typeof body.recipient === 'string' ? body.recipient.trim() : undefined,
+          slippageBps:
+            typeof body.slippageBps === 'number' && Number.isFinite(body.slippageBps)
+              ? body.slippageBps
+              : undefined,
+          swapAllCollaterals: body.swapAllCollaterals === true,
+        });
+
+        return reply(200, plan);
       }
 
       if (method === 'POST' && pathname === '/api/tx/prepare') {
