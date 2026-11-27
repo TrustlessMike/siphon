@@ -2425,6 +2425,13 @@ function renderDefiUnwindPanel() {
       })
       .join('');
 
+    const flashUnwindCandidate = grp.positions.find(
+      (p) =>
+        p.category === 'debt_guard' &&
+        !p.isReady &&
+        /aave|neverland|hyperlend|spark|seamless|lendle/i.test(String(p.asset?.protocol || grp.name || ''))
+    );
+
     const headerActionHtml =
       grp.readyCount > 0
         ? `<button
@@ -2432,6 +2439,27 @@ function renderDefiUnwindPanel() {
             class="btn-outline-sm defi-proto-extract-btn"
             data-extract-protocol="${escHtml(grp.name)}"
           >Extract ${escHtml(grp.name)}</button>`
+        : flashUnwindCandidate
+        ? `<div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+            <button
+              type="button"
+              class="btn-outline-sm defi-proto-extract-btn"
+              data-flash-unwind-chain="${escHtml(flashUnwindCandidate.asset.chain)}"
+              data-flash-unwind-pool="${escHtml(flashUnwindCandidate.asset.protocolAddress || '')}"
+              data-flash-unwind-proto="${escHtml(grp.name)}"
+            >Flash Unwind ($0 Upfront)</button>
+            ${
+              grp.protocolUrl
+                ? `<a
+                    class="btn-outline-sm defi-proto-extract-btn"
+                    href="${escHtml(grp.protocolUrl)}"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style="text-decoration:none; display:inline-flex; align-items:center;"
+                  >Manage</a>`
+                : ''
+            }
+          </div>`
         : grp.protocolUrl
         ? `<a
             class="btn-outline-sm defi-proto-extract-btn"
@@ -2504,6 +2532,108 @@ function renderDefiUnwindPanel() {
       extractDefiAssets(protoReady, protoName);
     });
   });
+
+  // Wire Flash-Loan Self-Unwind ($0 Upfront) buttons for Aave V3 / Neverland / HyperLend Debt Guard groups
+  groupsHost.querySelectorAll('[data-flash-unwind-chain]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      executeAaveFlashUnwind({
+        chain: btn.dataset.flashUnwindChain,
+        poolAddress: btn.dataset.flashUnwindPool || undefined,
+        protocolName: btn.dataset.flashUnwindProto || 'Aave v3',
+        triggerBtn: btn,
+      });
+    });
+  });
+}
+
+async function executeAaveFlashUnwind({ chain, poolAddress, protocolName, triggerBtn }) {
+  const userAddress =
+    getConnectedEvmAddress() ||
+    (currentScan?.address && /^0x[0-9a-fA-F]{40}$/.test(currentScan.address)
+      ? currentScan.address
+      : null);
+  if (!userAddress) {
+    showToast('Connect or scan an EVM wallet first to quote Flash Unwind.');
+    return;
+  }
+  const origText = triggerBtn?.textContent || 'Flash Unwind ($0 Upfront)';
+  if (triggerBtn) {
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = 'Quoting Flash Unwind…';
+  }
+  try {
+    const plan = await api('/api/defi/aave-flash-unwind-plan', {
+      method: 'POST',
+      body: JSON.stringify({
+        chain,
+        poolAddress,
+        userAddress,
+      }),
+    });
+    if (!plan?.supported) {
+      showToast(plan?.reason || `Flash Unwind unavailable on ${protocolName}.`);
+      return;
+    }
+
+    const debtSummary = (plan.activeDebts || [])
+      .map((d) => `${d.debtUi} ${d.symbol}`)
+      .join(' + ');
+    const netSummary = (plan.estimatedNetSurplus || [])
+      .map((s) => `${s.amountUi} ${s.symbol}`)
+      .join(' + ');
+    const feePct = (Number(plan.flashLoanPremiumBps || 0) / 100).toFixed(2);
+
+    if (plan.previewOnly || !Array.isArray(plan.transactions) || plan.transactions.length === 0) {
+      const routeHint =
+        plan.swaps?.length > 0
+          ? ` via ${plan.swaps[0].provider} (${plan.swaps[0].amountInUi} ${plan.swaps[0].tokenInSymbol} → ${plan.swaps[0].expectedOutUi} ${plan.swaps[0].tokenOutSymbol})`
+          : '';
+      showToast(
+        `Flash Unwind quote ready on ${plan.chainName}: clears ${debtSummary} (${feePct}% pool fee${routeHint}) → returns ${netSummary || 'net equity'}. Deploy TurgaliumFlashUnwind & set TURGALIUM_FLASH_UNWIND_${String(chain).toUpperCase()} to sign live.`,
+        9000
+      );
+      return;
+    }
+
+    const connectedEvm = getConnectedEvmAddress();
+    if (!connectedEvm) {
+      showToast('Connect your EVM wallet to sign the Flash Unwind transaction.');
+      openWalletModal('evm');
+      return;
+    }
+    if (triggerBtn) triggerBtn.textContent = `Confirm in Wallet (${plan.chainName})…`;
+    const sendRes = await sendCallsWithFallback({
+      chainId: plan.chainId,
+      chain: plan.chain,
+      chainName: plan.chainName,
+      calls: plan.transactions.map((t) => ({
+        to: t.to,
+        data: t.data || '0x',
+        value: t.value || '0x0',
+        stepId: t.stepId,
+        label: t.label,
+      })),
+      primaryProvider: 'aave_flash_unwind',
+      expectedFrom: connectedEvm,
+    });
+    if (sendRes?.failed) {
+      throw new Error(sendRes.failedReason || 'Flash Unwind transaction failed.');
+    }
+    showToast(
+      `Flash Unwind sent on ${plan.chainName}! Cleared ${debtSummary} → returning ${netSummary || 'net equity'}. Refreshing scan…`,
+      7000
+    );
+    setTimeout(() => {
+      runScan({ address: connectedEvm, refresh: true, autoOpen: true }).catch(() => {});
+    }, 5000);
+  } catch (err) {
+    showToast(err?.message || 'Flash Unwind quote failed.');
+  } finally {
+    if (triggerBtn) {
+      triggerBtn.disabled = false;
+      triggerBtn.textContent = origText;
+    }
+  }
 }
 
 function buildUnlockedUnderlyingAssets(chain, withdrawnDefiAssets) {

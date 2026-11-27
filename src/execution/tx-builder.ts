@@ -12,6 +12,10 @@ import {
   type AaveRepayStepTx,
 } from '../defi/aave-unwind.js';
 import {
+  buildAaveFlashUnwindPlan,
+  getFlashUnwindContractAddress,
+} from '../defi/flash-unwind.js';
+import {
   AAVE_V2_LENDING_POOLS,
   checkCompoundAccountSafety,
   COMPOUND_V3_COMETS,
@@ -220,6 +224,7 @@ export interface PreparedExecution {
     | 'circle_cctp'
     | 'enso_multi_input'
     | 'aave_v3'
+    | 'aave_flash_unwind'
     | 'aave_v2'
     | 'compound_v3'
     | 'compound_v2'
@@ -427,6 +432,7 @@ async function buildDefiWithdrawExecution(params: {
   followUpQuoteFn?: FollowUpQuoteFn;
   aaveSafetyCheckFn?: AaveSafetyCheckFn;
   aaveDebtInspectorFn?: typeof inspectAavePoolActiveDebts;
+  aaveFlashUnwindPlannerFn?: typeof buildAaveFlashUnwindPlan;
   compoundSafetyCheckFn?: CompoundSafetyCheckFn;
   routeAuctionOptions?: RouteAuctionExecutionOptions;
   allowanceCheckFn?: Erc20AllowanceCheckFn;
@@ -441,6 +447,7 @@ async function buildDefiWithdrawExecution(params: {
     followUpQuoteFn,
     aaveSafetyCheckFn = checkAaveV3AccountSafety,
     aaveDebtInspectorFn,
+    aaveFlashUnwindPlannerFn,
     compoundSafetyCheckFn = checkCompoundAccountSafety,
     routeAuctionOptions,
     allowanceCheckFn,
@@ -630,12 +637,63 @@ async function buildDefiWithdrawExecution(params: {
         });
 
         if (!partial.canWithdrawAny) {
+          // If TurgaliumFlashUnwind is deployed on this chain (or an explicit planner was injected),
+          // automatically build the $0-upfront atomic Flash-Loan Self-Unwind tx bundle!
+          const flashContract =
+            protocolId === 'aave_v3' ? getFlashUnwindContractAddress(evmChain) : null;
+          if (protocolId === 'aave_v3' && poolTarget && (flashContract || aaveFlashUnwindPlannerFn)) {
+            const flashPlanner = aaveFlashUnwindPlannerFn ?? buildAaveFlashUnwindPlan;
+            const flashPlan = await flashPlanner({
+              chain: evmChain,
+              poolAddress: poolTarget,
+              userAddress,
+              recipient: userAddress,
+            }).catch(() => null);
+
+            if (flashPlan?.supported && !flashPlan.previewOnly && flashPlan.transactions.length > 0) {
+              const netSummary = flashPlan.estimatedNetSurplus
+                .map((s) => `${s.amountUi} ${s.symbol}`)
+                .join(' + ');
+              return {
+                assetId: asset.id,
+                action: asset.action,
+                provider: 'aave_flash_unwind',
+                chain: evmChain,
+                chainId: cfg.chainId,
+                chainName: cfg.name,
+                explorerUrl: cfg.explorerUrl,
+                estimatedOutput: netSummary
+                  ? `${netSummary} unlocked on ${cfg.name}`
+                  : `Net equity unlocked on ${cfg.name}`,
+                estimatedSeconds: 15,
+                defiExitPlan: resolvedExitPlan,
+                transactions: flashPlan.transactions.map((t) => ({
+                  stepId: t.stepId,
+                  label: t.label,
+                  description: t.description,
+                  chain: t.chain,
+                  chainId: t.chainId,
+                  chainName: t.chainName,
+                  explorerUrl: t.explorerUrl,
+                  from: t.from,
+                  to: t.to,
+                  data: t.data,
+                  value: t.value,
+                })),
+                notes: [
+                  `Atomic Flash-Loan Self-Unwind ($0 upfront capital): repays 100% debt on ${flashPlan.protocolName} and unlocks ${netSummary || 'net equity'} in 1 tx.`,
+                  ...flashPlan.notes,
+                ],
+              };
+            }
+          }
+
           const shortfallHint =
             debtInspection?.checked && debtInspection.activeDebts.length > 0
               ? ` Hold ${debtInspection.activeDebts
                   .filter((d) => !d.canRepayFull)
                   .map((d) => `${d.shortfallUi} ${d.symbol}`)
-                  .join(' + ')} on ${cfg.name} to unlock 1-Click Repay + Full Withdraw.`
+                  .join(' + ')} on ${cfg.name} to unlock 1-Click Repay + Full Withdraw, or use Flash-Loan Self-Unwind (POST /api/defi/aave-flash-unwind-plan).`
               : '';
           throw new Error(
             `Aave v3 safety guard: wallet has $${debtUsd.toFixed(2)} active debt (HF ${partial.currentHealthFactor.toFixed(2)}). ${partial.reason}${shortfallHint}`
@@ -1772,6 +1830,7 @@ export async function prepareRealExecution(params: {
   followUpQuoteFn?: FollowUpQuoteFn;
   aaveSafetyCheckFn?: AaveSafetyCheckFn;
   aaveDebtInspectorFn?: typeof inspectAavePoolActiveDebts;
+  aaveFlashUnwindPlannerFn?: typeof buildAaveFlashUnwindPlan;
   compoundSafetyCheckFn?: CompoundSafetyCheckFn;
   allowanceCheckFn?: Erc20AllowanceCheckFn;
   routeAuctionOptions?: RouteAuctionExecutionOptions;
@@ -1788,6 +1847,7 @@ export async function prepareRealExecution(params: {
     followUpQuoteFn,
     aaveSafetyCheckFn,
     aaveDebtInspectorFn,
+    aaveFlashUnwindPlannerFn,
     compoundSafetyCheckFn,
     allowanceCheckFn,
     routeAuctionOptions,
@@ -1872,6 +1932,7 @@ export async function prepareRealExecution(params: {
       followUpQuoteFn,
       aaveSafetyCheckFn,
       aaveDebtInspectorFn,
+      aaveFlashUnwindPlannerFn,
       compoundSafetyCheckFn,
       routeAuctionOptions,
       allowanceCheckFn,
@@ -2038,6 +2099,7 @@ export async function prepareChainBatchExecution(params: {
   allowanceCheckFn?: Erc20AllowanceCheckFn;
   aaveSafetyCheckFn?: AaveSafetyCheckFn;
   aaveDebtInspectorFn?: typeof inspectAavePoolActiveDebts;
+  aaveFlashUnwindPlannerFn?: typeof buildAaveFlashUnwindPlan;
   compoundSafetyCheckFn?: CompoundSafetyCheckFn;
   routeAuctionOptions?: RouteAuctionExecutionOptions;
   liveGasPriceWei?: bigint;
@@ -2062,6 +2124,7 @@ export async function prepareChainBatchExecution(params: {
     allowanceCheckFn,
     aaveSafetyCheckFn,
     aaveDebtInspectorFn,
+    aaveFlashUnwindPlannerFn,
     compoundSafetyCheckFn,
     routeAuctionOptions,
     liveGasPriceWei,
@@ -2402,6 +2465,7 @@ export async function prepareChainBatchExecution(params: {
       followUpQuoteFn,
       aaveSafetyCheckFn,
       aaveDebtInspectorFn,
+      aaveFlashUnwindPlannerFn,
       compoundSafetyCheckFn,
       allowanceCheckFn,
       routeAuctionOptions: effectiveAuctionOptions,

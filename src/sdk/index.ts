@@ -377,6 +377,26 @@ export {
   type AaveRepayStepTx,
 } from '../defi/aave-unwind.js';
 export {
+  buildAaveFlashUnwindPlan,
+  inspectAavePoolFullPosition,
+  quoteFlashUnwindSwap,
+  encodeFlashUnwindSimpleCalldata,
+  encodeFlashUnwindMultiCalldata,
+  getFlashUnwindContractAddress,
+  getTrustedFlashSwapRouters,
+  isTrustedFlashSwapRouter,
+  FLASH_UNWIND_SELECTORS,
+  CANONICAL_FLASH_SWAP_ROUTERS,
+  type AaveFlashUnwindPlan,
+  type AavePoolFullPosition,
+  type FlashUnwindCollateralItem,
+  type FlashUnwindDebtItem,
+  type FlashSwapQuote,
+  type FlashCollateralPullParam,
+  type FlashSwapStepParam,
+  type FlashPermitApprovalParam,
+} from '../defi/flash-unwind.js';
+export {
   BoundedTtlCache,
   InFlightCoalescer,
   type BoundedTtlCacheOptions,
