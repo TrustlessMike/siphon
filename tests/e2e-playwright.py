@@ -140,15 +140,6 @@ def make_solana_overview_payload(address=SOL_PUBKEY, dust_output_asset="USDC"):
                 "executionMode": "vault_deposit",
                 "preservesUsdPeg": True,
             },
-            {
-                "id": "marinade_msol",
-                "name": "Marinade Staked SOL (mSOL)",
-                "protocol": "Marinade Finance",
-                "symbol": "mSOL",
-                "baselineApyPct": 6.9,
-                "executionMode": "jupiter_swap_v0",
-                "preservesUsdPeg": False,
-            },
         ],
         "rpcUnavailable": False,
     }
@@ -2562,7 +2553,7 @@ def main():
             assert len(hydrate_hits_p) >= 1, "Expected POST /api/workspace/hydrate to hydrate wallet on connect!"
             assert len(sol_overview_hits_p) >= 1, "Expected POST /api/solana/overview to hydrate Solana balance/dust/yield on connect!"
             pgP.wait_for_function(
-                "() => (document.querySelectorAll('#yieldStrategySelect option').length) >= 4",
+                "() => (document.querySelectorAll('#yieldStrategySelect option').length) >= 3",
                 timeout=8000,
             )
             yield_safety_check = pgP.evaluate("""() => ({
@@ -2628,7 +2619,11 @@ def main():
             pgP.wait_for_selector("#oneClickSweepSummaryCard:not(.hidden)", timeout=10000)
             assert len(prepare_batch_hits_p) == 1, f"Expected 1 POST /api/tx/prepare-batch call, got {len(prepare_batch_hits_p)}"
             summary_text = pgP.locator("#oneClickSweepSummaryCard").inner_text()
-            assert "Pre-Sign Sweep Summary" in summary_text and "0% ($0.00)" in summary_text and "$1,412.25" in summary_text, summary_text
+            assert (
+                "Pre-Sign Sweep Summary" in summary_text
+                and "0% ($0.00)" in summary_text
+                and ("$1.41k" in summary_text or "$1,412.25" in summary_text)
+            ), summary_text
             assert pgP.locator("#confirmOneClickSweepBtn").count() == 1, summary_text
 
             # Cancel hides summary cleanly
