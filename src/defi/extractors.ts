@@ -110,11 +110,25 @@ export const AUDITED_AAVE_V3_POOLS: Partial<Record<EvmChainId, string[]>> = {
   ethereum: [
     '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2', // Aave v3 Ethereum Core
     '0x4e033931ad43597d96D6bcc25c280717730B58B1', // Aave v3 Ethereum Prime (Lido)
+    '0x0AA97c284e98396202b6A04024F5E2c65026F3c0', // Aave v3 Ethereum EtherFi
     '0xC13e21B648A5Ee794902342038FF3aDAB66BE987', // SparkLend Ethereum
   ],
   base: [
     '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5', // Aave v3 Base
     '0x8F44Fd754285aa6A2b8B9B97739B79746e0475a7', // Seamless Protocol Base
+    '0x30798cFe2CCa822321ceed7e6085e633aAbC492F', // Radiant Base
+  ],
+  bnb: [
+    '0x6807dc923806fE8Fd134338EABCA509979a7e0cB', // Aave v3 BNB
+    '0xcB0620b181140e57D1C0D8b724cde623cA963c8C', // Kinza Finance BNB
+  ],
+  linea: [
+    '0xc47b8C00b0f69a36fa203Ffeac0334874574a8Ac', // Aave v3 Linea
+    '0x2f9bB73a8e98793e26Cb2F6C4ad037BDf1C6B269', // ZeroLend Linea
+  ],
+  zksync: [
+    '0x78e30497a3c7527d953c6B1E3541b021A98Ac43c', // Aave v3 zkSync Era
+    '0x4d9429246EA989C9CeE203B43F6d1C7D83e3B8F8', // ZeroLend zkSync Era
   ],
   mantle: [
     '0xCFa5aE7c2CE8Fadc6426C1ff872cA45378Fb7cF3', // Lendle Mantle
@@ -122,6 +136,10 @@ export const AUDITED_AAVE_V3_POOLS: Partial<Record<EvmChainId, string[]>> = {
   gnosis: [
     '0xb50201558B00496A145fE76f7424749556E326D8', // Aave v3 Gnosis
     '0x2Dae5307c5E3FD1CF5A72Cb6F698f915860607e0', // SparkLend Gnosis
+  ],
+  hyperevm: [
+    '0x00A89d7a5A02160f20150EbEA7a2b5E4879A1A8b', // HyperLend HyperEVM
+    '0xceCcE0EB9DD2Ef7996e01e25DD70e461F918A14b', // HypurrFi HyperEVM
   ],
   monad: [
     '0x80F00661b13CC5F6ccd3885bE7b4C9c67545D585', // Neverland Money Main Pool (Monad)
@@ -186,10 +204,54 @@ export const COMPOUND_V3_COMETS: Partial<Record<EvmChainId, string[]>> = {
 };
 
 export const COMPOUND_V2_COMPTROLLERS: Partial<Record<EvmChainId, string[]>> = {
-  ethereum: ['0x3d9819210A31b4961b30EF54bE2aeD79B9c9Cd3B'], // Compound v2 Comptroller
+  ethereum: [
+    '0x3d9819210A31b4961b30EF54bE2aeD79B9c9Cd3B', // Compound v2 Comptroller
+    '0x687a01ecF6d3907658f7A7c714749fAC32336D1B', // Venus Ethereum Comptroller
+  ],
   bnb: ['0xfD36E2c2a6789Db23113685031d7F16329158384'], // Venus Unitroller
   avalanche: ['0x486Af39519B4Dc9a7fCcd318217352830E8AD9b4'], // Benqi Comptroller
-  base: ['0xfBb21d0380beE3312B33c4353c8936a0F13EF26C'], // Moonwell Comptroller
+  base: [
+    '0xfBb21d0380beE3312B33c4353c8936a0F13EF26C', // Moonwell Base Comptroller
+    '0x0C7973F9598AA62f9e03B94E92C967fD5437426C', // Venus Base Comptroller
+  ],
+  optimism: [
+    '0xCa889f40aae37FFf165BccF69aeF1E82b5C511B9', // Moonwell Optimism Comptroller
+    '0x5593FF68bE84C966821eEf5F0a988C285D5B7CeC', // Venus Optimism Comptroller
+  ],
+  arbitrum: [
+    '0x317c1A5739F39046E20b08ac9BeEa3f10fD43326', // Venus Arbitrum Comptroller
+  ],
+  linea: [
+    '0x1b4d3b0421dDc1eB216D230Bc01527422Fb93103', // Mendi Finance Linea Comptroller
+  ],
+};
+
+/**
+ * On-chain verified Morpho Blue singleton addresses (0.00% flash loans + Morpho market unwinding).
+ */
+export const MORPHO_BLUE_SINGLETONS: Partial<Record<EvmChainId, string>> = {
+  ethereum: '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb',
+  base: '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb',
+  arbitrum: '0x6c247b1F6182318877311737BaC0844bAa518F5e',
+  optimism: '0xce95AfbB8EA029495c66020883F87aaE8864AF92',
+  polygon: '0x1bF0c2541F820E775182832f06c0B7Fc27A25f67',
+  unichain: '0x8f5ae9CddB9f68de460C77730b018Ae7E04a140A',
+  hyperevm: '0x68e37dE8d93d3496ae143F2E900490f6280C57cD',
+  worldchain: '0xE741BC7c34758b4caE05062794E8Ae24978AF432',
+  monad: '0xD5D960E8C380B724a48AC59E2DfF1b2CB4a1eAee',
+};
+
+/**
+ * Canonical Balancer V2 Vault (0.00% flash loan provider across EVM chains).
+ */
+export const BALANCER_V2_FLASH_VAULTS: Partial<Record<EvmChainId, string>> = {
+  ethereum: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+  base: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+  arbitrum: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+  optimism: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+  polygon: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+  avalanche: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
+  gnosis: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
 };
 
 export interface BalancerV2VaultConfig {
@@ -2134,10 +2196,14 @@ export function identifyProtocolExtractorId(
     proto.includes('aave') ||
     proto.includes('neverland') ||
     proto.includes('hyperlend') ||
+    proto.includes('hypurrfi') ||
     proto.includes('sparklend') ||
     proto.includes('seamless') ||
     proto.includes('lendle') ||
-    proto.includes('zerolend')
+    proto.includes('zerolend') ||
+    proto.includes('kinza') ||
+    proto.includes('radiant') ||
+    proto.includes('tydro')
   ) {
     // Governance locks / staking / rewards contracts (e.g. Neverland veDUST, HyperLend Staked HPL,
     // ZeroLend Locked ZERO) are NOT Aave v3 lending pools — route them to external_protocol cleanly
@@ -2158,7 +2224,8 @@ export function identifyProtocolExtractorId(
     proto.includes('compound v2') ||
     proto.includes('venus') ||
     proto.includes('benqi') ||
-    proto.includes('moonwell')
+    proto.includes('moonwell') ||
+    proto.includes('mendi')
   ) {
     return 'compound_v2';
   }

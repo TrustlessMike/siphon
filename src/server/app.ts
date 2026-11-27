@@ -23,7 +23,12 @@ import {
   buildAaveRepayPreSteps,
   inspectAavePoolActiveDebts,
 } from '../defi/aave-unwind.js';
-import { buildAaveFlashUnwindPlan } from '../defi/flash-unwind.js';
+import {
+  buildAaveFlashUnwindPlan,
+  getDefaultLendingMarket,
+  isAllowedLendingMarket,
+  type FlashUnwindProtocolFamily,
+} from '../defi/flash-unwind.js';
 import { isAllowedAaveV3Pool } from '../defi/extractors.js';
 import { buildPreSignSimulationProof, verifyOnchainExecutionProof } from '../execution/proof.js';
 import {
@@ -1859,10 +1864,16 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         });
       }
 
-      if (method === 'POST' && pathname === '/api/defi/aave-flash-unwind-plan') {
+      if (
+        method === 'POST' &&
+        (pathname === '/api/defi/aave-flash-unwind-plan' ||
+          pathname === '/api/defi/flash-unwind-plan')
+      ) {
         const body = await readJsonBody<{
           chain?: string;
           poolAddress?: string;
+          marketAddress?: string;
+          protocolFamily?: string;
           userAddress?: string;
           recipient?: string;
           slippageBps?: number;
@@ -1877,20 +1888,36 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         if (!/^0x[0-9a-fA-F]{40}$/.test(userAddress)) {
           return reply(400, { error: 'Valid 0x EVM userAddress is required.' });
         }
-        const chainCfg = CHAIN_LIST.find((c) => c.id === chainRaw);
+        const familyRaw =
+          typeof body.protocolFamily === 'string' ? body.protocolFamily.trim().toLowerCase() : 'aave_v3';
+        const validFamilies: FlashUnwindProtocolFamily[] = [
+          'aave_v3',
+          'aave_v2',
+          'compound_v3',
+          'compound_v2',
+          'morpho_blue',
+        ];
+        const lendingFamily: FlashUnwindProtocolFamily = validFamilies.includes(
+          familyRaw as FlashUnwindProtocolFamily
+        )
+          ? (familyRaw as FlashUnwindProtocolFamily)
+          : 'aave_v3';
+
         const poolAddress =
+          (typeof body.marketAddress === 'string' && body.marketAddress.trim()) ||
           (typeof body.poolAddress === 'string' && body.poolAddress.trim()) ||
-          chainCfg?.aaveV3Pool ||
+          getDefaultLendingMarket(chainRaw, lendingFamily) ||
           '';
-        if (!poolAddress || !isAllowedAaveV3Pool(chainRaw, poolAddress)) {
+        if (!poolAddress || !isAllowedLendingMarket(chainRaw, lendingFamily, poolAddress)) {
           return reply(400, {
-            error: `No audited Aave v3 / fork Pool configured for ${chainRaw}${poolAddress ? ` (${poolAddress})` : ''}.`,
+            error: `No audited ${lendingFamily} / Aave v3 lending market configured for ${chainRaw}${poolAddress ? ` (${poolAddress})` : ''}.`,
           });
         }
 
         const plan = await buildAaveFlashUnwindPlan({
           chain: chainRaw,
           poolAddress,
+          lendingFamily,
           userAddress,
           recipient: typeof body.recipient === 'string' ? body.recipient.trim() : undefined,
           slippageBps:
