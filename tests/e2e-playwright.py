@@ -2628,7 +2628,7 @@ def main():
 
             # Cancel hides summary cleanly
             pgP.click("#cancelOneClickSweepBtn")
-            pgP.wait_for_selector("#oneClickSweepSummaryCard.hidden", timeout=5000)
+            pgP.wait_for_selector("#oneClickSweepSummaryCard", state="hidden", timeout=5000)
 
             # Re-open 1-Click Sweep summary and confirm execution, waiting for queue completion
             rpc_before_sweep = pgP.evaluate("() => (window.__evmRpcP || []).length")
