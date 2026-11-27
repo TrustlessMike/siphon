@@ -486,3 +486,515 @@ export function renderConvergenceSvg(plan, scan) {
     </svg>
   `;
 }
+
+const HERO_CHAINS = Object.freeze([
+  // Left Hemisphere — EVM Ecosystem (6 flagships + 14 satellites = 20 EVMs)
+  { id: 'ethereum', name: 'Ethereum', group: 'evm', angle: -106, color: '#4F46E5', labelPos: 'top', dur: 3.1, delay: -0.3, route: 'Ethereum → Solana' },
+  { id: 'base', name: 'Base', group: 'evm', angle: -134, color: '#0052FF', labelPos: 'top-left', dur: 2.7, delay: -1.2, route: 'Base → Solana' },
+  { id: 'arbitrum', name: 'Arbitrum', group: 'evm', angle: -164, color: '#12AAFF', labelPos: 'left', dur: 2.9, delay: -2.1, route: 'Arbitrum → Solana' },
+  { id: 'optimism', name: 'Optimism', group: 'evm', angle: 164, color: '#FE0420', labelPos: 'left', dur: 3.0, delay: -0.8, route: 'Optimism → Solana' },
+  { id: 'polygon', name: 'Polygon', group: 'evm', angle: 134, color: '#7B3FE4', labelPos: 'bottom-left', dur: 2.8, delay: -1.7, route: 'Polygon → Solana' },
+  { id: 'bnb', name: 'BNB', group: 'evm', angle: 106, color: '#D97706', labelPos: 'bottom', dur: 3.2, delay: -2.4, route: 'BNB Chain → Solana' },
+
+  // Right Hemisphere — Non-EVM Ecosystems (all 6 non-EVM families)
+  { id: 'btc', name: 'Bitcoin', group: 'btc', angle: -74, color: '#F7931A', labelPos: 'top', dur: 3.3, delay: -0.6, route: 'Bitcoin → Solana' },
+  { id: 'cosmos', name: 'Cosmos', group: 'cosmos', angle: -46, color: '#BA3FD9', labelPos: 'top-right', dur: 2.9, delay: -1.5, route: 'Cosmos IBC → Solana' },
+  { id: 'sui', name: 'Sui', group: 'sui', angle: -16, color: '#4BA2FF', labelPos: 'right', dur: 2.6, delay: -2.2, route: 'Sui → Solana' },
+  { id: 'aptos', name: 'Aptos', group: 'aptos', angle: 16, color: '#18181B', labelPos: 'right', dur: 2.8, delay: -1.0, route: 'Aptos → Solana' },
+  { id: 'ton', name: 'TON', group: 'ton', angle: 46, color: '#0098EA', labelPos: 'bottom-right', dur: 3.0, delay: -1.9, route: 'TON → Solana' },
+  { id: 'tron', name: 'Tron', group: 'tron', angle: 74, color: '#D92D20', labelPos: 'bottom', dur: 3.1, delay: -2.7, route: 'Tron → Solana' },
+]);
+
+const HERO_EVM_SATELLITES = Object.freeze([
+  { deg: -113, color: '#E84142' },
+  { deg: -120, color: '#836EF9' },
+  { deg: -127, color: '#0284C7' },
+  { deg: -141, color: '#EC4899' },
+  { deg: -149, color: '#18181B' },
+  { deg: -157, color: '#B45309' },
+  { deg: -172, color: '#0F766E' },
+  { deg: 172, color: '#CA8A04' },
+  { deg: 157, color: '#111827' },
+  { deg: 149, color: '#0F766E' },
+  { deg: 141, color: '#92400E' },
+  { deg: 127, color: '#1E3A8A' },
+  { deg: 120, color: '#6D28D9' },
+  { deg: 113, color: '#047857' },
+]);
+
+function heroCubicAt(p0, p1, p2, p3, t) {
+  const mt = 1 - t;
+  const x = mt * mt * mt * p0.x + 3 * mt * mt * t * p1.x + 3 * mt * t * t * p2.x + t * t * t * p3.x;
+  const y = mt * mt * mt * p0.y + 3 * mt * mt * t * p1.y + 3 * mt * t * t * p2.y + t * t * t * p3.y;
+  const dx = 3 * mt * mt * (p1.x - p0.x) + 6 * mt * t * (p2.x - p1.x) + 3 * t * t * (p3.x - p2.x);
+  const dy = 3 * mt * mt * (p1.y - p0.y) + 6 * mt * t * (p2.y - p1.y) + 3 * t * t * (p3.y - p2.y);
+  return { x, y, angle: Math.atan2(dy, dx) };
+}
+
+function buildHeroSvgMarkup() {
+  const CX = 340;
+  const CY = 232;
+  const RX = 232;
+  const RY = 158;
+  const NODE_R = 20.5;
+  const reducedMotion = prefersReducedMotion();
+
+  const ticks = [];
+  for (let i = 0; i < 36; i++) {
+    const rad = (i * 10 * Math.PI) / 180;
+    const isMajor = i % 9 === 0;
+    const r1 = isMajor ? 69 : 70.5;
+    const r2 = isMajor ? 76 : 74;
+    ticks.push(
+      `<line x1="${(CX + Math.cos(rad) * r1).toFixed(2)}" y1="${(CY + Math.sin(rad) * r1).toFixed(2)}" x2="${(CX + Math.cos(rad) * r2).toFixed(2)}" y2="${(CY + Math.sin(rad) * r2).toFixed(2)}" stroke="${isMajor ? '#94A3B8' : '#CBD5E1'}" stroke-width="${isMajor ? '1.35' : '0.9'}" stroke-linecap="round" />`
+    );
+  }
+
+  const sats = HERO_EVM_SATELLITES.map(({ deg, color }) => {
+    const rad = (deg * Math.PI) / 180;
+    const sx = CX + Math.cos(rad) * (RX + 14);
+    const sy = CY + Math.sin(rad) * (RY + 10);
+    return `<circle cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="2.4" fill="${color}" fill-opacity="0.52" stroke="#FFFFFF" stroke-width="0.8" />`;
+  });
+
+  const dynDefs = [];
+  const conduits = [];
+  const pulses = [];
+  const nodes = [];
+
+  for (const chain of HERO_CHAINS) {
+    const rad = (chain.angle * Math.PI) / 180;
+    const x0 = CX + Math.cos(rad) * RX;
+    const y0 = CY + Math.sin(rad) * RY;
+    const dx = x0 - CX;
+    const dy = y0 - CY;
+
+    const c1x = CX + dx * 0.62;
+    const c1y = CY + dy * 0.84;
+    const c2x = CX + dx * 0.34;
+    const c2y = CY + dy * 0.24;
+
+    const endLen = Math.hypot(dx, dy);
+    const ex = CX + (dx / endLen) * 50;
+    const ey = CY + (dy / endLen) * 50;
+
+    const exitAngle = Math.atan2(c1y - y0, c1x - x0);
+    const sx = x0 + Math.cos(exitAngle) * NODE_R;
+    const sy = y0 + Math.sin(exitAngle) * NODE_R;
+
+    const d = `M ${sx.toFixed(1)} ${sy.toFixed(1)} C ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${c2x.toFixed(1)} ${c2y.toFixed(1)}, ${ex.toFixed(1)} ${ey.toFixed(1)}`;
+    const pathId = `tg-hero-path-${chain.id}`;
+    const gradId = `tg-hero-grad-${chain.id}`;
+
+    dynDefs.push(`<path id="${pathId}" d="${d}" />`);
+    dynDefs.push(`
+      <linearGradient id="${gradId}" gradientUnits="userSpaceOnUse" x1="${sx.toFixed(1)}" y1="${sy.toFixed(1)}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}">
+        <stop offset="0%" stop-color="${chain.color}" stop-opacity="0.58" />
+        <stop offset="55%" stop-color="#38BDF8" stop-opacity="0.66" />
+        <stop offset="100%" stop-color="#14F195" stop-opacity="0.95" />
+      </linearGradient>
+    `);
+
+    conduits.push(
+      `<path d="${d}" class="tg-hero-conduit-base" data-hero-chain="${chain.id}" data-hero-group="${chain.group}" />`
+    );
+    conduits.push(
+      `<path d="${d}" stroke="url(#${gradId})" class="tg-hero-conduit-flow" data-hero-chain="${chain.id}" data-hero-group="${chain.group}" />`
+    );
+
+    const mid = heroCubicAt({ x: sx, y: sy }, { x: c1x, y: c1y }, { x: c2x, y: c2y }, { x: ex, y: ey }, 0.56);
+    const midDeg = (mid.angle * 180) / Math.PI;
+    conduits.push(
+      `<path d="M -3.5 -3 L 1.5 0 L -3.5 3" transform="translate(${mid.x.toFixed(1)}, ${mid.y.toFixed(1)}) rotate(${midDeg.toFixed(1)})" stroke="#0EA5E9" class="tg-hero-chevron" data-hero-chain="${chain.id}" data-hero-group="${chain.group}" />`
+    );
+
+    if (!reducedMotion) {
+      pulses.push(`
+        <g class="tg-hero-pulse" data-hero-chain="${chain.id}" data-hero-group="${chain.group}">
+          <circle r="4.4" fill="${chain.color}" fill-opacity="0.3" filter="url(#tg-hero-pulse-glow)">
+            <animateMotion dur="${chain.dur}s" repeatCount="indefinite" begin="${chain.delay}s" calcMode="spline" keyTimes="0;1" keySplines="0.38 0 0.22 1"><mpath href="#${pathId}" /></animateMotion>
+            <animate attributeName="opacity" values="0;0.95;1;0" keyTimes="0;0.12;0.86;1" dur="${chain.dur}s" repeatCount="indefinite" begin="${chain.delay}s" />
+          </circle>
+          <circle r="2.2" fill="#FFFFFF" stroke="${chain.color}" stroke-width="1.25">
+            <animateMotion dur="${chain.dur}s" repeatCount="indefinite" begin="${chain.delay}s" calcMode="spline" keyTimes="0;1" keySplines="0.38 0 0.22 1"><mpath href="#${pathId}" /></animateMotion>
+            <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.12;0.86;1" dur="${chain.dur}s" repeatCount="indefinite" begin="${chain.delay}s" />
+          </circle>
+        </g>
+      `);
+    }
+
+    let lx = 0;
+    let ly = 0;
+    let anchor = 'middle';
+    if (chain.labelPos === 'top') {
+      ly = -30;
+    } else if (chain.labelPos === 'bottom') {
+      ly = 37;
+    } else if (chain.labelPos === 'left') {
+      lx = -29;
+      ly = 4;
+      anchor = 'end';
+    } else if (chain.labelPos === 'right') {
+      lx = 29;
+      ly = 4;
+      anchor = 'start';
+    } else if (chain.labelPos === 'top-left') {
+      lx = -25;
+      ly = -14;
+      anchor = 'end';
+    } else if (chain.labelPos === 'top-right') {
+      lx = 25;
+      ly = -14;
+      anchor = 'start';
+    } else if (chain.labelPos === 'bottom-left') {
+      lx = -25;
+      ly = 21;
+      anchor = 'end';
+    } else if (chain.labelPos === 'bottom-right') {
+      lx = 25;
+      ly = 21;
+      anchor = 'start';
+    }
+
+    nodes.push(`
+      <g class="tg-hero-node" data-hero-chain="${chain.id}" data-hero-group="${chain.group}" transform="translate(${x0.toFixed(1)}, ${y0.toFixed(1)})" tabindex="0" role="button" aria-label="${escapeXml(chain.route)}">
+        <circle r="26" fill="${chain.color}" fill-opacity="0.09" stroke="${chain.color}" stroke-opacity="0.38" stroke-width="1" class="tg-hero-node-ring" />
+        <circle r="${NODE_R}" fill="#FFFFFF" stroke="#E4E6EB" stroke-width="1.2" filter="url(#tg-hero-node-shadow)" class="tg-hero-node-disc" />
+        <circle cx="${(Math.cos(exitAngle) * NODE_R).toFixed(1)}" cy="${(Math.sin(exitAngle) * NODE_R).toFixed(1)}" r="2.7" fill="${chain.color}" stroke="#FFFFFF" stroke-width="1.25" />
+        <g transform="translate(-10, -10) scale(0.8333)"><use href="#tg-hero-icon-${chain.id}" /></g>
+        <text x="${lx}" y="${ly}" text-anchor="${anchor}" class="tg-hero-node-label">${escapeXml(chain.name)}</text>
+      </g>
+    `);
+  }
+
+  return `
+    <svg id="turgaliumHeroSvg" class="tg-hero-svg" viewBox="0 0 680 468" role="img" aria-label="Multi-chain convergence to Solana: 20 EVM chains, Bitcoin, Cosmos, Sui, Aptos, TON, and Tron flowing home to Solana" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <pattern id="tg-hero-dots" width="22" height="22" patternUnits="userSpaceOnUse">
+          <circle cx="1.5" cy="1.5" r="0.85" fill="#E5E9F0" />
+        </pattern>
+        <radialGradient id="tg-hero-grid-fade" cx="50%" cy="50%" r="54%">
+          <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.12" />
+          <stop offset="48%" stop-color="#FFFFFF" stop-opacity="0.92" />
+          <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0" />
+        </radialGradient>
+        <mask id="tg-hero-grid-mask">
+          <rect width="680" height="468" fill="url(#tg-hero-grid-fade)" />
+        </mask>
+        <radialGradient id="tg-hero-sol-bloom" cx="50%" cy="50%" r="50%">
+          <stop offset="0%" stop-color="#14F195" stop-opacity="0.22" />
+          <stop offset="36%" stop-color="#C6F4FF" stop-opacity="0.42" />
+          <stop offset="68%" stop-color="#38BDF8" stop-opacity="0.1" />
+          <stop offset="86%" stop-color="#9945FF" stop-opacity="0.04" />
+          <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0" />
+        </radialGradient>
+        <linearGradient id="tg-hero-sol-spectrum" x1="0%" y1="100%" x2="100%" y2="0%">
+          <stop offset="0%" stop-color="#9945FF" />
+          <stop offset="48%" stop-color="#00C2FF" />
+          <stop offset="100%" stop-color="#14F195" />
+        </linearGradient>
+        <linearGradient id="tg-hero-sol-b1" x1="3" y1="6.5" x2="21" y2="6.5" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stop-color="#00D4FF" />
+          <stop offset="100%" stop-color="#14F195" />
+        </linearGradient>
+        <linearGradient id="tg-hero-sol-b2" x1="3" y1="12" x2="21" y2="12" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stop-color="#7B61FF" />
+          <stop offset="100%" stop-color="#1FE4B5" />
+        </linearGradient>
+        <linearGradient id="tg-hero-sol-b3" x1="3" y1="17.5" x2="21" y2="17.5" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stop-color="#B84DFF" />
+          <stop offset="100%" stop-color="#38BDF8" />
+        </linearGradient>
+        <radialGradient id="tg-hero-core-fill" cx="38%" cy="26%" r="74%">
+          <stop offset="0%" stop-color="#27272A" />
+          <stop offset="56%" stop-color="#0D0D10" />
+          <stop offset="100%" stop-color="#050507" />
+        </radialGradient>
+        <linearGradient id="tg-hero-core-rim" x1="0%" y1="0%" x2="0%" y2="100%">
+          <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.3" />
+          <stop offset="48%" stop-color="#FFFFFF" stop-opacity="0.04" />
+          <stop offset="100%" stop-color="#14F195" stop-opacity="0.25" />
+        </linearGradient>
+        <filter id="tg-hero-node-shadow" x="-30%" y="-25%" width="160%" height="165%">
+          <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0F172A" flood-opacity="0.07" />
+        </filter>
+        <filter id="tg-hero-core-shadow" x="-35%" y="-30%" width="170%" height="175%">
+          <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#0F172A" flood-opacity="0.13" />
+        </filter>
+        <filter id="tg-hero-pill-shadow" x="-20%" y="-35%" width="140%" height="185%">
+          <feDropShadow dx="0" dy="2" stdDeviation="3.5" flood-color="#0F172A" flood-opacity="0.08" />
+        </filter>
+        <filter id="tg-hero-pulse-glow" x="-120%" y="-120%" width="340%" height="340%">
+          <feGaussianBlur stdDeviation="2.2" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+        <linearGradient id="tg-hero-poly-g" x1="3" y1="17" x2="20" y2="7" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#A726C1" />
+          <stop offset="1" stop-color="#7B3FE4" />
+        </linearGradient>
+        ${dynDefs.join('')}
+        <g id="tg-hero-icon-ethereum">
+          <path fill="#8FFCF3" d="M12 3v6.651l5.625 2.516z" />
+          <path fill="#CABCF8" d="m12 3-5.625 9.166L12 9.653z" />
+          <path fill="#CBA7F5" d="M12 16.478V21l5.625-7.784z" />
+          <path fill="#74A0F3" d="M12 21v-4.522l-5.625-3.262z" />
+          <path fill="#CBA7F5" d="m12 15.43 5.625-3.263L12 9.652z" />
+          <path fill="#74A0F3" d="M6.375 12.167 12 15.43V9.652z" />
+          <path fill="#202699" fill-rule="evenodd" d="m12 15.43-5.625-3.263L12 3l5.624 9.166zm-5.252-3.528 5.161-8.41v6.114zm-.077.229 5.238-2.327v5.364zm5.418-2.327v5.364l5.234-3.037zm0-.198 5.161 2.296-5.161-8.41z" clip-rule="evenodd" />
+          <path fill="#202699" fill-rule="evenodd" d="m12 16.406-5.625-3.195L12 21l5.624-7.79zm-4.995-2.633 4.904 2.79v4.005zm5.084 2.79v4.005l4.905-6.795z" clip-rule="evenodd" />
+        </g>
+        <g id="tg-hero-icon-base">
+          <path fill="#0052FF" d="M11.985 21a9 9 0 1 0 0-18c-4.703 0-8.56 3.606-8.965 8.204h11.884v1.592H3.02c.405 4.598 4.262 8.204 8.965 8.204Z" />
+        </g>
+        <g id="tg-hero-icon-arbitrum">
+          <path fill="#213147" d="M4.515 8.471v7.056c0 .45.245.867.64 1.092l6.205 3.529a1.3 1.3 0 0 0 1.28 0l6.203-3.53c.396-.224.64-.64.64-1.09V8.47c0-.45-.244-.867-.64-1.091L12.64 3.85a1.3 1.3 0 0 0-1.28 0L5.155 7.38a1.25 1.25 0 0 0-.639 1.091" />
+          <path fill="#12AAFF" d="m13.353 13.368-.885 2.39a.3.3 0 0 0 0 .205l1.523 4.112 1.76-1.001-2.113-5.706a.152.152 0 0 0-.285 0m1.774-4.019a.152.152 0 0 0-.285 0l-.885 2.39a.3.3 0 0 0 0 .205l2.494 6.732 1.761-1.001z" />
+          <path fill="#9DCCED" d="M11.998 4.115a.3.3 0 0 1 .126.033l6.715 3.818a.25.25 0 0 1 .126.214v7.635c0 .089-.048.17-.126.214l-6.715 3.819a.25.25 0 0 1-.126.032.3.3 0 0 1-.125-.032l-6.715-3.815a.25.25 0 0 1-.126-.215V8.182c0-.089.048-.17.126-.215l6.715-3.818a.26.26 0 0 1 .125-.034m0-1.115c-.238 0-.478.06-.692.183L4.593 7A1.36 1.36 0 0 0 3.9 8.182v7.635c0 .487.264.938.693 1.181l6.714 3.819a1.41 1.41 0 0 0 1.386 0l6.714-3.818a1.36 1.36 0 0 0 .693-1.182V8.182A1.36 1.36 0 0 0 19.407 7l-6.716-3.817A1.4 1.4 0 0 0 11.998 3" />
+          <path fill="#FFFFFF" d="M11.433 7.635H9.731a.3.3 0 0 0-.285.197l-3.649 9.852 1.761 1.001 4.018-10.849a.15.15 0 0 0-.143-.2m2.979-.001h-1.703a.3.3 0 0 0-.284.197l-4.167 11.25 1.761 1 4.535-12.246a.15.15 0 0 0-.142-.2" />
+        </g>
+        <g id="tg-hero-icon-optimism">
+          <path fill="#FE0420" fill-rule="evenodd" d="M3.966 15.8q.979.7 2.512.7 1.854 0 2.962-.838 1.108-.85 1.559-2.562.27-1.05.464-2.163.063-.398.064-.663 0-.874-.451-1.499a2.7 2.7 0 0 0-1.237-.95Q9.053 7.5 8.062 7.5q-3.644 0-4.52 3.437a40 40 0 0 0-.477 2.163q-.058.335-.065.674 0 1.314.966 2.026m4.65-2.775c-.247.957-.926 1.58-1.958 1.58-1.02 0-1.368-.69-1.184-1.58a27 27 0 0 1 .464-2.05c.265-1.034.89-1.58 1.956-1.58 1.017 0 1.348.68 1.173 1.58a30 30 0 0 1-.451 2.05m3.902 3.385q.076.09.214.089h1.704a.38.38 0 0 0 .238-.089.36.36 0 0 0 .138-.232l.538-2.52h1.733c1.094 0 1.95-.53 2.576-1.002q.953-.707 1.266-2.186.075-.348.075-.67 0-1.117-.851-1.71-.84-.591-2.23-.591h-3.333a.38.38 0 0 0-.238.09.38.38 0 0 0-.138.232l-1.73 8.356a.3.3 0 0 0 .038.232m6.09-5.966c-.157.689-.757 1.319-1.462 1.319h-1.44l.496-2.369h1.503c.512 0 .94.102.94.665q0 .165-.037.385" clip-rule="evenodd" />
+        </g>
+        <g id="tg-hero-icon-polygon">
+          <path fill="url(#tg-hero-poly-g)" d="m16.364 15.217 4.27-2.435a.73.73 0 0 0 .366-.627V7.284a.72.72 0 0 0-.366-.627l-4.27-2.435a.74.74 0 0 0-.732 0l-4.27 2.435a.72.72 0 0 0-.366.627v8.704l-2.994 1.707-2.994-1.707v-3.415l2.994-1.707 1.974 1.127V9.702l-1.608-.918a.75.75 0 0 0-.732 0l-4.27 2.435a.72.72 0 0 0-.366.627v4.87c0 .258.14.498.366.627l4.27 2.436a.75.75 0 0 0 .732 0l4.27-2.436a.72.72 0 0 0 .366-.626V8.012l.053-.03 2.94-1.677 2.994 1.707v3.415l-2.994 1.707-1.972-1.124v2.291l1.606.916a.75.75 0 0 0 .732 0z" />
+        </g>
+        <g id="tg-hero-icon-bnb">
+          <path fill="#F0B90B" d="M7.09 5.755 12 3l4.91 2.755-1.8 1.02L12 5.035l-3.105 1.74zm9.82 3.48-1.8-1.02L12 9.955l-3.105-1.74-1.805 1.02v2.035l3.1 1.74v3.475l1.81 1.02 1.805-1.02V13.01l3.105-1.74zm0 5.515v-2.04l-1.8 1.02v2.035zm1.285.72-3.105 1.735v2.04l4.91-2.76v-5.51l-1.805 1.015zM16.39 7.495l1.8 1.02v2.035L20 9.535v-2.04l-1.805-1.02L16.39 7.5zm-6.2 10.45v2.035L12 21l1.805-1.02v-2.03L12 18.965l-1.805-1.02zm-3.1-3.2 1.8 1.02V13.73l-1.8-1.02v2.04zm3.1-7.25L12 8.515l1.805-1.02L12 6.475 10.195 7.5zm-4.385 1.02 1.805-1.02-1.8-1.02L4 7.5v2.04l1.805 1.015zm0 3.475L4 10.975v5.51l4.91 2.76V17.2l-3.1-1.735v-3.48z" />
+        </g>
+        <g id="tg-hero-icon-btc">
+          <path fill="#F7931A" d="M18.763 10.236c.279-1.895-1.155-2.905-3.131-3.591l.64-2.553-1.56-.389-.623 2.49-1.245-.297.631-2.508L11.915 3l-.641 2.562-.992-.234v-.01l-2.157-.54-.415 1.668s1.155.272 1.137.28c.631.163.74.578.722.903l-.723 2.923.163.054-.171-.036-1.02 4.087c-.072.19-.27.478-.712.36.018.028-1.128-.27-1.128-.27l-.776 1.778 2.03.505 1.11.289-.65 2.59 1.56.387.633-2.562 1.253.324-.64 2.554 1.56.388.641-2.59c2.662.505 4.665.307 5.505-2.102.676-1.94-.037-3.05-1.435-3.79 1.02-.225 1.786-.902 1.985-2.282zm-3.564 4.999c-.479 1.94-3.745.884-4.8.63l.857-3.436c1.055.27 4.448.784 3.943 2.796zm.478-5.026c-.433 1.76-3.158.866-4.033.65l.775-3.113c.885.217 3.718.632 3.258 2.463" />
+        </g>
+        <g id="tg-hero-icon-cosmos">
+          <path fill="#BA3FD9" fill-rule="evenodd" d="M12 3.624 4.577 7.812v8.376L12 20.376l7.423-4.188V7.812zM19.975 7.5 12 3 4.024 7.5v9L12 21l7.975-4.5z" clip-rule="evenodd" />
+          <path fill="#BA3FD9" fill-rule="evenodd" d="M11.997 8.772c-.57 0-1.034-.454-1.034-1.012 0-.557.464-1.01 1.034-1.01s1.034.453 1.034 1.01c0 .558-.464 1.012-1.034 1.012m0-1.472c-.26 0-.47.207-.47.46 0 .254.21.46.47.46s.47-.206.47-.46a.466.466 0 0 0-.47-.46" clip-rule="evenodd" />
+          <path fill="#BA3FD9" d="M11.731 8.94a1.25 1.25 0 0 0 .553 0v1.89a1.3 1.3 0 0 0-.553 0zm-.621 2.241-1.676-.946a1.2 1.2 0 0 1-.277.468l1.676.945c.056-.176.151-.335.277-.467m-.277 1.169-1.676.946a1.2 1.2 0 0 1 .277.468l1.676-.946a1.2 1.2 0 0 1-.277-.467m.898.818v1.891a1.3 1.3 0 0 1 .553 0v-1.89a1.25 1.25 0 0 1-.553 0m1.173-.352 1.677.946a1.2 1.2 0 0 1 .276-.468l-1.676-.945a1.2 1.2 0 0 1-.277.467m.277-1.17 1.676-.945a1.2 1.2 0 0 1-.276-.468l-1.677.946c.126.132.222.291.277.467" />
+          <path fill="#BA3FD9" fill-rule="evenodd" d="M9.142 10.395a1.05 1.05 0 0 1-1.413.37 1 1 0 0 1-.38-1.381 1.05 1.05 0 0 1 1.414-.37 1 1 0 0 1 .379 1.38m-1.304-.736a.455.455 0 0 0 .172.629.477.477 0 0 0 .643-.169.455.455 0 0 0-.172-.628.477.477 0 0 0-.643.168m1.313 3.964a1 1 0 0 1-.379 1.38 1.05 1.05 0 0 1-1.413-.37 1 1 0 0 1 .38-1.38 1.05 1.05 0 0 1 1.412.37m-1.303.736c.13.22.418.294.643.168a.455.455 0 0 0 .172-.629.477.477 0 0 0-.643-.168.455.455 0 0 0-.172.629m4.169.869c.57 0 1.034.454 1.034 1.011 0 .558-.464 1.011-1.034 1.011s-1.034-.453-1.034-1.01c0-.558.464-1.012 1.034-1.012m0 1.472c.26 0 .47-.207.47-.46a.466.466 0 0 0-.47-.46c-.26 0-.47.206-.47.46 0 .253.21.46.47.46m2.855-3.094a1.05 1.05 0 0 1 1.413-.37 1 1 0 0 1 .379 1.381 1.05 1.05 0 0 1-1.413.37 1 1 0 0 1-.379-1.38m1.304.736a.455.455 0 0 0-.173-.628.477.477 0 0 0-.643.168.455.455 0 0 0 .173.628.477.477 0 0 0 .643-.168m-1.313-3.965a1 1 0 0 1 .38-1.38 1.05 1.05 0 0 1 1.412.37 1 1 0 0 1-.379 1.38 1.05 1.05 0 0 1-1.413-.37m1.304-.735a.477.477 0 0 0-.643-.168.455.455 0 0 0-.172.628c.13.22.418.295.643.168a.455.455 0 0 0 .172-.628m-4.17 1.889c-.26 0-.47.207-.47.46 0 .254.21.46.47.46s.47-.206.47-.46a.466.466 0 0 0-.47-.46m0 1.471c-.57 0-1.034-.453-1.034-1.01 0-.558.464-1.012 1.034-1.012s1.034.454 1.034 1.011c0 .558-.464 1.011-1.034 1.011" clip-rule="evenodd" />
+        </g>
+        <g id="tg-hero-icon-sui">
+          <path fill="#4BA2FF" d="M16.128 10.508a5.44 5.44 0 0 1 1.15 3.356 5.47 5.47 0 0 1-1.182 3.4l-.063.079-.016-.107a5 5 0 0 0-.053-.26c-.37-1.656-1.566-3.08-3.546-4.233-1.334-.774-2.102-1.705-2.304-2.765a4.1 4.1 0 0 1 .16-1.969c.15-.494.385-.961.693-1.376l.773-.963a.332.332 0 0 1 .518 0zm1.218-.964L12.19 3.092a.244.244 0 0 0-.38 0L6.653 9.549l-.016.016a7.1 7.1 0 0 0-1.52 4.405C5.118 17.85 8.199 21 12 21s6.883-3.15 6.883-7.03a7.1 7.1 0 0 0-1.52-4.405zm-9.46.943.46-.577.017.105.037.255c.301 1.604 1.366 2.938 3.15 3.97 1.551.905 2.45 1.943 2.71 3.081.1.443.128.898.079 1.35v.027l-.021.01a5.2 5.2 0 0 1-2.319.544c-2.911 0-5.278-2.412-5.278-5.388a5.44 5.44 0 0 1 1.165-3.377" />
+        </g>
+        <g id="tg-hero-icon-aptos">
+          <circle cx="12" cy="12" r="10.2" fill="#18181B" />
+          <g transform="translate(12 12) scale(0.76) translate(-12 -12)">
+            <path fill="#F8FAFC" d="M15.336 9.02a.65.65 0 0 1-.483-.217l-.643-.726a.507.507 0 0 0-.757 0l-.552.623a.95.95 0 0 1-.713.322h-8.68a9 9 0 0 0-.473 2.221h8.196a.53.53 0 0 0 .38-.163l.764-.796a.5.5 0 0 1 .365-.155h.031c.145 0 .283.061.379.17l.643.726a.65.65 0 0 0 .483.218h6.69a9 9 0 0 0-.473-2.221zm-7.341 6.894a.53.53 0 0 0 .38-.163l.764-.796a.5.5 0 0 1 .365-.156h.031c.145 0 .283.062.379.17l.643.727a.65.65 0 0 0 .483.218h9.066c.34-.702.588-1.456.736-2.244h-8.701a.65.65 0 0 1-.483-.217l-.643-.727a.507.507 0 0 0-.757 0l-.552.624a.95.95 0 0 1-.713.321H3.158c.148.789.397 1.542.737 2.243zm6.431-9.32a.53.53 0 0 0 .382-.163l.763-.796a.5.5 0 0 1 .364-.155h.032c.144 0 .283.061.378.17l.643.727a.65.65 0 0 0 .484.217h1.723A8.99 8.99 0 0 0 12.001 3a8.99 8.99 0 0 0-7.195 3.594zm-5.82 11.544a.65.65 0 0 1-.484-.218l-.643-.726a.507.507 0 0 0-.756 0l-.552.623a.95.95 0 0 1-.713.321h-.037A8.97 8.97 0 0 0 12.001 21a8.97 8.97 0 0 0 6.578-2.862z" />
+          </g>
+        </g>
+        <g id="tg-hero-icon-ton">
+          <path fill="#0098EA" d="M18.078 3H5.922C3.687 3 2.27 5.41 3.394 7.36l7.503 13.003c.49.85 1.716.85 2.206 0L20.607 7.36C21.729 5.414 20.313 3 18.079 3zM10.89 16.464l-1.634-3.162L5.314 6.25a.689.689 0 0 1 .606-1.03h4.969v11.244zm7.791-10.215-3.94 7.054-1.635 3.16V5.22h4.97c.544 0 .865.578.605 1.03" />
+        </g>
+        <g id="tg-hero-icon-tron">
+          <path fill="#D92D20" fill-rule="evenodd" d="M4.42 3.186a.57.57 0 0 1 .552-.17L16.876 5.93a.5.5 0 0 1 .197.092l2.422 1.767a.565.565 0 0 1 .133.773l-8.332 12.191a.563.563 0 0 1-.998-.13L4.306 3.753a.57.57 0 0 1 .114-.566M6.383 6.23l4.16 11.712.684-6.069zm5.958 5.838-.695 6.175 5.884-8.61zm5.72-3.93-3.793 1.78 2.542-2.691zm-2.396-1.343L6.41 4.531l5.426 6.318z" clip-rule="evenodd" />
+        </g>
+        <g id="tg-hero-icon-solana">
+          <path fill="url(#tg-hero-sol-b1)" d="M18.413 7.902a.62.62 0 0 1-.411.163H3.58c-.512 0-.77-.585-.416-.928l2.369-2.284a.6.6 0 0 1 .41-.169H20.42c.517 0 .77.59.41.935z" />
+          <path fill="url(#tg-hero-sol-b2)" d="M18.413 10.473a.62.62 0 0 0-.411-.158H3.58c-.512 0-.77.58-.416.923l2.369 2.29c.111.103.257.16.41.163H20.42c.517 0 .77-.586.41-.928z" />
+          <path fill="url(#tg-hero-sol-b3)" d="M18.413 19.158a.62.62 0 0 1-.411.158H3.58c-.512 0-.77-.58-.416-.923l2.369-2.29a.6.6 0 0 1 .41-.163H20.42c.517 0 .77.586.41.928z" />
+        </g>
+      </defs>
+
+      <rect width="680" height="468" fill="url(#tg-hero-dots)" mask="url(#tg-hero-grid-mask)" />
+      <ellipse cx="340" cy="232" rx="232" ry="158" fill="none" stroke="#E8ECF2" stroke-width="1" stroke-dasharray="3 5" />
+      <ellipse cx="340" cy="232" rx="154" ry="108" fill="none" stroke="#EEF2F7" stroke-width="0.9" />
+      <g stroke="#DCE2EC" stroke-width="1" stroke-linecap="round">
+        <line x1="340" y1="22" x2="340" y2="38" />
+        <line x1="340" y1="428" x2="340" y2="444" />
+        <line x1="20" y1="232" x2="34" y2="232" />
+        <line x1="646" y1="232" x2="660" y2="232" />
+      </g>
+      <path d="M 271 67 A 246 168 0 0 0 271 397" fill="none" stroke="#DCE3EE" stroke-width="1" stroke-dasharray="2 5" />
+
+      <circle cx="340" cy="232" r="122" fill="url(#tg-hero-sol-bloom)" class="tg-hero-sol-bloom" />
+      <g>${conduits.join('')}</g>
+      <g>${pulses.join('')}</g>
+
+      <g id="tg-hero-solana-home">
+        <circle cx="340" cy="232" r="44" fill="none" stroke="url(#tg-hero-sol-spectrum)" class="tg-hero-ripple-1" />
+        <circle cx="340" cy="232" r="44" fill="none" stroke="#38BDF8" class="tg-hero-ripple-2" />
+        <g class="tg-hero-aperture-rev">${ticks.join('')}</g>
+        <circle cx="340" cy="232" r="68" fill="none" stroke="#E2E8F0" stroke-width="1" />
+        <circle cx="340" cy="232" r="62" fill="none" stroke="url(#tg-hero-sol-spectrum)" stroke-width="1.35" stroke-dasharray="12 8 3 8" stroke-opacity="0.72" class="tg-hero-aperture-spin" />
+        <circle cx="340" cy="232" r="53" fill="#FFFFFF" stroke="#E4E6EB" stroke-width="1.25" filter="url(#tg-hero-core-shadow)" />
+        <circle cx="340" cy="232" r="47" fill="#EEFBFF" stroke="#BAE6FD" stroke-width="1" />
+        <circle cx="340" cy="232" r="39" fill="url(#tg-hero-core-fill)" />
+        <circle cx="340" cy="232" r="38.2" fill="none" stroke="url(#tg-hero-core-rim)" stroke-width="1.2" />
+        <g transform="translate(319, 211) scale(1.75)"><use href="#tg-hero-icon-solana" /></g>
+      </g>
+
+      <g>${sats.join('')}</g>
+      <g>${nodes.join('')}</g>
+
+      <g id="tg-hero-status-pill" transform="translate(340, 286)" filter="url(#tg-hero-pill-shadow)">
+        <rect id="tg-hero-status-bg" x="-62" y="-11.5" width="124" height="23" rx="11.5" fill="#FFFFFF" stroke="#DCE2EC" stroke-width="1" />
+        <circle id="tg-hero-status-dot" cx="-48" cy="0" r="3.2" fill="#10B981" class="tg-hero-live-dot" />
+        <text id="tg-hero-status-text" x="5" y="3.8" text-anchor="middle" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="11" font-weight="600" fill="#18181B" letter-spacing="-0.01em">Solana Home</text>
+      </g>
+
+      <g id="tg-hero-more-evms" transform="translate(60, 232)" tabindex="0" role="button" aria-label="20 EVM chains to Solana" filter="url(#tg-hero-pill-shadow)" class="tg-hero-more-evms">
+        <line x1="34" y1="0" x2="38" y2="0" stroke="#CBD5E1" stroke-width="1" />
+        <rect x="-34" y="-11" width="68" height="22" rx="11" fill="#FFFFFF" stroke="#E4E6EB" stroke-width="1" />
+        <text x="0" y="3.5" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, monospace" font-size="10" font-weight="600" fill="#3F3F46">+14 EVMs</text>
+      </g>
+    </svg>
+  `;
+}
+
+/**
+ * Mounts the Turgalium Daylight custom SVG multi-chain convergence hero with
+ * interactive route isolation and full pause-when-hidden support (zero rAF).
+ */
+export function mountTurgaliumHeroSvg(container) {
+  if (!container) {
+    return { setActive() {}, setPaused() {}, isRunning() { return false; }, destroy() {} };
+  }
+
+  container.innerHTML = buildHeroSvgMarkup();
+  const svg = container.querySelector('#turgaliumHeroSvg');
+  if (!svg) {
+    return { setActive() {}, setPaused() {}, isRunning() { return false; }, destroy() {} };
+  }
+
+  const statusText = svg.querySelector('#tg-hero-status-text');
+  const statusDot = svg.querySelector('#tg-hero-status-dot');
+  const statusBg = svg.querySelector('#tg-hero-status-bg');
+  const stageCard = container.closest('.hero-visual-col');
+  const footerChips = Array.from(stageCard?.querySelectorAll('.hero-chain-chip') || []);
+  const listeners = [];
+
+  let paused = false;
+  let destroyed = false;
+
+  const isShellHidden = () => {
+    const shell = document.getElementById('siteShell');
+    if (shell && (shell.classList.contains('hidden') || shell.hidden)) return true;
+    return Boolean(container.closest('.hidden'));
+  };
+
+  const shouldRun = () =>
+    !destroyed && !paused && !document.hidden && !isShellHidden() && !prefersReducedMotion();
+
+  const syncAnimationState = () => {
+    const running = shouldRun();
+    svg.classList.toggle('is-paused', !running);
+    try {
+      if (running) svg.unpauseAnimations?.();
+      else svg.pauseAnimations?.();
+    } catch {
+      // ignore environments without SMIL animation controls
+    }
+  };
+
+  const updatePill = (text, dotColor) => {
+    if (!statusText || !statusDot || !statusBg) return;
+    statusText.textContent = text;
+    statusDot.setAttribute('fill', dotColor);
+    const w = Math.max(120, Math.round(text.length * 6.5 + 42));
+    statusBg.setAttribute('width', String(w));
+    statusBg.setAttribute('x', String(Math.round(-w / 2)));
+    statusDot.setAttribute('cx', String(Math.round(-w / 2 + 14)));
+  };
+
+  const setFocus = ({ chainId = null, group = null }) => {
+    svg.classList.add('has-focus');
+    const isMatch = (elNode) => {
+      if (chainId) return elNode.getAttribute('data-hero-chain') === chainId;
+      if (group) return elNode.getAttribute('data-hero-group') === group;
+      return false;
+    };
+
+    svg.querySelectorAll('[data-hero-chain]').forEach((node) => {
+      node.classList.toggle('is-active', isMatch(node));
+    });
+
+    footerChips.forEach((chip) => {
+      const chipChain = chip.getAttribute('data-hero-chain');
+      const chipGroup = chip.getAttribute('data-hero-group');
+      const matchedChain = chainId ? HERO_CHAINS.find((c) => c.id === chainId) : null;
+      const active =
+        (chainId && chipChain === chainId) ||
+        (group && chipGroup === group) ||
+        (matchedChain?.group === 'evm' && chipGroup === 'evm');
+      chip.classList.toggle('is-active', Boolean(active));
+    });
+
+    if (group === 'evm') {
+      updatePill('20 EVMs → Solana', '#0052FF');
+    } else if (chainId) {
+      const chain = HERO_CHAINS.find((c) => c.id === chainId);
+      if (chain) updatePill(chain.route, chain.color);
+    }
+  };
+
+  const clearFocus = () => {
+    svg.classList.remove('has-focus');
+    svg.querySelectorAll('.is-active').forEach((n) => n.classList.remove('is-active'));
+    footerChips.forEach((c) => c.classList.remove('is-active'));
+    updatePill('Solana Home', '#10B981');
+  };
+
+  const bind = (target, event, handler) => {
+    if (!target) return;
+    target.addEventListener(event, handler);
+    listeners.push([target, event, handler]);
+  };
+
+  svg.querySelectorAll('.tg-hero-node').forEach((node) => {
+    const chainId = node.getAttribute('data-hero-chain');
+    bind(node, 'mouseenter', () => setFocus({ chainId }));
+    bind(node, 'focus', () => setFocus({ chainId }));
+    bind(node, 'mouseleave', clearFocus);
+    bind(node, 'blur', clearFocus);
+  });
+
+  const moreEvms = svg.querySelector('#tg-hero-more-evms');
+  bind(moreEvms, 'mouseenter', () => setFocus({ group: 'evm' }));
+  bind(moreEvms, 'focus', () => setFocus({ group: 'evm' }));
+  bind(moreEvms, 'mouseleave', clearFocus);
+  bind(moreEvms, 'blur', clearFocus);
+
+  footerChips.forEach((chip) => {
+    const group = chip.getAttribute('data-hero-group');
+    const chainId = chip.getAttribute('data-hero-chain');
+    bind(chip, 'mouseenter', () => setFocus({ chainId, group }));
+    bind(chip, 'focus', () => setFocus({ chainId, group }));
+    bind(chip, 'mouseleave', clearFocus);
+    bind(chip, 'blur', clearFocus);
+  });
+
+  bind(document, 'visibilitychange', syncAnimationState);
+
+  const siteShellEl = document.getElementById('siteShell');
+  const mo =
+    siteShellEl && typeof MutationObserver !== 'undefined'
+      ? new MutationObserver(() => syncAnimationState())
+      : null;
+  if (mo && siteShellEl) {
+    mo.observe(siteShellEl, { attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
+  }
+
+  syncAnimationState();
+
+  return {
+    setActive(isActive) {
+      svg.classList.toggle('is-boosted', Boolean(isActive));
+    },
+    setPaused(isPaused) {
+      paused = Boolean(isPaused);
+      syncAnimationState();
+    },
+    isRunning() {
+      return shouldRun();
+    },
+    destroy() {
+      destroyed = true;
+      syncAnimationState();
+      mo?.disconnect();
+      for (const [target, event, handler] of listeners) {
+        target.removeEventListener(event, handler);
+      }
+      listeners.length = 0;
+    },
+  };
+}
