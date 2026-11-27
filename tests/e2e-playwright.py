@@ -306,6 +306,7 @@ def main():
         env={
             **os.environ,
             "PORT": str(PORT),
+            "TURGALIUM_RATE_LIMIT_MAX": "1200",
             "TURGALIUM_ROUTER_OPTIMISM": "0x2222222222222222222222222222222222222222",
             "TURGALIUM_FEE_RECIPIENT_EVM": "0x1111111111111111111111111111111111111111",
         },
