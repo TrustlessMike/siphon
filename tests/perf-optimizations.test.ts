@@ -22,6 +22,7 @@ test('Wave 14 Performance: split vendor bundles, immutable cache headers, HEAD e
       'walletconnect-sdk.js',
       'three.module.js',
       'three.core.js',
+      'gsap.js',
     ]) {
       assert.ok(
         fs.existsSync(path.resolve('public/vendor', file)),

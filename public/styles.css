@@ -569,8 +569,8 @@ select option {
   width: 100%;
   aspect-ratio: 680 / 468;
   border-radius: 15px;
-  background: radial-gradient(circle at 50% 49%, #ffffff 0%, #fafcff 66%, #f4f7fb 100%);
-  border: 1px solid #edf0f5;
+  background: radial-gradient(circle at 50% 48%, #161629 0%, #0a0a12 58%, #07070b 100%);
+  border: 1px solid #1c1c2a;
   overflow: hidden;
 }
 
@@ -581,6 +581,11 @@ select option {
   user-select: none;
 }
 
+/* Hidden only for the instant between mount and GSAP taking over (avoids a flash of the finished frame). */
+.tg-hero-svg.is-preparing .tg-hero-content {
+  opacity: 0;
+}
+
 .tg-hero-node {
   cursor: pointer;
   outline: none;
@@ -588,11 +593,11 @@ select option {
 }
 
 .tg-hero-node-disc {
-  transition: stroke 200ms ease, stroke-width 200ms ease;
+  transition: stroke-opacity 200ms ease;
 }
 
 .tg-hero-node-ring {
-  opacity: 0;
+  opacity: 0.6;
   transition: opacity 220ms ease;
 }
 
@@ -600,43 +605,40 @@ select option {
   font-family: var(--font-sans);
   font-size: 11.5px;
   font-weight: 600;
-  fill: #3f3f46;
+  fill: #d4d4dc;
   letter-spacing: -0.012em;
   transition: fill 180ms ease;
 }
 
 .tg-hero-conduit-base {
   fill: none;
-  stroke: #e4e7ee;
-  stroke-width: 1.35;
+  stroke: rgba(255, 255, 255, 0.07);
+  stroke-width: 4;
   stroke-linecap: round;
-  transition: stroke 220ms ease, stroke-width 220ms ease, opacity 220ms ease;
+  transition: opacity 220ms ease;
 }
 
 .tg-hero-conduit-flow {
   fill: none;
-  stroke-width: 1.75;
+  stroke-width: 1.5;
   stroke-linecap: round;
-  opacity: 0.62;
+  opacity: 0.78;
   transition: opacity 220ms ease, stroke-width 220ms ease;
 }
 
-.tg-hero-chevron {
-  fill: none;
-  stroke-width: 1.45;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  opacity: 0.65;
-  transition: opacity 200ms ease, stroke-width 200ms ease;
-}
-
-.tg-hero-pulse {
+.tg-hero-pulse,
+.tg-hero-ripple {
   transition: opacity 220ms ease;
 }
 
 .tg-hero-more-evms {
   cursor: pointer;
   outline: none;
+}
+
+.tg-hero-sol-bloom {
+  opacity: 0.85;
+  transition: opacity 300ms ease;
 }
 
 .tg-hero-svg.has-focus .tg-hero-node:not(.is-active) {
@@ -648,10 +650,6 @@ select option {
 }
 
 .tg-hero-svg.has-focus .tg-hero-conduit-flow:not(.is-active) {
-  opacity: 0.12;
-}
-
-.tg-hero-svg.has-focus .tg-hero-chevron:not(.is-active) {
   opacity: 0.14;
 }
 
@@ -659,8 +657,13 @@ select option {
   opacity: 0.15;
 }
 
-.tg-hero-node.is-active .tg-hero-node-disc {
-  stroke-width: 1.75;
+.tg-hero-node.is-active .tg-hero-node-disc,
+.tg-hero-node:focus-visible .tg-hero-node-disc {
+  stroke-opacity: 1;
+}
+
+.tg-hero-more-evms:focus-visible rect {
+  stroke: #14f195;
 }
 
 .tg-hero-node.is-active .tg-hero-node-ring {
@@ -668,48 +671,12 @@ select option {
 }
 
 .tg-hero-node.is-active .tg-hero-node-label {
-  fill: #0a0a0a;
+  fill: #ffffff;
 }
 
 .tg-hero-conduit-flow.is-active {
   opacity: 1;
-  stroke-width: 2.55;
-}
-
-.tg-hero-chevron.is-active {
-  opacity: 1;
-  stroke-width: 1.9;
-}
-
-@keyframes tg-hero-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@keyframes tg-hero-spin-rev {
-  from {
-    transform: rotate(360deg);
-  }
-  to {
-    transform: rotate(0deg);
-  }
-}
-
-@keyframes tg-hero-ripple {
-  0% {
-    r: 44;
-    opacity: 0.38;
-    stroke-width: 1.4;
-  }
-  100% {
-    r: 82;
-    opacity: 0;
-    stroke-width: 0.5;
-  }
+  stroke-width: 2.6;
 }
 
 @keyframes tg-hero-breathe {
@@ -722,24 +689,6 @@ select option {
   }
 }
 
-.tg-hero-aperture-spin {
-  transform-origin: 340px 232px;
-  animation: tg-hero-spin 48s linear infinite;
-}
-
-.tg-hero-aperture-rev {
-  transform-origin: 340px 232px;
-  animation: tg-hero-spin-rev 68s linear infinite;
-}
-
-.tg-hero-ripple-1 {
-  animation: tg-hero-ripple 3.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
-}
-
-.tg-hero-ripple-2 {
-  animation: tg-hero-ripple 3.8s cubic-bezier(0.16, 1, 0.3, 1) infinite 1.9s;
-}
-
 .tg-hero-live-dot {
   animation: tg-hero-breathe 2.4s ease-in-out infinite;
 }
@@ -748,23 +697,17 @@ select option {
   opacity: 1;
 }
 
-.tg-hero-svg.is-paused .tg-hero-aperture-spin,
-.tg-hero-svg.is-paused .tg-hero-aperture-rev,
-.tg-hero-svg.is-paused .tg-hero-ripple-1,
-.tg-hero-svg.is-paused .tg-hero-ripple-2,
 .tg-hero-svg.is-paused .tg-hero-live-dot {
   animation-play-state: paused;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .tg-hero-aperture-spin,
-  .tg-hero-aperture-rev,
-  .tg-hero-ripple-1,
-  .tg-hero-ripple-2,
   .tg-hero-live-dot {
     animation: none !important;
   }
-  .tg-hero-pulse {
+  .tg-hero-pulse,
+  .tg-hero-ripple,
+  .tg-hero-big-ripple {
     display: none;
   }
 }

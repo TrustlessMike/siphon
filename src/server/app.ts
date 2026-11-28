@@ -583,6 +583,7 @@ function serveStaticFile(res: ServerResponse, reqPath: string, isHead = false): 
     'wallet-sdks.js',
     'three.module.js',
     'three.core.js',
+    'gsap.js',
   ]);
   if (reqPath.startsWith('/vendor/')) {
     const fileName = reqPath.slice('/vendor/'.length);

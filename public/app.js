@@ -1,4 +1,4 @@
-import { renderConvergenceSvg, mountTurgaliumHeroSvg } from './turgalium-svg.js?v=5';
+import { renderConvergenceSvg, mountTurgaliumHeroSvg } from './turgalium-svg.js?v=6';
 import {
   claimCctpOnSolana,
   connectCoinbaseSmartWallet,

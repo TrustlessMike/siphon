@@ -578,6 +578,7 @@ def main():
             assert "Connect Solana or enter destination" in boot_dest["summary"], boot_dest
 
             # 1B. Verify Coinbase Smart Wallet SDK + WalletConnect SDK + HEAD / COOP + Custom SVG Hero
+            pgD.wait_for_function("() => document.getElementById('turgaliumHeroSvg')?.getAttribute('data-hero-engine') === 'gsap'", timeout=15000)
             sdk_gfx = pgD.evaluate("""async () => {
               const headRes = await fetch('/', { method: 'HEAD' });
               const mod = await import('/vendor/wallet-sdks.js');
@@ -594,6 +595,8 @@ def main():
                 canvasW: Math.round(rect.width || 0),
                 canvasH: Math.round(rect.height || 0),
                 heroChainNodes: svg ? svg.querySelectorAll('.tg-hero-node').length : 0,
+                heroTokens: svg ? svg.querySelectorAll('.tg-hero-token').length : 0,
+                heroRunning: Boolean(window.__turgaliumHeroScene?.isRunning?.()),
               };
             }""")
             assert sdk_gfx["headStatus"] == 200, sdk_gfx
@@ -601,6 +604,7 @@ def main():
             assert sdk_gfx["coinbaseReady"] and sdk_gfx["wcReady"], sdk_gfx
             assert sdk_gfx["canvasW"] > 200 and sdk_gfx["canvasH"] > 200, sdk_gfx
             assert sdk_gfx["heroChainNodes"] == 12, sdk_gfx
+            assert sdk_gfx["heroTokens"] == 12 and sdk_gfx["heroRunning"], sdk_gfx
 
             overflowD = {"website": pgD.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")}
             maybe_shot(pgD, "goal_desktop_website_1440.png", full_page=True)

@@ -29,6 +29,7 @@ const entries = [
   { in: 'src/client/coinbase-sdk.ts', out: 'coinbase-sdk.js' },
   { in: 'src/client/walletconnect-sdk.ts', out: 'walletconnect-sdk.js' },
   { in: 'src/client/wallet-sdks.ts', out: 'wallet-sdks.js' },
+  { in: 'src/client/gsap-vendor.ts', out: 'gsap.js' },
 ];
 
 await Promise.all(
