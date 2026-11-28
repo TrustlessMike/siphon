@@ -36,6 +36,7 @@ import {
   sendEip5792Batch,
   sendRealEvmTransaction,
   setSavedWalletConnectProjectId,
+  signAndSendSolanaVersionedTx,
   signFamilyGaslessIntent,
   signGaslessTypedData,
   subscribeWalletDiscovery,
@@ -2672,55 +2673,25 @@ async function executeAaveFlashUnwind({ chain, poolAddress, protocolFamily = 'aa
     }
 
     if (needsNativeGas) {
-      const refuelSource = findBestGasRefuelSourceChain(plan.chain);
-      if (!refuelSource) {
+      const autoGas = await ensureChainGasAutomatically({
+        targetChain: plan.chain,
+        targetChainName: plan.chainName,
+        targetSymbol: plan.nativeGasStatus?.nativeSymbol || 'gas',
+        targetAddress: connectedEvm,
+        shortfallUsd: plan.nativeGasStatus?.shortfallUsd || 0.35,
+        onStatus: (msg) => {
+          if (triggerBtn) triggerBtn.textContent = msg;
+        },
+      });
+      if (!autoGas.ok) {
         showToast(
-          plan.nativeGasStatus.reason ||
-            `${plan.chainName} needs native gas (${plan.nativeGasStatus.nativeSymbol}) to submit Flash Unwind.`,
+          autoGas.reason ||
+            plan.nativeGasStatus?.reason ||
+            `${plan.chainName} needs native gas to submit Flash Unwind.`,
           8000
         );
         return;
       }
-      if (triggerBtn) {
-        triggerBtn.textContent = `Refueling ${plan.chainName} gas from ${refuelSource.chainName || refuelSource.chain}…`;
-      }
-      const refuelQuote = await api('/api/gas/refuel-quote', {
-        method: 'POST',
-        body: JSON.stringify({
-          fromChain: refuelSource.chain,
-          toChain: plan.chain,
-          userAddress: connectedEvm,
-          amountUsd: Math.max(0.5, Number(plan.nativeGasStatus.shortfallUsd || 0.5) + 0.5),
-        }),
-      });
-      if (!refuelQuote?.transaction?.to) {
-        throw new Error('Could not quote unified cross-chain gas refuel.');
-      }
-      const refuelSend = await sendCallsWithFallback({
-        chainId: refuelQuote.fromChainId,
-        chain: refuelQuote.fromChain,
-        chainName: refuelQuote.fromChainName,
-        calls: [
-          {
-            to: refuelQuote.transaction.to,
-            data: refuelQuote.transaction.data || '0x',
-            value: refuelQuote.transaction.value || '0x0',
-            stepId: 'flash_unwind_gas_refuel',
-            label: refuelQuote.transaction.label,
-          },
-        ],
-        primaryProvider: 'relay',
-        expectedFrom: connectedEvm,
-      });
-      if (refuelSend?.failed) {
-        throw new Error(refuelSend.failedReason || 'Unified gas refuel transaction failed.');
-      }
-      const waitMs = Math.min(8000, Math.max(2500, Number(refuelQuote.estimatedSeconds || 3) * 1000));
-      showToast(
-        `Unified gas sent (${refuelQuote.estimatedOutFormatted} arriving on ${plan.chainName} in ~${refuelQuote.estimatedSeconds}s) — continuing into Flash Unwind…`,
-        5000
-      );
-      await new Promise((r) => setTimeout(r, waitMs));
     }
 
     if (triggerBtn) triggerBtn.textContent = `Confirm in Wallet (${plan.chainName})…`;
@@ -4445,7 +4416,8 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
       });
     }
 
-    // Zero-gas pre-sign guard: never open a doomed wallet popup when live native balance is 0
+    // Automatic Gas Unifier: if target chain has $0 gas, automatically refuel from whichever
+    // funded EVM chain or connected Solana wallet holds gas before opening the target-chain tx.
     const liveChainMeta = currentScan.chains.find((c) => c.chain === chain);
     const liveNativeBal = safeNum(liveChainMeta?.nativeBalance);
     const liveRpcMode = String(liveChainMeta?.rpcStatus || '').toLowerCase();
@@ -4457,16 +4429,33 @@ async function executeChainBatchLive(chain, existingJobId = null, opts = {}) {
       liveNativeBal <= 0
     ) {
       const sym = liveChainMeta.nativeSymbol || 'gas';
-      const noGasMsg = `${batch.chainName} has 0 ${sym} ($0.00) for gas — refuel ~$1 ${sym} from a funded chain first.`;
-      await patchJobLeg(jobId, chain, {
-        status: 'failed',
-        statusText: noGasMsg,
+      const autoGas = await ensureChainGasAutomatically({
+        targetChain: chain,
+        targetChainName: batch.chainName || liveChainMeta.chainName || chain,
+        targetSymbol: sym,
+        targetAddress: connectedEvm,
+        shortfallUsd: 0.45,
+        onStatus: (msg) => {
+          patchJobLeg(jobId, chain, { status: 'preparing', statusText: msg }).catch(() => {});
+          if (isDefiGuided) {
+            updateDefiStepperStep('withdraw', { status: 'active', detail: msg });
+          }
+        },
       });
-      if (isDefiGuided) {
-        updateDefiStepperStep('withdraw', { status: 'failed', detail: noGasMsg }, { active: false, dismissible: true });
+      if (!autoGas.ok) {
+        const noGasMsg =
+          autoGas.reason ||
+          `${batch.chainName} has 0 ${sym} ($0.00) for gas and no funded wallet/chain found to auto-refuel from.`;
+        await patchJobLeg(jobId, chain, {
+          status: 'failed',
+          statusText: noGasMsg,
+        });
+        if (isDefiGuided) {
+          updateDefiStepperStep('withdraw', { status: 'failed', detail: noGasMsg }, { active: false, dismissible: true });
+        }
+        showToast(noGasMsg);
+        return { userRejected: false, failed: true, zeroGas: true };
       }
-      showToast(noGasMsg);
-      return { userRejected: false, failed: true, zeroGas: true };
     }
 
     const stage1 = await sendCallsWithFallback({
@@ -4822,12 +4811,13 @@ function clearOneClickSweepSummary() {
 
 function findBestGasRefuelSourceChain(targetChain) {
   const chains = Array.isArray(currentScan?.chains) ? currentScan.chains : [];
-  const preferredOrder = ['base', 'arbitrum', 'optimism', 'avalanche', 'polygon', 'ethereum'];
+  const preferredOrder = ['base', 'arbitrum', 'optimism', 'avalanche', 'polygon', 'ethereum', 'monad', 'hyperevm', 'bnb', 'sonic'];
   const candidates = chains
     .filter((c) => {
       if (!c || !c.chain || c.chain === targetChain) return false;
+      if (c.family && c.family !== 'evm') return false;
       const usd = safeNum(c.nativeBalance) * safeNum(c.nativePriceUsd);
-      return usd >= 1.35 && c.rpcStatus !== 'error';
+      return usd >= 0.75 && c.rpcStatus !== 'error';
     })
     .sort((a, b) => {
       const ia = preferredOrder.indexOf(a.chain);
@@ -4837,7 +4827,146 @@ function findBestGasRefuelSourceChain(targetChain) {
       if (pa !== pb) return pa - pb;
       return safeNum(b.nativeBalance) * safeNum(b.nativePriceUsd) - safeNum(a.nativeBalance) * safeNum(a.nativePriceUsd);
     });
-  return candidates[0] || null;
+  if (candidates[0]) {
+    return candidates[0];
+  }
+
+  // Cross-ecosystem fallback: pull gas automatically from connected Solana wallet (SOL -> EVM via Relay in ~1s)
+  const solAddr = getConnectedSolanaAddress();
+  const solBal = safeNum(solanaBalances?.solBalance);
+  if (solAddr && solBal >= 0.012) {
+    return {
+      chain: 'solana',
+      chainName: 'Solana',
+      nativeSymbol: 'SOL',
+      nativeBalance: solBal,
+      isSolana: true,
+      userAddress: solAddr,
+    };
+  }
+  return null;
+}
+
+async function waitForGasArrivalOnChain(targetChain, targetAddress, maxWaitMs = 15_000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const status = await api(
+        `/api/gas/native-balance?chain=${encodeURIComponent(targetChain)}&address=${encodeURIComponent(targetAddress)}`
+      );
+      if (status && safeNum(status.nativeBalanceUi) > 0) {
+        const cm = currentScan?.chains?.find((c) => c.chain === targetChain);
+        if (cm) {
+          cm.nativeBalance = safeNum(status.nativeBalanceUi);
+        }
+        return true;
+      }
+    } catch {
+      // Transient RPC poll error — retry until deadline
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+  return false;
+}
+
+async function ensureChainGasAutomatically({
+  targetChain,
+  targetChainName,
+  targetSymbol,
+  targetAddress,
+  shortfallUsd = 0.4,
+  onStatus,
+}) {
+  try {
+    const source = findBestGasRefuelSourceChain(targetChain);
+    if (!source) {
+      return {
+        ok: false,
+        reason: `No funded chain or Solana wallet (>= $0.75 gas) found to auto-refuel ${targetChainName || targetChain}.`,
+      };
+    }
+    const amountUsd = Number(Math.min(5, Math.max(0.55, safeNum(shortfallUsd) + 0.35)).toFixed(2));
+    const sourceLabel = source.chainName || source.chain;
+    if (onStatus) {
+      onStatus(`Auto-Gas Unifier: refueling ~$${amountUsd.toFixed(2)} ${targetSymbol || 'gas'} from ${sourceLabel}…`);
+    }
+
+    const quote = await api('/api/gas/refuel-quote', {
+      method: 'POST',
+      body: JSON.stringify({
+        fromChain: source.chain,
+        toChain: targetChain,
+        userAddress: source.isSolana ? source.userAddress : targetAddress,
+        recipientAddress: targetAddress,
+        amountUsd,
+      }),
+    });
+
+    if (source.isSolana && quote?.solanaTransaction?.serializedTransactionBase64) {
+      if (onStatus) {
+        onStatus(`Confirm ~$${amountUsd.toFixed(2)} SOL gas drop (${sourceLabel} → ${targetChainName})…`);
+      }
+      await signAndSendSolanaVersionedTx(quote.solanaTransaction.serializedTransactionBase64, {
+        expectedFeePayer: source.userAddress,
+        allowedProgramIds: quote.solanaTransaction.allowedProgramIds,
+      });
+      if (solanaBalances && typeof solanaBalances.solBalance === 'number') {
+        solanaBalances.solBalance = Math.max(0, solanaBalances.solBalance - safeNum(quote.amountInUi));
+      }
+    } else if (quote?.transaction?.to) {
+      if (onStatus) {
+        onStatus(`Confirm ~$${amountUsd.toFixed(2)} gas drop (${sourceLabel} → ${targetChainName})…`);
+      }
+      const tx = quote.transaction;
+      const sendRes = await sendCallsWithFallback({
+        chainId: quote.fromChainId,
+        chain: quote.fromChain,
+        chainName: quote.fromChainName,
+        calls: [
+          {
+            to: tx.to,
+            data: tx.data || '0x',
+            value: tx.value || '0x0',
+            gas: tx.gas || undefined,
+            stepId: 'auto_gas_unifier',
+            label: tx.label || `Refuel ${quote.toChainName} gas`,
+          },
+        ],
+        primaryProvider: 'relay',
+        expectedFrom: targetAddress,
+      });
+      if (sendRes?.failed) {
+        return { ok: false, reason: sendRes.failedReason || 'Auto-Gas Unifier transaction failed.' };
+      }
+      const srcMeta = currentScan?.chains?.find((c) => c.chain === source.chain);
+      if (srcMeta) {
+        srcMeta.nativeBalance = Math.max(0, safeNum(srcMeta.nativeBalance) - safeNum(quote.amountInUi));
+      }
+    } else {
+      return { ok: false, reason: 'Could not build unified cross-chain gas refuel transaction.' };
+    }
+
+    showToast(
+      `Auto-Gas Unifier sent ${quote.estimatedOutFormatted} from ${sourceLabel} → ${targetChainName} (~${quote.estimatedSeconds}s). Waiting for arrival…`,
+      5000
+    );
+    if (onStatus) {
+      onStatus(`Waiting for ${quote.estimatedOutFormatted} to land on ${targetChainName}…`);
+    }
+    const arrived = await waitForGasArrivalOnChain(targetChain, targetAddress, 15_000);
+    if (!arrived) {
+      return {
+        ok: false,
+        reason: `Gas drop (${quote.estimatedOutFormatted}) is still settling on ${targetChainName}. Click again in a few seconds once it lands.`,
+      };
+    }
+    return { ok: true, refueled: true, source, quote };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err?.message || `Auto-Gas Unifier failed for ${targetChainName || targetChain}.`,
+    };
+  }
 }
 
 async function executeOneClickGasRefuel(fromChain, toChain, triggerBtn) {
@@ -4853,49 +4982,62 @@ async function executeOneClickGasRefuel(fromChain, toChain, triggerBtn) {
     triggerBtn.textContent = 'Building 1-Click Refuel…';
   }
   try {
+    const isSolSource = fromChain === 'solana';
+    const solAddr = isSolSource ? getConnectedSolanaAddress() : null;
+    if (isSolSource && !solAddr) {
+      throw new Error('Connect your Solana wallet to refuel EVM gas from SOL.');
+    }
     const quote = await api('/api/gas/refuel-quote', {
       method: 'POST',
       body: JSON.stringify({
         fromChain,
         toChain,
-        userAddress: connectedEvm,
+        userAddress: isSolSource ? solAddr : connectedEvm,
+        recipientAddress: connectedEvm,
         amountUsd: 1.0,
       }),
     });
-    const tx = quote?.transaction;
-    if (!tx?.to || !tx?.chainId) {
-      throw new Error('Could not build gas refuel transaction.');
-    }
-    if (triggerBtn) triggerBtn.textContent = `Confirm in Wallet (${quote.fromChainName})…`;
-    const sendRes = await sendCallsWithFallback({
-      chainId: tx.chainId,
-      chain: tx.chain,
-      chainName: quote.fromChainName,
-      calls: [
-        {
-          to: tx.to,
-          data: tx.data || '0x',
-          value: tx.value || '0x0',
-          gas: tx.gas || undefined,
-          stepId: 'gas_refuel',
-          label: tx.label || `Refuel ${quote.toChainName} gas`,
-        },
-      ],
-      primaryProvider: 'relay',
-      expectedFrom: connectedEvm,
-    });
-    if (sendRes?.failed) {
-      throw new Error(sendRes.failedReason || 'Gas refuel transaction failed.');
+    if (isSolSource && quote?.solanaTransaction?.serializedTransactionBase64) {
+      if (triggerBtn) triggerBtn.textContent = 'Confirm SOL gas drop in Solana wallet…';
+      await signAndSendSolanaVersionedTx(quote.solanaTransaction.serializedTransactionBase64, {
+        expectedFeePayer: solAddr,
+        allowedProgramIds: quote.solanaTransaction.allowedProgramIds,
+      });
+    } else {
+      const tx = quote?.transaction;
+      if (!tx?.to || !tx?.chainId) {
+        throw new Error('Could not build gas refuel transaction.');
+      }
+      if (triggerBtn) triggerBtn.textContent = `Confirm in Wallet (${quote.fromChainName})…`;
+      const sendRes = await sendCallsWithFallback({
+        chainId: tx.chainId,
+        chain: tx.chain,
+        chainName: quote.fromChainName,
+        calls: [
+          {
+            to: tx.to,
+            data: tx.data || '0x',
+            value: tx.value || '0x0',
+            gas: tx.gas || undefined,
+            stepId: 'gas_refuel',
+            label: tx.label || `Refuel ${quote.toChainName} gas`,
+          },
+        ],
+        primaryProvider: 'relay',
+        expectedFrom: connectedEvm,
+      });
+      if (sendRes?.failed) {
+        throw new Error(sendRes.failedReason || 'Gas refuel transaction failed.');
+      }
     }
     showToast(
       `Gas refuel sent: ${quote.estimatedOutFormatted} arriving on ${quote.toChainName} in ~${quote.estimatedSeconds}s. Refreshing balances…`
     );
     clearOneClickSweepSummary();
-    setTimeout(() => {
-      if (connectedEvm) {
-        runScan({ address: connectedEvm, refresh: true, autoOpen: true }).catch(() => {});
-      }
-    }, Math.min(8000, Math.max(3500, safeInt(quote.estimatedSeconds) * 1000)));
+    await waitForGasArrivalOnChain(toChain, connectedEvm, 10_000);
+    if (connectedEvm) {
+      runScan({ address: connectedEvm, refresh: true, autoOpen: true }).catch(() => {});
+    }
   } catch (err) {
     showToast(err?.message || 'Gas refuel failed.');
   } finally {
@@ -4955,10 +5097,11 @@ function renderOneClickSweepSummary() {
     ? gasStatusMap[primaryZeroGasChain] || currentScan?.chains?.find((c) => c.chain === primaryZeroGasChain)
     : null;
   const refuelSource = primaryZeroGasChain ? findBestGasRefuelSourceChain(primaryZeroGasChain) : null;
+  const canAutoUnifyGas = hasZeroGas && Boolean(refuelSource);
 
-  const hasFailures = failedItems.length > 0 || hasZeroGas;
+  const hasFailures = failedItems.length > 0 || (hasZeroGas && !canAutoUnifyGas);
   const canProceed =
-    (!hasZeroGas || fundedChains.length > 0) &&
+    (!hasZeroGas || canAutoUnifyGas || fundedChains.length > 0) &&
     (readyCount > 0 || (items.length === 0 && displayChains.length > 0));
 
   card.classList.remove('hidden');
@@ -4989,7 +5132,7 @@ function renderOneClickSweepSummary() {
         const targetSym = primaryZeroGasInfo?.nativeSymbol || 'gas';
         const targetName = primaryZeroGasInfo?.chainName || primaryZeroGasChain;
         const refuelBtnHtml = refuelSource
-          ? `<button type="button" class="btn-pill-dark btn-sm" id="oneClickRefuelGasBtn">Refuel $1 ${escapeHtml(targetSym)} from ${escapeHtml(refuelSource.chainName || refuelSource.chain)}</button>`
+          ? `<button type="button" class="btn-outline-sm" id="oneClickRefuelGasBtn">Refuel $1 ${escapeHtml(targetSym)} from ${escapeHtml(refuelSource.chainName || refuelSource.chain)} Now</button>`
           : '';
         const skipBtnHtml =
           fundedChains.length > 0
@@ -4998,8 +5141,16 @@ function renderOneClickSweepSummary() {
         return `
           <div class="one-click-gas-rescue" id="oneClickGasRescueBox">
             <div class="one-click-gas-rescue-text">
-              <strong>Not enough gas on ${escapeHtml(names)}.</strong>
-              <span>Deposit ~$0.50 ${escapeHtml(targetSym)} or refuel in 1 click from a funded chain before signing.</span>
+              <strong>${
+                canAutoUnifyGas
+                  ? `Auto-Gas Unifier ready for ${escapeHtml(names)}.`
+                  : `Not enough gas on ${escapeHtml(names)}.`
+              }</strong>
+              <span>${
+                canAutoUnifyGas
+                  ? `Confirming below will automatically pull ~$0.75 ${escapeHtml(targetSym)} from ${escapeHtml(refuelSource.chainName || refuelSource.chain)} (1–4s) right before signing.`
+                  : `Deposit ~$0.50 ${escapeHtml(targetSym)} or connect a funded wallet/chain to auto-unify gas.`
+              }</span>
             </div>
             ${
               refuelBtnHtml || skipBtnHtml
@@ -5028,7 +5179,9 @@ function renderOneClickSweepSummary() {
     ? `${displayChains.length} ${displayChains.length === 1 ? 'chain' : 'chains'} ready`
     : `${readyCount}/${totalCount} ready${durationMs > 0 ? ` · ${durationMs}ms` : ''}`;
 
-  const confirmLabel = hasZeroGas
+  const confirmLabel = canAutoUnifyGas
+    ? `Auto-Unify Gas & Confirm Sweep (${displayChains.length} ${displayChains.length === 1 ? 'Chain' : 'Chains'})`
+    : hasZeroGas
     ? `Sweep ${fundedChains.length} Funded ${fundedChains.length === 1 ? 'Chain' : 'Chains'} Only`
     : `Confirm & Sign Sweep (${totalSignatures} ${totalSignatures === 1 ? 'sig' : 'sigs'})`;
 
@@ -5088,8 +5241,22 @@ function renderOneClickSweepSummary() {
     runPreparedSweepQueue(snap);
   };
 
+  const runAllWithAutoGas = () => {
+    const snap = pendingBatchSummary;
+    if (!snap) return;
+    if (hasZeroGas && !canAutoUnifyGas && fundedChains.length > 0) {
+      const fundedSet = new Set(fundedChains);
+      runPreparedSweepQueue({
+        ...snap,
+        activeChains: snap.activeChains.filter((ch) => fundedSet.has(ch)),
+      });
+      return;
+    }
+    runPreparedSweepQueue(snap);
+  };
+
   document.getElementById('oneClickSkipZeroGasBtn')?.addEventListener('click', runFilteredFundedSweep);
-  document.getElementById('confirmOneClickSweepBtn')?.addEventListener('click', runFilteredFundedSweep);
+  document.getElementById('confirmOneClickSweepBtn')?.addEventListener('click', runAllWithAutoGas);
   document.getElementById('cancelOneClickSweepBtn')?.addEventListener('click', () => {
     clearOneClickSweepSummary();
     updateWalletButtons();

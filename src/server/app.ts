@@ -47,7 +47,11 @@ import {
   prepareChainBatchExecution,
   prepareRealExecution,
 } from '../execution/tx-builder.js';
-import { buildGasRefuelQuote } from '../execution/gas-refuel.js';
+import {
+  buildGasRefuelQuote,
+  evaluateChainNativeGasStatus,
+  fetchChainNativeBalancesWei,
+} from '../execution/gas-refuel.js';
 import {
   buildGaslessSweepIntent,
   configureGaslessIntentStore,
@@ -2099,19 +2103,48 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         }
       }
 
+      if (method === 'GET' && pathname === '/api/gas/native-balance') {
+        const chainRaw = (url.searchParams.get('chain') ?? '').trim().toLowerCase();
+        const address = (url.searchParams.get('address') ?? '').trim();
+        if (!isEvmChain(chainRaw)) {
+          return reply(400, { error: 'Valid EVM chain query parameter is required.' });
+        }
+        if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+          return reply(400, { error: 'Valid 0x EVM address query parameter is required.' });
+        }
+        try {
+          const balances = await fetchChainNativeBalancesWei({
+            chains: [chainRaw],
+            userAddress: address,
+          });
+          const status = evaluateChainNativeGasStatus({
+            chain: chainRaw,
+            nativeBalanceWei: balances[chainRaw],
+            requiredMsgValueWei: 0n,
+            estimatedGasUsd: chainRaw === 'ethereum' ? 3.5 : 0.25,
+          });
+          return reply(200, status);
+        } catch (err) {
+          return reply(400, {
+            error: err instanceof Error ? err.message : 'Could not fetch native balance',
+          });
+        }
+      }
+
       if (method === 'POST' && pathname === '/api/gas/refuel-quote') {
         const body = await readJsonBody<{
           fromChain?: string;
           toChain?: string;
           userAddress?: string;
+          recipientAddress?: string;
           amountUsd?: number;
         }>(req);
 
         const fromChain = typeof body.fromChain === 'string' ? body.fromChain.trim().toLowerCase() : '';
         const toChain = typeof body.toChain === 'string' ? body.toChain.trim().toLowerCase() : '';
-        if (!isEvmChain(fromChain) || !isEvmChain(toChain)) {
+        if ((fromChain !== 'solana' && !isEvmChain(fromChain)) || !isEvmChain(toChain)) {
           return reply(400, {
-            error: 'Valid EVM fromChain and toChain are required for gas refuel.',
+            error: 'Valid EVM (or solana) fromChain and EVM toChain are required for gas refuel.',
           });
         }
         if (!body.userAddress || typeof body.userAddress !== 'string') {
@@ -2119,9 +2152,13 @@ export function createTurgaliumServer(opts: TurgaliumServerOptions = {}) {
         }
         try {
           const quote = await buildGasRefuelQuote({
-            fromChain,
+            fromChain: fromChain === 'solana' ? 'solana' : fromChain,
             toChain,
             userAddress: body.userAddress,
+            recipientAddress:
+              typeof body.recipientAddress === 'string' && body.recipientAddress.trim()
+                ? body.recipientAddress.trim()
+                : undefined,
             amountUsd: typeof body.amountUsd === 'number' ? body.amountUsd : 1.0,
           });
           return reply(200, quote);

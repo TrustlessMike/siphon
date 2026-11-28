@@ -282,6 +282,7 @@ test('Wave 24: evaluateChainNativeGasStatus and buildGasRefuelQuote + HTTP /api/
   assert.equal(quote.provider, 'relay');
   assert.equal(quote.fromChain, 'base');
   assert.equal(quote.toChain, 'polygon');
+  assert.ok(quote.transaction, 'EVM refuel quote must include transaction');
   assert.equal(quote.transaction.to, RELAY_ROUTER);
   assert.equal(quote.transaction.chainId, 8453);
   assert.ok(quote.amountInUi < 0.01, `Expected ~$1 in ETH (<0.01 ETH), got ${quote.amountInUi}`);
@@ -331,7 +332,112 @@ test('Wave 24: evaluateChainNativeGasStatus and buildGasRefuelQuote + HTTP /api/
     assert.equal(badRes.status, 400);
     const badJson = (await badRes.json()) as { error: string };
     assert.match(badJson.error, /different/i);
+
+    const badBalRes = await fetch(`http://127.0.0.1:${port}/api/gas/native-balance?chain=monad&address=bad`);
+    assert.equal(badBalRes.status, 400);
   } finally {
     await new Promise<void>((r) => srv.close(() => r()));
   }
+});
+
+test('Auto-Gas Unifier: buildGasRefuelQuote supports Solana SOL -> Monad EVM refuel & cross-wallet recipientAddress, rejecting rogue Solana programs', async () => {
+  const { Keypair } = await import('@solana/web3.js');
+  const solPayer = Keypair.generate().publicKey.toBase58();
+  const targetWallet = '0xb7b570Dc117b4946925bc39166418516FB011CbB';
+  const relaySolProgram = '99vQwtBwYtrqqD9YSXbdum3KBdxPAVxYTaQ3cfnJSrN2';
+  const fakeBlockhash = Keypair.generate().publicKey.toBase58();
+
+  let sentBody: Record<string, unknown> | null = null;
+  const solQuote = await buildGasRefuelQuote({
+    fromChain: 'solana',
+    toChain: 'monad',
+    userAddress: solPayer,
+    recipientAddress: targetWallet,
+    amountUsd: 0.75,
+    nativePrices: { 'coingecko:solana': 150, SOL: 150 },
+    solanaBlockhashFn: async () => fakeBlockhash,
+    fetcher: (async (_url: string, init?: RequestInit) => {
+      sentBody = JSON.parse(String(init?.body || '{}'));
+      return new Response(
+        JSON.stringify({
+          requestId: 'req_sol_to_monad',
+          details: {
+            timeEstimate: 1,
+            currencyOut: { amountFormatted: '67.12', amountUsd: '0.70', currency: { symbol: 'MON' } },
+          },
+          steps: [
+            {
+              id: 'deposit',
+              kind: 'transaction',
+              items: [
+                {
+                  data: {
+                    instructions: [
+                      {
+                        programId: relaySolProgram,
+                        keys: [{ pubkey: solPayer, isSigner: true, isWritable: true }],
+                        data: '0d9e0ddf',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }) as unknown as typeof fetch,
+  });
+
+  assert.equal(solQuote.fromChain, 'solana');
+  assert.equal(solQuote.toChain, 'monad');
+  assert.equal(solQuote.recipientAddress, targetWallet);
+  assert.equal((sentBody as Record<string, unknown> | null)?.originChainId, 792703809);
+  assert.equal((sentBody as Record<string, unknown> | null)?.recipient, targetWallet);
+  assert.ok(solQuote.solanaTransaction, 'Solana refuel quote must include solanaTransaction');
+  assert.equal(solQuote.solanaTransaction.feePayer, solPayer);
+  assert.ok(solQuote.solanaTransaction.serializedTransactionBase64.length > 20);
+  assert.deepEqual(solQuote.solanaTransaction.allowedProgramIds, [relaySolProgram]);
+
+  // Fail-closed: rogue/unknown Solana program rejected
+  await assert.rejects(
+    buildGasRefuelQuote({
+      fromChain: 'solana',
+      toChain: 'monad',
+      userAddress: solPayer,
+      recipientAddress: targetWallet,
+      amountUsd: 0.75,
+      nativePrices: { SOL: 150 },
+      solanaBlockhashFn: async () => fakeBlockhash,
+      fetcher: (async () =>
+        new Response(
+          JSON.stringify({
+            requestId: 'req_rogue',
+            details: { timeEstimate: 1, currencyOut: { amountFormatted: '67.12', amountUsd: '0.70', currency: { symbol: 'MON' } } },
+            steps: [
+              {
+                id: 'deposit',
+                kind: 'transaction',
+                items: [
+                  {
+                    data: {
+                      instructions: [
+                        {
+                          programId: Keypair.generate().publicKey.toBase58(),
+                          keys: [{ pubkey: solPayer, isSigner: true, isWritable: true }],
+                          data: 'deadbeef',
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )) as unknown as typeof fetch,
+    }),
+    /unexpected Solana program/i
+  );
 });

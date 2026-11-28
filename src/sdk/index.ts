@@ -361,9 +361,11 @@ export {
   fetchChainNativeBalancesWei,
   evaluateChainNativeGasStatus,
   type ChainNativeGasStatus,
+  type GasRefuelSourceChain,
   type GasRefuelQuoteRequest,
   type GasRefuelQuoteResult,
   type GasRefuelTransaction,
+  type GasRefuelSolanaTransaction,
 } from '../execution/gas-refuel.js';
 
 export {
