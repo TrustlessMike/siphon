@@ -489,77 +489,83 @@ export function renderConvergenceSvg(plan, scan) {
 
 const HERO_CHAINS = Object.freeze([
   // Left Hemisphere — EVM Ecosystem (6 flagships + 14 satellites = 20 EVMs)
-  { id: 'ethereum', name: 'Ethereum', group: 'evm', angle: -106, color: '#4F46E5', labelPos: 'top', dur: 3.1, delay: -0.3, route: 'Ethereum → Solana' },
-  { id: 'base', name: 'Base', group: 'evm', angle: -134, color: '#0052FF', labelPos: 'top-left', dur: 2.7, delay: -1.2, route: 'Base → Solana' },
-  { id: 'arbitrum', name: 'Arbitrum', group: 'evm', angle: -164, color: '#12AAFF', labelPos: 'left', dur: 2.9, delay: -2.1, route: 'Arbitrum → Solana' },
-  { id: 'optimism', name: 'Optimism', group: 'evm', angle: 164, color: '#FE0420', labelPos: 'left', dur: 3.0, delay: -0.8, route: 'Optimism → Solana' },
-  { id: 'polygon', name: 'Polygon', group: 'evm', angle: 134, color: '#7B3FE4', labelPos: 'bottom-left', dur: 2.8, delay: -1.7, route: 'Polygon → Solana' },
-  { id: 'bnb', name: 'BNB', group: 'evm', angle: 106, color: '#D97706', labelPos: 'bottom', dur: 3.2, delay: -2.4, route: 'BNB Chain → Solana' },
+  { id: 'ethereum', name: 'Ethereum', group: 'evm', angle: -106, color: '#818CF8', labelPos: 'top', route: 'Ethereum → Solana' },
+  { id: 'base', name: 'Base', group: 'evm', angle: -134, color: '#3B82F6', labelPos: 'top-left', route: 'Base → Solana' },
+  { id: 'arbitrum', name: 'Arbitrum', group: 'evm', angle: -164, color: '#12AAFF', labelPos: 'left', route: 'Arbitrum → Solana' },
+  { id: 'optimism', name: 'Optimism', group: 'evm', angle: 164, color: '#FF4D5E', labelPos: 'left', route: 'Optimism → Solana' },
+  { id: 'polygon', name: 'Polygon', group: 'evm', angle: 134, color: '#A46BFF', labelPos: 'bottom-left', route: 'Polygon → Solana' },
+  { id: 'bnb', name: 'BNB', group: 'evm', angle: 106, color: '#F0B90B', labelPos: 'bottom', route: 'BNB Chain → Solana' },
 
   // Right Hemisphere — Non-EVM Ecosystems (all 6 non-EVM families)
-  { id: 'btc', name: 'Bitcoin', group: 'btc', angle: -74, color: '#F7931A', labelPos: 'top', dur: 3.3, delay: -0.6, route: 'Bitcoin → Solana' },
-  { id: 'cosmos', name: 'Cosmos', group: 'cosmos', angle: -46, color: '#BA3FD9', labelPos: 'top-right', dur: 2.9, delay: -1.5, route: 'Cosmos IBC → Solana' },
-  { id: 'sui', name: 'Sui', group: 'sui', angle: -16, color: '#4BA2FF', labelPos: 'right', dur: 2.6, delay: -2.2, route: 'Sui → Solana' },
-  { id: 'aptos', name: 'Aptos', group: 'aptos', angle: 16, color: '#18181B', labelPos: 'right', dur: 2.8, delay: -1.0, route: 'Aptos → Solana' },
-  { id: 'ton', name: 'TON', group: 'ton', angle: 46, color: '#0098EA', labelPos: 'bottom-right', dur: 3.0, delay: -1.9, route: 'TON → Solana' },
-  { id: 'tron', name: 'Tron', group: 'tron', angle: 74, color: '#D92D20', labelPos: 'bottom', dur: 3.1, delay: -2.7, route: 'Tron → Solana' },
+  { id: 'btc', name: 'Bitcoin', group: 'btc', angle: -74, color: '#F7931A', labelPos: 'top', route: 'Bitcoin → Solana' },
+  { id: 'cosmos', name: 'Cosmos', group: 'cosmos', angle: -46, color: '#D46BF0', labelPos: 'top-right', route: 'Cosmos IBC → Solana' },
+  { id: 'sui', name: 'Sui', group: 'sui', angle: -16, color: '#4BA2FF', labelPos: 'right', route: 'Sui → Solana' },
+  { id: 'aptos', name: 'Aptos', group: 'aptos', angle: 16, color: '#E5E7EB', labelPos: 'right', route: 'Aptos → Solana' },
+  { id: 'ton', name: 'TON', group: 'ton', angle: 46, color: '#29B6F6', labelPos: 'bottom-right', route: 'TON → Solana' },
+  { id: 'tron', name: 'Tron', group: 'tron', angle: 74, color: '#FF5247', labelPos: 'bottom', route: 'Tron → Solana' },
+]);
+
+// Launch order for the intro + flow waves: clockwise from the top.
+const HERO_LAUNCH_ORDER = Object.freeze([
+  'ethereum', 'btc', 'cosmos', 'sui', 'aptos', 'ton', 'tron', 'bnb', 'polygon', 'optimism', 'arbitrum', 'base',
 ]);
 
 const HERO_EVM_SATELLITES = Object.freeze([
   { deg: -113, color: '#E84142' },
   { deg: -120, color: '#836EF9' },
-  { deg: -127, color: '#0284C7' },
+  { deg: -127, color: '#38BDF8' },
   { deg: -141, color: '#EC4899' },
-  { deg: -149, color: '#18181B' },
-  { deg: -157, color: '#B45309' },
-  { deg: -172, color: '#0F766E' },
-  { deg: 172, color: '#CA8A04' },
-  { deg: 157, color: '#111827' },
-  { deg: 149, color: '#0F766E' },
-  { deg: 141, color: '#92400E' },
-  { deg: 127, color: '#1E3A8A' },
-  { deg: 120, color: '#6D28D9' },
-  { deg: 113, color: '#047857' },
+  { deg: -149, color: '#A1A1AA' },
+  { deg: -157, color: '#F59E0B' },
+  { deg: -172, color: '#2DD4BF' },
+  { deg: 172, color: '#FACC15' },
+  { deg: 157, color: '#94A3B8' },
+  { deg: 149, color: '#34D399' },
+  { deg: 141, color: '#FB923C' },
+  { deg: 127, color: '#60A5FA' },
+  { deg: 120, color: '#A78BFA' },
+  { deg: 113, color: '#10B981' },
 ]);
 
-function heroCubicAt(p0, p1, p2, p3, t) {
-  const mt = 1 - t;
-  const x = mt * mt * mt * p0.x + 3 * mt * mt * t * p1.x + 3 * mt * t * t * p2.x + t * t * t * p3.x;
-  const y = mt * mt * mt * p0.y + 3 * mt * mt * t * p1.y + 3 * mt * t * t * p2.y + t * t * t * p3.y;
-  const dx = 3 * mt * mt * (p1.x - p0.x) + 6 * mt * t * (p2.x - p1.x) + 3 * t * t * (p3.x - p2.x);
-  const dy = 3 * mt * mt * (p1.y - p0.y) + 6 * mt * t * (p2.y - p1.y) + 3 * t * t * (p3.y - p2.y);
-  return { x, y, angle: Math.atan2(dy, dx) };
-}
+const HERO_CX = 340;
+const HERO_CY = 232;
+const HERO_CORE_R = 39;
+const HERO_TRAIL = 38;
 
+const HERO_LABEL_OFFSETS = Object.freeze({
+  top: [0, -30, 'middle'],
+  bottom: [0, 37, 'middle'],
+  left: [-29, 4, 'end'],
+  right: [29, 4, 'start'],
+  'top-left': [-25, -14, 'end'],
+  'top-right': [25, -14, 'start'],
+  'bottom-left': [-25, 21, 'end'],
+  'bottom-right': [25, 21, 'start'],
+});
+
+/**
+ * Static markup = the finished composition (every chain connected to Solana).
+ * GSAP only animates on top of it, so reduced-motion users and a failed GSAP
+ * load still get the complete graphic.
+ */
 function buildHeroSvgMarkup() {
-  const CX = 340;
-  const CY = 232;
+  const CX = HERO_CX;
+  const CY = HERO_CY;
   const RX = 232;
   const RY = 158;
   const NODE_R = 20.5;
-  const reducedMotion = prefersReducedMotion();
-
-  const ticks = [];
-  for (let i = 0; i < 36; i++) {
-    const rad = (i * 10 * Math.PI) / 180;
-    const isMajor = i % 9 === 0;
-    const r1 = isMajor ? 69 : 70.5;
-    const r2 = isMajor ? 76 : 74;
-    ticks.push(
-      `<line x1="${(CX + Math.cos(rad) * r1).toFixed(2)}" y1="${(CY + Math.sin(rad) * r1).toFixed(2)}" x2="${(CX + Math.cos(rad) * r2).toFixed(2)}" y2="${(CY + Math.sin(rad) * r2).toFixed(2)}" stroke="${isMajor ? '#94A3B8' : '#CBD5E1'}" stroke-width="${isMajor ? '1.35' : '0.9'}" stroke-linecap="round" />`
-    );
-  }
 
   const sats = HERO_EVM_SATELLITES.map(({ deg, color }) => {
     const rad = (deg * Math.PI) / 180;
     const sx = CX + Math.cos(rad) * (RX + 14);
     const sy = CY + Math.sin(rad) * (RY + 10);
-    return `<circle cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="2.4" fill="${color}" fill-opacity="0.52" stroke="#FFFFFF" stroke-width="0.8" />`;
+    return `<circle class="tg-hero-sat" cx="${sx.toFixed(1)}" cy="${sy.toFixed(1)}" r="2.4" fill="${color}" fill-opacity="0.9" stroke="#07070B" stroke-width="0.8" />`;
   });
 
   const dynDefs = [];
   const conduits = [];
   const pulses = [];
+  const ripples = [];
   const nodes = [];
 
   for (const chain of HERO_CHAINS) {
@@ -583,85 +589,50 @@ function buildHeroSvgMarkup() {
     const sy = y0 + Math.sin(exitAngle) * NODE_R;
 
     const d = `M ${sx.toFixed(1)} ${sy.toFixed(1)} C ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${c2x.toFixed(1)} ${c2y.toFixed(1)}, ${ex.toFixed(1)} ${ey.toFixed(1)}`;
-    const pathId = `tg-hero-path-${chain.id}`;
     const gradId = `tg-hero-grad-${chain.id}`;
+    const tokId = `tg-hero-tok-${chain.id}`;
+    const attrs = `data-hero-chain="${chain.id}" data-hero-group="${chain.group}"`;
 
-    dynDefs.push(`<path id="${pathId}" d="${d}" />`);
     dynDefs.push(`
       <linearGradient id="${gradId}" gradientUnits="userSpaceOnUse" x1="${sx.toFixed(1)}" y1="${sy.toFixed(1)}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}">
-        <stop offset="0%" stop-color="${chain.color}" stop-opacity="0.58" />
-        <stop offset="55%" stop-color="#38BDF8" stop-opacity="0.66" />
-        <stop offset="100%" stop-color="#14F195" stop-opacity="0.95" />
+        <stop offset="0%" stop-color="${chain.color}" />
+        <stop offset="100%" stop-color="#14F195" />
       </linearGradient>
+      <radialGradient id="${tokId}">
+        <stop offset="0%" stop-color="${chain.color}" stop-opacity="0.95" />
+        <stop offset="45%" stop-color="${chain.color}" stop-opacity="0.38" />
+        <stop offset="100%" stop-color="${chain.color}" stop-opacity="0" />
+      </radialGradient>
     `);
 
-    conduits.push(
-      `<path d="${d}" class="tg-hero-conduit-base" data-hero-chain="${chain.id}" data-hero-group="${chain.group}" />`
-    );
-    conduits.push(
-      `<path d="${d}" stroke="url(#${gradId})" class="tg-hero-conduit-flow" data-hero-chain="${chain.id}" data-hero-group="${chain.group}" />`
-    );
+    conduits.push(`<path d="${d}" class="tg-hero-conduit-base" ${attrs} />`);
+    conduits.push(`<path d="${d}" stroke="url(#${gradId})" class="tg-hero-conduit-flow" ${attrs} />`);
 
-    const mid = heroCubicAt({ x: sx, y: sy }, { x: c1x, y: c1y }, { x: c2x, y: c2y }, { x: ex, y: ey }, 0.56);
-    const midDeg = (mid.angle * 180) / Math.PI;
-    conduits.push(
-      `<path d="M -3.5 -3 L 1.5 0 L -3.5 3" transform="translate(${mid.x.toFixed(1)}, ${mid.y.toFixed(1)}) rotate(${midDeg.toFixed(1)})" stroke="#0EA5E9" class="tg-hero-chevron" data-hero-chain="${chain.id}" data-hero-group="${chain.group}" />`
-    );
-
-    if (!reducedMotion) {
-      pulses.push(`
-        <g class="tg-hero-pulse" data-hero-chain="${chain.id}" data-hero-group="${chain.group}">
-          <circle r="4.4" fill="${chain.color}" fill-opacity="0.3" filter="url(#tg-hero-pulse-glow)">
-            <animateMotion dur="${chain.dur}s" repeatCount="indefinite" begin="${chain.delay}s" calcMode="spline" keyTimes="0;1" keySplines="0.38 0 0.22 1"><mpath href="#${pathId}" /></animateMotion>
-            <animate attributeName="opacity" values="0;0.95;1;0" keyTimes="0;0.12;0.86;1" dur="${chain.dur}s" repeatCount="indefinite" begin="${chain.delay}s" />
-          </circle>
-          <circle r="2.2" fill="#FFFFFF" stroke="${chain.color}" stroke-width="1.25">
-            <animateMotion dur="${chain.dur}s" repeatCount="indefinite" begin="${chain.delay}s" calcMode="spline" keyTimes="0;1" keySplines="0.38 0 0.22 1"><mpath href="#${pathId}" /></animateMotion>
-            <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.12;0.86;1" dur="${chain.dur}s" repeatCount="indefinite" begin="${chain.delay}s" />
-          </circle>
+    // Motion layer: hidden until GSAP drives it.
+    pulses.push(`
+      <g class="tg-hero-pulse" ${attrs}>
+        <path d="${d}" class="tg-hero-flash" fill="none" stroke="url(#${gradId})" stroke-width="4.5" stroke-linecap="round" opacity="0" />
+        <path d="${d}" class="tg-hero-trail-glow" fill="none" stroke="${chain.color}" stroke-width="5" stroke-linecap="round" stroke-opacity="0.28" opacity="0" />
+        <path d="${d}" class="tg-hero-trail" fill="none" stroke="${chain.color}" stroke-width="2" stroke-linecap="round" opacity="0" />
+        <g class="tg-hero-token" opacity="0">
+          <circle r="9" fill="url(#${tokId})" />
+          <circle r="2.4" fill="#FFFFFF" />
         </g>
-      `);
-    }
+      </g>
+    `);
+    ripples.push(
+      `<circle class="tg-hero-ripple" ${attrs} cx="${CX}" cy="${CY}" r="${HERO_CORE_R + 9}" fill="none" stroke="${chain.color}" stroke-width="1.4" opacity="0" />`
+    );
 
-    let lx = 0;
-    let ly = 0;
-    let anchor = 'middle';
-    if (chain.labelPos === 'top') {
-      ly = -30;
-    } else if (chain.labelPos === 'bottom') {
-      ly = 37;
-    } else if (chain.labelPos === 'left') {
-      lx = -29;
-      ly = 4;
-      anchor = 'end';
-    } else if (chain.labelPos === 'right') {
-      lx = 29;
-      ly = 4;
-      anchor = 'start';
-    } else if (chain.labelPos === 'top-left') {
-      lx = -25;
-      ly = -14;
-      anchor = 'end';
-    } else if (chain.labelPos === 'top-right') {
-      lx = 25;
-      ly = -14;
-      anchor = 'start';
-    } else if (chain.labelPos === 'bottom-left') {
-      lx = -25;
-      ly = 21;
-      anchor = 'end';
-    } else if (chain.labelPos === 'bottom-right') {
-      lx = 25;
-      ly = 21;
-      anchor = 'start';
-    }
+    const [lx, ly, anchor] = HERO_LABEL_OFFSETS[chain.labelPos] || HERO_LABEL_OFFSETS.top;
 
     nodes.push(`
-      <g class="tg-hero-node" data-hero-chain="${chain.id}" data-hero-group="${chain.group}" transform="translate(${x0.toFixed(1)}, ${y0.toFixed(1)})" tabindex="0" role="button" aria-label="${escapeXml(chain.route)}">
-        <circle r="26" fill="${chain.color}" fill-opacity="0.09" stroke="${chain.color}" stroke-opacity="0.38" stroke-width="1" class="tg-hero-node-ring" />
-        <circle r="${NODE_R}" fill="#FFFFFF" stroke="#E4E6EB" stroke-width="1.2" filter="url(#tg-hero-node-shadow)" class="tg-hero-node-disc" />
-        <circle cx="${(Math.cos(exitAngle) * NODE_R).toFixed(1)}" cy="${(Math.sin(exitAngle) * NODE_R).toFixed(1)}" r="2.7" fill="${chain.color}" stroke="#FFFFFF" stroke-width="1.25" />
-        <g transform="translate(-10, -10) scale(0.8333)"><use href="#tg-hero-icon-${chain.id}" /></g>
+      <g class="tg-hero-node" ${attrs} transform="translate(${x0.toFixed(1)}, ${y0.toFixed(1)})" tabindex="0" role="button" aria-label="${escapeXml(chain.route)}">
+        <g class="tg-hero-node-body">
+          <circle r="26.5" fill="${chain.color}" fill-opacity="0.16" stroke="${chain.color}" stroke-opacity="0.6" stroke-width="1" class="tg-hero-node-ring" />
+          <circle r="${NODE_R}" fill="#FFFFFF" stroke="${chain.color}" stroke-opacity="0" stroke-width="1.6" class="tg-hero-node-disc" />
+          <g transform="translate(-10, -10) scale(0.8333)"><use href="#tg-hero-icon-${chain.id}" /></g>
+        </g>
         <text x="${lx}" y="${ly}" text-anchor="${anchor}" class="tg-hero-node-label">${escapeXml(chain.name)}</text>
       </g>
     `);
@@ -670,23 +641,26 @@ function buildHeroSvgMarkup() {
   return `
     <svg id="turgaliumHeroSvg" class="tg-hero-svg" viewBox="0 0 680 468" role="img" aria-label="Multi-chain convergence to Solana: 20 EVM chains, Bitcoin, Cosmos, Sui, Aptos, TON, and Tron flowing home to Solana" xmlns="http://www.w3.org/2000/svg">
       <defs>
+        <radialGradient id="tg-hero-bg" cx="50%" cy="48%" r="62%">
+          <stop offset="0%" stop-color="#161629" />
+          <stop offset="55%" stop-color="#0A0A12" />
+          <stop offset="100%" stop-color="#07070B" />
+        </radialGradient>
         <pattern id="tg-hero-dots" width="22" height="22" patternUnits="userSpaceOnUse">
-          <circle cx="1.5" cy="1.5" r="0.85" fill="#E5E9F0" />
+          <circle cx="1.5" cy="1.5" r="0.85" fill="#2A2A3C" />
         </pattern>
-        <radialGradient id="tg-hero-grid-fade" cx="50%" cy="50%" r="54%">
-          <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.12" />
-          <stop offset="48%" stop-color="#FFFFFF" stop-opacity="0.92" />
+        <radialGradient id="tg-hero-grid-fade" cx="50%" cy="50%" r="56%">
+          <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.9" />
           <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0" />
         </radialGradient>
         <mask id="tg-hero-grid-mask">
           <rect width="680" height="468" fill="url(#tg-hero-grid-fade)" />
         </mask>
         <radialGradient id="tg-hero-sol-bloom" cx="50%" cy="50%" r="50%">
-          <stop offset="0%" stop-color="#14F195" stop-opacity="0.22" />
-          <stop offset="36%" stop-color="#C6F4FF" stop-opacity="0.42" />
-          <stop offset="68%" stop-color="#38BDF8" stop-opacity="0.1" />
-          <stop offset="86%" stop-color="#9945FF" stop-opacity="0.04" />
-          <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0" />
+          <stop offset="0%" stop-color="#14F195" stop-opacity="0.4" />
+          <stop offset="40%" stop-color="#00C2FF" stop-opacity="0.15" />
+          <stop offset="72%" stop-color="#9945FF" stop-opacity="0.05" />
+          <stop offset="100%" stop-color="#9945FF" stop-opacity="0" />
         </radialGradient>
         <linearGradient id="tg-hero-sol-spectrum" x1="0%" y1="100%" x2="100%" y2="0%">
           <stop offset="0%" stop-color="#9945FF" />
@@ -706,31 +680,10 @@ function buildHeroSvgMarkup() {
           <stop offset="100%" stop-color="#38BDF8" />
         </linearGradient>
         <radialGradient id="tg-hero-core-fill" cx="38%" cy="26%" r="74%">
-          <stop offset="0%" stop-color="#27272A" />
-          <stop offset="56%" stop-color="#0D0D10" />
+          <stop offset="0%" stop-color="#2B2B36" />
+          <stop offset="60%" stop-color="#0F0F16" />
           <stop offset="100%" stop-color="#050507" />
         </radialGradient>
-        <linearGradient id="tg-hero-core-rim" x1="0%" y1="0%" x2="0%" y2="100%">
-          <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.3" />
-          <stop offset="48%" stop-color="#FFFFFF" stop-opacity="0.04" />
-          <stop offset="100%" stop-color="#14F195" stop-opacity="0.25" />
-        </linearGradient>
-        <filter id="tg-hero-node-shadow" x="-30%" y="-25%" width="160%" height="165%">
-          <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0F172A" flood-opacity="0.07" />
-        </filter>
-        <filter id="tg-hero-core-shadow" x="-35%" y="-30%" width="170%" height="175%">
-          <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#0F172A" flood-opacity="0.13" />
-        </filter>
-        <filter id="tg-hero-pill-shadow" x="-20%" y="-35%" width="140%" height="185%">
-          <feDropShadow dx="0" dy="2" stdDeviation="3.5" flood-color="#0F172A" flood-opacity="0.08" />
-        </filter>
-        <filter id="tg-hero-pulse-glow" x="-120%" y="-120%" width="340%" height="340%">
-          <feGaussianBlur stdDeviation="2.2" result="blur" />
-          <feMerge>
-            <feMergeNode in="blur" />
-            <feMergeNode in="SourceGraphic" />
-          </feMerge>
-        </filter>
         <linearGradient id="tg-hero-poly-g" x1="3" y1="17" x2="20" y2="7" gradientUnits="userSpaceOnUse">
           <stop stop-color="#A726C1" />
           <stop offset="1" stop-color="#7B3FE4" />
@@ -795,55 +748,165 @@ function buildHeroSvgMarkup() {
         </g>
       </defs>
 
+      <rect width="680" height="468" fill="url(#tg-hero-bg)" />
       <rect width="680" height="468" fill="url(#tg-hero-dots)" mask="url(#tg-hero-grid-mask)" />
-      <ellipse cx="340" cy="232" rx="232" ry="158" fill="none" stroke="#E8ECF2" stroke-width="1" stroke-dasharray="3 5" />
-      <ellipse cx="340" cy="232" rx="154" ry="108" fill="none" stroke="#EEF2F7" stroke-width="0.9" />
-      <g stroke="#DCE2EC" stroke-width="1" stroke-linecap="round">
-        <line x1="340" y1="22" x2="340" y2="38" />
-        <line x1="340" y1="428" x2="340" y2="444" />
-        <line x1="20" y1="232" x2="34" y2="232" />
-        <line x1="646" y1="232" x2="660" y2="232" />
-      </g>
-      <path d="M 271 67 A 246 168 0 0 0 271 397" fill="none" stroke="#DCE3EE" stroke-width="1" stroke-dasharray="2 5" />
 
-      <circle cx="340" cy="232" r="122" fill="url(#tg-hero-sol-bloom)" class="tg-hero-sol-bloom" />
-      <g>${conduits.join('')}</g>
-      <g>${pulses.join('')}</g>
+      <g class="tg-hero-content">
+        <ellipse class="tg-hero-orbit" cx="${CX}" cy="${CY}" rx="${RX}" ry="${RY}" fill="none" stroke="#2B2B3D" stroke-width="1" stroke-dasharray="3 6" />
+        <circle cx="${CX}" cy="${CY}" r="150" fill="url(#tg-hero-sol-bloom)" class="tg-hero-sol-bloom" />
 
-      <g id="tg-hero-solana-home">
-        <circle cx="340" cy="232" r="44" fill="none" stroke="url(#tg-hero-sol-spectrum)" class="tg-hero-ripple-1" />
-        <circle cx="340" cy="232" r="44" fill="none" stroke="#38BDF8" class="tg-hero-ripple-2" />
-        <g class="tg-hero-aperture-rev">${ticks.join('')}</g>
-        <circle cx="340" cy="232" r="68" fill="none" stroke="#E2E8F0" stroke-width="1" />
-        <circle cx="340" cy="232" r="62" fill="none" stroke="url(#tg-hero-sol-spectrum)" stroke-width="1.35" stroke-dasharray="12 8 3 8" stroke-opacity="0.72" class="tg-hero-aperture-spin" />
-        <circle cx="340" cy="232" r="53" fill="#FFFFFF" stroke="#E4E6EB" stroke-width="1.25" filter="url(#tg-hero-core-shadow)" />
-        <circle cx="340" cy="232" r="47" fill="#EEFBFF" stroke="#BAE6FD" stroke-width="1" />
-        <circle cx="340" cy="232" r="39" fill="url(#tg-hero-core-fill)" />
-        <circle cx="340" cy="232" r="38.2" fill="none" stroke="url(#tg-hero-core-rim)" stroke-width="1.2" />
-        <g transform="translate(319, 211) scale(1.75)"><use href="#tg-hero-icon-solana" /></g>
-      </g>
+        <g>${conduits.join('')}</g>
+        <g>${pulses.join('')}</g>
+        <g>
+          ${ripples.join('')}
+          <circle class="tg-hero-big-ripple" cx="${CX}" cy="${CY}" r="${HERO_CORE_R}" fill="none" stroke="url(#tg-hero-sol-spectrum)" stroke-width="2.2" opacity="0" />
+          <circle class="tg-hero-big-ripple" cx="${CX}" cy="${CY}" r="${HERO_CORE_R}" fill="none" stroke="url(#tg-hero-sol-spectrum)" stroke-width="1.4" opacity="0" />
+        </g>
 
-      <g>${sats.join('')}</g>
-      <g>${nodes.join('')}</g>
+        <g id="tg-hero-solana-home">
+          <circle class="tg-hero-ring" cx="${CX}" cy="${CY}" r="56" fill="none" stroke="url(#tg-hero-sol-spectrum)" stroke-width="1.35" stroke-dasharray="12 8 3 8" stroke-opacity="0.8" />
+          <circle cx="${CX}" cy="${CY}" r="46" fill="#0B0B12" stroke="#30303F" stroke-width="1" />
+          <circle cx="${CX}" cy="${CY}" r="${HERO_CORE_R}" fill="url(#tg-hero-core-fill)" stroke="url(#tg-hero-sol-spectrum)" stroke-width="1.8" />
+          <g transform="translate(319, 211) scale(1.75)"><use href="#tg-hero-icon-solana" /></g>
+        </g>
 
-      <g id="tg-hero-status-pill" transform="translate(340, 286)" filter="url(#tg-hero-pill-shadow)">
-        <rect id="tg-hero-status-bg" x="-62" y="-11.5" width="124" height="23" rx="11.5" fill="#FFFFFF" stroke="#DCE2EC" stroke-width="1" />
-        <circle id="tg-hero-status-dot" cx="-48" cy="0" r="3.2" fill="#10B981" class="tg-hero-live-dot" />
-        <text id="tg-hero-status-text" x="5" y="3.8" text-anchor="middle" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="11" font-weight="600" fill="#18181B" letter-spacing="-0.01em">Solana Home</text>
-      </g>
+        <g>${sats.join('')}</g>
+        <g>${nodes.join('')}</g>
 
-      <g id="tg-hero-more-evms" transform="translate(60, 232)" tabindex="0" role="button" aria-label="20 EVM chains to Solana" filter="url(#tg-hero-pill-shadow)" class="tg-hero-more-evms">
-        <line x1="34" y1="0" x2="38" y2="0" stroke="#CBD5E1" stroke-width="1" />
-        <rect x="-34" y="-11" width="68" height="22" rx="11" fill="#FFFFFF" stroke="#E4E6EB" stroke-width="1" />
-        <text x="0" y="3.5" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, monospace" font-size="10" font-weight="600" fill="#3F3F46">+14 EVMs</text>
+        <g id="tg-hero-status-pill" transform="translate(340, 300)">
+          <rect id="tg-hero-status-bg" x="-62" y="-11.5" width="124" height="23" rx="11.5" fill="#0E0E17" stroke="#34344A" stroke-width="1" />
+          <circle id="tg-hero-status-dot" cx="-48" cy="0" r="3.2" fill="#14F195" class="tg-hero-live-dot" />
+          <text id="tg-hero-status-text" x="5" y="3.8" text-anchor="middle" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="11" font-weight="600" fill="#F4F4F8" letter-spacing="-0.01em">Solana Home</text>
+        </g>
+
+        <g id="tg-hero-more-evms" transform="translate(60, 232)" tabindex="0" role="button" aria-label="20 EVM chains to Solana" class="tg-hero-more-evms">
+          <rect x="-34" y="-11" width="68" height="22" rx="11" fill="#0E0E17" stroke="#34344A" stroke-width="1" />
+          <text x="0" y="3.5" text-anchor="middle" font-family="JetBrains Mono, ui-monospace, SFMono-Regular, monospace" font-size="10" font-weight="600" fill="#D4D4DC">+14 EVMs</text>
+        </g>
       </g>
     </svg>
   `;
 }
 
 /**
- * Mounts the Turgalium Daylight custom SVG multi-chain convergence hero with
- * interactive route isolation and full pause-when-hidden support (zero rAF).
+ * Builds the GSAP choreography on an already-rendered hero SVG.
+ * Intro (plays once): Solana core lands, chains pop in, conduits draw home.
+ * Loop (repeats): three waves of tokens fly home, then every route flashes.
+ */
+function buildHeroMotion(gsap, svg) {
+  const origin = `${HERO_CX} ${HERO_CY}`;
+  const q = (sel) => Array.from(svg.querySelectorAll(sel));
+  const one = (sel) => svg.querySelector(sel);
+  const ordered = (sel) =>
+    HERO_LAUNCH_ORDER.map((id) => svg.querySelector(`${sel}[data-hero-chain="${id}"]`)).filter(Boolean);
+
+  const core = one('#tg-hero-solana-home');
+  const bloom = one('.tg-hero-sol-bloom');
+  const orbit = one('.tg-hero-orbit');
+  const pills = [one('#tg-hero-status-pill'), one('#tg-hero-more-evms')].filter(Boolean);
+  const nodes = ordered('.tg-hero-node');
+  const bodies = nodes.map((n) => n.querySelector('.tg-hero-node-body'));
+  const labels = nodes.map((n) => n.querySelector('.tg-hero-node-label'));
+  const rings = nodes.map((n) => n.querySelector('.tg-hero-node-ring'));
+  const flows = ordered('.tg-hero-conduit-flow');
+  const bases = ordered('.tg-hero-conduit-base');
+  const pulses = ordered('.tg-hero-pulse');
+  const ripples = ordered('.tg-hero-ripple');
+  const bigRipples = q('.tg-hero-big-ripple');
+  const flashes = pulses.map((p) => p.querySelector('.tg-hero-flash'));
+  const sats = q('.tg-hero-sat');
+
+  // ---- Intro -------------------------------------------------------------
+  gsap.set(core, { svgOrigin: origin, scale: 0, opacity: 0 });
+  gsap.set(bloom, { svgOrigin: origin, scale: 0.4, opacity: 0 });
+  gsap.set(bodies, { svgOrigin: '0 0', scale: 0 });
+  gsap.set([...labels, ...bases, ...pills], { opacity: 0 });
+  gsap.set(sats, { transformOrigin: '50% 50%', scale: 0 });
+  gsap.set(flows, { drawSVG: '0% 0%' });
+  gsap.set(orbit, { opacity: 0 });
+
+  const intro = gsap.timeline({ paused: true, defaults: { ease: 'power2.out' } });
+  intro
+    .to(core, { scale: 1, opacity: 1, duration: 0.8, ease: 'back.out(1.9)' }, 0.15)
+    .to(bloom, { scale: 1, opacity: 0.85, duration: 1.1 }, 0.2)
+    .to(orbit, { opacity: 1, duration: 0.9 }, 0.3)
+    .to(bodies, { scale: 1, duration: 0.5, ease: 'back.out(2.2)', stagger: 0.07 }, 0.7)
+    .to(labels, { opacity: 1, duration: 0.3, stagger: 0.07 }, 0.86)
+    .to(sats, { scale: 1, duration: 0.3, ease: 'back.out(3)', stagger: 0.025 }, 1.3)
+    .to(flows, { drawSVG: '0% 100%', duration: 0.7, ease: 'power2.inOut', stagger: 0.05 }, 1.6)
+    .to(bases, { opacity: 1, duration: 0.45, stagger: 0.05 }, 1.9)
+    .to(pills, { opacity: 1, duration: 0.4 }, 2.4)
+    // hand opacity back to CSS so hover route-isolation can dim these again
+    .set([...labels, ...bases, ...pills, bloom, orbit], { clearProps: 'opacity' }, 3.0);
+
+  // ---- Loop --------------------------------------------------------------
+  const TRAVEL = 1.15;
+  const STAGGER = 0.11;
+  const WAVE_GAP = 1.6;
+  const WAVES = 3;
+  const loop = gsap.timeline({ paused: true, repeat: -1, repeatDelay: 0.5 });
+
+  pulses.forEach((pulse, i) => {
+    const flow = flows[i];
+    const token = pulse.querySelector('.tg-hero-token');
+    const trails = [pulse.querySelector('.tg-hero-trail-glow'), pulse.querySelector('.tg-hero-trail')];
+    const length = flow.getTotalLength();
+    gsap.set(trails, { strokeDasharray: `${HERO_TRAIL} ${length + HERO_TRAIL}`, strokeDashoffset: HERO_TRAIL });
+
+    for (let wave = 0; wave < WAVES; wave += 1) {
+      const start = wave * WAVE_GAP + i * STAGGER;
+      const arrive = start + TRAVEL;
+      loop
+        .fromTo(rings[i], { scale: 1 }, { scale: 1.22, svgOrigin: '0 0', duration: 0.17, yoyo: true, repeat: 1, ease: 'sine.inOut' }, start)
+        .set([token, ...trails], { opacity: 1 }, start + 0.1)
+        .fromTo(
+          token,
+          { motionPath: { path: flow, align: flow, alignOrigin: [0.5, 0.5], start: 0, end: 0 } },
+          { motionPath: { path: flow, align: flow, alignOrigin: [0.5, 0.5], start: 0, end: 1 }, duration: TRAVEL, ease: 'power2.in', immediateRender: false },
+          start + 0.1
+        )
+        .fromTo(trails, { strokeDashoffset: HERO_TRAIL }, { strokeDashoffset: HERO_TRAIL - length, duration: TRAVEL, ease: 'power2.in', immediateRender: false }, start + 0.1)
+        .to([token, ...trails], { opacity: 0, duration: 0.12 }, arrive + 0.04)
+        .fromTo(
+          ripples[i],
+          { attr: { r: HERO_CORE_R + 9 }, opacity: 0.85 },
+          { attr: { r: HERO_CORE_R + 46 }, opacity: 0, duration: 0.7, ease: 'power1.out', immediateRender: false },
+          arrive + 0.1
+        );
+    }
+  });
+
+  const finale = (WAVES - 1) * WAVE_GAP + (pulses.length - 1) * STAGGER + TRAVEL + 0.35;
+  loop
+    .to(flashes, { opacity: 0.9, duration: 0.25, stagger: 0.015 }, finale)
+    .to(flashes, { opacity: 0, duration: 0.9 }, finale + 0.45)
+    .to(core, { scale: 1.12, duration: 0.22, ease: 'power2.out' }, finale + 0.05)
+    .to(core, { scale: 1, duration: 0.9, ease: 'elastic.out(1, 0.4)' }, finale + 0.27)
+    .to(bloom, { scale: 1.3, duration: 0.5, ease: 'power2.out' }, finale)
+    .to(bloom, { scale: 1, duration: 1.2, ease: 'sine.inOut' }, finale + 0.5)
+    .fromTo(
+      bigRipples[0],
+      { attr: { r: HERO_CORE_R }, opacity: 0.9 },
+      { attr: { r: 300 }, opacity: 0, duration: 1.5, ease: 'power2.out', immediateRender: false },
+      finale + 0.08
+    )
+    .fromTo(
+      bigRipples[1],
+      { attr: { r: HERO_CORE_R }, opacity: 0.65 },
+      { attr: { r: 225 }, opacity: 0, duration: 1.5, ease: 'power2.out', immediateRender: false },
+      finale + 0.3
+    );
+
+  const spin = gsap.to(one('.tg-hero-ring'), { rotation: 360, svgOrigin: origin, duration: 48, ease: 'none', repeat: -1, paused: true });
+
+  return { intro, loop, spin };
+}
+
+/**
+ * Mounts the Turgalium custom SVG multi-chain convergence hero.
+ * Motion is a GSAP timeline loaded lazily from /vendor/gsap.js; it is fully
+ * paused (GSAP ticker asleep, zero rAF) while the site shell is hidden, the tab
+ * is in the background, or the stage is scrolled off-screen.
  */
 export function mountTurgaliumHeroSvg(container) {
   if (!container) {
@@ -865,6 +928,11 @@ export function mountTurgaliumHeroSvg(container) {
 
   let paused = false;
   let destroyed = false;
+  let inView = true;
+  let boosted = false;
+  let engine = null; // gsap instance once loaded
+  let motion = null; // { intro, loop, spin }
+  let introDone = false;
 
   const isShellHidden = () => {
     const shell = document.getElementById('siteShell');
@@ -873,16 +941,48 @@ export function mountTurgaliumHeroSvg(container) {
   };
 
   const shouldRun = () =>
-    !destroyed && !paused && !document.hidden && !isShellHidden() && !prefersReducedMotion();
+    !destroyed && !paused && inView && !document.hidden && !isShellHidden() && !prefersReducedMotion();
 
   const syncAnimationState = () => {
     const running = shouldRun();
     svg.classList.toggle('is-paused', !running);
+    if (!engine || !motion) return;
+    if (running) {
+      engine.ticker.wake();
+      motion.spin.play();
+      if (introDone) motion.loop.play();
+      else motion.intro.play();
+    } else {
+      motion.intro.pause();
+      motion.loop.pause();
+      motion.spin.pause();
+      // Nothing else on the page uses GSAP: put its rAF ticker to sleep entirely.
+      engine.ticker.sleep();
+    }
+  };
+
+  const startMotion = async () => {
+    if (prefersReducedMotion()) return; // static composition only
+    svg.classList.add('is-preparing');
+    const revealTimer = setTimeout(() => svg.classList.remove('is-preparing'), 4000);
     try {
-      if (running) svg.unpauseAnimations?.();
-      else svg.pauseAnimations?.();
+      const mod = await import('./vendor/gsap.js?v=1');
+      if (destroyed || !mod?.gsap) return;
+      engine = mod.gsap;
+      motion = buildHeroMotion(engine, svg);
+      motion.intro.eventCallback('onComplete', () => {
+        introDone = true;
+        if (shouldRun()) motion.loop.play(0);
+      });
+      motion.loop.timeScale(boosted ? 1.35 : 1);
+      svg.setAttribute('data-hero-engine', 'gsap');
     } catch {
-      // ignore environments without SMIL animation controls
+      // GSAP unavailable: keep the complete static graphic.
+      svg.setAttribute('data-hero-engine', 'static');
+    } finally {
+      clearTimeout(revealTimer);
+      svg.classList.remove('is-preparing');
+      syncAnimationState();
     }
   };
 
@@ -920,7 +1020,7 @@ export function mountTurgaliumHeroSvg(container) {
     });
 
     if (group === 'evm') {
-      updatePill('20 EVMs → Solana', '#0052FF');
+      updatePill('20 EVMs → Solana', '#3B82F6');
     } else if (chainId) {
       const chain = HERO_CHAINS.find((c) => c.id === chainId);
       if (chain) updatePill(chain.route, chain.color);
@@ -931,7 +1031,7 @@ export function mountTurgaliumHeroSvg(container) {
     svg.classList.remove('has-focus');
     svg.querySelectorAll('.is-active').forEach((n) => n.classList.remove('is-active'));
     footerChips.forEach((c) => c.classList.remove('is-active'));
-    updatePill('Solana Home', '#10B981');
+    updatePill('Solana Home', '#14F195');
   };
 
   const bind = (target, event, handler) => {
@@ -974,11 +1074,23 @@ export function mountTurgaliumHeroSvg(container) {
     mo.observe(siteShellEl, { attributes: true, attributeFilter: ['class', 'hidden', 'style'] });
   }
 
+  const io =
+    typeof IntersectionObserver !== 'undefined'
+      ? new IntersectionObserver((entries) => {
+          inView = entries.some((entry) => entry.isIntersecting);
+          syncAnimationState();
+        })
+      : null;
+  io?.observe(container);
+
   syncAnimationState();
+  startMotion();
 
   return {
     setActive(isActive) {
-      svg.classList.toggle('is-boosted', Boolean(isActive));
+      boosted = Boolean(isActive);
+      svg.classList.toggle('is-boosted', boosted);
+      motion?.loop.timeScale(boosted ? 1.35 : 1);
     },
     setPaused(isPaused) {
       paused = Boolean(isPaused);
@@ -990,7 +1102,11 @@ export function mountTurgaliumHeroSvg(container) {
     destroy() {
       destroyed = true;
       syncAnimationState();
+      motion?.intro.kill();
+      motion?.loop.kill();
+      motion?.spin.kill();
       mo?.disconnect();
+      io?.disconnect();
       for (const [target, event, handler] of listeners) {
         target.removeEventListener(event, handler);
       }
